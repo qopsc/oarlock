@@ -3881,3 +3881,72 @@ The requested group contains 56 original findings. **Closed or deduplicated: 0; 
 **Options:** (1) reuse the existing editor close-revision callback in the tab-close guard, record acknowledged revisions with the pending confirmation, and recheck after asynchronous hazard evaluation; if any still-dirty buffer changed, show confirmation again. Cover edits before confirmation and during the awaited check, clean saves, closed tabs and new hazards. (2) Freeze affected editors while the prompt/check is active; this changes editing behavior and needs reliable unfreeze on every exit.
 
 **Recommendation:** option 1, consistent with the previously approved window-close behavior. Passing the callback and expanding pending-close state changes the shared close contract, so no implementation is made pending the architecture decision. The triage stops here under the requested proposal checkpoint; the other 55 findings remain to be individually validated and ranked. No push.
+
+## Ownership, ordering, and cancellation: 56-finding triage
+
+AP013 was approved. R020 is fixed by `5b5e167`: bulk-close confirmation now uses the existing close-revision mechanism, rechecks after terminal hazard checks, and asks again for new edits. Hook regressions cover edits before confirmation and during the asynchronous check, and a save during the check. Full frontend checks passed: 5,491 tests passed, 2 skipped, types and lint passed (80 existing warnings). The first sandboxed full run could not bind its loopback servers; the unrestricted rerun passed.
+
+Each row below was checked against the current implementation. Except for R020, these are source-level validations of the described paths and potential interleavings, not claims that a live race was reproduced. A risk belongs in Tier 1 when the described path could lose or corrupt user data; its exact trigger and impact still need focused testing before a fix. Windows/WSL-only issues are labelled; AI implementation remains on hold. No duplicate was closed without evidence.
+
+**Counts:** 1 closed, 0 duplicates; 55 open: Tier 1 = 12, Tier 2 = 27, Tier 3 = 15, Tier 4 = 1.
+
+| ID | Result | Current-code check / impact |
+| --- | --- | --- |
+| R004 | Tier 2 | Native forwarding and frontend context still fall back from a missing explicit caller to the active window and space. |
+| R008 | Tier 2 | Explorer search still samples the environment without depending on it; matching roots can retain other-environment results (WSL). |
+| R009 | Tier 1 | Explorer's confirmation still keeps a path-only target and reads the live selection; a surviving menu could delete the wrong entries. Live navigation remains to reproduce. |
+| R010 | Tier 2 | Directory refresh has a workspace generation but no per-directory ordering; late listings can replace newer ones. |
+| R013 | Tier 3 | The supersession table still gives new overflow keys untracked tickets; older work for such a key cannot be superseded. |
+| R016 | Tier 3 | Several tab and pane state updaters still return disposal information through variables read immediately outside React's updater. |
+| R017 | Tier 2 | Commit-file diff reuse still matches repository, SHA and path without the active space. |
+| R018 | Tier 2 | Space-switcher pointer cancellation still calls the pointer-up path, which can commit the drag. |
+| R020 | CLOSED | `5b5e167` rechecks acknowledged buffer revisions before bulk close and includes asynchronous regression tests. |
+| R021 | Tier 3 | Quick Terminal still remounts the next pane immediately on exit even as it hides the window. |
+| R025 | Tier 2 | Distribution refresh still applies every completion without a request generation (Windows/WSL). |
+| R035 | Tier 1 | New File still reads the ambient environment after awaiting authorization and can create an unintended file in another environment (WSL). |
+| R036 | Tier 2 | File-written events still match path without environment; regular reload refuses dirty buffers, limiting the established impact to unwanted reloads (WSL/path aliases). |
+| R037 | Tier 3 | Discard coordinator Retry attempts still share client/listener slots without an attempt identity. |
+| R038 | Tier 1 | A thrown document-mutation application still abandons the remainder of a sequenced batch; stale bindings can endanger later saves. No data-loss reproduction yet. |
+| R042 | Tier 3 | The Vim command slot still waits for an unresolved continuation even after owner invalidation. |
+| R047 | Tier 2 | LSP navigation checks view lifetime but not request order or the requested document snapshot. |
+| R050 | Tier 3 | LSP install recheck can complete after dismissal or leave its checking state stuck on a failed save. |
+| R061 | Tier 2 | Opening the Git graph still accepts an asynchronously resolved repository without checking the initiating context. |
+| R062 | Tier 2 | Nested repository discovery still depends on folder alone, not the environment (WSL). |
+| R064 | Tier 2 | A refreshed Git status still retains old repository upstream metadata when deciding auto-fetch. |
+| R065 | Tier 3 | Remote Git actions still have no synchronous in-flight admission guard; busy can clear while another action runs. |
+| R066 | Tier 3 | Native PTY startup still registers the spawned session after awaiting spawn without checking whether its page closed. |
+| R075 | Tier 3 | An older terminal restart can still resume after close and clear a newer initialization. |
+| R076 | Tier 1 | The PTY writer still drops a failed batch, resumes later input, and reports failure only to the console; input or commands can be corrupted. |
+| R080 | Tier 1 | Clipboard capture and paste confirmation still await while later terminal input can pass them, potentially changing commands. |
+| R081 | Tier 2 | Registered-program file drops still omit the source environment, unlike shell insertion (cross-environment/WSL). |
+| R085 | Tier 2 | History popover reads still lack request ordering and destruction checks. |
+| R087 | Tier 1 | Retargeting the shared shell editor still uses a history-recorded replacement, so Undo can restore another leaf's text over its draft. |
+| R097 | Tier 2 | Installed-font lookup still caches an empty or failed lookup as null without retry. |
+| R101 | Tier 2 | Linux portal initial color-scheme read can still overwrite a newer change signal. |
+| R108 | Tier 2 | The cwd dropdown still samples the ambient environment and accepts out-of-order replies (WSL for cross-environment case). |
+| R109 | Tier 2 | A delayed shader import can still overwrite a newer selection or reset. |
+| R141 | Tier 3 | OAuth cancellation still does not interrupt preparation or token exchange; final token publication retains its cancellation guard. AI on hold. |
+| R144 | Tier 1 | Skill enablement still clones, saves and replaces settings outside one transaction, allowing concurrent toggles to be lost. AI on hold. |
+| R149 | Tier 1 | Agent launcher still saves a whole stale local command map, potentially restoring another window's edits. AI on hold. |
+| R150 | Tier 3 | Agent review still marks a round reviewed before asynchronous import/submission and lacks failure recovery. AI on hold. |
+| R151 | Tier 3 | Pending agent review still selects only the first agent for a session and can strand another's review. AI on hold. |
+| R152 | Tier 3 | The dedicated skills watcher still only logs watch/start failures, leaving consumers unaware of degraded coverage. AI on hold. |
+| R155 | Tier 2 | Approval diff still marks an ID opened before its cancellable read, so an effect rerun can leave its diff absent. AI on hold. |
+| R158 | Tier 2 | Local notifications still derive finish transitions from the currently selected chat rather than the originating chat. AI on hold. |
+| R161 | Tier 2 | Composer drag delivery still discards the source environment before import (WSL); AI on hold. |
+| R163 | Tier 1 | Model preferences still build whole arrays/maps from snapshots, so overlapping edits can lose saved choices. AI on hold. |
+| R167 | Tier 4 | Mini-window drag still restores body selection only on pointer end, not unmount. AI on hold. |
+| R172 | Tier 2 | Subagent deltas still discard older global revisions even when a newer delta affected another task. AI on hold. |
+| R178 | Tier 3 | Sampling dialog unmount still removes its abort listener without aborting the active generation. AI on hold. |
+| R180 | Tier 2 | User skill catalog still does not refresh for same-root environment or skills changes. AI on hold. |
+| R181 | Tier 2 | Skill/trust refreshes still lack request ordering and the prompt lacks navigation ownership. AI on hold. |
+| R182 | Tier 3 | Git skill preview still accepts a late result after close and can leave its candidate alive. AI on hold. |
+| R183 | Tier 2 | MCP status snapshot still races listener registration and can replace a newer event-derived list. AI on hold. |
+| R201 | Tier 1 | Independent theme-file ingestions still upsert in completion order and can persist an older theme over a newer save. |
+| R202 | Tier 1 | Theme ingestion still uses the current environment rather than the write's owner, potentially persisting the wrong theme (WSL). |
+| R206 | Tier 2 | Delayed theme/background imports still select their results after a newer choice or cancellation. |
+| R212 | Tier 1 | Delayed `cd` still uses ambient environment and does not revalidate prompt/session ownership, so text can enter a different running program. |
+| R213 | Tier 2 | Launch-file handling still sends host paths through the active space's file opener without a Local binding (Windows/WSL). |
+| R214 | Tier 2 | Git gutter baseline still drops a response received before the CodeMirror view exists. |
+
+Tier assignments are ordering priorities, not new severity determinations or proof of reproduced loss. Tier 1 AI entries remain held for the backend replacement; Windows-only entries remain relevant to the future port. No other production fixes were made during triage.
