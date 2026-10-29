@@ -1,10 +1,10 @@
 //! Copy files and supported symbolic links using handles with atomic,
 //! no-replace publication. Unsupported filesystems and entries fail safely.
+#[cfg(target_os = "macos")]
+use super::copy::{copy_name, MAX_COPY_SUFFIX};
 use super::{
     attachment::handle_path,
-    copy::{
-        copy_destination, copy_name, CopyFailure, CopyResult, MAX_COPY_SOURCES, MAX_COPY_SUFFIX,
-    },
+    copy::{copy_destination, CopyFailure, CopyResult, MAX_COPY_SOURCES},
     index::FileIndexState,
     mutate::note_dir_changed,
     to_canon,
@@ -34,7 +34,7 @@ pub(super) fn copy_batch(
     )
 }
 
-// Kept behind the refusal while the destination-location race is unresolved.
+// Workspace checks reject static escapes; unrelated same-user races are best effort.
 fn copy_batch_impl(
     sources: Vec<String>,
     dest_dir: &str,
@@ -131,27 +131,79 @@ fn open_regular(_path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(target_os = "macos")]
-fn publish(source: &fs::File, dest: &Dir, name: &std::ffi::OsStr) -> io::Result<()> {
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-    let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
-    // fclonefileat addresses the opened file itself, requires a vacant target,
-    // and atomically creates a copy. Unsupported volumes or cross-volume copies
-    // return an error and do not fall back to a pathname-based publication.
-    let result =
-        unsafe { libc::fclonefileat(source.as_raw_fd(), dest.as_raw_fd(), name.as_ptr(), 0) };
-    if result == 0 {
+fn check_tree(path: &Path, registry: &WorkspaceRegistry, depth: usize) -> io::Result<()> {
+    if depth > 128 {
+        return Err(io::Error::other("Copy folder exceeds maximum depth"));
+    }
+    ensure_supported_mode(path)?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = fs::symlink_metadata(&path)?.file_type();
+        if !kind.is_symlink() {
+            ensure_supported_mode(&path)?;
+        }
+        if kind.is_symlink() {
+            let target = fs::canonicalize(&path).map_err(|_| {
+                io::Error::other("Cannot verify a symbolic link in the copied folder")
+            })?;
+            if !registry.gates(Origin::App).reaches(&target) {
+                return Err(io::Error::other(
+                    "A symbolic link in the copied folder escapes authorized folders",
+                ));
+            }
+        } else if kind.is_dir() {
+            check_tree(&path, registry, depth + 1)?;
+        } else if !kind.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Copy folder contains an unsupported file type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_supported_mode(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if fs::symlink_metadata(path)?.permissions().mode() & 0o6000 != 0 {
+        return Err(io::Error::new(io::ErrorKind::Unsupported,
+            "Copying files with setuid or setgid permissions is unsupported because macOS cannot preserve them"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stage_copy(source: &Path, dest: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            state: *mut libc::c_void,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+    let from = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let to = std::ffi::CString::new(dest.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // COPYFILE_ALL includes ACLs, mode, extended attributes and data. Do not
+    // follow symlinks, and never replace an existing staging entry.
+    const FLAGS: u32 = 0xf | (1 << 15) | (1 << 17) | (1 << 18) | (1 << 19);
+    if unsafe { copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), FLAGS) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn publish(_source: &fs::File, _dest: &Dir, _name: &std::ffi::OsStr) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Safe file copying is unavailable on this platform",
-    ))
+#[cfg(target_os = "macos")]
+struct StagedCopy(super::private_staging::PrivateDirectory);
+#[cfg(target_os = "macos")]
+impl Drop for StagedCopy {
+    fn drop(&mut self) {
+        self.0.cleanup_content();
+    }
 }
 
 fn copy_file(
@@ -181,35 +233,58 @@ fn copy_file(
         ));
     }
     let kind = file.metadata()?.file_type();
-    if !kind.is_file() && !(cfg!(target_os = "macos") && kind.is_symlink()) {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "Only regular files and supported symbolic links can currently be copied safely; folders are unavailable"));
-    }
-    before_publish();
-    for n in 0..=MAX_COPY_SUFFIX {
-        let target = if n == 0 {
-            name.to_os_string()
-        } else {
-            copy_name(name, n, false)
-        };
-        context.validate().map_err(io::Error::other)?;
-        match publish(&file, context.dir, &target) {
-            Ok(()) => return Ok(target),
-            Err(error)
-                if error.kind() == io::ErrorKind::AlreadyExists && context.rename_on_conflict =>
-            {
-                continue
+    #[cfg(target_os = "macos")]
+    {
+        if kind.is_dir() {
+            if context.destination.starts_with(source) {
+                return Err(io::Error::other("Cannot copy a folder into itself"));
             }
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOTSUP) | Some(libc::EXDEV)
-                ) =>
+            check_tree(source, context.registry, 0)?;
+        } else if kind.is_file() {
+            ensure_supported_mode(source)?;
+        } else if !kind.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported copy source",
+            ));
+        }
+        let staged = StagedCopy(super::private_staging::PrivateDirectory::for_destination(
+            context.dir,
+        )?);
+        let staged_path = staged.0.content_path()?;
+        stage_copy(source, &staged_path)?;
+        before_publish();
+        for n in 0..=MAX_COPY_SUFFIX {
+            let target = if n == 0 {
+                name.to_os_string()
+            } else {
+                copy_name(name, n, kind.is_dir())
+            };
+            context.validate().map_err(io::Error::other)?;
+            staged.0.verify()?;
+            match super::mutate::rename_no_replace(&staged_path, &context.destination.join(&target))
             {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "Safe copying is unavailable across these volumes or on this filesystem; use your system file manager"));
+                Ok(()) => return Ok(target),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && context.rename_on_conflict =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (kind, before_publish, name);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Metadata-preserving copying is unavailable on this platform",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "No free copy name",

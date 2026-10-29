@@ -27,11 +27,17 @@ use tauri::Manager;
 
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 
-/// Refuse operations that cannot yet bind the final directory entry to the
-/// object the user selected. A pinned parent alone does not prevent replacing
-/// that entry immediately before an unlink or rename.
+/// The remaining final-entry race with noncooperating local programs is
+/// best effort on supported platforms; static authorization still applies.
 pub(crate) fn require_owned_entry_operation() -> Result<(), String> {
-    Err("This file operation is unavailable because its target cannot be safely verified. Use a terminal or your system file manager instead.".into())
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("This file operation is unavailable because its target cannot be safely verified. Use a terminal or your system file manager instead.".into())
+    }
 }
 
 #[cfg(test)]

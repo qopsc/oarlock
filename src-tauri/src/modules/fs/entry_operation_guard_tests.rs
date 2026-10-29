@@ -8,6 +8,7 @@ mod primitive_tests;
 #[path = "folder_clone_primitive_tests.rs"]
 mod folder_clone_primitive_tests;
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[test]
 fn unavailable_entry_operations_fail_before_their_work_can_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -20,4 +21,10 @@ fn unavailable_entry_operations_fail_before_their_work_can_run() {
     let error = attempt().unwrap_err();
     assert!(error.contains("cannot be safely verified"));
     assert_eq!(std::fs::read_to_string(file).unwrap(), "keep");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn supported_entry_operations_are_available() {
+    require_owned_entry_operation().unwrap();
 }

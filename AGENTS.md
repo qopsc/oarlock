@@ -5278,3 +5278,15 @@ only; no Windows/Linux runtime certification. Total client JS 2,880,576 gzip byt
 (-1,500), unchanged budget 2,882,080. Startup 251,032 (-40), primary terminal 95,786 (+1 from
 chunk output), both within unchanged budgets. No dependency added. Logs
 /tmp/oarlock-review106-*.log. AI remains on hold. No commit or push.
+
+
+Explorer mutation policy (macOS release): rename, move and delete check authorized
+entries and publish the existing document mutation events. They do not guarantee
+against another same-user process replacing entries after those checks. macOS copy
+stages privately outside worktrees on the destination filesystem and uses the native
+metadata-preserving copy operation followed by a no-replace publication. Nested
+links escaping authorized folders are refused; links are not traversed. A folder
+copy reads entries as encountered, so concurrent external edits can produce mixed
+versions. Copies are refused when a suitable private same-volume staging location
+is unavailable. Linux rename, move and delete use the same checks; metadata-safe
+copy remains unavailable there pending validation. Windows remains a later port.

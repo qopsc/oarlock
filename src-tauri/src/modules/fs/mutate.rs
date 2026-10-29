@@ -1005,4 +1005,31 @@ mod tests {
         assert!(real.is_dir(), "target dir must survive");
         assert_eq!(std::fs::read(real.join("keep.txt")).unwrap(), b"keep");
     }
+    #[cfg(unix)]
+    #[test]
+    fn static_symlink_parent_cannot_escape_move_rename_or_batch_delete() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let escaped = root.join("link");
+        symlink(outside.path(), &escaped).unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let local = root.join("local");
+        std::fs::write(&local, "local").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        assert!(registry
+            .gates(Origin::App)
+            .authorized_entry(&escaped.join("victim"))
+            .is_err());
+        assert!(move_path(&root, &escaped.join("victim"), &root.join("moved"), None).is_err());
+        assert!(move_path(&root, &local, &escaped.join("new"), None).is_err());
+        let result =
+            fs_delete_batch_impl(vec![s(escaped.join("victim"))], &root, &WorkspaceEnv::Local);
+        assert_eq!(result.failed, 1);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), "local");
+    }
 }

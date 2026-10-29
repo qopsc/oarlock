@@ -5,13 +5,41 @@ use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 use std::{fs::File, io, path::Path};
 
 pub(crate) const CONTENT: &str = "content";
-struct PrivateDirectory {
+pub(crate) struct PrivateDirectory {
     parent: Dir,
     name: String,
     directory: Dir,
     identity: File,
 }
 impl PrivateDirectory {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn for_destination(destination: &Dir) -> io::Result<Self> {
+        let parent = staging_root(destination, &std::env::temp_dir())?;
+        Self::create(&parent)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn content_path(&self) -> io::Result<std::path::PathBuf> {
+        self.verify()?;
+        outside_worktrees(&self.identity)?;
+        Ok(super::attachment::handle_path(&self.identity)
+            .map_err(io::Error::other)?
+            .join(CONTENT))
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn cleanup_content(&self) {
+        if self.verify().is_err() {
+            return;
+        }
+        match self.directory.symlink_metadata(CONTENT) {
+            Ok(meta) if meta.is_dir() => {
+                let _ = self.directory.remove_dir_all(CONTENT);
+            }
+            Ok(_) => {
+                let _ = self.directory.remove_file(CONTENT);
+            }
+            Err(_) => {}
+        }
+    }
     fn create(parent: &Dir) -> io::Result<Self> {
         let mut builder = DirBuilder::new();
         builder.recursive(false);
@@ -59,7 +87,7 @@ impl PrivateDirectory {
             "Cannot allocate a private staging directory",
         ))
     }
-    fn verify(&self) -> io::Result<()> {
+    pub(crate) fn verify(&self) -> io::Result<()> {
         if !entry_matches(&self.parent, Path::new(&self.name), &self.identity)? {
             return Err(io::Error::other("Private staging directory changed"));
         }

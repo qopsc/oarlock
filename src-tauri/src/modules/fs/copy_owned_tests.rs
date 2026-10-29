@@ -19,7 +19,7 @@ fn fixture() -> (
 
 #[cfg(target_os = "macos")]
 #[test]
-fn dormant_batch_copies_regular_files_without_replacing_conflicts() {
+fn batch_copies_regular_files_without_replacing_conflicts() {
     let (_tmp, src, dest, registry) = fixture();
     fs::write(src.join("a.txt"), "new").unwrap();
     fs::write(dest.join("a.txt"), "old").unwrap();
@@ -251,9 +251,10 @@ fn a_replaced_source_link_is_never_copied_from_its_new_entry() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn directories_are_refused_without_partial_copies() {
+fn folders_are_copied_without_partial_publication() {
     let (_tmp, src, dest, registry) = fixture();
     fs::create_dir(src.join("folder")).unwrap();
+    fs::write(src.join("folder/file"), "nested").unwrap();
     let path = |p: &Path| p.to_string_lossy().into_owned();
     let result = copy_batch_impl(
         vec![path(&src.join("folder"))],
@@ -265,9 +266,11 @@ fn directories_are_refused_without_partial_copies() {
         false,
     )
     .unwrap();
-    assert!(result.created.is_empty());
-    assert_eq!(result.failed.len(), 1);
-    assert_eq!(fs::read_dir(dest).unwrap().count(), 0);
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(
+        fs::read_to_string(dest.join("folder/file")).unwrap(),
+        "nested"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -337,7 +340,7 @@ fn folder_with_nested_outside_link_leaves_no_partial_copy() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn simultaneous_dormant_copies_choose_distinct_names() {
+fn simultaneous_copies_choose_distinct_names() {
     let (_tmp, src, dest, registry) = fixture();
     let source = src.join("file.txt");
     fs::write(&source, "data").unwrap();
@@ -415,8 +418,9 @@ fn unsupported_platform_does_not_publish_a_file() {
     assert!(!dest.join("a").exists());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn guarded_batch_refuses_copy_without_mutating_the_destination() {
+fn guarded_batch_copies_to_authorized_destination() {
     let (_tmp, src, dest, registry) = fixture();
     let source = src.join("file.txt");
     fs::write(&source, "source").unwrap();
@@ -430,9 +434,10 @@ fn guarded_batch_refuses_copy_without_mutating_the_destination() {
         &FileIndexState::default(),
         false,
     );
-    assert!(result.unwrap_err().contains("cannot be safely verified"));
+    let result = result.unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
     assert_eq!(fs::read_to_string(source).unwrap(), "source");
-    assert_eq!(fs::read_dir(dest).unwrap().count(), 0);
+    assert_eq!(fs::read_to_string(dest.join("file.txt")).unwrap(), "source");
 }
 
 #[cfg(unix)]
@@ -456,7 +461,85 @@ fn guarded_batch_does_not_write_when_destination_has_moved_outside() {
         &FileIndexState::default(),
         false,
     );
-    assert!(result.unwrap_err().contains("cannot be safely verified"));
+    assert!(result.is_err());
     assert!(!outside.path().join("file.txt").exists());
     assert!(!moved.join("file.txt").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn copies_acl_and_extended_attributes() {
+    use crate::modules::fs::access_control::tests::{acl_text, add_acl};
+    use std::os::unix::ffi::OsStrExt;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("file");
+    fs::write(&source, "metadata").unwrap();
+    add_acl(&source, "group:everyone deny write");
+    let path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+    let key = c"com.oarlock.test";
+    let value = b"preserve";
+    assert_eq!(
+        unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        },
+        0
+    );
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch(
+        vec![text(&source)],
+        &text(&dest),
+        &text(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let copied = dest.join("file");
+    assert_eq!(acl_text(&source), acl_text(&copied));
+    let copied_path = std::ffi::CString::new(copied.as_os_str().as_bytes()).unwrap();
+    let mut read = [0u8; 32];
+    let size = unsafe {
+        libc::getxattr(
+            copied_path.as_ptr(),
+            key.as_ptr(),
+            read.as_mut_ptr().cast(),
+            read.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(&read[..size as usize], value);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn refuses_a_copy_whose_privileged_mode_cannot_be_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("privileged");
+    fs::write(&source, "data").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o4755)).unwrap();
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch(
+        vec![text(&source)],
+        &text(&dest),
+        &text(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed[0].message.contains("setuid"));
+    assert!(!dest.join("privileged").exists());
 }
