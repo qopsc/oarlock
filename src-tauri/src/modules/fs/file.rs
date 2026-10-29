@@ -336,7 +336,7 @@ pub async fn fs_write_file(
             })
             .map_err(|e| {
                 log::warn!("fs_write_file({}) failed: {e}", target.display());
-                e.to_string()
+                format!("Cannot save {}: {e}", target.display())
             })?;
 
             if !existed {
@@ -407,7 +407,9 @@ pub async fn fs_save_document(
                 Err(document_save::SaveError::Conflict(version)) => {
                     Ok(DocumentSaveResult::Conflict { version })
                 }
-                Err(document_save::SaveError::Failed(error)) => Err(error),
+                Err(document_save::SaveError::Failed(error)) => {
+                    Err(format!("Cannot save {}: {error}", target.display()))
+                }
             }
         })
     })

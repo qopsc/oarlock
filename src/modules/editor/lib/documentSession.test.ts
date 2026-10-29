@@ -393,6 +393,22 @@ describe("DocumentSession save conflicts (crynta/terax-ai#1375)", () => {
     expect(t.host.saved).not.toHaveBeenCalled();
   });
 
+  it("retains the draft when atomic replacement is unavailable", async () => {
+    const t = setup({ "/p/a.ts": "old\n" });
+    t.session.open("/p/a.ts");
+    await flush();
+    t.session.change("unsaved draft\n");
+    t.failures.set("/p/a.ts", "Atomic replacement failed for /p/a.ts: read-only filesystem");
+    expect(await t.session.save()).toBe(false);
+    expect(t.session.text()).toBe("unsaved draft\n");
+    expect(t.dirty()).toBe(true);
+    expect(t.host.saveFailed).toHaveBeenCalledWith(
+      "/p/a.ts",
+      new Error("Atomic replacement failed for /p/a.ts: read-only filesystem"),
+    );
+    expect(t.host.saved).not.toHaveBeenCalled();
+  });
+
   it("reports a failed autosave", async () => {
     vi.useFakeTimers();
     const t = setup({ "/p/a.ts": "one\n" }, { enabled: true, delay: 500 });

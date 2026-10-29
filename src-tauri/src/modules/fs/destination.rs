@@ -127,7 +127,15 @@ impl Destination {
     }
 
     pub fn stage(&self, content: &[u8]) -> io::Result<Staged<'_>> {
-        let candidate = PrivateCandidate::create(&self.dir)?;
+        let candidate = PrivateCandidate::create(&self.dir).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Cannot create private same-volume staging for {}: {error}",
+                    self.opened.display()
+                ),
+            )
+        })?;
         candidate.file().write_all(content)?;
         candidate.file().sync_all()?;
         Ok(Staged {
@@ -158,7 +166,16 @@ impl Staged<'_> {
         if replace {
             self.candidate
                 .directory()
-                .rename(CONTENT, dir, &self.destination.name)?;
+                .rename(CONTENT, dir, &self.destination.name)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Atomic replacement failed for {}: {error}",
+                            self.destination.opened.display()
+                        ),
+                    )
+                })?;
         } else {
             self.candidate
                 .directory()
@@ -200,6 +217,24 @@ mod tests {
             !staging_dir.exists(),
             "empty inheritance probe was stranded"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_directory_refusal_reports_the_target_and_retains_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("report.txt");
+        fs::write(&target, b"original").unwrap();
+        let destination = Destination::pin(&target, false, &|_| Ok(())).unwrap();
+        let staged = destination.stage(b"draft").unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let result = staged.persist(true);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Atomic replacement failed"), "{error}");
+        assert!(error.contains("report.txt"), "{error}");
+        assert_eq!(fs::read(target).unwrap(), b"original");
     }
 
     #[test]

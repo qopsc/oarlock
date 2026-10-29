@@ -6,16 +6,97 @@ use std::{fs::File, io, path::Path};
 
 pub(crate) const CONTENT: &str = "content";
 pub(crate) struct PrivateDirectory {
-    parent: Dir,
+    parent: Option<Dir>,
     name: String,
+    #[cfg(target_os = "macos")]
+    replacement_path: Option<std::path::PathBuf>,
     directory: Dir,
     identity: File,
 }
 impl PrivateDirectory {
     #[cfg(target_os = "macos")]
     pub(crate) fn for_destination(destination: &Dir) -> io::Result<Self> {
-        let parent = staging_root(destination, &std::env::temp_dir())?;
-        Self::create(&parent)
+        use objc2::rc::autoreleasepool;
+        use objc2_foundation::{
+            NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask, NSURL,
+        };
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let destination_file = destination.try_clone()?.into_std_file();
+        let destination_path =
+            super::attachment::handle_path(&destination_file).map_err(io::Error::other)?;
+        let c_path = std::ffi::CString::new(destination_path.as_os_str().as_bytes())
+            .map_err(io::Error::other)?;
+        let path = autoreleasepool(|_| {
+            let url = unsafe {
+                NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+                    std::ptr::NonNull::new(c_path.as_ptr().cast_mut()).expect("CString pointer"),
+                    true,
+                    None,
+                )
+            };
+            let result = NSFileManager::defaultManager()
+                .URLForDirectory_inDomain_appropriateForURL_create_error(
+                    NSSearchPathDirectory::ItemReplacementDirectory,
+                    NSSearchPathDomainMask::UserDomainMask,
+                    Some(&url),
+                    true,
+                )
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "Cannot create per-volume replacement directory: {error}"
+                    ))
+                })?;
+            let bytes =
+                unsafe { std::ffi::CStr::from_ptr(result.fileSystemRepresentation().as_ptr()) }
+                    .to_bytes()
+                    .to_vec();
+            Ok::<_, io::Error>(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                bytes,
+            )))
+        })?;
+        let path = std::fs::canonicalize(path)
+            .map_err(|e| io::Error::other(format!("canonicalize replacement dir: {e}")))?;
+        let directory = staging_root(destination, &path)
+            .map_err(|e| io::Error::other(format!("open replacement root {path:?}: {e}")))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("Replacement directory has no name"))?
+            .to_string_lossy()
+            .into_owned();
+        let identity = directory.try_clone()?.into_std_file();
+        use std::os::unix::fs::MetadataExt;
+        if identity.metadata()?.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::other("Replacement directory owner changed"));
+        }
+        // macOS grants access to the created directory while denying open() on
+        // its TemporaryItems parent. Keep the opened directory identity, and
+        // recheck its returned pathname before cleanup; external races remain
+        // best effort under the approved same-user threat model.
+        let private = Self {
+            parent: None,
+            name,
+            replacement_path: Some(path),
+            directory,
+            identity,
+        };
+        private
+            .verify()
+            .map_err(|e| io::Error::other(format!("verify replacement root: {e}")))?;
+        AccessControl::privatize_directory(&private.identity)
+            .map_err(|e| io::Error::other(format!("privatize replacement root: {e}")))?;
+        if private
+            .directory
+            .entries()
+            .map_err(|e| io::Error::other(format!("list replacement root: {e}")))?
+            .next()
+            .is_some()
+        {
+            return Err(io::Error::other("Replacement directory is not empty"));
+        }
+        private
+            .verify()
+            .map_err(|e| io::Error::other(format!("final replacement verify: {e}")))?;
+        Ok(private)
     }
     #[cfg(target_os = "macos")]
     pub(crate) fn content_path(&self) -> io::Result<std::path::PathBuf> {
@@ -68,8 +149,10 @@ impl PrivateDirectory {
                 }
             }
             let private = Self {
-                parent: parent.try_clone()?,
+                parent: Some(parent.try_clone()?),
                 name,
+                #[cfg(target_os = "macos")]
+                replacement_path: None,
                 directory,
                 identity,
             };
@@ -88,18 +171,55 @@ impl PrivateDirectory {
         ))
     }
     pub(crate) fn verify(&self) -> io::Result<()> {
-        if !entry_matches(&self.parent, Path::new(&self.name), &self.identity)? {
-            return Err(io::Error::other("Private staging directory changed"));
+        if let Some(parent) = &self.parent {
+            if !entry_matches(parent, Path::new(&self.name), &self.identity)? {
+                return Err(io::Error::other("Private staging directory changed"));
+            }
+            return Ok(());
         }
-        Ok(())
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let path = self
+                .replacement_path
+                .as_ref()
+                .ok_or_else(|| io::Error::other("Missing replacement path"))?;
+            let current = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(path)?;
+            let current = current.metadata()?;
+            let original = self.identity.metadata()?;
+            if (current.dev(), current.ino()) != (original.dev(), original.ino()) {
+                return Err(io::Error::other("Private staging directory changed"));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err(io::Error::other("Missing staging parent"))
     }
 }
 impl Drop for PrivateDirectory {
     fn drop(&mut self) {
-        if self.verify().is_ok() {
-            if let Err(error) = self.parent.remove_dir(&self.name) {
-                log::warn!("Could not remove private staging directory: {error}");
+        if self.verify().is_err() {
+            return;
+        }
+        let result = if let Some(parent) = &self.parent {
+            parent.remove_dir(&self.name)
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                self.replacement_path
+                    .as_ref()
+                    .map_or(Ok(()), std::fs::remove_dir)
             }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Could not remove private staging directory: {error}");
         }
     }
 }
@@ -110,8 +230,11 @@ pub(crate) struct PrivateCandidate {
 }
 impl PrivateCandidate {
     pub fn create(destination: &Dir) -> io::Result<Self> {
-        let parent = staging_root(destination, &std::env::temp_dir())?;
-        let directory = PrivateDirectory::create(&parent)?;
+        #[cfg(target_os = "macos")]
+        let directory = PrivateDirectory::for_destination(destination)?;
+        #[cfg(not(target_os = "macos"))]
+        let directory =
+            PrivateDirectory::create(&staging_root(destination, &std::env::temp_dir())?)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -119,10 +242,17 @@ impl PrivateCandidate {
             use cap_std::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = directory.directory.open_with(CONTENT, &options)?.into_std();
+        let file = directory
+            .directory
+            .open_with(CONTENT, &options)
+            .map_err(|e| io::Error::other(format!("create candidate: {e}")))?
+            .into_std();
         let candidate = Self { directory, file };
-        AccessControl::prepare_staging(&candidate.file)?;
-        candidate.verify()?;
+        AccessControl::prepare_staging(&candidate.file)
+            .map_err(|e| io::Error::other(format!("prepare candidate: {e}")))?;
+        candidate
+            .verify()
+            .map_err(|e| io::Error::other(format!("verify candidate: {e}")))?;
         Ok(candidate)
     }
     pub fn file(&self) -> &File {
@@ -245,6 +375,57 @@ mod tests {
         );
         let error = staging_root(&destination, Path::new("/dev")).unwrap_err();
         assert!(error.to_string().contains("destination filesystem"));
+    }
+
+    #[test]
+    #[ignore = "requires OARLOCK_TEST_VOLUME pointing to a separate writable mounted filesystem"]
+    fn cross_volume_staging_stays_private_and_saves_conditionally() {
+        use super::super::{destination::Destination, document_save};
+        use std::os::unix::fs::MetadataExt;
+        let volume = std::env::var_os("OARLOCK_TEST_VOLUME").expect("set OARLOCK_TEST_VOLUME");
+        let root = tempfile::tempdir_in(volume).unwrap();
+        assert_ne!(
+            root.path().metadata().unwrap().dev(),
+            std::env::temp_dir().metadata().unwrap().dev()
+        );
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join(".gitignore"), ".env\n").unwrap();
+        let target = root.path().join(".env");
+        std::fs::write(&target, b"original").unwrap();
+        let destination = Destination::pin(&target, false, &|_| Ok(())).unwrap();
+        let staged = destination.stage(b"private draft").unwrap();
+        assert_eq!(
+            staged.file().metadata().unwrap().dev(),
+            root.path().metadata().unwrap().dev()
+        );
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert!(
+            !status.contains("NSIRD") && !status.contains("oarlock-stage"),
+            "{status}"
+        );
+        git(&["add", "--all"]);
+        assert_eq!(
+            git(&["diff", "--cached", "--name-only"]).trim(),
+            ".gitignore"
+        );
+        drop(staged);
+        let original = std::fs::File::open(&target).unwrap();
+        let version = document_save::version(&original, b"original").unwrap();
+        document_save::write_checked(&target, b"updated", Some(&version), |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"updated");
     }
 
     #[test]

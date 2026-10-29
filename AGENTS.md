@@ -3969,10 +3969,14 @@ capturing an ignored .env draft under the temporary content filename inside the
 worktree. The user approved moving staging outside worktrees on the same filesystem
 and refusing operations where no suitable location is available.
 
-The final `fs/private_staging` implementation opens the OS temporary directory,
-resolves its native handle path, refuses detected ancestor .git markers (including
-linked-worktree files), and requires the destination filesystem. It creates an
-operation-owned private directory there. No editor placeholder or content file
+On macOS `fs/private_staging` asks Foundation for an item replacement directory
+on the destination volume, opens and verifies the resulting directory, and refuses
+ancestor .git markers (including linked-worktree files). macOS does not permit
+opening its shared TemporaryItems parent, so cleanup rechecks the directory's
+identity through its returned path; a separate same-user process can race that
+final check. Other platforms currently use the OS temporary directory and require
+the destination filesystem. The operation-owned directory is made private before
+any content file is created. No editor placeholder or content file
 is created in the worktree. New-file inheritance is reproduced with an empty
 kernel-created probe below the private directory, using the destination parent's
 ACL inheritance and group rules. Probes are cleared and removed without exposing
@@ -3980,8 +3984,8 @@ content. Linux explicitly removes an inherited temp-directory default ACL when
 the real destination has none. Existing-file replacements retain their captured
 access rules as before. Unsuitable temporary locations, cross-filesystem staging,
 unsupported ACLs/platforms and verification failures remain explicit errors;
-there is no fallback to staging plaintext inside the workspace. This can prevent
-saves on external volumes when the OS temporary directory is on another volume.
+there is no fallback to staging plaintext inside the workspace. On platforms using
+the OS temporary directory, saves can fail if it is on another volume.
 
 Git's public index.lock reservation remains empty while the private candidate is
 written and verified. A prepared candidate replaces that reservation before the

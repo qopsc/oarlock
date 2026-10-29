@@ -3828,3 +3828,14 @@ Manual on a signed release candidate with a fresh isolated profile and disposabl
 3. Enable app access to all folders and retry a non-hidden outside image, then disable it and request a fresh preview. Expected: access follows the setting for each new request; dot-file restrictions continue to apply. Test only non-sensitive disposable files. Confirm ordinary reload and tab-close behavior.
 
 **Open release blockers: 3** — R026-U, R229 and R231. R111 is now a release checklist item; Windows-port and AI-on-hold rows remain excluded. The macOS release build, signed-package live checks and Linux runtime remain unverified. No push.
+
+
+## R026-U macOS implementation checkpoint
+
+The approved policy is to refuse with a clear error and retain a dirty buffer. On macOS, Foundation creates an item-replacement directory appropriate to the destination volume. The directory is checked against worktrees, verified by its opened identity and made private before content is written; metadata, ACL and conditional-save checks remain in force. macOS refuses opening the shared TemporaryItems parent even for its owner, so cleanup rechecks the returned directory path and identity before removal; a noncooperating same-user process can race that final check under the approved best-effort policy. Failures name the target and the staging or atomic-replacement error.
+
+A real APFS disk-image regression confirmed staging and conditional save on a different device from system temp and verified neither `git status` nor `git add --all` exposes the ignored draft. The image was detached and removed. A read-only-directory test retains the original and names the file; the frontend regression retains the dirty draft on a replacement failure. Linux O_TMPFILE implementation remains pending the requested decision on where to link the unnamed file before rename; R026-U therefore remains open. MAJOR triage has not started.
+
+| ID | Severity | Area | Finding | Disposition |
+| --- | --- | --- | --- | --- |
+| R235 | MAJOR | Editor saving | Some unsupported filesystems cannot preserve metadata or provide verified atomic replacement, so users cannot save through Oarlock even if they would accept a non-atomic write. | Future explicit “Save anyway (non-atomic)” option requires a separate design; do not build it in this batch. Current policy refuses and keeps the buffer dirty. |
