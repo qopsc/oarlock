@@ -42,6 +42,7 @@ import { inlineSuggestion } from "./inlineSuggest";
 import { completionWord } from "./pathComplete";
 import type { CompletionOwner } from "./safePathCompletion";
 import { ownedPathCompletion } from "./ownedPathCompletion";
+import { replaceShellDraft } from "./shellDraftHistory";
 
 const shellLanguage = StreamLanguage.define(shell);
 
@@ -332,6 +333,7 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
   const themeComp = new Compartment();
   const highlightComp = new Compartment();
   const editableComp = new Compartment();
+  const historyComp = new Compartment();
 
   const clear = (view: EditorView) =>
     view.dispatch({
@@ -375,7 +377,7 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
   const state = EditorState.create({
     doc: "",
     extensions: [
-      history(),
+      historyComp.of(history()),
       drawSelection({ cursorBlinkRate: 1100 }),
       rectangularSelection(),
       crosshairCursor(),
@@ -432,11 +434,7 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
     view,
     focus: () => view.focus(),
     getValue: () => view.state.doc.toString(),
-    setValue: (text) =>
-      view.dispatch({
-        changes: { from: 0, to: view.state.doc.length, insert: text },
-        selection: { anchor: text.length },
-      }),
+    setValue: (text) => replaceShellDraft(view, historyComp, text),
     clear: () => clear(view),
     setEditable: (editable) =>
       view.dispatch({
