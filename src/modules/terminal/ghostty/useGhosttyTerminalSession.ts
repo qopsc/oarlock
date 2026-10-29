@@ -670,6 +670,7 @@ export function disposeGhosttySession(leafId: number): boolean {
   session.model?.dispose();
   session.ptyResize.reset();
   session.writer.dispose();
+  toast.dismiss(`terminal-input-${leafId}`);
   void session.pty?.close();
   session.pty = null;
   sessions.delete(leafId);
@@ -740,6 +741,7 @@ async function respawnGhosttySession(
 ): Promise<boolean> {
   const session = sessions.get(leafId);
   if (!session || session.disposed) return false;
+  toast.dismiss(`terminal-input-${leafId}`);
   session.generation += 1;
   session.requests.dispose();
   session.input?.dispose();
@@ -885,6 +887,11 @@ function ensureSession(
     ptyResize,
     writer: new BoundedPtyWriter((error) => {
       console.error("[oarlock] Ghostty PTY write failed:", error);
+      toast.error("Terminal input stopped", {
+        id: `terminal-input-${leafId}`,
+        duration: Number.POSITIVE_INFINITY,
+        description: "Some input may be incomplete. Restart this terminal before continuing.",
+      });
     }),
     container: null,
     callbacks: {},

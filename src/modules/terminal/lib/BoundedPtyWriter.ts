@@ -21,6 +21,8 @@ export class BoundedPtyWriter {
   private pty: PtySession | null = null;
   private flushing = false;
   private disposed = false;
+  private failed = false;
+  private generation = 0;
   private inputBytes = 0;
   private replyBytes = 0;
 
@@ -28,12 +30,15 @@ export class BoundedPtyWriter {
 
   attach(pty: PtySession): void {
     if (this.disposed) return;
+    this.generation += 1;
     this.pty = pty;
     void this.flush();
   }
 
   detach(): void {
+    this.generation += 1;
     this.pty = null;
+    this.failed = false;
   }
 
   /** Bytes queued and not yet handed to the PTY. */
@@ -55,14 +60,17 @@ export class BoundedPtyWriter {
    * input still cannot grow the queue without bound.
    */
   enqueue(bytes: Uint8Array, reply = false): boolean {
-    if (this.disposed || bytes.byteLength === 0) return false;
+    if (this.disposed || this.failed || bytes.byteLength === 0) return false;
     const queued = reply ? this.replyBytes : this.inputBytes;
     const fits =
       queued + bytes.byteLength <= MAX_PENDING_BYTES ||
       (reply &&
         queued <= MAX_PENDING_BYTES &&
         bytes.byteLength <= MAX_REPLY_BYTES);
-    if (!fits) return false;
+    if (!fits) {
+      this.fail(new Error("Terminal input queue is full"));
+      return false;
+    }
     this.queue.push({ bytes, reply });
     if (reply) this.replyBytes += bytes.byteLength;
     else this.inputBytes += bytes.byteLength;
@@ -72,27 +80,37 @@ export class BoundedPtyWriter {
 
   dispose(): void {
     this.disposed = true;
+    this.generation += 1;
     this.pty = null;
     this.clear();
   }
 
+  private fail(error: unknown): void {
+    if (this.disposed || this.failed) return;
+    this.failed = true;
+    this.clear();
+    this.onError(error);
+  }
+
   private async flush(): Promise<void> {
-    if (this.flushing || this.disposed || !this.pty) return;
+    if (this.flushing || this.disposed || this.failed || !this.pty) return;
     this.flushing = true;
     try {
-      while (!this.disposed && this.pty && this.queue.length > 0) {
+      while (!this.disposed && !this.failed && this.pty && this.queue.length > 0) {
         const pty = this.pty;
+        const generation = this.generation;
         const batch = this.takeBatch();
         try {
           await pty.write(batch);
         } catch (error) {
-          this.onError(error);
+          if (generation !== this.generation) continue;
+          this.fail(error);
           return;
         }
       }
     } finally {
       this.flushing = false;
-      if (!this.disposed && this.pty && this.queue.length > 0) {
+      if (!this.disposed && !this.failed && this.pty && this.queue.length > 0) {
         queueMicrotask(() => void this.flush());
       }
     }

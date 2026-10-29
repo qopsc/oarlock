@@ -24,11 +24,13 @@ function stalledPty() {
 
 describe("BoundedPtyWriter", () => {
   it("refuses input past its budget while the PTY is not reading", () => {
-    const writer = new BoundedPtyWriter(() => undefined);
+    const failed = vi.fn();
+    const writer = new BoundedPtyWriter(failed);
     expect(writer.enqueue(new Uint8Array(200 * KiB))).toBe(true);
     expect(writer.enqueue(new Uint8Array(100 * KiB))).toBe(false);
-    expect(writer.enqueue(new Uint8Array(56 * KiB))).toBe(true);
-    expect(writer.pendingBytes).toBe(256 * KiB);
+    expect(writer.enqueue(new Uint8Array(56 * KiB))).toBe(false);
+    expect(writer.pendingBytes).toBe(0);
+    expect(failed).toHaveBeenCalledOnce();
   });
 
   it("takes a large reply the program asked for once, then refuses more replies", () => {
@@ -37,10 +39,10 @@ describe("BoundedPtyWriter", () => {
     // A clipboard answer far past the budget goes through.
     expect(writer.enqueue(new Uint8Array(40 * KiB * KiB), true)).toBe(true);
     // With that backlog no more replies are taken; typing still is.
-    expect(writer.enqueue(new Uint8Array(1), true)).toBe(false);
     expect(writer.enqueue(new Uint8Array(6 * KiB))).toBe(true);
-    expect(writer.enqueue(new Uint8Array(1))).toBe(false);
     expect(writer.pendingBytes).toBe(256 * KiB + 40 * KiB * KiB);
+    expect(writer.enqueue(new Uint8Array(1), true)).toBe(false);
+    expect(writer.enqueue(new Uint8Array(1))).toBe(false);
     // Larger than any answer the core makes: refused.
     expect(
       new BoundedPtyWriter(() => undefined).enqueue(
@@ -48,6 +50,45 @@ describe("BoundedPtyWriter", () => {
         true,
       ),
     ).toBe(false);
+  });
+
+  it("stops after a failed write instead of sending later input", async () => {
+    let reject!: (error: Error) => void;
+    const write = vi.fn(() => new Promise<void>((_, fail) => { reject = fail; }));
+    const failed = vi.fn();
+    const writer = new BoundedPtyWriter(failed);
+    const pty = { id: 1, write, close: vi.fn(), resize: vi.fn() } as PtySession;
+    writer.attach(pty);
+    writer.enqueue(Uint8Array.of(1));
+    writer.enqueue(Uint8Array.of(2));
+    reject(new Error("write failed"));
+    await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writer.pendingBytes).toBe(0);
+    expect(writer.enqueue(Uint8Array.of(3))).toBe(false);
+  });
+
+  it("does not let an old PTY failure stop its replacement", async () => {
+    let reject!: (error: Error) => void;
+    const old: PtySession = {
+      id: 1,
+      write: () => new Promise<void>((_, fail) => { reject = fail; }),
+      close: async () => {},
+      resize: async () => {},
+    };
+    const nextWrite = vi.fn(async () => {});
+    const next = { id: 2, write: nextWrite } as unknown as PtySession;
+    const failed = vi.fn();
+    const writer = new BoundedPtyWriter(failed);
+    writer.attach(old);
+    writer.enqueue(Uint8Array.of(1));
+    writer.detach();
+    writer.clear();
+    writer.attach(next);
+    writer.enqueue(Uint8Array.of(2));
+    reject(new Error("old PTY closed"));
+    await vi.waitFor(() => expect(nextWrite).toHaveBeenCalledOnce());
+    expect(failed).not.toHaveBeenCalled();
   });
 
   it("writes in order, one write in flight, a large reply unbatched", async () => {
