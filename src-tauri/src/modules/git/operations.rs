@@ -780,7 +780,11 @@ pub fn push(
 ) -> Result<GitPushResult> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(registry, &repo_root)?;
+    super::remote_guard::inspect(
+        registry,
+        &repo_root,
+        super::remote_guard::RemoteAction::Push,
+    )?;
 
     let upstream = repo_root.line(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])?;
     if upstream.is_none() {
@@ -1119,7 +1123,11 @@ pub fn fetch(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(registry, &repo_root)?;
+    super::remote_guard::inspect(
+        registry,
+        &repo_root,
+        super::remote_guard::RemoteAction::Fetch,
+    )?;
     let output = repo_root.run(["fetch", "--prune"], NETWORK_TIMEOUT_SECS)?;
     ensure_success(&output, "git fetch failed")
 }
@@ -1131,7 +1139,11 @@ pub fn pull_ff_only(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(registry, &repo_root)?;
+    super::remote_guard::inspect(
+        registry,
+        &repo_root,
+        super::remote_guard::RemoteAction::Fetch,
+    )?;
     let output = repo_root.run(["pull", "--ff-only"], NETWORK_TIMEOUT_SECS)?;
     ensure_success(&output, "git pull --ff-only failed")
 }
