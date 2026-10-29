@@ -80,6 +80,55 @@ impl PaneIds {
     }
 }
 
+#[derive(Default)]
+struct PendingRequests {
+    last_id: u64,
+    requests: HashMap<String, PendingResponse>,
+}
+struct PendingResponse {
+    window: String,
+    sender: SyncSender<FrontendResponse>,
+}
+impl PendingRequests {
+    fn insert(
+        &mut self,
+        window: &str,
+        sender: SyncSender<FrontendResponse>,
+    ) -> Result<String, &'static str> {
+        if self.requests.len() >= MAX_PENDING_REQUESTS {
+            return Err("too many pending frontend requests");
+        }
+        self.last_id = self
+            .last_id
+            .checked_add(1)
+            .ok_or("control request identifiers exhausted")?;
+        let id = format!("ui-{:016x}", self.last_id);
+        self.requests.insert(
+            id.clone(),
+            PendingResponse {
+                window: window.to_owned(),
+                sender,
+            },
+        );
+        Ok(id)
+    }
+    fn remove(&mut self, id: &str) {
+        self.requests.remove(id);
+    }
+    fn respond(&mut self, id: &str, window: &str, response: FrontendResponse) -> bool {
+        if !self
+            .requests
+            .get(id)
+            .is_some_and(|pending| pending.window == window)
+        {
+            return false;
+        }
+        self.requests
+            .remove(id)
+            .is_some_and(|pending| pending.sender.send(response).is_ok())
+    }
+}
+
 struct ControlCore {
     runtime: OnceLock<RuntimeInfo>,
     /// Windows whose page handles control requests.
@@ -87,7 +136,7 @@ struct ControlCore {
     panes: Mutex<PaneIds>,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
-    pending: Mutex<HashMap<String, SyncSender<FrontendResponse>>>,
+    pending: Mutex<PendingRequests>,
 }
 
 #[derive(Clone)]
@@ -101,7 +150,7 @@ impl Default for ControlState {
             panes: Mutex::new(PaneIds::default()),
             shutting_down: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingRequests::default()),
         }))
     }
 }
@@ -545,23 +594,19 @@ fn forward_to_frontend(
 
     let id = request.id.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
+    let frontend_id = match state
+        .0
+        .pending
+        .lock()
+        .expect("control pending poisoned")
+        .insert(&target, sender)
     {
-        let mut pending = state.0.pending.lock().expect("control pending poisoned");
-        if pending.len() >= MAX_PENDING_REQUESTS {
-            return ControlResponse::failure(
-                id,
-                "server_busy",
-                "too many pending frontend requests",
-            );
-        }
-        if pending.contains_key(&id) {
-            return ControlResponse::failure(id, "duplicate_id", "request id is already pending");
-        }
-        pending.insert(id.clone(), sender);
-    }
+        Ok(id) => id,
+        Err(message) => return ControlResponse::failure(id, "server_busy", message),
+    };
 
     let frontend_request = FrontendRequest {
-        id: id.clone(),
+        id: frontend_id.clone(),
         method: request.method,
         params: request.params,
         caller,
@@ -572,7 +617,7 @@ fn forward_to_frontend(
             .pending
             .lock()
             .expect("control pending poisoned")
-            .remove(&id);
+            .remove(&frontend_id);
         return ControlResponse::failure(
             id,
             "frontend_unavailable",
@@ -599,7 +644,7 @@ fn forward_to_frontend(
                 .pending
                 .lock()
                 .expect("control pending poisoned")
-                .remove(&id);
+                .remove(&frontend_id);
             ControlResponse::failure(id, "frontend_timeout", "Oarlock UI did not respond in time")
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => ControlResponse::failure(
@@ -626,17 +671,21 @@ pub fn control_frontend_ready(
 
 #[tauri::command]
 pub fn control_respond(
+    window: tauri::Window,
     state: tauri::State<'_, ControlState>,
     request_id: String,
     response: FrontendResponse,
 ) -> bool {
-    let sender = state
+    let delivered = state
         .0
         .pending
         .lock()
         .expect("control pending poisoned")
-        .remove(&request_id);
-    sender.is_some_and(|sender| sender.send(response).is_ok())
+        .respond(&request_id, window.label(), response);
+    if !delivered {
+        log::warn!("Dropped expired, duplicate, unknown or wrong-window control response");
+    }
+    delivered
 }
 
 fn write_response(stream: &mut TcpStream, response: &ControlResponse) -> std::io::Result<()> {
@@ -1125,5 +1174,64 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+    fn frontend_response(value: &str) -> FrontendResponse {
+        FrontendResponse {
+            ok: true,
+            result: Some(json!(value)),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn late_response_after_timeout_is_dropped() {
+        let mut pending = PendingRequests::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = pending.insert("main", sender).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        pending.remove(&id);
+        assert!(!pending.respond(&id, "main", frontend_response("late")));
+    }
+
+    #[test]
+    fn reused_caller_id_cannot_reuse_a_frontend_reply_slot() {
+        let mut pending = PendingRequests::default();
+        let (first, _) = mpsc::sync_channel(1);
+        let first_id = pending.insert("main", first).unwrap();
+        pending.remove(&first_id);
+        let (second, receiver) = mpsc::sync_channel(1);
+        let second_id = pending.insert("main", second).unwrap();
+        assert_ne!(first_id, second_id);
+        assert!(!pending.respond(&first_id, "main", frontend_response("stale")));
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.respond(&second_id, "main", frontend_response("current")));
+        assert_eq!(receiver.recv().unwrap().result, Some(json!("current")));
+    }
+
+    #[test]
+    fn duplicate_and_wrong_window_replies_are_dropped() {
+        let mut pending = PendingRequests::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = pending.insert("main", sender).unwrap();
+        assert!(!pending.respond(&id, "other", frontend_response("wrong")));
+        assert!(pending.respond(&id, "main", frontend_response("first")));
+        assert!(!pending.respond(&id, "main", frontend_response("duplicate")));
+        assert_eq!(receiver.recv().unwrap().result, Some(json!("first")));
+    }
+
+    #[test]
+    fn request_id_exhaustion_never_wraps() {
+        let mut pending = PendingRequests {
+            last_id: u64::MAX,
+            ..Default::default()
+        };
+        let (sender, _) = mpsc::sync_channel(1);
+        assert_eq!(
+            pending.insert("main", sender).unwrap_err(),
+            "control request identifiers exhausted"
+        );
     }
 }
