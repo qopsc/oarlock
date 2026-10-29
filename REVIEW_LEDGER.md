@@ -3766,6 +3766,8 @@ Windows is outside the current macOS-first release; these entries are retained f
 | K001 | WINDOWS PORT | F4 / 10 | Windows custom theme migration/saves are blocked by the existing safe-write implementation. | Windows-only, moved to the Windows port; not a blocker for the macOS-first release. Remains log-only. |
 | R019 | WINDOWS PORT | 08 | Saved-window restoration requires adoption when the saved registry has no main window, but `windows/restore.rs::prepare` explicitly refuses every platform except macOS/Linux. Closing the original window, then quitting a remaining window, can leave Windows unable to restore that saved layout on its next launch. | Windows-only, moved to the Windows port; not a blocker for the macOS-first release. State remains retained. |
 | R026-W | WINDOWS PORT | 10 | The native safe-write implementation does not support Windows staging and ACL preservation. | Deferred to the Windows port; distinct Unix limitations remain R026-U. |
+| R035 | WINDOWS PORT | 12 | New-file authorization can finish after switching between WSL environments and create the file in the wrong distribution. | Deferred with WSL support to the Windows port. |
+| R202 | WINDOWS PORT | F4 | Theme-file ingestion can use the current WSL environment instead of the environment that wrote the file. | Deferred with WSL support to the Windows port. |
 
 ## Explorer restoration and Git remote checkpoint (2026-10-29)
 
@@ -3970,3 +3972,9 @@ Updated group counts: **4 closed, 0 duplicates; 52 open: Tier 1 = 9, Tier 2 = 27
 **Options:** (1) introduce a bounded per-terminal input gate that holds subsequent terminal-bound key/text/composition and paste operations in arrival order until the pending capture and any confirmation resolve, releases them in order, and cancels on terminal disposal/restart. Define clear failure/overflow behavior and cover IME, Kitty keyboard replies, prompt-mode routing, simultaneous pastes and focus changes. (2) cancel a pending paste when later input arrives and tell the user; this is simpler but lets an incomplete command receive Enter and would not preserve the requested input order. (3) suppress later input until the paste finishes and show that input was not sent; this avoids reordering but discards keystrokes.
 
 **Recommendation:** option 1, using the existing terminal lifetime and bounded fail-stop policy while adding the missing input-order gate. The gate is a new mechanism, and needs an explicit decision under the standing triage rule. No R080 production code was changed. No push.
+
+## AP014 continuation checkpoint
+
+The user approved an ordered gate as part of the existing per-terminal writer and extended the requirement to app-generated writes such as `cd`: queued work must be cancelled when its terminal context changes. R035 and R202 are moved to the Windows port above; R144, R149 and R163 remain on AI hold. The remaining release Tier 1 findings are R080, R212, R038 and R201. Tier 2 remains 27 in the 56-finding group.
+
+AP014 is in progress, not fixed: an uncommitted writer/controller prototype reserves positions for clipboard reads and confirmation, and focused tests exercise raw input and terminal-proxy command-bar routing. Direct CodeMirror command-bar input and context-bound app-generated writes still need integration and regression coverage. The initial focused run had one confirmation-test failure due to the prototype's additional promise turn; no passing full suite or complete fix is claimed. The production prototype must not be committed or released in this state.
