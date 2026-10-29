@@ -13,6 +13,7 @@ export {
 } from "./lib/panes";
 export {
   clearFocusedTerminal,
+  captureGhosttyInputOwner,
   disposeSession,
   leafHasForegroundProcess,
   leafIdForPty,
@@ -34,6 +35,7 @@ export {
 } from "./lib/terminalStatus";
 export { equalizePanes, resizeActivePane } from "./lib/paneLayout";
 export {
+  captureNewTerminalNavigation,
   setTerminalFileOpener,
   setTerminalLinkNavigation,
   setTerminalPreviewOpener,

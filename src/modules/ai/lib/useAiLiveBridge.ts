@@ -1,11 +1,13 @@
 import { type RefObject, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useManagedAgentsStore } from "@/modules/agents/store/managedAgentsStore";
+import { toast } from "sonner";
 import {
+  captureGhosttyInputOwner,
+  captureNewTerminalNavigation,
   findLeafCwd,
   type TerminalPaneHandle,
   whenSessionReady,
-  writeToSession,
 } from "@/modules/terminal";
 import type { Tab } from "@/modules/tabs";
 import type { Live } from "../store/chatStore";
@@ -126,6 +128,7 @@ export function useAiLiveBridge(params: Params) {
             cwd ?? undefined,
             `claude · ${short}`,
           );
+          const navigation = captureNewTerminalNavigation(tabId);
           useManagedAgentsStore
             .getState()
             .register({ leafId, tabId, sessionId, task: oneLine, cwd });
@@ -133,8 +136,17 @@ export function useAiLiveBridge(params: Params) {
             agent: "claude",
           }).catch(() => {});
           void (async () => {
+            try {
             await Promise.all([whenSessionReady(leafId), hooksReady]);
-            if (!writeToSession(leafId, "claude\r")) {
+            if (!navigation.active()) {
+              toast.message("Terminal launch cancelled", {
+                description: "The selected terminal changed before launch.",
+              });
+              useManagedAgentsStore.getState().remove(leafId);
+              return;
+            }
+            const owner = captureGhosttyInputOwner(leafId);
+            if (!owner?.write("claude\r")) {
               useManagedAgentsStore.getState().remove(leafId);
               return;
             }
@@ -143,6 +155,13 @@ export function useAiLiveBridge(params: Params) {
               return term ? term.getBuffer(120) : null;
             };
             const result = await waitForClaudeTuiReady(readBuf);
+            if (!owner.active() || !navigation.active()) {
+              toast.message("Agent input cancelled", {
+                description: "The terminal changed before the prompt was sent.",
+              });
+              useManagedAgentsStore.getState().remove(leafId);
+              return;
+            }
             if (result !== "ready") {
               if (result === "timeout") {
                 console.warn(
@@ -152,12 +171,18 @@ export function useAiLiveBridge(params: Params) {
               useManagedAgentsStore.getState().remove(leafId);
               return;
             }
-            if (!writeToSession(leafId, `\x1b[200~${trimmed}\x1b[201~`)) {
+            if (!owner.write(`\x1b[200~${trimmed}\x1b[201~`)) {
               useManagedAgentsStore.getState().remove(leafId);
               return;
             }
-            setTimeout(() => writeToSession(leafId, "\r"), 120);
+            setTimeout(() => owner.write("\r"), 120);
             useManagedAgentsStore.getState().setPhase(leafId, "working");
+            } catch (error) {
+              toast.error("Could not launch agent terminal", { description: String(error) });
+              useManagedAgentsStore.getState().remove(leafId);
+            } finally {
+              navigation.dispose();
+            }
           })();
           return { tabId, leafId };
         },

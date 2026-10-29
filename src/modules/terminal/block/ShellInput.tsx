@@ -4,11 +4,16 @@ import { usePreferencesStore } from "@/modules/settings/preferences";
 import { shortcutText } from "@/modules/shortcuts";
 import { useTheme } from "@/modules/theme";
 import { useEffect, useRef } from "react";
+import { toast } from "sonner";
 import { runScopeHandlers } from "@codemirror/view";
 import { useFontFeatureStack } from "../lib/fontFeatures";
 import {
   clearLeafBlockSelection,
   captureGhosttyCompletionOwner,
+  deferGhosttyInput,
+  holdingGhosttyInput,
+  noteGhosttyUserInput,
+  reserveGhosttyInput,
   getLeafDraft,
   leafGridSelection,
   setLeafDraft,
@@ -103,6 +108,31 @@ export default function ShellInput({
         const owner = captureGhosttyCompletionOwner(leaf);
         const revision = completionLifetime.current.revision;
         return owner && { ...owner, active: () => completionLifetime.current.revision === revision && leafIdRef.current === leaf && focusableRef.current && owner.active() };
+      },
+      inputGate: {
+        defer: (action, size) => {
+          const leaf = leafIdRef.current;
+          return deferGhosttyInput(leaf, () => {
+            if (leafIdRef.current === leaf && handleRef.current === handle) action();
+            else toast.message("Pending terminal input cancelled", {
+              id: `terminal-input-cancelled-${leaf}`,
+              description: "The terminal changed before the input could be applied.",
+            });
+          }, size);
+        },
+        holding: () => holdingGhosttyInput(leafIdRef.current),
+        reserve: () => {
+          const leaf = leafIdRef.current;
+          const finish = reserveGhosttyInput(leaf);
+          return finish && ((action, size) => finish(() => {
+            if (leafIdRef.current === leaf && handleRef.current === handle) action();
+            else toast.message("Pending terminal input cancelled", {
+              id: `terminal-input-cancelled-${leaf}`,
+              description: "The terminal changed before the input could be applied.",
+            });
+          }, size));
+        },
+        noteInput: () => noteGhosttyUserInput(leafIdRef.current),
       },
       onChange: (text) =>
         setLeafInputActivity(leafIdRef.current, text.length > 0),

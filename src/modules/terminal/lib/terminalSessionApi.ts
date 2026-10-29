@@ -2,6 +2,11 @@ import type { BlockMode } from "@/modules/terminal/block/lib/modeMachine";
 import {
   clearGhosttySession,
   captureGhosttyCompletionOwner,
+  captureGhosttyInputOwner,
+  deferGhosttyInput,
+  holdingGhosttyInput,
+  noteGhosttyUserInput,
+  reserveGhosttyInput,
   disposeGhosttySession,
   dropOnGhosttySession,
   focusGhosttySession,
@@ -56,6 +61,8 @@ export async function whenSessionReady(
 export function writeToSession(leafId: number, data: string): boolean {
   return writeToGhosttySession(leafId, data);
 }
+
+export { captureGhosttyInputOwner, deferGhosttyInput, holdingGhosttyInput, noteGhosttyUserInput, reserveGhosttyInput };
 
 export function submitToLeaf(leafId: number, text: string): void {
   submitToGhosttySession(leafId, text);

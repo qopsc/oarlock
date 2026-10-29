@@ -43,6 +43,7 @@ import { completionWord } from "./pathComplete";
 import type { CompletionOwner } from "./safePathCompletion";
 import { ownedPathCompletion } from "./ownedPathCompletion";
 import { replaceShellDraft } from "./shellDraftHistory";
+import { shellInputGate, type ShellInputGateOwner } from "./shellInputGate";
 
 const shellLanguage = StreamLanguage.define(shell);
 
@@ -67,6 +68,7 @@ export type ShellEditorOptions = {
   completionOwner?: () => CompletionOwner | null;
   /** Fires on every edit with the current text (used to gate empty-state UI). */
   onChange?: (text: string) => void;
+  inputGate?: ShellInputGateOwner;
 };
 
 export type ShellEditorHandle = {
@@ -334,6 +336,7 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
   const highlightComp = new Compartment();
   const editableComp = new Compartment();
   const historyComp = new Compartment();
+  const inputGate = opts.inputGate ? shellInputGate(opts.inputGate) : null;
 
   const clear = (view: EditorView) =>
     view.dispatch({
@@ -399,6 +402,7 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
       }),
       completionListKeys,
       completionListClaims(IS_MAC),
+      ...(inputGate?.extensions ?? []),
       ...(opts.suggest ? inlineSuggestion(opts.suggest) : []),
       ...(opts.historyList ? historyPopover(opts.historyList) : []),
       placeholder(opts.placeholderText ?? "Run a command"),
@@ -434,7 +438,10 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
     view,
     focus: () => view.focus(),
     getValue: () => view.state.doc.toString(),
-    setValue: (text) => replaceShellDraft(view, historyComp, text),
+    setValue: (text) => {
+      inputGate?.cancel();
+      replaceShellDraft(view, historyComp, text);
+    },
     clear: () => clear(view),
     setEditable: (editable) =>
       view.dispatch({
@@ -450,6 +457,9 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
           highlightComp.reconfigure(syntaxHighlighting(highlightStyle())),
         ],
       }),
-    destroy: () => view.destroy(),
+    destroy: () => {
+      inputGate?.cancel();
+      view.destroy();
+    },
   };
 }

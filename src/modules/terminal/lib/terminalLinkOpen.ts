@@ -13,6 +13,39 @@ export function captureTerminalNavigation(): () => boolean {
   return () => current !== null && !current.controller.signal.aborted;
 }
 
+/** The quick terminal has no workspace navigation, but still has an owner. */
+export function captureTerminalInputNavigation(): () => boolean {
+  const current = navigation;
+  return () => current ? !current.controller.signal.aborted : navigation === null;
+}
+
+/** Own work that starts while a new terminal tab is being mounted. */
+export function captureNewTerminalNavigation(tabId: number) {
+  let live = true;
+  let target: LinkNavigation | null = navigation?.tabId === tabId ? navigation : null;
+  let previous = navigation;
+  let invalid = previous === null;
+  const changed = () => {
+    if (target) { invalid = true; return; }
+    queueMicrotask(() => {
+      if (!live || invalid) return;
+      if (!navigation || navigation.tabId !== tabId) { invalid = true; return; }
+      target = navigation;
+      previous = target;
+      target.controller.signal.addEventListener("abort", changed, { once: true });
+    });
+  };
+  previous?.controller.signal.addEventListener("abort", changed, { once: true });
+  return {
+    active: () => live && !invalid && target !== null &&
+      target === navigation && !target.controller.signal.aborted,
+    dispose: () => {
+      live = false;
+      previous?.controller.signal.removeEventListener("abort", changed);
+    },
+  };
+}
+
 /** Each committed tab/space change permanently invalidates earlier clicks. */
 export function setTerminalLinkNavigation(
   spaceId: string,

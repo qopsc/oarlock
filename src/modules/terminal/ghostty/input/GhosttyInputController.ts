@@ -159,6 +159,9 @@ export type GhosttyInputControllerOptions = {
   /** CSS pixels the drawn grid is moved up inside the pointer target; zero when absent. */
   readonly gridShiftY?: () => number;
   readonly onData: (bytes: Uint8Array) => void;
+  readonly onInput?: () => void;
+  readonly reserveInput?: () => ((action: () => void, size?: number) => void) | null;
+  readonly deferInput?: (action: () => void, size?: number) => boolean;
   /**
    * Copies the selection; false when nothing is selected, and the key goes
    * on to the program. `clearSelection` asks for the copied selection to be
@@ -253,6 +256,8 @@ export class GhosttyInputController {
 
   /** Text inserted other than from a clipboard (drops, scripted input). */
   paste(text: string): void {
+    this.options.onInput?.();
+    if (this.options.deferInput?.(() => this.deliverPaste(text, null), text.length * 2)) return;
     this.deliverPaste(text, null);
   }
 
@@ -262,6 +267,8 @@ export class GhosttyInputController {
    * clipboard itself; anything else gets the text.
    */
   pasteFromClipboard(text: string, primary = false, image = false): void {
+    this.options.onInput?.();
+    if (this.options.deferInput?.(() => this.deliverPaste(text, primary, image), text.length * 2)) return;
     this.deliverPaste(text, primary, image);
   }
 
@@ -306,19 +313,22 @@ export class GhosttyInputController {
   private pasteText(text: string): void {
     const bracketed = this.options.model.modes().bracketedPaste;
     if (this.options.confirmPaste && isUnsafePaste(text, bracketed)) {
-      void this.options.confirmPaste(text).then((confirmed) => {
-        // Bracketed paste may have changed while the user decided.
-        if (confirmed && !this.disposed) {
-          this.emitText(
-            encodeTerminalPaste(
-              text,
-              this.options.model.modes().bracketedPaste,
-            ),
-            "paste",
-            false,
-          );
-        }
-      });
+      const reserved = this.options.reserveInput?.();
+      if (this.options.reserveInput && !reserved) return;
+      const finish = reserved ?? ((action: () => void, _size?: number) => action());
+      void Promise.resolve().then(() => this.options.confirmPaste?.(text) ?? false).then(
+        (confirmed) => finish(() => {
+          if (confirmed && !this.disposed) {
+            this.emitText(
+              encodeTerminalPaste(text, this.options.model.modes().bracketedPaste),
+              "paste", false,
+            );
+          }
+        }, text.length * 2),
+        (error) => finish(() => {
+          if (!this.disposed) this.options.onClipboardError?.(error);
+        }),
+      );
       return;
     }
     this.emitText(encodeTerminalPaste(text, bracketed), "paste", false);
@@ -349,6 +359,7 @@ export class GhosttyInputController {
   }
 
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
+    if (!event.defaultPrevented) this.options.onInput?.();
     this.nativeSelection?.reset();
     // A new keystroke: its text is never a copy of the previous one's.
     this.lastData = "";
@@ -375,6 +386,9 @@ export class GhosttyInputController {
     });
     if (clipboard === "paste" || clipboard === "pasteText") {
       consume(event);
+      const reserved = this.options.reserveInput?.();
+      if (this.options.reserveInput && !reserved) return;
+      const finish = reserved ?? ((action: () => void, _size?: number) => action());
       const images = this.options.model.pasteEventsWanted?.()
         ? "always"
         : "if-empty";
@@ -384,16 +398,21 @@ export class GhosttyInputController {
         this.clipboardLifetime.signal,
       )
         .then((snapshot) => {
-          if (this.disposed || this.options.model.isDisposed?.()) return;
           const text = snapshot.text ?? "";
-          if (text || this.options.model.pasteEventsWanted?.()) {
-            this.pasteFromClipboard(text, false, snapshot.image !== null);
-          } else if (clipboard === "pasteText") {
-            this.sendHeldKey(event);
-          } else if (snapshot.image !== null) this.sendControlV();
+          const hasImage = snapshot.image !== null;
+          finish(() => {
+            if (this.disposed || this.options.model.isDisposed?.()) return;
+            if (text || this.options.model.pasteEventsWanted?.()) {
+              this.pasteFromClipboard(text, false, hasImage);
+            } else if (clipboard === "pasteText") {
+              this.sendHeldKey(event);
+            } else if (hasImage) this.sendControlV();
+          }, text.length * 2);
         })
         .catch((error) => {
-          if (!this.disposed) this.options.onClipboardError?.(error);
+          finish(() => {
+            if (!this.disposed) this.options.onClipboardError?.(error);
+          });
         });
       return;
     }
@@ -405,6 +424,18 @@ export class GhosttyInputController {
       return;
     }
 
+    if (!(this.isMac && event.metaKey) &&
+        this.options.deferInput?.(() => this.finishKeyDown(event), event.key.length * 2)) {
+      consume(event);
+      return;
+    }
+    this.finishKeyDown(event);
+  };
+
+  private finishKeyDown(event: KeyboardEvent): void {
+    if (this.disposed || this.options.model.isDisposed?.()) return;
+    this.lastData = "";
+    this.lastSource = null;
     if (this.options.onKeyDown?.(event)) {
       consume(event);
       return;
@@ -473,7 +504,7 @@ export class GhosttyInputController {
       this.options.model.scrollToBottom();
       this.options.onData(encoded);
     }
-  };
+  }
 
   private encodeKeyDown(event: KeyboardEvent, key: Key): Uint8Array {
     const utf8 = event.key.length === 1 ? event.key : undefined;
@@ -570,10 +601,21 @@ export class GhosttyInputController {
     if (event.code === "AltLeft" || event.code === "AltRight") {
       this.optionKeys.delete(event.code);
     }
+    const prevented = event.defaultPrevented;
+    const composing = this.composing || event.isComposing;
+    if (this.options.deferInput?.(() => this.finishKeyUp(event, prevented, composing))) {
+      consume(event);
+      return;
+    }
+    this.finishKeyUp(event, prevented, composing);
+  };
+
+  private finishKeyUp(event: KeyboardEvent, prevented: boolean, composing: boolean): void {
+    if (this.disposed || this.options.model.isDisposed?.()) return;
     const pressed = this.pressedKeys.get(event.code);
     if (!pressed) return;
     this.pressedKeys.delete(event.code);
-    if (event.defaultPrevented || this.composing || event.isComposing) return;
+    if (prevented || composing) return;
     const encoded = this.options.model.encodeKey({
       ...pressed,
       action: KeyAction.RELEASE,
@@ -584,7 +626,7 @@ export class GhosttyInputController {
       consume(event);
       this.options.onData(encoded);
     }
-  };
+  }
 
   private readonly handleBeforeInput = (event: InputEvent): void => {
     if (this.composing || event.isComposing) return;
@@ -612,15 +654,14 @@ export class GhosttyInputController {
         return;
     }
     if (!data) return;
+    this.options.onInput?.();
     consume(event);
-    this.emitText(
-      data,
-      "beforeinput",
-      true,
-      true,
-      event.inputType === "insertText" ||
-        event.inputType === "insertReplacementText",
+    const value = data;
+    const deliver = () => this.emitText(
+      value, "beforeinput", true, true,
+      event.inputType === "insertText" || event.inputType === "insertReplacementText",
     );
+    if (!this.options.deferInput?.(deliver, value.length * 2)) deliver();
     this.proxy.arm();
   };
 
@@ -630,7 +671,12 @@ export class GhosttyInputController {
 
   private readonly handleCompositionEnd = (event: CompositionEvent): void => {
     this.composing = false;
-    if (event.data) this.emitText(event.data, "composition", true, true, true);
+    if (event.data) {
+      this.options.onInput?.();
+      const text = event.data;
+      const deliver = () => this.emitText(text, "composition", true, true, true);
+      if (!this.options.deferInput?.(deliver, text.length * 2)) deliver();
+    }
     this.proxy.arm();
   };
 

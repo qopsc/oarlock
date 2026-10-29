@@ -1,7 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { useManagedAgentsStore } from "@/modules/agents/store/managedAgentsStore";
-import { writeToSession } from "@/modules/terminal";
+import { captureGhosttyInputOwner } from "@/modules/terminal";
 import type { ToolContext } from "./context";
 
 // Claude Code's TUI treats a trailing CR in the same write chunk as the text
@@ -81,11 +81,12 @@ export function buildManagedAgentTools(ctx: ToolContext) {
         if (hasControlChars(oneLine)) {
           return { error: "instruction contains control characters" };
         }
-        if (!writeToSession(managed.leafId, oneLine)) {
+        const owner = captureGhosttyInputOwner(managed.leafId);
+        if (!owner?.write(oneLine)) {
           store.remove(managed.leafId);
           return { error: "agent terminal is no longer available (closed?)" };
         }
-        setTimeout(() => writeToSession(managed.leafId, "\r"), SUBMIT_DELAY_MS);
+        setTimeout(() => owner.write("\r"), SUBMIT_DELAY_MS);
         store.bumpRound(managed.leafId);
         return { ok: true, sent: oneLine, round: store.get(managed.leafId)?.rounds };
       },

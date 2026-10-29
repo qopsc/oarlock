@@ -19,7 +19,7 @@ import {
 } from "@/lib/launchDir";
 import { toast } from "sonner";
 import { IS_MAC } from "@/lib/platform";
-import { cdCommandLine } from "@/lib/shellQuote";
+import { quoteShellPath, type DropShell } from "@/modules/terminal/lib/quoteShellPath";
 import { usePresence } from "@/lib/usePresence";
 import { useZoom } from "@/lib/useZoom";
 import { cn, isMarkdownPath } from "@/lib/utils";
@@ -109,6 +109,8 @@ import {
 import { DEFAULT_SPACE_ID } from "@/modules/tabs/lib/useTabs";
 import {
   adjustFocusedTerminalFont,
+  captureGhosttyInputOwner,
+  captureNewTerminalNavigation,
   clearFocusedTerminal,
   disposeSession,
   equalizePanes,
@@ -132,6 +134,7 @@ import {
   TerminalPromptDialog,
   useAgentActivityStore,
   useTerminalFileDrop,
+  useTerminalStatusStore,
   whenSessionReady,
   writeToSession,
 } from "@/modules/terminal";
@@ -149,7 +152,6 @@ import {
 import { UpdaterDialog } from "@/modules/updater";
 import {
   authorizeFileFolder,
-  currentWorkspaceEnv,
   type WorkspaceEnv,
   useWorkspaceEnvStore,
   workspaceScopeKey,
@@ -168,7 +170,6 @@ import {
   useState,
 } from "react";
 import { CloseDialogs } from "./components/CloseDialogs";
-import { detectShell } from "./components/useSystemInfo";
 import {
   TOGGLE_BLOCK_INPUT_EVENT,
   WorkspaceInputBar,
@@ -737,11 +738,12 @@ export default function App() {
         request.instances === 1
           ? launcher.label
           : `${launcher.label} × ${request.instances}`;
-      const { leafIds: agentLeafIds } = newAgentGroupTab(
+      const { tabId, leafIds: agentLeafIds } = newAgentGroupTab(
         inheritedCwdForNewTab(),
         title,
         request.instances,
       );
+      const navigation = captureNewTerminalNavigation(tabId);
       const hooksReady = launcher.supportsHooks
         ? invoke("agent_enable_hooks", {
             agent: request.agent,
@@ -753,16 +755,23 @@ export default function App() {
           })
         : Promise.resolve();
 
-      for (const leafId of agentLeafIds) {
-        void (async () => {
+      void Promise.all(agentLeafIds.map(async (leafId) => {
           await Promise.all([whenSessionReady(leafId), hooksReady]);
+          if (!navigation.active()) {
+            toast.message("Terminal launch cancelled", {
+              id: `terminal-launch-${tabId}`,
+              description: "The selected terminal changed before launch.",
+            });
+            return;
+          }
           if (!writeToSession(leafId, `${command.command}\r`)) {
             console.error(
               `[oarlock] agent terminal ${leafId} closed before launch`,
             );
           }
-        })();
-      }
+        })).catch((error) => toast.error("Could not launch terminal", {
+          description: String(error),
+        })).finally(navigation.dispose);
     },
     [inheritedCwdForNewTab, newAgentGroupTab],
   );
@@ -774,37 +783,42 @@ export default function App() {
   // vim) would take the `cd` as its own input.
   const cdRequest = useRef(0);
   const sendCd = useCallback(
-    async (path: string) => {
+    (path: string) => {
       if (activeLeafId === null) return;
       const leafId = activeLeafId;
       const request = ++cdRequest.current;
-      const atPrompt = await leafShellAtPrompt(leafId);
-      if (request !== cdRequest.current) return;
-      const term = terminalRefs.current.get(leafId);
-      if (!term) return;
-      if (atPrompt !== true) {
-        toast(
-          atPrompt === false
-            ? "A program is running in this terminal"
-            : "Could not tell whether this terminal is at its prompt",
-          {
-            description: "Its directory was left as it is.",
-            action: {
-              label: "Open in new tab",
-              onClick: () => cdInNewTab(path),
-            },
-          },
-        );
+      const owner = captureGhosttyInputOwner(leafId);
+      if (!owner?.pty) {
+        toast.error("Could not change terminal directory", {
+          description: "The terminal is not ready.",
+        });
         return;
       }
-      const shell =
-        usePreferencesStore.getState().terminalShell || (await detectShell());
-      if (request !== cdRequest.current) return;
-      const wsl = currentWorkspaceEnv().kind === "wsl";
-      term.write(`${cdCommandLine(path, shell, wsl)}\r`);
-      term.focus();
+      const terminalPty = owner.pty;
+      const valid = () => {
+        const tab = tabsRef.current.find((item) => item.id === activeIdRef.current);
+        return request === cdRequest.current && tab?.kind === "terminal" &&
+          tab.activeLeafId === leafId &&
+          !useTerminalStatusStore.getState().leaves[leafId]?.running;
+      };
+      owner.schedule(async () => {
+        const atPrompt = await leafShellAtPrompt(leafId);
+        if (atPrompt !== true) throw new Error(
+          atPrompt === false ? "A program is running in this terminal." :
+            "Could not verify the terminal is at its prompt.",
+        );
+        const prepared = await invoke<{ shell: DropShell; paths: string[] }>(
+          "pty_prepare_path_drop",
+          { id: terminalPty.id, paths: [path], source: owner.workspace },
+        );
+        const target = prepared.paths[0];
+        if (!target) throw new Error("Could not resolve the directory.");
+        const prefix = prepared.shell === "cmd" ? "cd /d " : "cd ";
+        return `${prefix}${quoteShellPath(target, prepared.shell)}\r`;
+      }, valid);
+      terminalRefs.current.get(leafId)?.focus();
     },
-    [activeLeafId, cdInNewTab],
+    [activeLeafId],
   );
 
   const handleOpenFile = useCallback(
