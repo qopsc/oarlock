@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoke = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("./endpointProbe", () => ({ requestEndpointProbe: invoke }));
 
 import { pingEndpoint } from "./endpointPing";
 
@@ -15,9 +15,10 @@ describe("pingEndpoint", () => {
     expect(await pingEndpoint("https://llm.example.com/v1")).toEqual({
       status: "ok",
     });
-    expect(invoke).toHaveBeenCalledWith("lm_ping", {
-      baseUrl: "https://llm.example.com/v1",
-    });
+    expect(invoke).toHaveBeenCalledWith(
+      "https://llm.example.com/v1",
+      expect.any(AbortSignal),
+    );
   });
 
   it("keeps the reason a server could not be reached", async () => {

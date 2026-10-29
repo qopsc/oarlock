@@ -295,8 +295,7 @@ struct DirWatch {
 /// inside its work tree or in its git directory (index, HEAD, ORIG_HEAD, FETCH_HEAD and the
 /// lock files git writes at the top level) can change what `git status` says.
 struct RepoWatch {
-    spellings: Spellings,
-    git_dir: String,
+    git_dirs: HashMap<String, Spellings>,
 }
 
 /// Refcounted directories (explorer expansion and open editors can ask for the
@@ -310,6 +309,31 @@ pub struct WatchSet {
 }
 
 impl WatchSet {
+    pub fn refresh_targets(&self) -> (Vec<String>, Vec<String>) {
+        let mut files: Vec<_> = self
+            .dirs
+            .values()
+            .flat_map(|d| d.spellings.iter().cloned())
+            .collect();
+        files.extend(
+            self.files
+                .values()
+                .flat_map(|dir| dir.values())
+                .flat_map(|file| file.spellings.iter().cloned()),
+        );
+        let mut repos: Vec<_> = self
+            .repos
+            .values()
+            .flat_map(|r| r.git_dirs.values())
+            .flat_map(|s| s.iter().cloned())
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        repos.sort_unstable();
+        repos.dedup();
+        (files, repos)
+    }
+
     /// True when the directory was not watched before. `poll` is fixed by the first
     /// registration: every caller derives it from the same canonical key.
     pub fn add_dir(&mut self, key: String, spelling: String, path: PathBuf, poll: bool) -> bool {
@@ -344,6 +368,9 @@ impl WatchSet {
         if !watch.spellings.remove(spelling) || !watch.spellings.is_empty() {
             return false;
         }
+        if self.files.contains_key(key) {
+            return false;
+        }
         self.dirs.remove(key);
         true
     }
@@ -370,6 +397,9 @@ impl WatchSet {
         let Some(watch) = self.dirs.get(key) else {
             return false;
         };
+        if watch.spellings.is_empty() {
+            return false;
+        }
         match (watch.listing, current) {
             (Some(before), Some(now)) => before != now,
             // Unreadable or too large to fingerprint: never a change on its own, or an unreadable
@@ -379,20 +409,29 @@ impl WatchSet {
     }
 
     /// Where a watched directory lives on disk.
-    pub fn dir_path(&self, key: &str) -> Option<PathBuf> {
-        self.dirs.get(key).map(|watch| watch.path.clone())
+    pub fn listing_path(&self, key: &str) -> Option<PathBuf> {
+        self.dirs
+            .get(key)
+            .filter(|watch| !watch.spellings.is_empty())
+            .map(|watch| watch.path.clone())
     }
 
     pub fn has_polled_dirs(&self) -> bool {
         self.dirs.values().any(|watch| watch.poll)
     }
 
-    /// The directories the OS cannot notify about, re-read on a timer instead.
-    pub fn polled_dirs(&self) -> Vec<(String, PathBuf)> {
+    /// Polling targets, with a listing path only when a directory consumer needs it.
+    /// File-only consumers poll their registered file stamps without scanning the folder.
+    pub fn polled_dirs(&self) -> Vec<(String, Option<PathBuf>)> {
         self.dirs
             .iter()
             .filter(|(_, watch)| watch.poll)
-            .map(|(key, watch)| (key.clone(), watch.path.clone()))
+            .map(|(key, watch)| {
+                (
+                    key.clone(),
+                    (!watch.spellings.is_empty()).then(|| watch.path.clone()),
+                )
+            })
             .collect()
     }
 
@@ -405,6 +444,9 @@ impl WatchSet {
         let Some(watch) = self.dirs.get_mut(key) else {
             return false;
         };
+        if watch.spellings.is_empty() {
+            return false;
+        }
         let previous = std::mem::replace(&mut watch.listing, current);
         match (previous, current) {
             (Some(before), Some(now)) => before != now,
@@ -412,13 +454,22 @@ impl WatchSet {
         }
     }
 
+    /// File registrations retain parent coverage independently of directory listings.
+    /// Returns true only when OS coverage must change.
     pub fn add_file(
         &mut self,
         dir: String,
         file: String,
         spelling: String,
         stamp: Option<FileStamp>,
-    ) {
+    ) -> bool {
+        let moved = !self.dirs.contains_key(&dir);
+        self.dirs.entry(dir.clone()).or_insert_with(|| DirWatch {
+            spellings: Spellings::default(),
+            path: PathBuf::from(&dir),
+            listing: None,
+            poll: is_wsl_share(&dir),
+        });
         self.files
             .entry(dir)
             .or_default()
@@ -429,21 +480,33 @@ impl WatchSet {
             })
             .spellings
             .add(spelling);
+        moved
     }
 
-    pub fn remove_file(&mut self, dir: &str, file: &str, spelling: &str) {
+    pub fn remove_file(&mut self, dir: &str, file: &str, spelling: &str) -> bool {
         let Some(in_dir) = self.files.get_mut(dir) else {
-            return;
+            return false;
         };
-        if let Some(watch) = in_dir.get_mut(file) {
-            if !watch.spellings.remove(spelling) || !watch.spellings.is_empty() {
-                return;
-            }
-            in_dir.remove(file);
+        let Some(watch) = in_dir.get_mut(file) else {
+            return false;
+        };
+        if !watch.spellings.remove(spelling) || !watch.spellings.is_empty() {
+            return false;
         }
-        if in_dir.is_empty() {
-            self.files.remove(dir);
+        in_dir.remove(file);
+        if !in_dir.is_empty() {
+            return false;
         }
+        self.files.remove(dir);
+        if self
+            .dirs
+            .get(dir)
+            .is_some_and(|watch| watch.spellings.is_empty())
+        {
+            self.dirs.remove(dir);
+            return true;
+        }
+        false
     }
 
     /// The directories the OS can notify about; the ones on the WSL share are polled instead.
@@ -524,28 +587,31 @@ impl WatchSet {
         self.repos
             .entry(root)
             .or_insert_with(|| RepoWatch {
-                spellings: Spellings::default(),
-                git_dir,
+                git_dirs: HashMap::new(),
             })
-            .spellings
+            .git_dirs
+            .entry(git_dir)
+            .or_default()
             .add(spelling);
     }
 
-    pub fn remove_repo(&mut self, root: &str, spelling: &str) {
+    pub fn remove_repo(&mut self, root: &str, spelling: &str, git_dir: &str) -> bool {
         let Some(repo) = self.repos.get_mut(root) else {
-            return;
+            return false;
         };
-        if repo.spellings.remove(spelling) && repo.spellings.is_empty() {
+        let Some(spellings) = repo.git_dirs.get_mut(git_dir) else {
+            return false;
+        };
+        if !spellings.remove(spelling) {
+            return false;
+        }
+        if spellings.is_empty() {
+            repo.git_dirs.remove(git_dir);
+        }
+        if repo.git_dirs.is_empty() {
             self.repos.remove(root);
         }
-    }
-
-    /// The git directory of `root` while it is registered under `spelling`.
-    pub fn repo_git_dir(&self, root: &str, spelling: &str) -> Option<String> {
-        self.repos
-            .get(root)
-            .filter(|repo| repo.spellings.0.contains_key(spelling))
-            .map(|repo| repo.git_dir.clone())
+        true
     }
 
     /// The repositories, by every spelling they were registered under, that any of `paths`
@@ -557,8 +623,10 @@ impl WatchSet {
         let mut hit: Vec<String> = Vec::new();
         for path in paths {
             for (root, repo) in &self.repos {
-                if is_within(path, root) || is_within(path, &repo.git_dir) {
-                    hit.extend(repo.spellings.iter().cloned());
+                for (git_dir, spellings) in &repo.git_dirs {
+                    if is_within(path, root) || is_within(path, git_dir) {
+                        hit.extend(spellings.iter().cloned());
+                    }
                 }
             }
         }
@@ -789,6 +857,76 @@ mod tests {
         assert!(is_skipped(Path::new("/p/obj")));
         assert!(!is_skipped(Path::new("/a/src")));
         assert!(!is_skipped(Path::new("/a/node_modules/pkg")));
+    }
+
+    #[test]
+    fn explicit_files_share_parent_coverage_without_subscribing_to_its_listing() {
+        let mut set = WatchSet::default();
+        assert!(set.add_file(
+            "/repo/build".into(),
+            "/repo/build/a".into(),
+            "/alias/a".into(),
+            None
+        ));
+        assert!(!set.add_file(
+            "/repo/build".into(),
+            "/repo/build/a".into(),
+            "/alias/a".into(),
+            None
+        ));
+        assert!(!set.add_file(
+            "/repo/build".into(),
+            "/repo/build/b".into(),
+            "/alias/b".into(),
+            None
+        ));
+        assert!(set.contains_dir("/repo/build"));
+        assert!(set.listing_path("/repo/build").is_none());
+        assert!(!set.listing_moved("/repo/build", None));
+        assert!(!set.listing_changed("/repo/build", None));
+        assert!(!set.remove_file("/repo/build", "/repo/build/a", "/unknown"));
+        assert!(!set.remove_file("/repo/build", "/repo/build/a", "/alias/a"));
+        assert!(!set.remove_file("/repo/build", "/repo/build/a", "/alias/a"));
+        assert!(set.remove_file("/repo/build", "/repo/build/b", "/alias/b"));
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn file_and_folder_coverage_survive_either_release_order() {
+        for file_first in [true, false] {
+            let mut set = WatchSet::default();
+            assert!(set.add_file("/a".into(), "/a/f".into(), "/a/f".into(), None));
+            assert!(!set.add_dir("/a".into(), "/alias".into(), "/a".into(), false));
+            assert_eq!(set.listing_path("/a"), Some(PathBuf::from("/a")));
+            if file_first {
+                assert!(!set.remove_file("/a", "/a/f", "/a/f"));
+                assert!(set.remove_dir("/a", "/alias"));
+            } else {
+                assert!(!set.remove_dir("/a", "/alias"));
+                assert!(set.listing_path("/a").is_none());
+                assert!(set.remove_file("/a", "/a/f", "/a/f"));
+            }
+            assert!(set.is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_wsl_file_activates_polling_only_for_its_lifetime() {
+        let mut set = WatchSet::default();
+        let dir = "//wsl.localhost/Ubuntu/project/build";
+        let file = format!("{dir}/output");
+        assert!(set.add_file(
+            dir.into(),
+            file.clone(),
+            "/project/build/output".into(),
+            None
+        ));
+        assert!(set.has_polled_dirs());
+        assert_eq!(set.polled_dirs().len(), 1);
+        assert!(set.dir_paths().next().is_none());
+        assert!(set.listing_path(dir).is_none());
+        assert!(set.remove_file(dir, &file, "/project/build/output"));
+        assert!(!set.has_polled_dirs());
     }
 
     #[test]
@@ -1306,10 +1444,14 @@ mod tests {
             .repos_touched(["/w/repository", "/w", "/elsewhere"])
             .is_empty());
 
-        set.remove_repo("/w/feature", "/link/feature");
+        set.remove_repo(
+            "/w/feature",
+            "/link/feature",
+            "/w/repo/.git/worktrees/feature",
+        );
         assert_eq!(set.repos_touched(["/w/feature"]), vec!["/w/feature"]);
-        set.remove_repo("/w/feature", "/w/feature");
-        set.remove_repo("/w/repo", "/w/repo");
+        set.remove_repo("/w/feature", "/w/feature", "/w/repo/.git/worktrees/feature");
+        set.remove_repo("/w/repo", "/w/repo", "/w/repo/.git");
         assert!(set.repos_touched(["/w/repo/src"]).is_empty());
         assert!(set.is_empty());
     }
@@ -1336,11 +1478,11 @@ mod tests {
             vec![
                 (
                     "//wsl.localhost/U/home".to_owned(),
-                    PathBuf::from("//wsl.localhost/U/home")
+                    Some(PathBuf::from("//wsl.localhost/U/home"))
                 ),
                 (
                     "//wsl.localhost/U/home/src".to_owned(),
-                    PathBuf::from("//wsl.localhost/U/home/src")
+                    Some(PathBuf::from("//wsl.localhost/U/home/src"))
                 ),
             ]
         );

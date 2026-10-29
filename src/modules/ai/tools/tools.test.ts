@@ -49,6 +49,7 @@ describe("TOOL_APPROVAL", () => {
       .sort();
     expect(gated).toEqual([
       "bash_background",
+      "bash_detach",
       "bash_run",
       "create_directory",
       "edit",
@@ -85,6 +86,7 @@ describe("approval modes", () => {
   it("asks before every mutating tool in Ask mode, plan mode or not", () => {
     const gated = [
       "bash_background",
+      "bash_detach",
       "bash_run",
       "create_directory",
       "edit",
@@ -108,6 +110,7 @@ describe("approval modes", () => {
     // File changes are queued for the plan review instead of written.
     expect(asking({ mode: "auto", planMode: true })).toEqual([
       "bash_background",
+      "bash_detach",
       "bash_run",
       "send_to_agent",
       "spawn_coding_agent",

@@ -1,3 +1,4 @@
+import { answerApproval } from "../lib/approvalResponse";
 import {
   Conversation,
   ConversationContent,
@@ -214,7 +215,8 @@ export function AiChatView({
     !isBusy && hitStepCap && lastMessage?.role === "assistant";
 
   const onApproval = useCallback(
-    (id: string, approved: boolean) => addToolApprovalResponse({ id, approved }),
+    (id: string, approved: boolean) =>
+      answerApproval(addToolApprovalResponse, id, approved),
     [addToolApprovalResponse],
   );
 
@@ -574,9 +576,7 @@ const ReadGroup = memo(function ReadGroup({ parts }: { parts: AnyPart[] }) {
                 strokeWidth={1.75}
                 className="shrink-0 opacity-60"
               />
-              <span className="truncate text-foreground">
-                {basename(path)}
-              </span>
+              <span className="truncate text-foreground">{basename(path)}</span>
               <span className="truncate opacity-60">{path}</span>
             </li>
           ))}
@@ -634,12 +634,7 @@ const aiStreamdownComponents = {
 };
 
 function AiMessageResponse(props: Omit<MessageResponseProps, "components">) {
-  return (
-    <MessageResponse
-      {...props}
-      components={aiStreamdownComponents}
-    />
-  );
+  return <MessageResponse {...props} components={aiStreamdownComponents} />;
 }
 
 const RenderedPart = memo(function RenderedPart({
@@ -727,6 +722,9 @@ const RenderedTool = memo(function RenderedTool({
       input={part.input}
       output={"output" in part ? part.output : undefined}
       errorText={"errorText" in part ? part.errorText : undefined}
+      denialReason={
+        part.state === "output-denied" ? part.approval?.reason : undefined
+      }
       defaultOpen={toolName === "list_directory"}
     />
   );

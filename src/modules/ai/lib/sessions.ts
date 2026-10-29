@@ -1,6 +1,7 @@
 import type { UIMessage } from "@ai-sdk/react";
 import { activeChatKey } from "@/lib/appWindow";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import { toast } from "sonner";
 import type { ApprovalMode } from "./approvalMode";
@@ -185,16 +186,19 @@ async function saveConflictCopy(id: string): Promise<void> {
   await saveMessages(copyId, latest.messages, { durable: true });
   const current = (await store.get<SessionMeta[]>(KEY_SESSIONS)) ?? [];
   const now = Date.now();
-  await saveSessionsList([
-    {
-      id: copyId,
-      title: `${deriveTitle(latest.messages)} (copy)`,
-      createdAt: now,
-      updatedAt: now,
-      approvalMode: current.find((s) => s.id === id)?.approvalMode,
-    },
-    ...current,
-  ]);
+  await saveSessionsList(
+    [
+      {
+        id: copyId,
+        title: `${deriveTitle(latest.messages)} (copy)`,
+        createdAt: now,
+        updatedAt: now,
+        approvalMode: current.find((s) => s.id === id)?.approvalMode,
+      },
+      ...current,
+    ],
+    current,
+  );
   await store.save();
   if (failedWrites.get(id) === latest) {
     failedWrites.delete(id);
@@ -280,13 +284,14 @@ export async function loadAll(): Promise<LoadedSessions> {
       key !== KEY_ACTIVE &&
       (key === ACTIVE_PREFIX || key.startsWith(`${ACTIVE_PREFIX}:`)),
   );
-  const [sessions, activeId, ...elsewhere] = await Promise.all([
-    store.get<SessionMeta[]>(KEY_SESSIONS),
+  const [snapshot, activeId, ...elsewhere] = await Promise.all([
+    invoke<SessionSnapshot>("ai_sessions_snapshot"),
     store.get<string>(KEY_ACTIVE),
     ...otherWindows.map((key) => store.get<string>(key)),
   ]);
+  if (snapshot.revision >= latestSnapshot.revision) latestSnapshot = snapshot;
   return {
-    sessions: Array.isArray(sessions) ? sessions : [],
+    sessions: snapshot.sessions,
     activeId: typeof activeId === "string" ? activeId : null,
     activeElsewhere: new Set(
       elsewhere.filter((id): id is string => typeof id === "string"),
@@ -294,17 +299,78 @@ export async function loadAll(): Promise<LoadedSessions> {
   };
 }
 
-/**
- * Calls `onChange` with the history list whenever any window changes it, so
- * every window shows the same list and writes it back whole without undoing
- * another window's change.
- */
-export function onSessionsChanged(
+type SessionSnapshot = { revision: number; sessions: SessionMeta[] };
+type SessionDelta = {
+  creates: SessionMeta[];
+  updates: { id: string; patch: Partial<Omit<SessionMeta, "id">> }[];
+  deletes: string[];
+};
+
+export function sessionDelta(
+  next: SessionMeta[],
+  previous: SessionMeta[],
+): SessionDelta {
+  const before = new Map(previous.map((s) => [s.id, s]));
+  const after = new Set(next.map((s) => s.id));
+  return {
+    creates: next.filter((s) => !before.has(s.id)),
+    updates: next.flatMap((s) => {
+      const old = before.get(s.id);
+      if (!old) return [];
+      const patch = Object.fromEntries(
+        Object.entries(s).filter(
+          ([key, value]) =>
+            key !== "id" && value !== old[key as keyof SessionMeta],
+        ),
+      );
+      return Object.keys(patch).length ? [{ id: s.id, patch }] : [];
+    }),
+    deletes: previous.filter((s) => !after.has(s.id)).map((s) => s.id),
+  };
+}
+
+const pendingMetadata = new Set<SessionDelta>();
+let latestSnapshot: SessionSnapshot = { revision: -1, sessions: [] };
+const metadataListeners = new Set<(sessions: SessionMeta[]) => void>();
+function publishMetadata(snapshot = latestSnapshot) {
+  if (snapshot.revision >= latestSnapshot.revision) latestSnapshot = snapshot;
+  let sessions = latestSnapshot.sessions;
+  // Keep local optimistic changes until the native transaction acknowledges them.
+  for (const delta of pendingMetadata) {
+    sessions = sessions
+      .filter((s) => !delta.deletes.includes(s.id))
+      .map((s) => ({
+        ...s,
+        ...delta.updates.find((u) => u.id === s.id)?.patch,
+      }));
+    sessions = [
+      ...delta.creates.filter((s) => !sessions.some((v) => v.id === s.id)),
+      ...sessions,
+    ];
+  }
+  for (const listener of metadataListeners) listener(sessions);
+}
+
+/** Subscribe before taking a snapshot so startup cannot miss another window's write. */
+export async function onSessionsChanged(
   onChange: (sessions: SessionMeta[]) => void,
 ): Promise<() => void> {
-  return store.onKeyChange<SessionMeta[]>(KEY_SESSIONS, (value) => {
-    if (Array.isArray(value)) onChange(value);
-  });
+  const unlisten = await listen<SessionSnapshot>(
+    "ai:sessions-changed",
+    (event) => publishMetadata(event.payload),
+  );
+  metadataListeners.add(onChange);
+  try {
+    publishMetadata(await invoke<SessionSnapshot>("ai_sessions_snapshot"));
+  } catch (error) {
+    metadataListeners.delete(onChange);
+    unlisten();
+    throw error;
+  }
+  return () => {
+    metadataListeners.delete(onChange);
+    unlisten();
+  };
 }
 
 /**
@@ -336,8 +402,40 @@ export async function loadMessages(id: string): Promise<UIMessage[] | null> {
   }
 }
 
-export async function saveSessionsList(sessions: SessionMeta[]): Promise<void> {
-  await serial("$metadata", () => store.set(KEY_SESSIONS, sessions));
+function commitMetadata(): Promise<void> {
+  const operation = serial("$metadata", async () => {
+    // A failed transaction stays at the front. Retrying an older rename after
+    // a newer one committed would otherwise roll the user's title back.
+    for (const delta of pendingMetadata) {
+      const snapshot = await invoke<SessionSnapshot>("ai_sessions_mutate", {
+        delta,
+      });
+      pendingMetadata.delete(delta);
+      publishMetadata(snapshot);
+    }
+  }).catch((error: unknown) => {
+    toast.error("Could not save conversation list", {
+      description: String(error),
+      action: {
+        label: "Retry",
+        onClick: () => {
+          void commitMetadata();
+        },
+      },
+    });
+    throw error;
+  });
+  void operation.catch(() => {});
+  return operation;
+}
+
+export function saveSessionsList(
+  sessions: SessionMeta[],
+  previous: SessionMeta[] = [],
+): Promise<void> {
+  const delta = sessionDelta(sessions, previous);
+  pendingMetadata.add(delta);
+  return commitMetadata();
 }
 
 export async function saveActiveId(id: string | null): Promise<void> {
@@ -382,6 +480,7 @@ export async function flushSessionWrites(
 ): Promise<FlushResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS;
   const startedAt = Date.now();
+  if (pendingMetadata.size) void commitMetadata();
   for (const [id, op] of [...failedWrites]) {
     if (pendingWrites.has(id)) continue;
     void write(id, op.kind === "save" ? { ...op, durable: true } : op).catch(
@@ -413,6 +512,7 @@ export async function flushSessionWrites(
     ok:
       !timedOut &&
       !metadataFailed &&
+      pendingMetadata.size === 0 &&
       failed.length === 0 &&
       pendingWrites.size === 0,
     timedOut,

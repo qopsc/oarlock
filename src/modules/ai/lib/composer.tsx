@@ -1,3 +1,18 @@
+import { preferencesReady } from "@/modules/settings/readiness";
+import { usePreferencesStore } from "@/modules/settings/preferences";
+import { invoke } from "@tauri-apps/api/core";
+import { createComposerImports, type ComposerImport } from "./composerImports";
+import {
+  beginComposerWork,
+  cancelComposerWork,
+  type ComposerWork,
+} from "./composerWork";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import {
+  useWorkspaceEnvStore,
+  workspaceScopeKey,
+} from "@/modules/workspace/env";
+import { assertChatCanStart, useChatStop } from "../store/chatStop";
 import {
   createContext,
   useContext,
@@ -16,12 +31,10 @@ import {
   insertIntoPrompt,
   planComposerDrop,
 } from "./composerDrop";
-import type { ReadResult } from "./native";
 import { encodeForSending, imageNeedsEncoding } from "./imageAttachment";
 import { fileBlock, selectionBlock, snippetBlock } from "./messageBlocks";
-import { readClipboardImageFile } from "./pastedImages";
+import { readClipboardSnapshot } from "./pastedImages";
 import {
-  attachableText,
   attachmentName,
   MAX_TEXT_ATTACHMENT_BYTES,
   readDroppedFile,
@@ -37,7 +50,7 @@ import {
   tryRunSlashCommand,
   type SlashCommandMeta,
 } from "./slashCommands";
-import { getChat, useChatStore } from "../store/chatStore";
+import { useChatStore } from "../store/chatStore";
 import { useSnippetsStore } from "../store/snippetsStore";
 
 export type FileAttachment = {
@@ -60,9 +73,6 @@ type MessagePart =
   | { type: "text"; text: string }
   | { type: "file"; mediaType: string; url: string; filename?: string };
 
-export const ACCEPTED_FILES =
-  "image/*,.txt,.md,.json,.yaml,.yml,.toml,.sh,.zsh,.bash,.py,.js,.jsx,.ts,.tsx,.rs,.go,.java,.c,.cpp,.h,.hpp,.html,.css,.csv,.log,.env,.config,.conf,.ini,Dockerfile,.dockerfile";
-
 type Voice = ReturnType<typeof useWhisperRecording>;
 
 type ComposerCtx = {
@@ -70,17 +80,19 @@ type ComposerCtx = {
   value: string;
   setValue: React.Dispatch<React.SetStateAction<string>>;
   files: FileAttachment[];
-  addFiles: (list: FileList | readonly File[] | null) => Promise<void>;
+  pickFiles: () => Promise<void>;
+  beginImport: () => ComposerImport | null;
+  cancelImports: () => void;
   /** Attach the clipboard's image as the app reads it (a paste the webview
    *  handed no image, `pasteNeedsClipboardImage`). */
   pasteClipboardImage: () => Promise<void>;
   /** Attach a file by absolute path — used by the file explorer's "Attach to Agent". */
   attachFileByPath: (path: string) => Promise<void>;
   /** Attach prepared attachments (MCP resources); one already attached is kept once. */
-  attachFiles: (files: readonly FileAttachment[]) => void;
+  attachFiles: (files: readonly FileAttachment[], work: ComposerImport) => void;
   /** The open form of an MCP prompt or resource template, if any. */
   mcpForm: ArgumentsFormRequest | null;
-  setMcpForm: (form: ArgumentsFormRequest | null) => void;
+  setMcpForm: React.Dispatch<React.SetStateAction<ArgumentsFormRequest | null>>;
   removeFile: (id: string) => void;
   pickedSnippets: Snippet[];
   addSnippet: (s: Snippet) => void;
@@ -104,6 +116,8 @@ export function useComposer(): ComposerCtx {
   return ctx;
 }
 
+type Submission = ComposerWork & { admission: Promise<void> };
+
 type ProviderProps = {
   children: React.ReactNode;
 };
@@ -111,13 +125,23 @@ type ProviderProps = {
 export function AiComposerProvider({ children }: ProviderProps) {
   const sessionId = useChatStore((s) => s.activeSessionId);
   const status = useChatStore((s) => s.agentMeta.status);
-  const isBusy = status === "thinking" || status === "streaming";
+  const stopping = useChatStop((s) =>
+    sessionId ? s.states[sessionId]?.blocked === true : false,
+  );
+  const [preparingSubmission, setPreparingSubmission] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const turnBusy =
+    preparingSubmission ||
+    stopping ||
+    status === "thinking" ||
+    status === "streaming";
 
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<FileAttachment[]>([]);
   const [pickedSnippets, setPickedSnippets] = useState<Snippet[]>([]);
   const [pickedCommands, setPickedCommands] = useState<SlashCommandMeta[]>([]);
   const [mcpForm, setMcpForm] = useState<ArgumentsFormRequest | null>(null);
+  useEffect(() => () => mcpForm?.cancel(), [mcpForm]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const focusSignal = useChatStore((s) => s.focusSignal);
@@ -136,26 +160,27 @@ export function AiComposerProvider({ children }: ProviderProps) {
   }, [focusSignal, pendingPrefill, consumePrefill]);
 
   // Re-focus the textarea whenever the agent finishes a response
-  const prevIsBusyRef = useRef(false);
+  const prevTurnBusyRef = useRef(false);
   useEffect(() => {
-    if (prevIsBusyRef.current && !isBusy) {
+    if (prevTurnBusyRef.current && !turnBusy) {
       requestAnimationFrame(() => textareaRef.current?.focus());
     }
-    prevIsBusyRef.current = isBusy;
-  }, [isBusy, textareaRef]);
+    prevTurnBusyRef.current = turnBusy;
+  }, [turnBusy, textareaRef]);
 
+  const attachFromExplorer = useEffectEvent((path: string) => {
+    void attachFileByPath(path);
+  });
   // Listen for explorer's "Attach to Agent" event.
   useEffect(() => {
     const onAttach = (e: Event) => {
       const path = (e as CustomEvent<string>).detail;
       if (typeof path === "string" && path.length > 0) {
-        void attachFileByPath(path);
+        attachFromExplorer(path);
       }
     };
     window.addEventListener("oarlock:ai-attach-file", onAttach);
     return () => window.removeEventListener("oarlock:ai-attach-file", onAttach);
-    // attachFileByPath is stable for our purposes (closes over setFiles only)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -170,9 +195,7 @@ export function AiComposerProvider({ children }: ProviderProps) {
         next.push({
           id: sel.id,
           name:
-            sel.source === "editor"
-              ? "Editor selection"
-              : "Terminal selection",
+            sel.source === "editor" ? "Editor selection" : "Terminal selection",
           kind: "selection",
           mediaType: "text/plain",
           text: sel.text,
@@ -190,31 +213,152 @@ export function AiComposerProvider({ children }: ProviderProps) {
       requestAnimationFrame(() => textareaRef.current?.focus());
     },
   });
+  const isBusy = importing || turnBusy || voice.state !== "idle";
 
-  const addFiles = async (list: FileList | readonly File[] | null) => {
-    if (!list) return;
-    const next: FileAttachment[] = [];
-    for (const f of Array.from(list)) {
-      const att = await readAttachment(f);
-      if (att) next.push(att);
-    }
-    if (next.length) setFiles((prev) => [...prev, ...next]);
+  const importsRef = useRef<ReturnType<typeof createComposerImports> | null>(
+    null,
+  );
+  if (!importsRef.current)
+    importsRef.current = createComposerImports(setImporting);
+  const imports = importsRef.current;
+  useEffect(() => () => imports.cancel(), [imports]);
+  const beginImport = (): ComposerImport | null => {
+    const chat = useChatStore.getState();
+    if (!chat.activeSessionId) return null;
+    const work = imports.begin(chat.activeSessionId, currentWorkspaceEnv());
+    const chatId = chat.activeSessionId;
+    const space = useSpaces.getState().activeId;
+    const env = workspaceScopeKey(work.workspace);
+    work.onFinish(
+      useChatStore.subscribe((next) => {
+        if (
+          next.activeSessionId !== chatId ||
+          (chat.panelOpen && !next.panelOpen)
+        )
+          work.cancel();
+      }),
+    );
+    work.onFinish(
+      useSpaces.subscribe((next) => {
+        if (next.activeId !== space) work.cancel();
+      }),
+    );
+    work.onFinish(
+      useWorkspaceEnvStore.subscribe((next) => {
+        if (workspaceScopeKey(next.env) !== env) work.cancel();
+      }),
+    );
+    const admission = assertChatCanStart(chatId);
+    void admission.catch(() => {});
+    return Object.assign(work, { admission });
   };
-
-  const pasteClipboardImage = async () => {
-    const image = await readClipboardImageFile();
-    if (image) await addFiles([image]);
-  };
-
-  const removeFile = (id: string) =>
-    setFiles((prev) => prev.filter((f) => f.id !== id));
-
-  const attachFiles = (added: readonly FileAttachment[]) =>
+  const attachFiles = (
+    added: readonly FileAttachment[],
+    work: ComposerImport,
+  ) => {
+    if (!work.active()) return;
     setFiles((prev) => {
       const ids = new Set(prev.map((f) => f.id));
       const next = added.filter((f) => !ids.has(f.id));
       return next.length > 0 ? [...prev, ...next] : prev;
     });
+  };
+  const runImport = async (action: (work: ComposerImport) => Promise<void>) => {
+    const work = beginImport();
+    if (!work) return;
+    try {
+      await work.admission;
+      if (work.active()) await action(work);
+    } catch (error) {
+      if (work.active())
+        toast.error("Could not attach content", { description: String(error) });
+    } finally {
+      work.finish();
+    }
+  };
+  const importPath = async (
+    path: string,
+    picked: boolean,
+    work: ComposerImport,
+    workspace = work.workspace,
+  ) => {
+    if (!work.active()) return;
+    try {
+      const result = await (picked
+        ? readPickedFile(path, workspace)
+        : readDroppedFile(path, workspace));
+      if (!work.active()) return;
+      const id = `path-${workspaceScopeKey(workspace)}-${path}`;
+      if (result.kind === "text") {
+        attachFiles(
+          [
+            {
+              id,
+              name: result.name,
+              kind: "text",
+              mediaType: "text/plain",
+              text: result.content,
+              size: result.size,
+            },
+          ],
+          work,
+        );
+      } else {
+        const bytes = Uint8Array.from(atob(result.data), (c) =>
+          c.charCodeAt(0),
+        );
+        const attachment = await readAttachment(
+          new File([bytes], result.name, { type: result.media_type }),
+          work.signal,
+        );
+        if (attachment) attachFiles([{ ...attachment, id }], work);
+      }
+    } catch (error) {
+      if (work.active())
+        toast.error(`Could not attach ${attachmentName(path)}`, {
+          description: String(error),
+        });
+    }
+  };
+  const pickFiles = () =>
+    runImport(async (work) => {
+      const paths = await invoke<string[]>("ai_pick_attachment_files");
+      for (const path of paths) {
+        if (!work.active()) break;
+        await importPath(path, true, work, { kind: "local" });
+      }
+    });
+  const pasteClipboardImage = async () => {
+    const work = beginImport();
+    if (!work) return;
+    try {
+      // Capture at paste start, not after asynchronous chat admission.
+      const [snapshot] = await Promise.all([
+        readClipboardSnapshot(),
+        work.admission,
+      ]);
+      if (!work.active()) return;
+      if (snapshot.kind === "files") {
+        for (const path of snapshot.paths) {
+          if (!work.active()) break;
+          await importPath(path, true, work, { kind: "local" });
+        }
+        return;
+      }
+      if (snapshot.kind === "empty") return;
+      const attachment = await readAttachment(snapshot.image, work.signal);
+      if (attachment) attachFiles([attachment], work);
+    } catch (error) {
+      if (work.active())
+        toast.error("Could not paste attachment", {
+          description: String(error),
+        });
+    } finally {
+      work.finish();
+    }
+  };
+  const removeFile = (id: string) =>
+    setFiles((prev) => prev.filter((f) => f.id !== id));
 
   const addSnippet = (s: Snippet) =>
     setPickedSnippets((prev) =>
@@ -232,45 +376,9 @@ export function AiComposerProvider({ children }: ProviderProps) {
 
   // Picked by the user (Attach to Agent, an @ mention) or dropped from the
   // explorer, which reads only what the agent itself may read.
-  const attachFileByPath = async (
-    path: string,
-    via: "picked" | "dropped" = "picked",
-  ) => {
-    const name = attachmentName(path);
-    let result: ReadResult;
-    try {
-      result =
-        via === "dropped"
-          ? await readDroppedFile(path)
-          : await readPickedFile(path);
-    } catch (e) {
-      toast.error(`Could not attach ${name}`, {
-        description: e instanceof Error ? e.message : String(e),
-      });
-      return;
-    }
-    const attachable = attachableText(result);
-    if (!attachable.ok) {
-      toast.error(`Could not attach ${name}`, {
-        description: attachable.reason,
-      });
-      return;
-    }
-    const id = `path-${path}`;
-    setFiles((prev) => {
-      if (prev.some((f) => f.id === id)) return prev;
-      const att: FileAttachment = {
-        id,
-        name,
-        kind: "text",
-        mediaType: "text/plain",
-        text: attachable.text,
-        size: attachable.size,
-      };
-      return [...prev, att];
-    });
-    // Open the AI panel & focus the input so the user sees the chip.
+  const attachFileByPath = async (path: string) => {
     useChatStore.getState().focusInput();
+    await runImport((work) => importPath(path, true, work));
   };
 
   // Explorer items dropped on the composer: folders are named at the caret
@@ -294,7 +402,12 @@ export function AiComposerProvider({ children }: ProviderProps) {
         textareaRef.current?.setSelectionRange(next.caret, next.caret),
       );
     }
-    for (const path of files) await attachFileByPath(path, "dropped");
+    await runImport(async (work) => {
+      for (const path of files) {
+        if (!work.active()) break;
+        await importPath(path, false, work);
+      }
+    });
   });
   useEffect(() => {
     const onDrop = (e: Event) => {
@@ -308,10 +421,73 @@ export function AiComposerProvider({ children }: ProviderProps) {
   // A skill or an MCP prompt is loaded (an MCP prompt's arguments asked for)
   // before its message is sent; nothing else is sent meanwhile.
   const preparing = useRef(false);
+  const sending = useRef(false);
+  const submission = useRef<Submission | null>(null);
+  useEffect(() => () => submission.current?.cancel(), []);
+  const beginSubmission = (): Submission | null => {
+    if (!sessionId || useChatStore.getState().activeSessionId !== sessionId)
+      return null;
+    const admission = assertChatCanStart(sessionId);
+    void admission.catch(() => {});
+    const work = Object.assign(beginComposerWork(sessionId), { admission });
+    submission.current = work;
+    setPreparingSubmission(true);
+    const space = useSpaces.getState().activeId;
+    const env = workspaceScopeKey(currentWorkspaceEnv());
+    work.onFinish(
+      useChatStore.subscribe((state) => {
+        if (state.activeSessionId !== sessionId) work.cancel();
+      }),
+    );
+    work.onFinish(
+      useSpaces.subscribe((state) => {
+        if (state.activeId !== space) work.cancel();
+      }),
+    );
+    work.onFinish(
+      useWorkspaceEnvStore.subscribe((state) => {
+        if (workspaceScopeKey(state.env) !== env) work.cancel();
+      }),
+    );
+    work.onFinish(() => {
+      if (submission.current !== work) return;
+      submission.current = null;
+      setPreparingSubmission(false);
+      preparing.current = false;
+      sending.current = false;
+    });
+    return work;
+  };
+  const consumeCommand = (source: string) => {
+    setValue("");
+    const handledName = source.slice(1).split(/\s/, 1)[0];
+    setPickedCommands((current) =>
+      current.filter((item) => item.name !== handledName),
+    );
+  };
 
   const submit = () => {
-    if (isBusy || preparing.current) return;
     const trimmed = value.trim();
+    const commandSource =
+      pickedCommands.length > 0 &&
+      !trimmed.startsWith("/") &&
+      !trimmed.startsWith("#")
+        ? `#${pickedCommands[0].name} ${trimmed}`.trim()
+        : trimmed;
+    if (/^[/#]stop(?:\s|$)/.test(commandSource)) {
+      cancelComposerWork(sessionId ?? "");
+      tryRunSlashCommand(commandSource);
+      consumeCommand(commandSource);
+      return;
+    }
+    if (
+      imports.busy() ||
+      voice.busy() ||
+      isBusy ||
+      preparing.current ||
+      sending.current
+    )
+      return;
     if (
       !trimmed &&
       files.length === 0 &&
@@ -329,22 +505,43 @@ export function AiComposerProvider({ children }: ProviderProps) {
       ? { command: pickedPrompt.name, text: trimmed }
       : typedPrompt;
     if (promptCall) {
+      const work = beginSubmission();
+      if (!work) return;
       preparing.current = true;
-      void import("@/modules/mcp/composer")
-        .then(({ runPromptCall }) =>
-          runPromptCall({
+      void work.admission
+        .then(async () => {
+          work.signal.throwIfAborted();
+          return import("@/modules/mcp/composer");
+        })
+        .then(({ runPromptCall }) => {
+          work.signal.throwIfAborted();
+          return runPromptCall({
+            signal: work.signal,
             command: promptCall.command,
             picked: pickedPrompt !== undefined,
-            showForm: setMcpForm,
+            showForm: (form) => {
+              if (work.signal.aborted) {
+                form.cancel();
+                return;
+              }
+              setMcpForm(form);
+              work.onFinish(() => {
+                form.cancel();
+                setMcpForm((current) => (current === form ? null : current));
+              });
+            },
             send: (block, images) =>
-              send(promptCall.text, null, [block], images),
-            sendAsWritten: () => send(trimmed, null, []),
-          }),
-        )
-        .finally(() => {
-          setMcpForm(null);
-          preparing.current = false;
-        });
+              send(work, promptCall.text, null, [block], images),
+            sendAsWritten: () => send(work, trimmed, null, []),
+          });
+        })
+        .catch((error) => {
+          if (!work.signal.aborted)
+            toast.error("Could not prepare prompt", {
+              description: String(error),
+            });
+        })
+        .finally(work.finish);
       return;
     }
 
@@ -358,29 +555,38 @@ export function AiComposerProvider({ children }: ProviderProps) {
         ? typedSkill
         : null;
     if (skillCall) {
+      const work = beginSubmission();
+      if (!work) return;
+      const root = useChatStore.getState().live.getWorkspaceRoot();
+      const env = currentWorkspaceEnv();
       preparing.current = true;
       void (async () => {
         try {
+          await work.admission;
+          work.signal.throwIfAborted();
           const { skillInvocation } = await import("@/modules/skills/composer");
+          work.signal.throwIfAborted();
           const result = await skillInvocation(
             skillCall.name,
             skillCall.args,
-            useChatStore.getState().live.getWorkspaceRoot(),
-            currentWorkspaceEnv(),
+            root,
+            env,
           );
+          work.signal.throwIfAborted();
           if (result.kind === "block") {
-            send(skillCall.args, null, [result.block]);
+            await send(work, skillCall.args, null, [result.block]);
           } else if (pickedSkill) {
             toast.error(`The skill ${skillCall.name} is not available`);
           } else {
-            send(trimmed, null, []);
+            await send(work, trimmed, null, []);
           }
         } catch (e) {
+          if (work.signal.aborted) return;
           toast.error(`Could not load the skill ${skillCall.name}`, {
             description: e instanceof Error ? e.message : String(e),
           });
         } finally {
-          preparing.current = false;
+          work.finish();
         }
       })();
       return;
@@ -390,14 +596,10 @@ export function AiComposerProvider({ children }: ProviderProps) {
     // the prompt to the AGENTS.md scan template before sending.
     let effectiveText = trimmed;
     let commandMarker: string | null = null;
-    let commandSource = trimmed;
-    if (pickedCommands.length > 0 && !trimmed.startsWith("/") && !trimmed.startsWith("#")) {
-      commandSource = `#${pickedCommands[0].name} ${trimmed}`.trim();
-    }
     if (commandSource.startsWith("/") || commandSource.startsWith("#")) {
       const outcome = tryRunSlashCommand(commandSource);
       if (outcome.kind === "handled") {
-        setValue("");
+        consumeCommand(commandSource);
         if (outcome.toast) console.info(outcome.toast);
         return;
       }
@@ -408,18 +610,21 @@ export function AiComposerProvider({ children }: ProviderProps) {
         }
       }
     }
-    send(effectiveText, commandMarker, []);
+    const work = beginSubmission();
+    if (work) void send(work, effectiveText, commandMarker, []);
   };
 
   /** Sends the message: the command marker, `leading` blocks (a skill's or an
    *  MCP prompt's, whose images come as `leadingImages`), snippets, selections
    *  and files, then the text. */
-  const send = (
+  const send = async (
+    work: Submission,
     effectiveText: string,
     commandMarker: string | null,
     leading: string[],
     leadingImages: readonly { mediaType: string; data: string }[] = [],
   ) => {
+    if (work.signal.aborted) return;
     const parts: MessagePart[] = [];
     const fileBlocks = files.flatMap((f) =>
       f.block
@@ -431,10 +636,8 @@ export function AiComposerProvider({ children }: ProviderProps) {
     const selectionBlocks = files
       .filter((f) => f.kind === "selection")
       .map((f) => selectionBlock(f.source ?? "terminal", f.text ?? ""));
-    const { body: bodyAfterTokens, blocks: snippetBlocks } = expandSnippetTokens(
-      effectiveText,
-      useSnippetsStore.getState().snippets,
-    );
+    const { body: bodyAfterTokens, blocks: snippetBlocks } =
+      expandSnippetTokens(effectiveText, useSnippetsStore.getState().snippets);
     const seenHandles = new Set<string>();
     const allSnippetBlocks: string[] = [];
     for (const s of pickedSnippets) {
@@ -479,33 +682,69 @@ export function AiComposerProvider({ children }: ProviderProps) {
       }
     }
 
-    if (!sessionId) return;
+    if (!sessionId || useChatStop.getState().states[sessionId]?.blocked) {
+      work.finish();
+      return;
+    }
     const store = useChatStore.getState();
     store.patchAgentMeta({ hitStepCap: false, compactionNotice: null });
     if (!store.mini.open) store.openMini();
-    void (async () => {
+    if (sending.current) {
+      work.finish();
+      return;
+    }
+    sending.current = true;
+    let accepted = false;
+    const pending = (async () => {
+      await work.admission;
+      work.signal.throwIfAborted();
       const { getOrCreateChat, sendUserMessage } = await import(
         "../store/chatRuntime"
       );
+      work.signal.throwIfAborted();
       const chat = getOrCreateChat(sessionId);
-      void sendUserMessage(chat, { role: "user", parts } as Parameters<
-        typeof chat.sendMessage
-      >[0]);
-    })();
-    setValue("");
-    setFiles([]);
-    setPickedSnippets([]);
-    setPickedCommands([]);
+      await sendUserMessage(
+        chat,
+        { role: "user", parts } as Parameters<typeof chat.sendMessage>[0],
+        () => {
+          accepted = true;
+          work.finish();
+          // A Stop rejection keeps the entire draft. Edits made while admission
+          // was pending belong to the next draft and must not be discarded.
+          setValue((current) => (current === value ? "" : current));
+          setFiles((current) =>
+            current.filter((item) => !files.includes(item)),
+          );
+          setPickedSnippets((current) =>
+            current.filter((item) => !pickedSnippets.includes(item)),
+          );
+          setPickedCommands((current) =>
+            current.filter((item) => !pickedCommands.includes(item)),
+          );
+        },
+      );
+    })()
+      .catch((error) => {
+        if (work.signal.aborted) return;
+        toast.error("Could not send message", { description: String(error) });
+      })
+      .finally(() => {
+        if (!accepted) work.finish();
+      });
     // Re-focus immediately after submit so the user can type a follow-up
     requestAnimationFrame(() => textareaRef.current?.focus());
+    await pending;
   };
 
   const stop = () => {
     if (!sessionId) return;
-    void getChat(sessionId)?.stop();
+    cancelComposerWork(sessionId);
+    useChatStore.getState().stopSession(sessionId);
   };
 
+  const ready = usePreferencesStore(preferencesReady);
   const canSend =
+    ready &&
     !isBusy &&
     (value.trim().length > 0 ||
       files.length > 0 ||
@@ -517,7 +756,9 @@ export function AiComposerProvider({ children }: ProviderProps) {
     value,
     setValue,
     files,
-    addFiles,
+    pickFiles,
+    beginImport,
+    cancelImports: imports.cancel,
     pasteClipboardImage,
     attachFileByPath,
     attachFiles,
@@ -542,13 +783,18 @@ export function AiComposerProvider({ children }: ProviderProps) {
 
 /** A picked or pasted file as an attachment; null (said in a toast) when it
  *  cannot be one. */
-async function readAttachment(file: File): Promise<FileAttachment | null> {
+async function readAttachment(
+  file: File,
+  signal: AbortSignal,
+): Promise<FileAttachment | null> {
+  signal.throwIfAborted();
   const id = `${file.name}-${file.size}-${file.lastModified}`;
   const name = file.name || "image";
   if (file.type.startsWith("image/")) {
     const image = imageNeedsEncoding(file.type, file.size)
-      ? await encodeForSending(file)
+      ? await encodeForSending(file, signal)
       : file;
+    signal.throwIfAborted();
     if (!image) {
       toast.error(`Could not attach ${name}`, {
         description:
@@ -556,7 +802,8 @@ async function readAttachment(file: File): Promise<FileAttachment | null> {
       });
       return null;
     }
-    const url = await readAsDataURL(image);
+    signal.throwIfAborted();
+    const url = await readAsDataURL(image, signal);
     return {
       id,
       name: image.name,
@@ -573,6 +820,7 @@ async function readAttachment(file: File): Promise<FileAttachment | null> {
     return null;
   }
   const text = await file.text();
+  signal.throwIfAborted();
   return {
     id,
     name: file.name,
@@ -583,11 +831,24 @@ async function readAttachment(file: File): Promise<FileAttachment | null> {
   };
 }
 
-function readAsDataURL(file: Blob): Promise<string> {
+function readAsDataURL(file: Blob, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result ?? ""));
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      reader.abort();
+      reject(signal.reason);
+    };
+    reader.onloadend = () => signal.removeEventListener("abort", abort);
+    reader.onload = () => {
+      if (!signal.aborted) resolve(String(reader.result ?? ""));
+    };
     reader.onerror = () => reject(reader.error);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+      return;
+    }
     reader.readAsDataURL(file);
   });
 }

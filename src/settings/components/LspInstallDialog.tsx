@@ -1,3 +1,4 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -39,7 +40,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
   const copyInstallCommand = async () => {
     if (!server.install) return;
     try {
-      await navigator.clipboard.writeText(server.install.command);
+      await writeClipboardText(server.install.command);
       setCopied(true);
     } catch {
       setCopied(false);

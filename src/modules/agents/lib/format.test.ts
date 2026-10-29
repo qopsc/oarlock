@@ -22,4 +22,10 @@ describe("displayAgent", () => {
   it("falls back to 'Agent' for an empty id", () => {
     expect(displayAgent("")).toBe("Agent");
   });
+
+  it("treats inherited object names as ordinary agent labels", () => {
+    expect(displayAgent("__proto__")).toBe("__proto__");
+    expect(displayAgent("constructor")).toBe("Constructor");
+    expect(displayAgent("hasOwnProperty")).toBe("HasOwnProperty");
+  });
 });

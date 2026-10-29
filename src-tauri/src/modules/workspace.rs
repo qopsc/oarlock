@@ -300,10 +300,11 @@ impl Gates<'_> {
         cwd: Option<&str>,
         workspace: &WorkspaceEnv,
     ) -> Result<Option<PathBuf>, String> {
-        let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+        workspace.validate_supported()?;
+        let Some(cwd) = cwd.filter(|s| !s.trim().is_empty()) else {
             return Ok(None);
         };
-        let resolved = resolve_path(cwd, workspace);
+        let resolved = resolve_path(cwd, workspace)?;
         let canonical =
             std::fs::canonicalize(&resolved).map_err(|e| format!("cwd not accessible: {e}"))?;
         if !canonical.is_dir() {
@@ -371,10 +372,11 @@ pub fn authorize_user_spawn_cwd(
     cwd: Option<&str>,
     workspace: &WorkspaceEnv,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+    workspace.validate_supported()?;
+    let Some(cwd) = cwd.filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
     };
-    let resolved = resolve_path(cwd, workspace);
+    let resolved = resolve_path(cwd, workspace)?;
     let canonical =
         std::fs::canonicalize(&resolved).map_err(|e| format!("cwd not accessible: {e}"))?;
     if !canonical.is_dir() {
@@ -391,7 +393,7 @@ pub fn user_spawn_cwd_or_home(
     cwd: Option<&str>,
     workspace: &WorkspaceEnv,
 ) -> Option<String> {
-    let cwd = cwd.map(str::trim).filter(|s| !s.is_empty())?;
+    let cwd = cwd.filter(|s| !s.trim().is_empty())?;
     match authorize_user_spawn_cwd(registry, Some(cwd), workspace) {
         Ok(_) => Some(cwd.to_owned()),
         Err(e) => {
@@ -432,7 +434,7 @@ pub async fn workspace_authorize(
     // Canonicalizing touches the disk (possibly a network volume).
     crate::modules::fs::blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let resolved = resolve_path(&path, &workspace);
+        let resolved = resolve_path(&path, &workspace)?;
         let registry = tauri::Manager::state::<WorkspaceRegistry>(&app);
         let canonical = match opened {
             Some(opened) => registry.authorize_opened(&resolved, opened),
@@ -442,17 +444,6 @@ pub async fn workspace_authorize(
         Ok(crate::modules::fs::to_canon(&canonical))
     })
     .await
-}
-
-/// Turns one origin's "access all folders" setting on or off (Settings, both off by default).
-/// Every window sends the stored settings when it starts and each change, so the gates follow
-/// the setting from the next command on.
-#[tauri::command]
-pub fn workspace_set_all_folders(app: tauri::AppHandle, origin: Origin, all: bool) {
-    let registry = tauri::Manager::state::<WorkspaceRegistry>(&app);
-    if registry.set_all_folders(origin, all) != all {
-        log::info!("access to all folders for {origin:?} requests: {all}");
-    }
 }
 
 #[tauri::command]
@@ -676,7 +667,7 @@ fn compute_child_env_overrides(
     appimage
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum WorkspaceEnv {
     #[default]
@@ -686,7 +677,35 @@ pub enum WorkspaceEnv {
     },
 }
 
+// Every IPC argument (including nested requests) shares this validation. Stored
+// frontend space metadata remains raw JSON, so unavailable spaces are preserved.
+impl<'de> Deserialize<'de> for WorkspaceEnv {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "lowercase")]
+        enum Wire {
+            Local,
+            Wsl { distro: String },
+        }
+        let env = match Wire::deserialize(deserializer)? {
+            Wire::Local => Self::Local,
+            Wire::Wsl { distro } => Self::Wsl { distro },
+        };
+        env.validate_supported().map_err(serde::de::Error::custom)?;
+        Ok(env)
+    }
+}
+
 impl WorkspaceEnv {
+    pub fn validate_supported(&self) -> Result<(), String> {
+        if let Self::Wsl { distro: _distro } = self {
+            #[cfg(not(windows))]
+            return Err("This WSL space is unavailable on this platform. It is kept for use on Windows; host paths will not be used.".into());
+            #[cfg(windows)]
+            validate_wsl_distro_name(_distro)?;
+        }
+        Ok(())
+    }
     pub fn from_option(workspace: Option<Self>) -> Self {
         workspace.unwrap_or_default()
     }
@@ -704,16 +723,18 @@ pub struct WslDistro {
 }
 
 #[cfg(windows)]
-pub fn resolve_path(path: &str, workspace: &WorkspaceEnv) -> PathBuf {
-    match workspace {
+pub fn resolve_path(path: &str, workspace: &WorkspaceEnv) -> Result<PathBuf, String> {
+    workspace.validate_supported()?;
+    Ok(match workspace {
         WorkspaceEnv::Local => PathBuf::from(path),
         WorkspaceEnv::Wsl { distro } => wsl_path_to_host(distro, path),
-    }
+    })
 }
 
 #[cfg(not(windows))]
-pub fn resolve_path(path: &str, _workspace: &WorkspaceEnv) -> PathBuf {
-    PathBuf::from(path)
+pub fn resolve_path(path: &str, workspace: &WorkspaceEnv) -> Result<PathBuf, String> {
+    workspace.validate_supported()?;
+    Ok(PathBuf::from(path))
 }
 
 /// True for WSL distro names safe to splice into a UNC path. Real WSL distros
@@ -1075,7 +1096,7 @@ mod tests {
     fn resolve_path_keeps_local_paths_unchanged() {
         let path = r"C:\Users\vinicios\repo";
         assert_eq!(
-            resolve_path(path, &WorkspaceEnv::Local),
+            resolve_path(path, &WorkspaceEnv::Local).unwrap(),
             PathBuf::from(path)
         );
     }
@@ -1086,7 +1107,7 @@ mod tests {
             distro: "Ubuntu".into(),
         };
         assert_eq!(
-            resolve_path("/home/vinicios/repo", &workspace),
+            resolve_path("/home/vinicios/repo", &workspace).unwrap(),
             wsl_path_to_host("Ubuntu", "/home/vinicios/repo")
         );
     }
@@ -1159,11 +1180,52 @@ mod auth_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("oarlock-auth-{label}-{nanos}-{}", std::process::id()));
+        p.push(format!(
+            "oarlock-auth-{label}-{nanos}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&p).expect("create tempdir");
         fs::canonicalize(&p).expect("canonicalize tempdir")
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn unsupported_environment_is_rejected_at_ipc_and_resolution_boundaries() {
+        let raw = serde_json::json!({"kind":"wsl", "distro":"Ubuntu"});
+        assert!(serde_json::from_value::<WorkspaceEnv>(raw.clone()).is_err());
+        // Persistence stays opaque JSON: neither the environment nor tabs vanish.
+        let saved = serde_json::json!({"env":raw,"tabs":[{"path":"/tmp/a"}]});
+        let restored: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(saved, restored);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("existing-host-file");
+        std::fs::write(&file, "unchanged").unwrap();
+        let env = WorkspaceEnv::Wsl {
+            distro: "Ubuntu".into(),
+        };
+        assert!(resolve_path(file.to_str().unwrap(), &env).is_err());
+        let reg = WorkspaceRegistry::default();
+        reg.authorize(dir.path()).unwrap();
+        assert!(reg
+            .gates(Origin::App)
+            .spawn_cwd(Some(dir.path().to_str().unwrap()), &env)
+            .is_err());
+        assert!(reg.gates(Origin::App).spawn_cwd(None, &env).is_err());
+        assert!(authorize_user_spawn_cwd(&reg, None, &env).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unchanged");
+        assert_eq!(
+            resolve_path(file.to_str().unwrap(), &WorkspaceEnv::Local).unwrap(),
+            file
+        );
+    }
+    #[test]
+    fn local_environment_remains_valid_at_the_ipc_boundary() {
+        assert_eq!(
+            serde_json::from_str::<WorkspaceEnv>(r#"{"kind":"local"}"#).unwrap(),
+            WorkspaceEnv::Local
+        );
+    }
     #[test]
     fn authorize_spawn_cwd_accepts_none() {
         let reg = WorkspaceRegistry::default();
@@ -1178,6 +1240,33 @@ mod auth_tests {
         assert!(authorize_spawn_cwd(&reg, Some("   "), &WorkspaceEnv::Local)
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_cwd_does_not_authorize_a_different_trimmed_path() {
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("folder");
+        let spaced = root.path().join("folder ");
+        fs::create_dir(&plain).unwrap();
+        fs::create_dir(&spaced).unwrap();
+        let reg = WorkspaceRegistry::default();
+        reg.authorize(&plain).unwrap();
+        assert!(authorize_spawn_cwd(&reg, spaced.to_str(), &WorkspaceEnv::Local).is_err());
+        reg.authorize(&spaced).unwrap();
+        assert_eq!(
+            authorize_spawn_cwd(&reg, spaced.to_str(), &WorkspaceEnv::Local)
+                .unwrap()
+                .unwrap(),
+            fs::canonicalize(&spaced).unwrap()
+        );
+        let fresh = WorkspaceRegistry::default();
+        assert_eq!(
+            user_spawn_cwd_or_home(&fresh, spaced.to_str(), &WorkspaceEnv::Local).unwrap(),
+            spaced.to_str().unwrap()
+        );
+        assert!(fresh.is_authorized(&fs::canonicalize(&spaced).unwrap()));
+        assert!(!fresh.is_authorized(&fs::canonicalize(&plain).unwrap()));
     }
 
     #[test]
@@ -1569,21 +1658,20 @@ mod auth_tests {
             distro: "Ubuntu".into(),
         };
         let reg = WorkspaceRegistry::default();
-        assert!(is_outside(reg.authorized_existing(&resolve_path(
-            &format!("{drvfs}/a.txt"),
-            &ubuntu
-        ))));
+        assert!(is_outside(reg.authorized_existing(
+            &resolve_path(&format!("{drvfs}/a.txt"), &ubuntu).unwrap()
+        )));
         reg.authorize(&root).unwrap();
         assert_eq!(
-            reg.authorized_existing(&resolve_path(&format!("{drvfs}/a.txt"), &ubuntu)),
+            reg.authorized_existing(&resolve_path(&format!("{drvfs}/a.txt"), &ubuntu).unwrap()),
             Ok(root.join("a.txt"))
         );
-        assert!(is_outside(
-            reg.authorized_existing(&resolve_path("/etc/passwd", &ubuntu))
-        ));
-        assert!(is_outside(
-            reg.authorized_new(&resolve_path("/home/me/new.txt", &ubuntu))
-        ));
+        assert!(is_outside(reg.authorized_existing(
+            &resolve_path("/etc/passwd", &ubuntu).unwrap()
+        )));
+        assert!(is_outside(reg.authorized_new(
+            &resolve_path("/home/me/new.txt", &ubuntu).unwrap()
+        )));
     }
 
     /// An authorized folder and a folder outside it, each with a file and a subfolder.
@@ -1750,6 +1838,7 @@ mod auth_tests {
         "fs_read_file",
         "fs_write_file",
         "shell_bg_spawn",
+        "shell_detached_spawn",
         "shell_run_command",
         "shell_session_open",
         "shell_session_run",
@@ -1851,13 +1940,22 @@ mod appimage_tests {
         let env = reader(&[
             ("LD_LIBRARY_PATH", "/tmp/.mount_Oarlock_X/usr/lib:/usr/lib"),
             ("PATH", "/tmp/.mount_Oarlock_X/usr/bin:/usr/bin:/bin"),
-            ("GST_PLUGIN_SYSTEM_PATH", "/tmp/.mount_Oarlock_X/usr/lib/gstreamer-1.0"),
+            (
+                "GST_PLUGIN_SYSTEM_PATH",
+                "/tmp/.mount_Oarlock_X/usr/lib/gstreamer-1.0",
+            ),
             ("APPDIR", "/tmp/.mount_Oarlock_X"),
         ]);
         let out = compute_appimage_env_overrides(appdir, env);
 
-        assert_eq!(find(&out, "LD_LIBRARY_PATH"), Some(&Some(OsString::from("/usr/lib"))));
-        assert_eq!(find(&out, "PATH"), Some(&Some(OsString::from("/usr/bin:/bin"))));
+        assert_eq!(
+            find(&out, "LD_LIBRARY_PATH"),
+            Some(&Some(OsString::from("/usr/lib")))
+        );
+        assert_eq!(
+            find(&out, "PATH"),
+            Some(&Some(OsString::from("/usr/bin:/bin")))
+        );
         // Only an APPDIR entry, so the var is removed entirely.
         assert_eq!(find(&out, "GST_PLUGIN_SYSTEM_PATH"), Some(&None));
         assert_eq!(find(&out, "APPDIR"), Some(&None));
@@ -1881,10 +1979,17 @@ mod appimage_tests {
     fn unsets_value_vars_only_when_pointing_into_appdir() {
         let appdir = Path::new("/tmp/.mount_Oarlock_X");
         let into = reader(&[("LD_PRELOAD", "/tmp/.mount_Oarlock_X/usr/lib/x.so")]);
-        assert_eq!(find(&compute_appimage_env_overrides(appdir, into), "LD_PRELOAD"), Some(&None));
+        assert_eq!(
+            find(&compute_appimage_env_overrides(appdir, into), "LD_PRELOAD"),
+            Some(&None)
+        );
 
         let outside = reader(&[("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")]);
-        assert!(find(&compute_appimage_env_overrides(appdir, outside), "FONTCONFIG_FILE").is_none());
+        assert!(find(
+            &compute_appimage_env_overrides(appdir, outside),
+            "FONTCONFIG_FILE"
+        )
+        .is_none());
     }
 }
 

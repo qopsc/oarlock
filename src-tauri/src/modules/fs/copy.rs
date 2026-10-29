@@ -1,17 +1,19 @@
-use super::{
-    index::FileIndexState,
-    mutate::{note_dir_changed, rename_no_replace},
-    to_canon,
-};
+use super::index::FileIndexState;
+#[cfg(test)]
+use super::mutate::{note_dir_changed, rename_no_replace};
+#[cfg(test)]
+use super::to_canon;
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
+#[cfg(test)]
 use std::io;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
-const MAX_COPY_SOURCES: usize = 1024;
-const MAX_COPY_SUFFIX: usize = 10_000;
+pub(super) const MAX_COPY_SOURCES: usize = 1024;
+pub(super) const MAX_COPY_SUFFIX: usize = 10_000;
+#[cfg(test)]
 const MAX_COPY_DEPTH: usize = 128;
 
 #[derive(Debug, Default, Serialize)]
@@ -35,8 +37,9 @@ pub async fn fs_copy(
     workspace: Option<WorkspaceEnv>,
     rename_on_conflict: Option<bool>,
 ) -> Result<CopyResult, String> {
+    super::require_owned_entry_operation()?;
     tauri::async_runtime::spawn_blocking(move || {
-        copy_batch(
+        super::copy_owned::copy_batch(
             sources,
             &dest_dir,
             &root,
@@ -50,14 +53,14 @@ pub async fn fs_copy(
     .map_err(|error| error.to_string())?
 }
 
-fn copy_destination(
+pub(super) fn copy_destination(
     dest_dir: &str,
     root: &str,
     workspace: &WorkspaceEnv,
     registry: &WorkspaceRegistry,
 ) -> Result<PathBuf, String> {
-    let root = resolve_path(root, workspace);
-    let dest = resolve_path(dest_dir, workspace);
+    let root = resolve_path(root, workspace)?;
+    let dest = resolve_path(dest_dir, workspace)?;
     if !root.is_absolute() || !dest.is_absolute() {
         return Err("copy destination and workspace root must be absolute".into());
     }
@@ -72,6 +75,7 @@ fn copy_destination(
     Ok(dest)
 }
 
+#[cfg(test)]
 fn copy_batch(
     sources: Vec<String>,
     dest_dir: &str,
@@ -105,6 +109,7 @@ fn copy_batch(
     Ok(result)
 }
 
+#[cfg(test)]
 fn copy_item(src: &Path, dest: &Path, rename_on_conflict: bool) -> io::Result<OsString> {
     if !src.is_absolute() {
         return Err(io::Error::new(
@@ -138,6 +143,7 @@ fn copy_item(src: &Path, dest: &Path, rename_on_conflict: bool) -> io::Result<Os
     publish_copy(&staged, dest, name, metadata.is_dir(), rename_on_conflict)
 }
 
+#[cfg(test)]
 fn publish_copy(
     staged: &Path,
     dest: &Path,
@@ -174,6 +180,7 @@ fn publish_copy(
     ))
 }
 
+#[cfg(test)]
 fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
     if depth > MAX_COPY_DEPTH {
         return Err(io::Error::new(
@@ -208,12 +215,12 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::windows::fs::{symlink_dir, symlink_file, FileTypeExt};
     let target = std::fs::read_link(src)?;
@@ -224,7 +231,7 @@ fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(test, not(any(unix, windows))))]
 fn copy_symlink(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -232,7 +239,7 @@ fn copy_symlink(_src: &Path, _dst: &Path) -> io::Result<()> {
     ))
 }
 
-fn copy_name(name: &OsStr, n: usize, is_dir: bool) -> OsString {
+pub(super) fn copy_name(name: &OsStr, n: usize, is_dir: bool) -> OsString {
     let path = Path::new(name);
     let (stem, ext) = match (is_dir, path.file_stem(), path.extension()) {
         (false, Some(stem), Some(ext)) => (stem, Some(ext)),

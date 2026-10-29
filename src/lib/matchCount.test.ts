@@ -14,6 +14,11 @@ const count = (over: Partial<MatchCount>): MatchCount => ({
 });
 
 describe("formatMatchCount", () => {
+  it("does not call a failed search No results", () => {
+    expect(formatMatchCount(count({ error: "Search timed out" }))).toBe(
+      "Search failed",
+    );
+  });
   it("shows the selected match against the total", () => {
     expect(formatMatchCount(count({ current: 3, total: 12 }))).toBe("3 of 12");
     expect(formatMatchCount(count({ current: 1, total: 1 }))).toBe("1 of 1");
@@ -45,6 +50,9 @@ describe("formatMatchCount", () => {
 
 describe("sameMatchCount", () => {
   it("compares by value", () => {
+    expect(
+      sameMatchCount(count({}), count({ error: "Search timed out" })),
+    ).toBe(false);
     expect(sameMatchCount(count({ total: 2 }), count({ total: 2 }))).toBe(true);
     expect(sameMatchCount(count({ total: 2 }), count({ total: 3 }))).toBe(
       false,

@@ -10,7 +10,7 @@ import type {
   OarlockGhosttyMimeData,
 } from "@oarlock/ghostty-core/adapted";
 import {
-  readClipboardImage,
+  readTerminalClipboardSnapshot,
   readPrimarySelection,
   readTerminalClipboard,
 } from "../lib/terminalClipboard";
@@ -160,6 +160,8 @@ export function pointerCursor(shape: GhosttyPointerShape): string {
 
 export type TerminalIntegrationContext = {
   readonly leafId: number;
+  /** Captured per request; changes when clipboard permission is changed. */
+  readonly clipboardSignal: () => AbortSignal;
   /** The pane is visible, focused and the window has focus. */
   readonly userIsLooking: () => boolean;
   /** Writes bytes to the program (terminal replies). */
@@ -248,10 +250,26 @@ export function terminalIntegrationCallbacks(
       if (target) target.style.cursor = pointerCursor(shape);
     },
     onClipboardRead: (selection, terminator) => {
-      void answerClipboardRead(context, selection, terminator);
+      const owner = context.clipboardSignal();
+      if (owner.aborted) return;
+      const cancel = () =>
+        context.reply(
+          encoder.encode(clipboardReadReply(selection, "", terminator)),
+        );
+      owner.addEventListener("abort", cancel, { once: true });
+      void answerClipboardRead(context, selection, terminator, owner).finally(
+        () => owner.removeEventListener("abort", cancel),
+      );
     },
     onKittyClipboardRead: (request) => {
-      void answerKittyClipboardRead(context, request);
+      const owner = context.clipboardSignal();
+      if (owner.aborted) return;
+      const cancel = () =>
+        context.answerKittyClipboardRead(request.id, { status: "denied" });
+      owner.addEventListener("abort", cancel, { once: true });
+      void answerKittyClipboardRead(context, request, owner).finally(() =>
+        owner.removeEventListener("abort", cancel),
+      );
     },
     onCommandStarted: (text) => {
       commandStartedAt = performance.now();
@@ -287,18 +305,32 @@ export function terminalIntegrationCallbacks(
 async function answerKittyClipboardRead(
   context: TerminalIntegrationContext,
   request: KittyClipboardReadRequest,
+  owner: AbortSignal,
 ): Promise<void> {
   // A listing alone shows only the types on offer; Kitty serves it unasked,
   // as it does a read with a paste event's password (the user pasted).
+  if (owner.aborted) return;
   const program = promptProgramName(request.name);
   const allowed =
     request.mimes.length === 0 ||
     request.granted ||
     behavior().clipboardRead === "allow" ||
-    (await requestTerminalPrompt({
-      kind: "clipboard-read",
-      ...(program ? { program } : {}),
-    })) === "allow";
+    (behavior().clipboardRead === "ask" &&
+      (await requestTerminalPrompt(
+        {
+          kind: "clipboard-read",
+          ...(program ? { program } : {}),
+        },
+        owner,
+        JSON.stringify([
+          "kitty",
+          request.name,
+          request.primary,
+          request.list,
+          request.mimes,
+        ]),
+      )) === "allow");
+  if (owner.aborted) return;
   if (!allowed) {
     context.answerKittyClipboardRead(request.id, { status: "denied" });
     return;
@@ -306,13 +338,17 @@ async function answerKittyClipboardRead(
   // The image is read (and encoded) only when it is asked for or listed.
   const image =
     !request.primary && (request.list || request.mimes.includes(IMAGE_MIME));
-  const [text, png] = await Promise.all([
-    request.primary ? readPrimarySelection() : readTerminalClipboard(),
-    image ? readClipboardImage() : null,
-  ]);
+  const snapshot = await readTerminalClipboardSnapshot(
+    image ? "always" : "never",
+    request.primary,
+    owner,
+  ).catch(() => null);
+  if (owner.aborted) return;
   context.answerKittyClipboardRead(
     request.id,
-    kittyClipboardAnswer(request.mimes, text, png),
+    snapshot
+      ? kittyClipboardAnswer(request.mimes, snapshot.text, snapshot.image)
+      : { status: "io-error" },
   );
 }
 
@@ -338,12 +374,19 @@ async function answerClipboardRead(
   context: TerminalIntegrationContext,
   selection: string,
   terminator: "st" | "bel",
+  owner: AbortSignal,
 ): Promise<void> {
+  if (owner.aborted) return;
   const access = behavior().clipboardRead;
   const allowed =
     access === "allow" ||
     (access === "ask" &&
-      (await requestTerminalPrompt({ kind: "clipboard-read" })) === "allow");
+      (await requestTerminalPrompt(
+        { kind: "clipboard-read" },
+        owner,
+        `osc52:${selection}`,
+      )) === "allow");
+  if (owner.aborted) return;
   // A denied read is answered empty so the program does not wait for it.
   const text = allowed
     ? selection === "p"
@@ -352,6 +395,7 @@ async function answerClipboardRead(
         ? await readTerminalClipboard()
         : ""
     : "";
+  if (owner.aborted) return;
   context.reply(
     encoder.encode(clipboardReadReply(selection, text, terminator)),
   );

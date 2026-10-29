@@ -8,12 +8,12 @@ import {
 import { listEndpointModels } from "@/modules/ai/lib/endpointModels";
 import { RefreshIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type ListState =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "ready"; url: string; models: string[] }
+  | { status: "ready"; models: string[] }
   | { status: "error"; message: string };
 
 /** Lists the models an OpenAI-compatible server offers (`GET <base>/models`),
@@ -21,26 +21,61 @@ type ListState =
  *  again on Refresh or when the base URL changed. */
 export function ModelBrowseButton({
   baseURL,
+  disabled = false,
   apiKey,
   onSelect,
 }: {
+  disabled?: boolean;
   baseURL: string;
   apiKey?: string | null;
   onSelect: (modelId: string) => void;
 }) {
-  const [state, setState] = useState<ListState>({ status: "idle" });
+  // A new identity invalidates results even when props change away and back.
+  const context = useMemo(
+    () => ({ baseURL, apiKey, disabled }),
+    [baseURL, apiKey, disabled],
+  );
+  const [result, setResult] = useState<{
+    context: typeof context;
+    state: ListState;
+  } | null>(null);
+  const state: ListState =
+    result?.context === context ? result.state : { status: "idle" };
   const request = useRef(0);
+  const pending = useRef<{
+    context: typeof context;
+    controller: AbortController;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      if (pending.current?.context === context) {
+        ++request.current;
+        pending.current.controller.abort();
+      }
+    },
+    [context],
+  );
 
   const load = async () => {
+    if (disabled) return;
+    pending.current?.controller.abort();
+    const controller = new AbortController();
+    pending.current = { context, controller };
     const id = ++request.current;
+    const setState = (state: ListState) => setResult({ context, state });
     setState({ status: "loading" });
     try {
-      const models = await listEndpointModels(baseURL, apiKey);
-      if (id === request.current) {
-        setState({ status: "ready", url: baseURL, models });
+      const models = await listEndpointModels(
+        baseURL,
+        apiKey,
+        undefined,
+        controller.signal,
+      );
+      if (id === request.current && !controller.signal.aborted) {
+        setState({ status: "ready", models });
       }
     } catch (error) {
-      if (id === request.current) {
+      if (id === request.current && !controller.signal.aborted) {
         setState({
           status: "error",
           message: error instanceof Error ? error.message : String(error),
@@ -50,8 +85,8 @@ export function ModelBrowseButton({
   };
 
   const onOpenChange = (open: boolean) => {
-    if (!open) return;
-    if (state.status === "ready" && state.url === baseURL) return;
+    if (!open || disabled) return;
+    if (state.status === "ready") return;
     void load();
   };
 
@@ -61,7 +96,7 @@ export function ModelBrowseButton({
         <Button
           size="sm"
           variant="outline"
-          disabled={!baseURL.trim()}
+          disabled={disabled || !baseURL.trim()}
           className="h-8 shrink-0 px-2.5 text-[11px]"
           title="Pick from the models this server lists"
         >
@@ -77,14 +112,14 @@ export function ModelBrowseButton({
             size="icon-xs"
             variant="ghost"
             onClick={() => void load()}
-            disabled={state.status === "loading"}
+            disabled={disabled || state.status === "loading"}
             aria-label="Refresh"
             title="Refresh"
           >
             <HugeiconsIcon icon={RefreshIcon} />
           </Button>
         </div>
-        {state.status === "ready" && state.models.length > 0 ? (
+        {!disabled && state.status === "ready" && state.models.length > 0 ? (
           <div className="max-h-64 overflow-y-auto overscroll-contain">
             {state.models.map((id) => (
               <DropdownMenuItem
@@ -104,11 +139,15 @@ export function ModelBrowseButton({
                 : "px-2 py-2 text-[11px] text-muted-foreground"
             }
           >
-            {state.status === "error"
-              ? `Could not list models: ${state.message}`
-              : state.status === "ready"
-                ? "The server lists no models."
-                : "Loading…"}
+            {disabled
+              ? "Resolve endpoint credentials before browsing."
+              : state.status === "idle"
+                ? "Refresh to list models for this endpoint."
+                : state.status === "error"
+                  ? `Could not list models: ${state.message}`
+                  : state.status === "ready"
+                    ? "The server lists no models."
+                    : "Loading…"}
           </div>
         )}
       </DropdownMenuContent>

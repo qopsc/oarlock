@@ -56,6 +56,9 @@ export type McpToolOverride = "allow" | "deny";
 type McpServerSource = "settings" | `imported:${string}` | `project:${string}`;
 
 export type McpServerConfig = {
+  /** Native project identity and presentation scope; never persisted as authority. */
+  projectKey?: string;
+  retainedOnly?: boolean;
   id: string;
   name: string;
   source: McpServerSource;
@@ -65,7 +68,7 @@ export type McpServerConfig = {
   transport: McpTransportConfig;
   /** Keyed by the server's own tool name. */
   tools: Record<string, McpToolOverride>;
-  /** Changes whenever a secret value is set, so running servers restart. */
+  /** Transport and credential revision; stale launches and editor saves are rejected. */
   secretsRevision: number;
 };
 

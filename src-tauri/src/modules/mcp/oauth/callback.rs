@@ -73,7 +73,7 @@ async fn answer(
     }
 }
 
-async fn read_head(stream: &mut TcpStream) -> Option<String> {
+async fn read_head(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Option<String> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -83,6 +83,9 @@ async fn read_head(stream: &mut TcpStream) -> Option<String> {
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            if end + 4 > MAX_HEAD {
+                return None;
+            }
             buffer.truncate(end);
             return String::from_utf8(buffer).ok();
         }
@@ -172,6 +175,19 @@ pub async fn respond(stream: &mut TcpStream, status: u16, html: &str) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_head_limit_includes_its_terminator() {
+        for length in [MAX_HEAD - 1, MAX_HEAD, MAX_HEAD + 1, MAX_HEAD + 1024] {
+            let mut request = vec![b'x'; length - 4];
+            request.extend_from_slice(b"\r\n\r\nbody");
+            let result = read_head(&mut request.as_slice()).await;
+            assert_eq!(result.is_some(), length <= MAX_HEAD, "length {length}");
+            if let Some(head) = result {
+                assert_eq!(head.len(), length - 4);
+            }
+        }
+    }
 
     #[test]
     fn only_the_callback_with_its_state_is_taken() {

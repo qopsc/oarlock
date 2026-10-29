@@ -83,11 +83,22 @@ jobs:
           printf '%s' "$KEY_CONTENT" > "$HOME/private_keys/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$HOME/private_keys/AuthKey.p8" >> "$GITHUB_ENV"
 
+      # The nested XPC bundle has its own entitlements and must be signed before
+      # Tauri seals the enclosing app. Import the existing release identity for
+      # the beforeBundleCommand; the action removes its temporary keychain later.
+      - name: Import identity for the sandboxed Git helper
+        if: startsWith(matrix.platform, 'macos')
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
       - id: tauri
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OARLOCK_CLI_TARGET: ${{ matrix.rust-target }}
+          OARLOCK_DISTRIBUTION_BUILD: "1"
 
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -106,6 +117,13 @@ jobs:
           prerelease: false
           tauriScript: bun run tauri
           args: ${{ matrix.args }}
+
+      - name: Verify packaged Git helper sandbox and signatures
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          OARLOCK_RELEASE_TARGET: ${{ matrix.rust-target }}
+        run: bun scripts/git-worker/verify-app.mjs "src-tauri/target/$OARLOCK_RELEASE_TARGET/release/bundle/macos"
 
       # Strip the bundled libwayland-* libs from the AppImage so it loads the
       # host copies at runtime. The Ubuntu 22.04 build host ships libwayland

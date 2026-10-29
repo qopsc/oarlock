@@ -188,6 +188,8 @@ function McpToolCallImpl({
   const output = "output" in part ? part.output : undefined;
   const errorText = "errorText" in part ? part.errorText : undefined;
   const isError = state === "output-error";
+  const denialReason =
+    part.state === "output-denied" ? part.approval?.reason : undefined;
   return (
     <Collapsible defaultOpen={isError} className="group/tool not-prose w-full">
       <CollapsibleTrigger
@@ -223,6 +225,11 @@ function McpToolCallImpl({
           </span>
         )}
       </CollapsibleTrigger>
+      {denialReason ? (
+        <p className="px-2 pb-1 text-[11px] text-muted-foreground">
+          {denialReason}
+        </p>
+      ) : null}
       <CollapsibleContent className="oarlock-collapsible-content">
         <div className="mt-1 ml-3 space-y-2 border-l border-border/60 pb-1 pl-3">
           <div className="space-y-1">

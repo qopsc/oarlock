@@ -1,3 +1,6 @@
+import { WorkspaceOwner } from "@/modules/workspace/owner";
+import { LOCAL_WORKSPACE } from "@/modules/workspace/env";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
 import type { Tab } from "@/modules/tabs";
 import type { TerminalSearchController } from "@/modules/terminal/search/TerminalSearchController";
 import { useEffect, useMemo, useRef } from "react";
@@ -33,6 +36,7 @@ export function TerminalStack({
   onExit,
   onFocusLeaf,
 }: Props) {
+  const spaces = useSpaces((s) => s.spaces);
   const terminals = useMemo(() => selectLiveTerminals(tabs), [tabs]);
 
   const registerRef = useRef(registerHandle);
@@ -101,18 +105,24 @@ export function TerminalStack({
             }}
             aria-hidden={!tabVisible}
           >
-            <PaneTreeView
-              node={
-                (t.zoomedLeafId !== undefined &&
-                  findLeafNode(t.paneTree, t.zoomedLeafId)) ||
-                t.paneTree
+            <WorkspaceOwner
+              env={
+                spaces.find((s) => s.id === t.spaceId)?.env ?? LOCAL_WORKSPACE
               }
-              tabVisible={tabVisible}
-              activeLeafId={t.activeLeafId}
-              blocks={t.blocks ?? false}
-              onFocusLeaf={(leafId) => onFocusLeaf(t.id, leafId)}
-              getBundle={getBundle}
-            />
+            >
+              <PaneTreeView
+                node={
+                  (t.zoomedLeafId !== undefined &&
+                    findLeafNode(t.paneTree, t.zoomedLeafId)) ||
+                  t.paneTree
+                }
+                tabVisible={tabVisible}
+                activeLeafId={t.activeLeafId}
+                blocks={t.blocks ?? false}
+                onFocusLeaf={(leafId) => onFocusLeaf(t.id, leafId)}
+                getBundle={getBundle}
+              />
+            </WorkspaceOwner>
           </div>
         );
       })}

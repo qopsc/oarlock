@@ -2,7 +2,7 @@ import type { Tab } from "@/modules/tabs";
 import { describe, expect, it, vi } from "vitest";
 import {
   editorTabsUnder,
-  notifyFilesDiscarded,
+  prepareFilesDiscard,
   notifyHeadMoved,
   onFilesDiscarded,
   onHeadMoved,
@@ -63,14 +63,21 @@ describe("editorTabsUnder", () => {
   });
 });
 
-describe("notifyFilesDiscarded", () => {
+describe("prepareFilesDiscard", () => {
   it("tells listeners the absolute paths until they unsubscribe", () => {
-    const listener = vi.fn();
+    const committed = vi.fn();
+    const listener = vi.fn(() => ({ complete: committed, dispose: vi.fn() }));
     const off = onFilesDiscarded(listener);
-    notifyFilesDiscarded("/repo", ["src/a.ts", "new/"]);
-    expect(listener).toHaveBeenCalledWith(["/repo/src/a.ts", "/repo/new/"]);
+    const commit = prepareFilesDiscard("/repo", ["src/a.ts", "new/"]);
+    expect(committed).not.toHaveBeenCalled();
+    commit.complete();
+    expect(committed).toHaveBeenCalledOnce();
+    commit.dispose();
+    expect(listener).toHaveBeenCalledWith(["/repo/src/a.ts", "/repo/new/"], {
+      kind: "local",
+    });
     off();
-    notifyFilesDiscarded("/repo", ["src/a.ts"]);
+    prepareFilesDiscard("/repo", ["src/a.ts"]);
     expect(listener).toHaveBeenCalledOnce();
   });
 });
@@ -84,4 +91,32 @@ describe("notifyHeadMoved", () => {
     notifyHeadMoved();
     expect(listener).toHaveBeenCalledOnce();
   });
+});
+
+it("newly mounted documents join active discards only in the owning environment", async () => {
+  const { registerDiscardDocument } = await import("./gitSignals");
+  const prep = { complete: vi.fn(), dispose: vi.fn() };
+  const prepare = vi.fn(() => prep);
+  const discard = prepareFilesDiscard("/repo", ["file"], {
+    kind: "wsl",
+    distro: "Ubuntu",
+  });
+  const other = registerDiscardDocument({
+    path: "/repo/file",
+    workspace: { kind: "wsl", distro: "Debian" },
+    prepare,
+  });
+  expect(prepare).not.toHaveBeenCalled();
+  const off = registerDiscardDocument({
+    path: "/repo/file",
+    workspace: { kind: "wsl", distro: "Ubuntu" },
+    prepare,
+  });
+  expect(prepare).toHaveBeenCalledWith(true);
+  discard.complete();
+  discard.dispose();
+  expect(prep.complete).toHaveBeenCalledOnce();
+  expect(prep.dispose).not.toHaveBeenCalled();
+  off();
+  other();
 });

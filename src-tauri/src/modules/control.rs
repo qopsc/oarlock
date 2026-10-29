@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use serde_json::{json, Value};
-use tauri::{Emitter, Manager};
 use oarlock_control_protocol::{
     ControlDescriptor, ControlRequest, ControlResponse, FrontendRequest, FrontendResponse,
     OpenParams, MAX_MESSAGE_BYTES, METHODS, METHOD_CAPABILITIES, METHOD_IDENTIFY, METHOD_OPEN,
     METHOD_PING, PROTOCOL_VERSION, SERVER_RESPONSE_ID,
 };
+use serde_json::{json, Value};
+use tauri::{Emitter, Manager};
 
 use crate::modules::{fs, windows, workspace};
 
@@ -182,7 +182,7 @@ pub fn start(app: tauri::AppHandle, state: ControlState) -> Result<(), String> {
         .map_err(|error| format!("read local control address: {error}"))?
         .to_string();
     let token = generate_token()?;
-    let descriptor_path = descriptor_path()?;
+    let descriptor_path = descriptor_path(&app.config().identifier)?;
     sweep_stale_launcher_dirs(&descriptor_path);
     let cli_path = find_bundled_cli();
     let launcher_dir = cli_path.as_deref().and_then(|cli_path| {
@@ -674,10 +674,10 @@ fn generate_token() -> Result<String, String> {
     Ok(token)
 }
 
-fn descriptor_path() -> Result<PathBuf, String> {
+fn descriptor_path(identifier: &str) -> Result<PathBuf, String> {
     let cache =
         dirs::cache_dir().ok_or_else(|| "could not resolve user cache directory".to_string())?;
-    let dir = cache.join("oarlock");
+    let dir = cache.join(super::profile::control_directory(identifier));
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("create control directory {}: {error}", dir.display()))?;
     #[cfg(unix)]
@@ -846,7 +846,11 @@ fn prepare_cli_launcher(descriptor: &Path, cli_path: &Path) -> Result<PathBuf, S
             .map_err(|error| format!("secure CLI bin directory: {error}"))?;
     }
 
-    let launcher = bin_dir.join(if cfg!(windows) { "oarlock.exe" } else { "oarlock" });
+    let launcher = bin_dir.join(if cfg!(windows) {
+        "oarlock.exe"
+    } else {
+        "oarlock"
+    });
     if std::fs::symlink_metadata(&launcher).is_ok() {
         std::fs::remove_file(&launcher)
             .map_err(|error| format!("replace stale CLI launcher: {error}"))?;
@@ -865,7 +869,11 @@ fn prepare_cli_launcher(descriptor: &Path, cli_path: &Path) -> Result<PathBuf, S
 }
 
 fn remove_launcher_dir(bin_dir: &Path) {
-    let launcher = bin_dir.join(if cfg!(windows) { "oarlock.exe" } else { "oarlock" });
+    let launcher = bin_dir.join(if cfg!(windows) {
+        "oarlock.exe"
+    } else {
+        "oarlock"
+    });
     let _ = std::fs::remove_file(launcher);
     let _ = std::fs::remove_dir(bin_dir);
     if let Some(run_dir) = bin_dir.parent() {
@@ -1064,7 +1072,11 @@ mod tests {
         let descriptor = temp.path().join("control.json");
 
         let bin_dir = prepare_cli_launcher(&descriptor, &cli).expect("prepare launcher");
-        let launcher = bin_dir.join(if cfg!(windows) { "oarlock.exe" } else { "oarlock" });
+        let launcher = bin_dir.join(if cfg!(windows) {
+            "oarlock.exe"
+        } else {
+            "oarlock"
+        });
         assert_eq!(std::fs::read(&launcher).expect("read launcher"), b"cli");
 
         remove_launcher_dir(&bin_dir);

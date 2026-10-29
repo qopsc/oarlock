@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { currentWorkspaceEnv } from "@/modules/workspace";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 
 /** The branch a new worktree checks out. */
 export type WorktreeBranch =
@@ -28,12 +28,13 @@ export function gitWorktreeAdd(
   repoRoot: string,
   branch: WorktreeBranch,
   path: string | null,
+  workspace: WorkspaceEnv,
 ): Promise<WorktreeAddResult> {
   return invoke<WorktreeAddResult>("git_worktree_add", {
     repoRoot,
     branch,
     path,
-    workspace: currentWorkspaceEnv(),
+    workspace,
   });
 }
 
@@ -42,11 +43,12 @@ export function gitWorktreeRemove(
   repoRoot: string,
   path: string,
   force: boolean,
+  workspace: WorkspaceEnv,
 ): Promise<WorktreeRemoveResult> {
   return invoke<WorktreeRemoveResult>("git_worktree_remove", {
     repoRoot,
     path,
     force,
-    workspace: currentWorkspaceEnv(),
+    workspace,
   });
 }

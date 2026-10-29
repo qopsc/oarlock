@@ -1,0 +1,10 @@
+:root {
+  --oarlock-navy: #15222f;
+  --oarlock-silver: #e9eef3;
+  --oarlock-steel: #c9d6e2;
+  --oarlock-night: #0b141d;
+  --oarlock-white: #ffffff;
+  --oarlock-font-brand: "Satoshi", "Inter", sans-serif;
+  --oarlock-font-ui: "Inter", system-ui, sans-serif;
+  --oarlock-font-code: "JetBrains Mono", monospace;
+}

@@ -2,8 +2,8 @@ import {
   type CloseManyHazards,
   type CloseManyKind,
   type CloseManyPending,
-  deletedPathTabs,
   evaluateCloseHazards,
+  partitionDeletedTabs,
   hasCloseManyHazards,
   hasNewCloseManyHazards,
 } from "@/app/hooks/tabCloseGuards";
@@ -25,6 +25,7 @@ function confirmRunningTerminal(): boolean {
 type Params = {
   tabs: Tab[];
   activeId: number;
+  editorIsDirty?: (id: number) => boolean | undefined;
   disposeTab: (id: number) => void;
   disposeDeletedTabs: (ids: number[]) => void;
   disposeTabs: (anchorId: number, plan: CloseTabsPlan) => void;
@@ -38,6 +39,7 @@ type Params = {
 export function useTabCloseGuards({
   tabs,
   activeId,
+  editorIsDirty,
   disposeTab,
   disposeDeletedTabs,
   disposeTabs,
@@ -66,7 +68,7 @@ export function useTabCloseGuards({
       // dialog entirely so confirming it doesn't appear to silently fail.
       if (nextActiveInSpace(tabs, id) === null) return;
       const t = tabs.find((x) => x.id === id);
-      if (t?.kind === "editor" && t.dirty) {
+      if (t?.kind === "editor" && (editorIsDirty?.(id) ?? t.dirty)) {
         setPendingCloseTab(id);
         return;
       }
@@ -80,7 +82,7 @@ export function useTabCloseGuards({
       }
       disposeTab(id);
     },
-    [tabs, disposeTab],
+    [tabs, disposeTab, editorIsDirty],
   );
 
   const captureCloseMany = useCallback((closeIds: number[]) => {
@@ -88,13 +90,15 @@ export function useTabCloseGuards({
     const affected = tabsRef.current.filter((tab) => close.has(tab.id));
     return {
       dirtyIds: affected
-        .filter((tab) => tab.kind === "editor" && tab.dirty)
+        .filter(
+          (tab) => tab.kind === "editor" && (editorIsDirty?.(tab.id) ?? tab.dirty),
+        )
         .map((tab) => tab.id),
       leafIds: affected
         .filter((tab) => tab.kind === "terminal")
         .flatMap((tab) => leafIds(tab.paneTree)),
     };
-  }, []);
+  }, [editorIsDirty]);
 
   const evaluateCloseMany = useCallback(
     (closeIds: number[]): Promise<CloseManyHazards> =>
@@ -209,8 +213,8 @@ export function useTabCloseGuards({
   }, []);
 
   const handlePathsDeleted = useCallback(
-    (paths: string[]) => {
-      const affected = deletedPathTabs(tabsRef.current, paths);
+    (ids: number[], isDirty: (id: number) => boolean | undefined) => {
+      const affected = partitionDeletedTabs(tabsRef.current, ids, isDirty);
       disposeDeletedTabs(affected.cleanIds);
       if (affected.dirtyIds.length > 0) {
         setPendingDeleteTabs((current) => [

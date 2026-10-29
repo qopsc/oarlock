@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 const answer = vi.hoisted(() => ({ next: null as ArrayBuffer | Error | null }));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: async (command: string) => {
-    if (command !== "clipboard_image_read") throw new Error(command);
+    if (command !== "ai_clipboard_snapshot") throw new Error(command);
     if (answer.next instanceof Error) throw answer.next;
     return answer.next;
   },
@@ -11,14 +11,44 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   clipboardImageFile,
+  createPasteSource,
   pastedImages,
   pasteKeepsText,
   pasteNeedsClipboardImage,
-  readClipboardImageFile,
+  decodeClipboardSnapshot,
+  readClipboardSnapshot,
 } from "./pastedImages";
 
 const png = new File([new Uint8Array([1])], "image.png", { type: "image/png" });
 const txt = new File(["x"], "notes.txt", { type: "text/plain" });
+
+it("consumes the middle-click hint once instead of suppressing the next image paste", () => {
+  const source = createPasteSource();
+  source.pointerDown(1, 100);
+  expect(source.takePrimary(120)).toBe(true);
+  expect(source.takePrimary(150)).toBe(false);
+});
+
+it("keyboard and other pointer gestures clear an unused middle-click hint", () => {
+  const source = createPasteSource();
+  source.pointerDown(1, 100);
+  source.keyDown();
+  expect(source.takePrimary(120)).toBe(false);
+  for (const button of [0, 2]) {
+    source.pointerDown(1, 100);
+    source.pointerDown(button, 110);
+    expect(source.takePrimary(120)).toBe(false);
+  }
+});
+
+it("does not infer a primary paste without a recent gesture in the same event clock", () => {
+  const source = createPasteSource();
+  expect(source.takePrimary(0)).toBe(false);
+  source.pointerDown(1, 100);
+  expect(source.takePrimary(1100)).toBe(false);
+  source.pointerDown(1, 100);
+  expect(source.takePrimary(90)).toBe(false);
+});
 
 function clipboard(input: {
   files?: File[];
@@ -78,6 +108,16 @@ describe("pasteKeepsText", () => {
 // crynta/terax-ai#274: WebKitGTK lists a clipboard image as "Files" and hands
 // over no file, so the app reads it.
 describe("pasteNeedsClipboardImage", () => {
+  it("uses native reads for image files but never for an image in the primary selection", () => {
+    for (const data of [
+      clipboard({ files: [png], types: ["Files"] }),
+      clipboard({ items: [{ kind: "file", type: "image/png", file: png }] }),
+      clipboard({ files: [png], types: ["text/plain", "Files"] }),
+    ]) {
+      expect(pasteNeedsClipboardImage(data, false)).toBe(true);
+      expect(pasteNeedsClipboardImage(data, true)).toBe(false);
+    }
+  });
   it("reads the clipboard's image when the webview handed none", () => {
     expect(
       pasteNeedsClipboardImage(clipboard({ types: ["Files"] }), false),
@@ -125,19 +165,37 @@ describe("clipboardImageFile", () => {
   });
 });
 
-describe("readClipboardImageFile", () => {
-  it("attaches the image the app reads off the clipboard", async () => {
-    answer.next = new Uint8Array([137, 80, 78, 71]).buffer;
-    const file = await readClipboardImageFile();
-    expect(file?.name).toBe("image.png");
-    expect(file?.type).toBe("image/png");
-    expect(file?.size).toBe(4);
+describe("native clipboard snapshots", () => {
+  it("decodes pixels, file paths and empty snapshots without another read", async () => {
+    answer.next = new Uint8Array([1, 137, 80, 78, 71]).buffer;
+    const snapshot = await readClipboardSnapshot();
+    expect(snapshot.kind).toBe("image");
+    if (snapshot.kind === "image") {
+      expect(snapshot.image.type).toBe("image/png");
+      expect(snapshot.image.size).toBe(4);
+    }
+    const payload = new TextEncoder().encode(
+      JSON.stringify(["/tmp/.env", "/tmp/é.png"]),
+    );
+    expect(
+      decodeClipboardSnapshot(new Uint8Array([2, ...payload]).buffer),
+    ).toEqual({ kind: "files", paths: ["/tmp/.env", "/tmp/é.png"] });
+    expect(decodeClipboardSnapshot(new Uint8Array([0]).buffer)).toEqual({
+      kind: "empty",
+    });
   });
-
-  it("finds nothing when the clipboard holds no image or cannot be read", async () => {
-    answer.next = new ArrayBuffer(0);
-    expect(await readClipboardImageFile()).toBeNull();
-    answer.next = new Error("clipboard unavailable");
-    expect(await readClipboardImageFile()).toBeNull();
+  it("surfaces failed or changed captures instead of silently falling back", async () => {
+    answer.next = new Error("Clipboard changed");
+    await expect(readClipboardSnapshot()).rejects.toThrow("Clipboard changed");
+    for (const data of [
+      [],
+      [1],
+      [5],
+      [0, 1],
+      [2, ...new TextEncoder().encode("[1]")],
+    ])
+      expect(() =>
+        decodeClipboardSnapshot(new Uint8Array(data).buffer),
+      ).toThrow();
   });
 });

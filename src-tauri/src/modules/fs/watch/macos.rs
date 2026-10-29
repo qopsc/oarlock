@@ -255,8 +255,8 @@ impl Backend for FsEvents {
         );
     }
 
-    fn needs_retry(&self) -> bool {
-        self.last_error.is_some()
+    fn health_error(&self) -> Option<String> {
+        self.last_error.map(str::to_owned)
     }
 }
 
@@ -281,6 +281,8 @@ mod tests {
         fn new() -> Self {
             let (tx, rx) = mpsc::channel();
             let sink = Sink {
+                health: Arc::default(),
+                app: None,
                 tx,
                 dirs: Arc::new(RwLock::new(Arc::new(plan::DirSet::new()))),
                 index: FileIndexState::default(),
@@ -443,6 +445,37 @@ mod tests {
         assert!(fx
             .drain(Duration::from_millis(900))
             .contains(&canon(&root.path().join("node_modules/pkg"))));
+    }
+
+    #[test]
+    fn explicit_file_coverage_lifts_and_restores_heavy_directory_exclusion() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("output.txt");
+        std::fs::write(&file, "initial").unwrap();
+        let key = canon(&dir);
+        let file_key = canon(&file);
+        let mut fx = Fixture::new();
+        fx.watch(root.path());
+        assert!(fx.backend.spec.as_ref().unwrap().exclusions.contains(&key));
+        assert!(fx.set.add_file(
+            key.clone(),
+            file_key.clone(),
+            file_key.clone(),
+            plan::FileStamp::of(&file)
+        ));
+        *fx.sink.dirs.write().unwrap() = Arc::new(fx.set.snapshot());
+        fx.backend.sync(&fx.set);
+        assert!(fx.backend.last_error.is_none());
+        assert!(!fx.backend.spec.as_ref().unwrap().exclusions.contains(&key));
+        fx.drain(Duration::from_millis(300));
+        std::fs::write(&file, "changed externally").unwrap();
+        assert!(fx.drain(Duration::from_millis(900)).contains(&key));
+        assert!(fx.set.remove_file(&key, &file_key, &file_key));
+        *fx.sink.dirs.write().unwrap() = Arc::new(fx.set.snapshot());
+        fx.backend.sync(&fx.set);
+        assert!(fx.backend.spec.as_ref().unwrap().exclusions.contains(&key));
     }
 
     #[test]

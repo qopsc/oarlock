@@ -29,7 +29,9 @@ import {
   loadServers,
   onMcpChanged,
   saveProjectRecord,
-  saveServers,
+  createServers,
+  updateServer,
+  deleteServer,
 } from "@/modules/mcp/lib/configStore";
 import {
   type ProjectServerRecord,
@@ -79,7 +81,7 @@ type StatusEvent = {
   report: Omit<WindowStatus, "window"> | null;
 };
 
-function useMcpState() {
+export function useMcpState() {
   const [servers, setServers] = useState<McpServerConfig[] | null>(null);
   const [projects, setProjects] = useState<ProjectServers[]>([]);
   const [records, setRecords] = useState<Record<string, ProjectServerRecord>>(
@@ -87,19 +89,38 @@ function useMcpState() {
   );
   const [knownTools, setKnownTools] = useState<Record<string, KnownTool[]>>({});
   const [statuses, setStatuses] = useState<WindowStatus[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Retry intentionally restarts the reads and subscriptions.
   useEffect(() => {
     let alive = true;
+    let generation = 0;
     const reloadServers = () => {
-      void loadServers().then((s) => alive && setServers(s));
-      void loadProjectRecords().then((r) => alive && setRecords(r));
-      void listProjectServers(true).then(
-        (p) => alive && setProjects(p),
-        () => alive && setProjects([]),
+      const request = ++generation;
+      const current = () => alive && request === generation;
+      void Promise.all([
+        loadServers(),
+        loadProjectRecords(),
+        listProjectServers(true).catch(() => []),
+      ]).then(
+        ([s, r, p]) => {
+          if (!current()) return;
+          setServers(s);
+          setRecords(r);
+          setProjects(p);
+          setLoadError(null);
+        },
+        (error) => {
+          if (current()) setLoadError(String(error));
+        },
       );
     };
     const reloadTools = () =>
-      void loadKnownTools().then((t) => alive && setKnownTools(t));
+      void loadKnownTools().then(
+        (t) => alive && setKnownTools(t),
+        (error) => alive && setLoadError(String(error)),
+      );
     reloadServers();
     reloadTools();
     void invoke<WindowStatus[]>("mcp_status_list").then(
@@ -109,30 +130,31 @@ function useMcpState() {
       onMcpChanged((change) =>
         change.kind === "servers" ? reloadServers() : reloadTools(),
       ),
-      listen<StatusEvent>(MCP_STATUS_EVENT, (event) =>
-        setStatuses((old) => applyStatusEvent(old, event.payload)),
+      listen<StatusEvent>(
+        MCP_STATUS_EVENT,
+        (event) =>
+          alive && setStatuses((old) => applyStatusEvent(old, event.payload)),
       ),
     ];
     return () => {
       alive = false;
-      for (const u of unlisten) void u.then((fn) => fn());
+      for (const u of unlisten) void u.then((fn) => fn()).catch(() => {});
     };
-  }, []);
+  }, [attempt]);
 
-  return { servers, setServers, projects, records, knownTools, statuses };
-}
-
-/** Writes the list; every window running a server follows it. */
-async function persist(
-  next: McpServerConfig[],
-  setServers: (s: McpServerConfig[]) => void,
-) {
-  setServers(next);
-  await saveServers(next);
+  return {
+    servers,
+    projects,
+    records,
+    knownTools,
+    statuses,
+    loadError,
+    retry: () => setAttempt((n) => n + 1),
+  };
 }
 
 export function McpSection() {
-  const { servers, setServers, projects, records, knownTools, statuses } =
+  const { servers, projects, records, knownTools, statuses, loadError, retry } =
     useMcpState();
   const [dialog, setDialog] = useState<ServerDraft | null>(null);
   const [importing, setImporting] = useState(false);
@@ -153,12 +175,10 @@ export function McpSection() {
     (id: string, change: (s: McpServerConfig) => McpServerConfig) => {
       if (!servers) return;
       setError(null);
-      persist(
-        servers.map((s) => (s.id === id ? change(s) : s)),
-        setServers,
-      ).catch(report);
+      const before = servers.find((s) => s.id === id);
+      if (before) updateServer(before, change(before)).catch(report);
     },
-    [servers, setServers, report],
+    [servers, report],
   );
 
   const openEditor = async (server: McpServerConfig | null) => {
@@ -182,71 +202,14 @@ export function McpSection() {
   };
 
   const saveDraft = async (draft: ServerDraft) => {
-    const current = servers ?? [];
     const changes = secretChanges(draft);
-    for (const secret of changes.set) {
-      await invoke("mcp_secret_set", {
-        serverId: draft.id,
-        kind: secret.kind,
-        name: secret.name,
-        value: secret.value,
-      });
-    }
-    if (changes.remove.length > 0) {
-      await invoke("mcp_secret_delete", {
-        serverId: draft.id,
-        secrets: changes.remove,
-      });
-    }
     const server = serverFromDraft(draft);
-    // A sign-in belongs to the URL it was made for.
-    const before = draft.base?.transport;
-    const after = server.transport;
-    if (
-      before &&
-      before.type !== "stdio" &&
-      (after.type === "stdio" || after.url !== before.url)
-    ) {
-      await invoke("mcp_oauth_sign_out", { serverId: server.id }).catch(
-        () => {},
-      );
-    }
-    // Switches flipped while the dialog was open are kept.
-    const latest = current.find((s) => s.id === server.id);
-    if (latest) {
-      server.enabled = latest.enabled;
-      server.trusted = latest.trusted;
-      server.tools = latest.tools;
-      server.secretsRevision = latest.secretsRevision;
-    }
-    if (changes.set.length > 0 || changes.remove.length > 0) {
-      server.secretsRevision += 1;
-    }
-    await persist(
-      latest
-        ? current.map((s) => (s.id === server.id ? server : s))
-        : [...current, server],
-      setServers,
-    );
+    if (draft.base) await updateServer(draft.base, server, changes.set, true);
+    else await createServers([server], changes.set);
   };
 
   const remove = async (server: McpServerConfig) => {
-    const refs = secretRefs(server.transport);
-    if (refs.length > 0) {
-      await invoke("mcp_secret_delete", {
-        serverId: server.id,
-        secrets: refs,
-      }).catch(() => {});
-    }
-    if (server.transport.type !== "stdio") {
-      await invoke("mcp_oauth_sign_out", { serverId: server.id }).catch(
-        () => {},
-      );
-    }
-    await persist(
-      (servers ?? []).filter((s) => s.id !== server.id),
-      setServers,
-    );
+    await deleteServer(server.id);
     await forgetKnownTools(server.id).catch(() => {});
   };
 
@@ -268,6 +231,14 @@ export function McpSection() {
         untrusted.
       </div>
 
+      {loadError && (
+        <div className="text-[11px] text-destructive" role="alert">
+          {loadError}{" "}
+          <Button variant="ghost" size="sm" onClick={retry}>
+            Retry
+          </Button>
+        </div>
+      )}
       {error ? (
         <div className="text-[11px] text-destructive">{error}</div>
       ) : null}
@@ -348,6 +319,7 @@ export function McpSection() {
                 setError(null);
                 saveProjectRecord(
                   server.id,
+                  recordOf(server, view.entryHash),
                   recordOf(change(server), view.entryHash),
                 ).catch(report);
               }}
@@ -361,8 +333,7 @@ export function McpSection() {
           existing={servers ?? []}
           onImport={async (imported) => {
             if (imported.length === 0) return;
-            const current = await loadServers();
-            await persist([...current, ...imported], setServers);
+            await createServers(imported);
           }}
           onClose={() => setImporting(false)}
         />
@@ -407,6 +378,8 @@ export function McpSection() {
 }
 
 type SignInProps = {
+  discoveryError?: string;
+  onRetryDiscovery?: () => void;
   status: AuthStatus | undefined;
   error: string | undefined;
   onSignIn: () => void;
@@ -422,6 +395,10 @@ function signInProps(
   return {
     status: auth.statuses[server.id],
     error: auth.errors[server.id],
+    discoveryError: server.enabled
+      ? auth.discoveryErrors[server.id]
+      : undefined,
+    onRetryDiscovery: () => auth.retryDiscovery(server),
     onSignIn: () => auth.signIn(server),
     onSignOut: () => auth.signOut(server),
     onCancel: () => auth.cancel(server),

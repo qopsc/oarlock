@@ -1,8 +1,20 @@
+import {
+  safeFindNext as findNext,
+  safeFindPrevious as findPrevious,
+} from "./search/regexView";
+import { editorQuitExtension } from "./lib/quitExtension";
+import { completionPreferences } from "./lib/autocomplete/preferences";
+import type { CompletionCredential } from "./lib/autocomplete/credential";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
+import {
+  workspaceEnvForPath,
+  workspaceScopeKey,
+} from "@/modules/workspace/env";
 import type { MatchCount } from "@/lib/matchCount";
 import { IS_MAC } from "@/lib/platform";
 import { endpointIdFromCompatModel } from "@/modules/ai/config";
-import { getCustomEndpointKey, getKey } from "@/modules/ai/lib/keyring";
-import { native } from "@/modules/ai/lib/native";
+import { readCustomEndpointKey, readKey } from "@/modules/ai/lib/keyring";
+import { createNative } from "@/modules/ai/lib/native";
 import { lspFormatDocument, useLspExtension } from "@/modules/lsp";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
@@ -15,8 +27,6 @@ import { useWorkspaceAssetUrl } from "@/modules/workspace";
 import { acceptCompletion, startCompletion } from "@codemirror/autocomplete";
 import { redo, undo } from "@codemirror/commands";
 import {
-  findNext,
-  findPrevious,
   openSearchPanel,
   SearchQuery,
   setSearchQuery,
@@ -43,6 +53,7 @@ import {
 import { toast } from "sonner";
 import {
   inlineCompletion,
+  refreshInlineCompletion,
   triggerInlineCompletion,
 } from "./lib/autocomplete/inlineExtension";
 import { diagnosticsReporter } from "./lib/diagnosticsReporter";
@@ -60,20 +71,22 @@ import {
   wordWrapExtension,
   wrapCompartment,
 } from "./lib/extensions";
-import {
-  readFileText,
-  resolveFormatter,
-  runExternalFormatter,
-} from "./lib/externalFormat";
+import { resolveFormatter, runExternalFormatter } from "./lib/externalFormat";
 import { gitChangeGutter, setGitBase } from "./lib/gitGutter";
 import { onHeadMoved } from "./lib/gitSignals";
 import { defaultIndentUnit, detectIndentUnit } from "./lib/indent";
-import { type LanguageResult, resolveLanguage } from "./lib/languageResolver";
+import {
+  documentLanguage,
+  parseFiletype,
+  vimFiletype,
+} from "./lib/documentLanguage";
+import { resolveLanguage } from "./lib/languageResolver";
+import { useDocumentLanguage } from "./lib/useDocumentLanguage";
 import { mediaPreviewKind } from "./lib/mediaPreview";
 import { SearchCountHub, searchCountHub } from "./lib/searchCount";
 import { FORCE_READ_LIMIT, useDocument } from "./lib/useDocument";
 import { useEditorThemeExt } from "./lib/useEditorThemeExt";
-import { applyFormattedContent, syncViewText } from "./lib/viewSync";
+import { syncViewText } from "./lib/viewSync";
 import { initVimGlobals, vimHandlersExtension } from "./lib/vim";
 import { MediaPreview } from "./MediaPreview";
 
@@ -103,7 +116,13 @@ export type EditorPaneHandle = {
   undo: () => void;
   redo: () => void;
   /** Persist the buffer (format-on-save + write), same as Mod+S / :w. */
-  save: () => Promise<void>;
+  save: () => Promise<boolean>;
+  /** Synchronous buffer state; tab decorations may still be awaiting a render. */
+  hasUnsavedChanges: () => boolean;
+  closeRevision: () => string;
+  prepareDiscard: () => import("./lib/documentSession").DiscardPreparation;
+  detach: () => void;
+  isDetached: () => boolean;
   /** Request an AI ghost suggestion at the cursor. */
   triggerAiComplete: () => void;
   /** Open CodeMirror's completion popup. */
@@ -113,7 +132,9 @@ export type EditorPaneHandle = {
 type Props = {
   path: string;
   overrideLanguage?: string | null;
+  onOverrideLanguage?: (language: string | null) => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onBindingChange?: (path: string, detached: boolean) => void;
   onSaved?: () => void;
   onClose?: () => void;
   mediaActive?: boolean;
@@ -122,6 +143,10 @@ type Props = {
 // Above this, syntax highlighting and LSP are disabled: a multi-MB lezer
 // parse tree and a didOpen of that size cost far more than they give.
 const SYNTAX_MAX_BYTES = 4 * 1024 * 1024;
+const reportLanguageFailure = (error: unknown) =>
+  toast.error("Could not load document language", {
+    description: String(error),
+  });
 
 // CodeMirror replaces its document whenever `value` changes identity, so a
 // reload whose text equals the previous value never reached the view, and
@@ -129,12 +154,15 @@ const SYNTAX_MAX_BYTES = 4 * 1024 * 1024;
 // mounts with; the pane pushes later text itself (syncViewText).
 function MountedCodeMirror({
   initialValue,
+  onDestroyEditor,
   ...props
 }: Omit<ReactCodeMirrorProps, "value"> & {
   initialValue: string;
+  onDestroyEditor: () => void;
   ref?: Ref<ReactCodeMirrorRef>;
 }) {
   const [value] = useState(initialValue);
+  useEffect(() => onDestroyEditor, [onDestroyEditor]);
   return <CodeMirror {...props} value={value} />;
 }
 
@@ -148,25 +176,96 @@ function formatBytes(n: number): string {
 // skip re-rendering entirely when App re-renders (terminal events, tab churn).
 export const EditorPane = memo(
   forwardRef<EditorPaneHandle, Props>(function EditorPane(props, ref) {
+    const owner = useOwnedWorkspace();
     const {
       path,
       overrideLanguage,
+      onOverrideLanguage,
       onDirtyChange,
+      onBindingChange,
       onSaved,
       onClose,
       mediaActive = true,
     } = props;
 
-    const { doc, onChange, save, reload, text, adoptDiskText, openAnyway } =
-      useDocument({
-        path,
-        onDirtyChange,
-      });
+    const language = useMemo(
+      () => documentLanguage(path, overrideLanguage),
+      [path, overrideLanguage],
+    );
+    const workspace = workspaceEnvForPath(path, owner);
+    const native = useMemo(() => createNative(() => workspace), [workspace]);
+    const {
+      doc,
+      detached,
+      detach,
+      isDetached,
+      recover,
+      canComplete,
+      onChange,
+      save,
+      isSaved,
+      hasUnsavedChanges,
+      closeRevision,
+      prepareDiscard,
+      reload,
+      text,
+      formatAndSave,
+      openAnyway,
+    } = useDocument({
+      path,
+      onDirtyChange,
+      onBindingChange,
+    });
+    const [recoveryPath, setRecoveryPath] = useState<string | null>(null);
+    const [recovering, setRecovering] = useState(false);
+    const recoverDraft = async (target: string) => {
+      if (recovering) return;
+      if (!/^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(target)) {
+        toast.error("Enter an absolute file path");
+        return;
+      }
+      if (
+        workspaceScopeKey(workspaceEnvForPath(target, owner)) !==
+        workspaceScopeKey(workspace)
+      ) {
+        toast.error("Choose a path in this document's environment");
+        return;
+      }
+      setRecovering(true);
+      try {
+        if (await recover(target)) setRecoveryPath(null);
+      } finally {
+        setRecovering(false);
+      }
+    };
     const reloadRef = useRef(reload);
     reloadRef.current = reload;
-    const adoptDiskTextRef = useRef(adoptDiskText);
-    adoptDiskTextRef.current = adoptDiskText;
+    const formatAndSaveRef = useRef(formatAndSave);
+    formatAndSaveRef.current = formatAndSave;
+    const saveLifetime = useRef(0);
+    // biome-ignore lint/correctness/useExhaustiveDependencies: changing document identity invalidates pending saves even when the view is reused.
+    useLayoutEffect(() => {
+      saveLifetime.current++;
+      return () => {
+        saveLifetime.current++;
+      };
+    }, [path, workspace, detached, language.id]);
     const cmRef = useRef<ReactCodeMirrorRef>(null);
+    const [editorView, setEditorView] = useState<EditorView | null>(null);
+    const handleDestroyEditor = useCallback(() => setEditorView(null), []);
+    const completionDocument = useRef(() => ({
+      workspace,
+      allowed: canComplete(path),
+    }));
+    completionDocument.current = () => ({
+      workspace,
+      allowed: canComplete(path),
+    });
+    // biome-ignore lint/correctness/useExhaustiveDependencies: document replacement must cancel work even when its text is unchanged
+    useLayoutEffect(() => {
+      if (cmRef.current?.view)
+        refreshInlineCompletion(cmRef.current.view, true);
+    }, [path, workspace, doc, detached]);
     // Outlives the views the pane creates, so a subscriber keeps its count.
     const [searchCounts] = useState(() => new SearchCountHub());
     const themeExt = useEditorThemeExt();
@@ -174,45 +273,98 @@ export const EditorPane = memo(
     const wordWrapColumn = usePreferencesStore((s) =>
       s.editorWordWrap ? s.editorWordWrapColumn : null,
     );
-    const languageRef = useRef<string | null>(null);
-    const [langId, setLangId] = useState<string | null>(null);
-    const apiKeyRef = useRef<string | null>(null);
+    const languageRef = useRef<string | null>(language.id);
+    languageRef.current = language.id;
+    const langId = language.id;
+    const languageChangeRef = useRef(onOverrideLanguage);
+    languageChangeRef.current = onOverrideLanguage;
+    const languageOverrideRef = useRef(overrideLanguage);
+    languageOverrideRef.current = overrideLanguage;
+    const changeFiletypeRef = useRef<(value: string) => void>(() => {});
+    const apiKeyRef = useRef<CompletionCredential | null>(null);
 
     useEffect(() => {
       let cancelled = false;
+      let generation = 0;
+      let watching: "loading" | "ready" | "failed" = "loading";
+      const refreshCompletion = (force = false) => {
+        const view = cmRef.current?.view;
+        if (view) refreshInlineCompletion(view, force);
+      };
       const refresh = async () => {
+        if (cancelled) return;
+        const request = ++generation;
         const s = usePreferencesStore.getState();
         const provider = s.autocompleteProvider;
-        if (
-          provider === "lmstudio" ||
-          provider === "mlx" ||
-          provider === "ollama"
-        ) {
-          apiKeyRef.current = null;
-          return;
+        const modelId = s.autocompleteModelId;
+        apiKeyRef.current = {
+          status: watching === "failed" ? "failed" : "loading",
+          provider,
+          modelId,
+        };
+        // Cancel before reading the keychain, even if a keyless request is live.
+        refreshCompletion(true);
+        if (watching !== "ready") return;
+        try {
+          const credential: CompletionCredential = {
+            status: "ready",
+            provider,
+            modelId,
+            key: null,
+            endpoint: null,
+          };
+          if (provider === "openai-compatible") {
+            const eid = endpointIdFromCompatModel(modelId);
+            if (!eid) throw new Error("No custom endpoint selected");
+            credential.endpoint = await readCustomEndpointKey(eid);
+          } else {
+            credential.key = await readKey(provider);
+          }
+          if (!cancelled && request === generation) {
+            apiKeyRef.current = credential;
+            refreshCompletion();
+          }
+        } catch {
+          if (!cancelled && request === generation) {
+            apiKeyRef.current = { status: "failed", provider, modelId };
+            refreshCompletion();
+            toast.error("Could not load autocomplete credentials", {
+              description:
+                "Turn autocomplete off and on in Settings → Models to retry.",
+            });
+          }
         }
-        // OpenAI-compatible keys live in a per-endpoint keyring slot.
-        if (provider === "openai-compatible") {
-          const eid = endpointIdFromCompatModel(s.autocompleteModelId);
-          const k = eid ? await getCustomEndpointKey(eid) : null;
-          if (!cancelled) apiKeyRef.current = k;
-          return;
-        }
-        const k = await getKey(provider);
-        if (!cancelled) apiKeyRef.current = k;
       };
-      void refresh();
       let unlistenKeys: (() => void) | undefined;
-      void onKeysChanged(() => void refresh()).then((un) => {
-        if (cancelled) un();
-        else unlistenKeys = un;
-      });
+      void onKeysChanged(() => void refresh())
+        .then((un) => {
+          if (cancelled) un();
+          else {
+            unlistenKeys = un;
+            watching = "ready";
+            void refresh();
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            watching = "failed";
+            void refresh();
+            toast.error("Could not watch API key changes", {
+              description: `Reload this window to retry. ${String(error)}`,
+            });
+          }
+        });
       const unsubPrefs = usePreferencesStore.subscribe((state, prev) => {
         if (
           state.autocompleteProvider !== prev.autocompleteProvider ||
-          state.autocompleteModelId !== prev.autocompleteModelId
+          state.autocompleteModelId !== prev.autocompleteModelId ||
+          (state.autocompleteEnabled && !prev.autocompleteEnabled)
         ) {
           void refresh();
+        } else {
+          // The driver compares only completion inputs; unrelated preferences
+          // do not discard a suggestion or interrupt its request.
+          refreshCompletion();
         }
       });
       return () => {
@@ -226,23 +378,71 @@ export const EditorPane = memo(
     // whole state, wiping the language compartment.
     const saveRef = useRef(save);
     saveRef.current = save;
+    const isSavedRef = useRef(isSaved);
+    isSavedRef.current = isSaved;
     const onSavedRef = useRef(onSaved);
     onSavedRef.current = onSaved;
     const onCloseRef = useRef(onClose);
     onCloseRef.current = onClose;
     const lspActiveRef = useRef(false);
+    changeFiletypeRef.current = (value) => {
+      const next = parseFiletype(value);
+      if (!languageChangeRef.current)
+        throw Error("This document cannot change its language.");
+      languageRef.current = documentLanguage(path, next).id;
+      languageOverrideRef.current = next;
+      saveLifetime.current++;
+      lspActiveRef.current = false;
+      languageChangeRef.current(next);
+    };
     const warnedNoLspRef = useRef(false);
     const warnedNoFormatRef = useRef(false);
 
     const performSave = useCallback(async () => {
+      if (isDetached()) return saveRef.current();
       const view = cmRef.current?.view;
+      const lifetime = saveLifetime.current;
+      const current = () =>
+        saveLifetime.current === lifetime && cmRef.current?.view === view;
       const prefs = usePreferencesStore.getState();
       const formatter = resolveFormatter(languageRef.current, prefs);
+      if (prefs.editorFormatOnSave && formatter !== "lsp") {
+        try {
+          const languageHint = languageOverrideRef.current
+            ? (languageRef.current ?? "txt")
+            : null;
+          const saved = await formatAndSaveRef.current(
+            async (file, content) => {
+              const result = await runExternalFormatter(
+                formatter,
+                file,
+                content,
+                prefs.editorCustomFormatCommand,
+                workspace,
+                languageHint,
+              );
+              if (!current())
+                throw Error(
+                  "Document language changed during formatting. Save again.",
+                );
+              return result;
+            },
+          );
+          if (saved && current()) onSavedRef.current?.();
+          return saved && current();
+        } catch (error) {
+          if (current())
+            toast.error(`${formatter} format failed; file not saved`, {
+              description: String(error),
+            });
+        }
+        return false;
+      }
       if (prefs.editorFormatOnSave && formatter === "lsp" && view) {
         if (lspActiveRef.current) {
           let res: "done" | "unsupported" = "done";
           try {
-            res = await lspFormatDocument(view);
+            res = await lspFormatDocument(view, current);
           } catch (e) {
             toast.error("Language server format failed", {
               description: String(e),
@@ -263,31 +463,12 @@ export const EditorPane = memo(
           });
         }
       }
-      // Snapshot before save: edits typed during the formatter round-trip
-      // must not be clobbered by the disk read-back.
-      const docAtSave = view?.state.doc;
+      if (!current()) return false;
       const saved = await saveRef.current();
-      if (!saved) return;
-      if (prefs.editorFormatOnSave && formatter !== "lsp") {
-        const error = await runExternalFormatter(
-          formatter,
-          pathRef.current,
-          prefs.editorCustomFormatCommand,
-        );
-        if (error) {
-          toast.error(`${formatter} format failed`, { description: error });
-        } else {
-          const readBack = await readFileText(pathRef.current);
-          if (readBack !== null && view && view.state.doc === docAtSave) {
-            applyFormattedContent(
-              view,
-              adoptDiskTextRef.current(readBack.text, readBack.mtime),
-            );
-          }
-        }
-      }
+      if (!saved || !current()) return false;
       onSavedRef.current?.();
-    }, []);
+      return true;
+    }, [workspace, isDetached]);
     const performSaveRef = useRef(performSave);
     performSaveRef.current = performSave;
 
@@ -367,6 +548,7 @@ export const EditorPane = memo(
 
     const extensions = useMemo(
       () => [
+        editorQuitExtension,
         // basicSetup is added before user extensions by @uiw/react-codemirror,
         // so we must elevate vim's precedence to win the keymap.
         vimCompartment.of(
@@ -380,10 +562,14 @@ export const EditorPane = memo(
           ),
         ),
         vimHandlersExtension(() => ({
-          save: () => {
-            void performSaveRef.current();
-          },
+          save: () => performSaveRef.current(),
+          identity: () => saveLifetime.current,
+          canClose: () => isSavedRef.current(),
           close: () => onCloseRef.current?.(),
+          filetype: {
+            get: () => vimFiletype(languageRef.current),
+            set: (value) => changeFiletypeRef.current(value),
+          },
         })),
         ...buildSharedExtensions(),
         searchCountHub.of(searchCounts),
@@ -395,43 +581,13 @@ export const EditorPane = memo(
         // Before inlineCompletion so an open popup wins Tab over the ghost.
         Prec.highest(keymap.of([{ key: "Tab", run: acceptCompletion }])),
         inlineCompletion({
-          getPrefs: () => {
-            const s = usePreferencesStore.getState();
-            const p = s.autocompleteProvider;
-            // autocompleteModelId holds the compat- id of the chosen endpoint.
-            const compatEp =
-              p === "openai-compatible"
-                ? s.customEndpoints.find(
-                    (e) =>
-                      e.id === endpointIdFromCompatModel(s.autocompleteModelId),
-                  )
-                : undefined;
-            const modelId =
-              p === "lmstudio"
-                ? s.lmstudioModelId
-                : p === "mlx"
-                  ? s.mlxModelId
-                  : p === "ollama"
-                    ? s.ollamaModelId
-                    : p === "openai-compatible"
-                      ? (compatEp?.modelId ?? "")
-                      : p === "openrouter"
-                        ? s.openrouterModelId
-                        : s.autocompleteModelId;
-            return {
-              enabled: s.autocompleteEnabled,
-              trigger: s.autocompleteTrigger,
-              provider: p,
-              modelId,
-              apiKey: apiKeyRef.current,
-              lmstudioBaseURL: s.lmstudioBaseURL,
-              mlxBaseURL: s.mlxBaseURL,
-              ollamaBaseURL: s.ollamaBaseURL,
-              openaiCompatibleBaseURL:
-                compatEp?.baseURL ?? s.openaiCompatibleBaseURL,
-            };
-          },
+          getPrefs: () =>
+            completionPreferences(
+              usePreferencesStore.getState(),
+              apiKeyRef.current,
+            ),
           getPath: () => pathRef.current,
+          getDocument: () => completionDocument.current(),
           getLanguage: () => languageRef.current,
         }),
         editorKeymap(() => void performSaveRef.current()),
@@ -474,6 +630,7 @@ export const EditorPane = memo(
         view.dispatch({
           effects: indentCompartment.reconfigure(indentExtension(unit)),
         });
+        refreshInlineCompletion(view);
       },
       [text],
     );
@@ -489,6 +646,7 @@ export const EditorPane = memo(
     // without one: apply what they could not (indent unit, a pending go-to
     // line or focus from opening the file at a location).
     const handleCreateEditor = (view: EditorView) => {
+      setEditorView(view);
       applyIndent(view, editorDefaultIndent);
       applyPendingGoto(view);
       applyPendingFocus(view);
@@ -508,7 +666,8 @@ export const EditorPane = memo(
       [],
     );
     useEffect(() => {
-      if (doc.status !== "ready" || doc.size > SYNTAX_MAX_BYTES) return;
+      if (detached || doc.status !== "ready" || doc.size > SYNTAX_MAX_BYTES)
+        return;
       if (!mediaActive) return;
       void headMoves;
       let cancelled = false;
@@ -522,64 +681,38 @@ export const EditorPane = memo(
       return () => {
         cancelled = true;
       };
-    }, [doc, path, mediaActive, headMoves]);
+    }, [doc, path, mediaActive, headMoves, native.gitFileBase, detached]);
 
-    const lspExt = useLspExtension(path, langId, doc.status === "ready");
+    const syntaxReady = doc.status === "ready" && doc.size <= SYNTAX_MAX_BYTES;
+    const lspExt = useLspExtension(path, langId, syntaxReady && !detached);
     useEffect(() => {
       lspActiveRef.current = lspExt !== null;
-      const view = cmRef.current?.view;
-      if (!view) return;
-      view.dispatch({
+      if (!editorView || doc.status !== "ready") return;
+      editorView.dispatch({
         effects: lspCompartment.reconfigure(lspExt ?? []),
       });
-    }, [lspExt]);
+    }, [lspExt, editorView, doc.status]);
 
     useEffect(
       () => () => useDiagnosticsStore.getState().report(pathRef.current, null),
       [],
     );
 
-    // Warm the language chunk while the file is still being read; the
-    // ready-gated effect below then resolves from cache.
+    // Every consumer uses the same selected language id. Parser loading may be
+    // asynchronous; never keep the previous language's parser while it loads.
     useEffect(() => {
-      const resolvePath = overrideLanguage ? `dummy.${overrideLanguage}` : path;
-      void resolveLanguage(resolvePath).catch(() => {});
+      const source = overrideLanguage ? `dummy.${overrideLanguage}` : path;
+      void resolveLanguage(source).catch(() => {});
     }, [path, overrideLanguage]);
 
-    useEffect(() => {
-      const ext =
-        overrideLanguage || (path.split(".").pop()?.toLowerCase() ?? null);
-      languageRef.current = ext;
-      if (doc.status !== "ready") return;
-      if (doc.size > SYNTAX_MAX_BYTES) {
-        setLangId(null);
-        const view = cmRef.current?.view;
-        view?.dispatch({ effects: languageCompartment.reconfigure([]) });
-        return;
-      }
-      let cancelled = false;
-      const resolve = async (): Promise<LanguageResult> => {
-        const resolvePath = overrideLanguage
-          ? `dummy.${overrideLanguage}`
-          : path;
-        return (
-          (await resolveLanguage(resolvePath)) ?? { ext: [], name: "", id: "" }
-        );
-      };
-      void resolve().then((result) => {
-        if (cancelled) return;
-        if (result.id) languageRef.current = result.id;
-        setLangId(result.id || ext);
-        const view = cmRef.current?.view;
-        if (!view) return;
-        view.dispatch({
-          effects: languageCompartment.reconfigure(result.ext),
-        });
-      });
-      return () => {
-        cancelled = true;
-      };
-    }, [path, doc.status, overrideLanguage]);
+    useDocumentLanguage(
+      doc.status === "ready" ? editorView : null,
+      overrideLanguage ? `dummy.${overrideLanguage}` : path,
+      syntaxReady,
+      languageCompartment,
+      refreshInlineCompletion,
+      reportLanguageFailure,
+    );
 
     useImperativeHandle(
       ref,
@@ -645,6 +778,11 @@ export const EditorPane = memo(
           if (view) redo(view);
         },
         save: () => performSaveRef.current(),
+        hasUnsavedChanges,
+        closeRevision,
+        prepareDiscard,
+        detach,
+        isDetached,
         triggerAiComplete: () => {
           const view = cmRef.current?.view;
           if (view) triggerInlineCompletion(view);
@@ -656,7 +794,17 @@ export const EditorPane = memo(
           startCompletion(view);
         },
       }),
-      [path, applyPendingFocus, applyPendingGoto, searchCounts],
+      [
+        path,
+        applyPendingFocus,
+        applyPendingGoto,
+        searchCounts,
+        hasUnsavedChanges,
+        closeRevision,
+        prepareDiscard,
+        detach,
+        isDetached,
+      ],
     );
 
     const mediaKind =
@@ -768,10 +916,63 @@ export const EditorPane = memo(
         className="flex h-full min-h-0 flex-col zoom-exempt"
         data-claims-mod-key={editorClaimedModKey(IS_MAC)}
       >
+        {detached && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center gap-2 border-b bg-muted px-3 py-2 text-xs"
+          >
+            <span>
+              File deleted. This draft is detached; automatic saves are paused.
+            </span>
+            <button
+              type="button"
+              disabled={recovering}
+              className="rounded border px-2 py-1 hover:bg-accent disabled:opacity-50"
+              onClick={() => void recoverDraft(path)}
+            >
+              Restore file
+            </button>
+            <button
+              type="button"
+              disabled={recovering}
+              className="rounded border px-2 py-1 hover:bg-accent disabled:opacity-50"
+              onClick={() => setRecoveryPath(path)}
+            >
+              Save As…
+            </button>
+            {recoveryPath !== null && (
+              <form
+                className="flex w-full gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void recoverDraft(recoveryPath);
+                }}
+              >
+                <input
+                  aria-label="Save draft as"
+                  className="min-w-0 flex-1 rounded border bg-background px-2 py-1"
+                  value={recoveryPath}
+                  onChange={(event) => setRecoveryPath(event.target.value)}
+                />
+                <button
+                  type="submit"
+                  disabled={recovering}
+                  className="rounded border px-2 py-1"
+                >
+                  Save
+                </button>
+                <button type="button" onClick={() => setRecoveryPath(null)}>
+                  Cancel
+                </button>
+              </form>
+            )}
+          </div>
+        )}
         <MountedCodeMirror
           ref={cmRef}
           initialValue={doc.content}
           onCreateEditor={handleCreateEditor}
+          onDestroyEditor={handleDestroyEditor}
           onChange={onChange}
           theme={themeExt}
           extensions={extensions}

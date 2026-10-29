@@ -1,3 +1,6 @@
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import { toast } from "sonner";
+import { canMoveBetweenSpaces } from "./environmentMove";
 import { pathKey } from "@/lib/pathKey";
 import { isMarkdownPath } from "@/lib/utils";
 import {
@@ -63,6 +66,7 @@ export type EditorTab = TabBase & {
   title: string;
   path: string;
   dirty: boolean;
+  detached?: boolean;
   /**
    * True while the tab is in the transient "preview" state — opened by a
    * single-click in the explorer and not yet pinned by the user. A preview tab
@@ -147,6 +151,7 @@ export type TabPatch = Partial<{
   cwd: string;
   path: string;
   dirty: boolean;
+  detached: boolean;
   url: string;
   /** Empty string resets a terminal tab to its cwd-derived name. */
   customTitle: string;
@@ -222,6 +227,7 @@ export function planFileTabOpen(
     const existing = tabs.find(
       (tab) =>
         tab.kind === "editor" &&
+        !tab.detached &&
         tab.spaceId === spaceId &&
         pathKey(tab.path) === key,
     );
@@ -254,6 +260,7 @@ export function planFileTabOpen(
   const persistent = tabs.find(
     (tab) =>
       tab.kind === "editor" &&
+      !tab.detached &&
       tab.spaceId === spaceId &&
       pathKey(tab.path) === key &&
       !tab.preview,
@@ -263,6 +270,7 @@ export function planFileTabOpen(
   const existingPreview = tabs.find(
     (tab) =>
       tab.kind === "editor" &&
+      !tab.detached &&
       tab.spaceId === spaceId &&
       pathKey(tab.path) === key &&
       tab.preview,
@@ -270,7 +278,12 @@ export function planFileTabOpen(
   if (existingPreview) return { tabs, tabId: existingPreview.id };
 
   const previewIndex = tabs.findIndex(
-    (tab) => tab.kind === "editor" && tab.spaceId === spaceId && tab.preview,
+    (tab) =>
+      tab.kind === "editor" &&
+      !tab.detached &&
+      tab.spaceId === spaceId &&
+      tab.preview &&
+      !tab.dirty,
   );
   const tabId = allocId();
   const tab: EditorTab = {
@@ -771,6 +784,15 @@ function placeNew(activeId: number, activates = true): TabInserter {
   );
 }
 
+function allowEnvironmentMove(from: string, to: string): boolean {
+  if (canMoveBetweenSpaces(useSpaces.getState().spaces, from, to)) return true;
+  toast.error("Tabs cannot move between environments", {
+    description:
+      "Open a new tab in the destination space instead. The existing tab keeps its environment.",
+  });
+  return false;
+}
+
 export function useTabs(initial?: Partial<TerminalTab>) {
   const [tabs, setTabs] = useState<Tab[]>(() => {
     const tabId = 1;
@@ -858,6 +880,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       const curr = tabsRef.current;
       const tab = curr.find((t) => t.id === tabId);
       if (!tab || tab.spaceId === targetSpaceId) return false;
+      if (!allowEnvironmentMove(tab.spaceId, targetSpaceId)) return false;
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId ? ({ ...t, spaceId: targetSpaceId } as Tab) : t,
@@ -884,6 +907,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       const moved = curr.find((t) => t.id === tabId);
       const target = curr.find((t) => t.id === targetTabId);
       if (!moved || !target) return false;
+      if (!allowEnvironmentMove(moved.spaceId, target.spaceId)) return false;
       const crossSpace = moved.spaceId !== target.spaceId;
       setTabs((prev) => {
         const without = prev.filter((t) => t.id !== tabId);
@@ -1402,6 +1426,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
           ...autoPin,
           ...(patch.title !== undefined && { title: patch.title }),
           ...(patch.dirty !== undefined && { dirty: patch.dirty }),
+          ...(patch.detached !== undefined && { detached: patch.detached }),
           ...(patch.path !== undefined && { path: patch.path }),
           ...(patch.overrideLanguage !== undefined && {
             overrideLanguage: patch.overrideLanguage,
@@ -1505,7 +1530,8 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     setTabs((curr) =>
       curr.map((t) => {
         if (t.id !== tabId || t.kind !== "terminal") return t;
-        if (t.zoomedLeafId !== undefined) return { ...t, zoomedLeafId: undefined };
+        if (t.zoomedLeafId !== undefined)
+          return { ...t, zoomedLeafId: undefined };
         if (leafIds(t.paneTree).length < 2) return t;
         return { ...t, zoomedLeafId: t.activeLeafId };
       }),
@@ -1549,7 +1575,12 @@ export function useTabs(initial?: Partial<TerminalTab>) {
             dir,
             t.cwd,
           );
-          return { ...t, paneTree, activeLeafId: leafId, zoomedLeafId: undefined };
+          return {
+            ...t,
+            paneTree,
+            activeLeafId: leafId,
+            zoomedLeafId: undefined,
+          };
         }),
       );
       return newLeafId;
@@ -1567,6 +1598,16 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       destinationTabId: number,
       position: SplitPosition,
     ): number | null => {
+      const source = tabsRef.current.find((tab) => tab.id === sourceTabId);
+      const destination = tabsRef.current.find(
+        (tab) => tab.id === destinationTabId,
+      );
+      if (
+        !source ||
+        !destination ||
+        !allowEnvironmentMove(source.spaceId, destination.spaceId)
+      )
+        return null;
       const limit = paneLimit();
       const plan = planMoveTabIntoSplit(
         tabsRef.current,

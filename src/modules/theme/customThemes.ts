@@ -1,53 +1,82 @@
-import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { LazyStore } from "@tauri-apps/plugin-store";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Theme } from "./types";
 
-const STORE_PATH = "oarlock-custom-themes.json";
-const KEY = "themes";
-const CHANGED_EVENT = "oarlock://custom-themes-changed";
-
-const store = new LazyStore(STORE_PATH, { defaults: {}, autoSave: 200 });
-
-export async function listCustomThemes(): Promise<Theme[]> {
-  const v = await store.get<Theme[]>(KEY);
-  return Array.isArray(v) ? v : [];
+export type ThemeSnapshot = { revision: number; themes: Theme[] };
+const EVENT = "oarlock://custom-themes-changed";
+let current: ThemeSnapshot | undefined;
+/** Full snapshots can skip revisions; older replies must never restore old state. */
+export function newerThemeSnapshot(
+  current: ThemeSnapshot | undefined,
+  next: ThemeSnapshot,
+): ThemeSnapshot {
+  return current && current.revision >= next.revision ? current : next;
 }
-
+const observers = new Set<(snapshot: ThemeSnapshot) => void>();
+function accept(next: ThemeSnapshot) {
+  const previous = current;
+  current = newerThemeSnapshot(current, next);
+  if (current !== previous) for (const observer of observers) observer(current);
+  return current;
+}
+export async function readCustomThemes(): Promise<ThemeSnapshot> {
+  return accept(await invoke<ThemeSnapshot>("themes_snapshot"));
+}
+export async function listCustomThemes(): Promise<Theme[]> {
+  return (await readCustomThemes()).themes;
+}
 export async function saveCustomTheme(theme: Theme): Promise<void> {
   await saveCustomThemes([theme]);
 }
-
-/** Upserts by id in one store write; a later duplicate id wins. */
+/** Native per-ID upsert; independent changes never replace the entire catalog. */
 export async function saveCustomThemes(
   themes: readonly Theme[],
 ): Promise<void> {
   if (themes.length === 0) return;
-  const incoming = new Map(themes.map((t) => [t.id, t]));
-  const current = await listCustomThemes();
-  const next = current
-    .filter((t) => !incoming.has(t.id))
-    .concat([...incoming.values()]);
-  await store.set(KEY, next);
-  await store.save();
-  await emit(CHANGED_EVENT);
+  accept(
+    await invoke<ThemeSnapshot>("themes_mutate", {
+      change: { kind: "upsert", themes },
+    }),
+  );
 }
-
 export async function deleteCustomTheme(id: string): Promise<void> {
-  const current = await listCustomThemes();
-  const next = current.filter((t) => t.id !== id);
-  if (next.length === current.length) return;
-  await store.set(KEY, next);
-  await store.save();
-  await emit(CHANGED_EVENT);
+  accept(
+    await invoke<ThemeSnapshot>("themes_mutate", {
+      change: { kind: "delete", id },
+    }),
+  );
 }
-
-export async function onCustomThemesChange(cb: () => void): Promise<UnlistenFn> {
-  const unsubLocal = await store.onChange((key) => {
-    if (key === KEY) cb();
+/** Subscribe before reading so changes during startup cannot be missed. */
+export async function watchCustomThemes(
+  changed: (snapshot: ThemeSnapshot) => void,
+  failed: (error: unknown) => void,
+): Promise<UnlistenFn> {
+  let alive = true;
+  let revision = -1;
+  const publish = (snapshot: ThemeSnapshot) => {
+    if (!alive || snapshot.revision <= revision) return;
+    revision = snapshot.revision;
+    changed(snapshot);
+  };
+  observers.add(publish);
+  let stop: UnlistenFn;
+  try {
+    stop = await listen<ThemeSnapshot>(EVENT, ({ payload }) => {
+      if (alive) publish(accept(payload));
+    });
+  } catch (error) {
+    observers.delete(publish);
+    throw error;
+  }
+  // Keep the listener through a failed read so another successful operation can
+  // recover the view. Settings can also explicitly reconnect and retry.
+  const initialRevision = revision;
+  void readCustomThemes().then(publish, (error) => {
+    if (alive && revision === initialRevision) failed(error);
   });
-  const unsubEvent = await listen(CHANGED_EVENT, () => cb());
   return () => {
-    unsubLocal();
-    unsubEvent();
+    alive = false;
+    observers.delete(publish);
+    stop();
   };
 }

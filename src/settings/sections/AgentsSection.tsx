@@ -40,6 +40,9 @@ import {
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   setAiApprovalMode,
+  setAiStopBackgroundJobs,
+  setAiStopSubagents,
+  setAiAllowUnmanagedJobs,
   setCustomInstructions,
   setSelectionAskAi,
 } from "@/modules/settings/store";
@@ -67,6 +70,9 @@ const ICON_OPTIONS: AgentIconId[] = [
 export function AgentsSection() {
   const customInstructions = usePreferencesStore((s) => s.customInstructions);
   const approvalMode = usePreferencesStore((s) => s.aiApprovalMode);
+  const allowUnmanaged = usePreferencesStore((s) => s.aiAllowUnmanagedJobs);
+  const stopSubagents = usePreferencesStore((s) => s.aiStopSubagents);
+  const stopBackgroundJobs = usePreferencesStore((s) => s.aiStopBackgroundJobs);
   const selectionAskAi = usePreferencesStore((s) => s.selectionAskAi);
   const customAgents = useAgentsStore((s) => s.customAgents);
   const activeAgentId = useAgentsStore((s) => s.activeId);
@@ -96,6 +102,39 @@ export function AgentsSection() {
       />
 
       <CustomInstructionsBlock value={customInstructions} />
+
+      <SettingRow
+        title="Allow unmanaged detached commands"
+        description="Off by default: managed jobs require foreground-mode programs. Enable a separate unmanaged launch tool for daemons. Unmanaged commands have no captured logs, Stop control, or job limit, and may outlive Oarlock. Turning this off does not stop existing commands."
+      >
+        <Switch
+          checked={allowUnmanaged}
+          onCheckedChange={(value) => void setAiAllowUnmanagedJobs(value)}
+          aria-label="Allow unmanaged detached commands"
+        />
+      </SettingRow>
+
+      <SettingRow
+        title="Stop background jobs with chat"
+        description="Stop and chat deletion also terminate background jobs launched by that chat. Foreground commands always stop. Off by default so dev servers can keep running."
+      >
+        <Switch
+          checked={stopBackgroundJobs}
+          onCheckedChange={(value) => void setAiStopBackgroundJobs(value)}
+          aria-label="Stop background jobs with chat"
+        />
+      </SettingRow>
+
+      <SettingRow
+        title="Stop subagents with chat"
+        description="Stop and chat deletion also cancel that chat’s subagents. Turn off to let them finish independently. Status and results remain available in Tasks, including after chat deletion. Closing their window interrupts them."
+      >
+        <Switch
+          checked={stopSubagents}
+          onCheckedChange={(value) => void setAiStopSubagents(value)}
+          aria-label="Stop subagents with chat"
+        />
+      </SettingRow>
 
       <section className="flex flex-col gap-2">
         <Label>Tool approval</Label>

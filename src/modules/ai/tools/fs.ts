@@ -1,6 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { native } from "../lib/native";
+import { native as defaultNative } from "../lib/native";
 import {
   checkReadableCanonical,
   checkWritableCanonical,
@@ -11,6 +11,7 @@ import { contentHash, writtenEntry } from "./readCache";
 import { textWindow } from "./textWindow";
 
 export function buildFsTools(ctx: ToolContext) {
+  const native = ctx.native ?? defaultNative;
   return {
     read_file: tool({
       description:
@@ -35,7 +36,10 @@ export function buildFsTools(ctx: ToolContext) {
       }),
       execute: async ({ path, offset, limit }) => {
         const reqPath = resolvePath(path, ctx.getCwd());
-        const safety = await checkReadableCanonical(reqPath, native.canonicalize);
+        const safety = await checkReadableCanonical(
+          reqPath,
+          native.canonicalize,
+        );
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
         try {
@@ -51,12 +55,23 @@ export function buildFsTools(ctx: ToolContext) {
           const hash = contentHash(r.content);
           const isFullRead = offset === undefined && limit === undefined;
           const prior = ctx.readCache.get(abs);
-          if (isFullRead && prior && prior.size === r.size && prior.hash === hash) {
+          if (
+            isFullRead &&
+            prior?.fullContent &&
+            prior.size === r.size &&
+            prior.hash === hash
+          ) {
             return { path: abs, unchanged: true, size: r.size };
           }
-          ctx.readCache.set(abs, { size: r.size, hash });
-
           const window = textWindow(r.content, offset, limit);
+          // A hash proves which file was read, not how much the model saw.
+          // Keep partial reads eligible for edits without suppressing unseen text.
+          const fullContent =
+            (window.startLine === 0 && !window.truncated) ||
+            (prior?.fullContent === true &&
+              prior.size === r.size &&
+              prior.hash === hash);
+          ctx.readCache.set(abs, { size: r.size, hash, fullContent });
           if (isFullRead) {
             return {
               path: abs,
@@ -64,7 +79,10 @@ export function buildFsTools(ctx: ToolContext) {
               size: r.size,
               total_lines: window.totalLines,
               ...(window.truncated
-                ? { truncated: true, hint: "call read_file with offset to continue" }
+                ? {
+                    truncated: true,
+                    hint: "call read_file with offset to continue",
+                  }
                 : {}),
             };
           }
@@ -93,7 +111,10 @@ export function buildFsTools(ctx: ToolContext) {
       }),
       execute: async ({ path }) => {
         const reqPath = resolvePath(path, ctx.getCwd());
-        const safety = await checkReadableCanonical(reqPath, native.canonicalize);
+        const safety = await checkReadableCanonical(
+          reqPath,
+          native.canonicalize,
+        );
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
         try {
@@ -117,7 +138,10 @@ export function buildFsTools(ctx: ToolContext) {
       }),
       execute: async ({ path, content }) => {
         const reqPath = resolvePath(path, ctx.getCwd());
-        const safety = await checkWritableCanonical(reqPath, native.canonicalize);
+        const safety = await checkWritableCanonical(
+          reqPath,
+          native.canonicalize,
+        );
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
 
@@ -131,6 +155,7 @@ export function buildFsTools(ctx: ToolContext) {
             isNewFile = true;
           }
           usePlanStore.getState().enqueue({
+            workspace: ctx.workspace,
             id: newQueuedEditId(),
             kind: "write_file",
             path: abs,
@@ -164,11 +189,15 @@ export function buildFsTools(ctx: ToolContext) {
       }),
       execute: async ({ path }) => {
         const reqPath = resolvePath(path, ctx.getCwd());
-        const safety = await checkWritableCanonical(reqPath, native.canonicalize);
+        const safety = await checkWritableCanonical(
+          reqPath,
+          native.canonicalize,
+        );
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
         if (usePlanStore.getState().active) {
           usePlanStore.getState().enqueue({
+            workspace: ctx.workspace,
             id: newQueuedEditId(),
             kind: "create_directory",
             path: abs,

@@ -1,3 +1,4 @@
+import { networkPage } from "@/lib/networkPage";
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -63,16 +64,16 @@ async function readBody(request: Request, label: string): Promise<Uint8Array> {
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
   const cancel = () => {
-    void reader.cancel().catch(() => {});
+    void reader.cancel(request.signal.reason).catch(() => {});
   };
   request.signal.addEventListener("abort", cancel, { once: true });
   const chunks: Uint8Array[] = [];
   let length = 0;
   try {
     while (true) {
-      if (request.signal.aborted) throw makeAbortError();
+      request.signal.throwIfAborted();
       const next = await reader.read();
-      if (request.signal.aborted) throw makeAbortError();
+      request.signal.throwIfAborted();
       if (next.done) break;
       length += next.value.byteLength;
       if (length > MAX_REQUEST_BYTES) {
@@ -102,9 +103,18 @@ async function proxyFetchImpl(
 ): Promise<Response> {
   const { label } = route;
   const request = new Request(input, init);
-  if (request.signal.aborted) throw makeAbortError();
+  let pageGeneration: string;
+  try {
+    request.signal.throwIfAborted();
+    pageGeneration = await networkPage(request.signal);
+    request.signal.throwIfAborted();
+  } catch (error) {
+    // No reader owns the upload yet while native page initialization is pending.
+    void request.body?.cancel(error).catch(() => {});
+    throw error;
+  }
   const body = await readBody(request, label);
-  if (request.signal.aborted) throw makeAbortError();
+  request.signal.throwIfAborted();
   const requestId = Array.from(
     crypto.getRandomValues(new Uint32Array(4)),
     (word) => word.toString(16).padStart(8, "0"),
@@ -122,12 +132,12 @@ async function proxyFetchImpl(
     let controller: ReadableStreamDefaultController<Uint8Array>;
     const channel = new Channel<ArrayBuffer>();
     const cancelNative = () =>
-      invoke<void>(route.cancel, { requestId }).catch(() => {});
+      invoke<void>(route.cancel, { requestId, pageGeneration }).catch(() => {});
     const cleanup = () => {
       request.signal.removeEventListener("abort", onAbort);
       channel.onmessage = () => {};
     };
-    const fail = (error: Error, cancel = true) => {
+    const fail = (error: unknown, cancel = true) => {
       if (closed) return;
       closed = true;
       cancelled = cancel;
@@ -136,7 +146,7 @@ async function proxyFetchImpl(
       if (!resolved) reject(error);
       if (cancel) void cancelNative();
     };
-    const onAbort = () => fail(makeAbortError());
+    const onAbort = () => fail(request.signal.reason);
     const acknowledge = () => {
       if (
         closed ||
@@ -150,7 +160,7 @@ async function proxyFetchImpl(
       const bytes = received;
       const count = packets;
       ackInFlight = true;
-      void invoke(route.ack, { requestId, bytes }).then(
+      void invoke(route.ack, { requestId, pageGeneration, bytes }).then(
         () => {
           acknowledged = Math.max(acknowledged, bytes);
           acknowledgedPackets = Math.max(acknowledgedPackets, count);
@@ -190,13 +200,15 @@ async function proxyFetchImpl(
               throw new Error(`Duplicate ${label} response headers`);
             const metadata = JSON.parse(decoder.decode(bytes)) as {
               status: number;
-              headers: Record<string, string>;
+              statusText?: string;
+              headers: HeadersInit;
             };
             const empty =
               request.method === "HEAD" ||
               [204, 205, 304].includes(metadata.status);
             const response = new Response(empty ? null : stream, {
               status: metadata.status,
+              statusText: metadata.statusText,
               headers: metadata.headers,
             });
             resolved = true;
@@ -255,6 +267,7 @@ async function proxyFetchImpl(
     }
     const metadata = JSON.stringify({
       requestId,
+      pageGeneration,
       url: request.url,
       method: request.method,
       headers: Object.fromEntries(request.headers),
@@ -282,8 +295,4 @@ async function proxyFetchImpl(
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function makeAbortError(): DOMException {
-  return new DOMException("Request aborted", "AbortError");
 }

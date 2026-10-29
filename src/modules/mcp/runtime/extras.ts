@@ -40,6 +40,7 @@ type Entry = {
   templates: McpTemplateEntry[];
   prompts: McpPromptEntry[];
   timers: Partial<Record<ListKind, ReturnType<typeof setTimeout>>>;
+  versions: Record<ListKind, number>;
   ready: Promise<void>;
 };
 
@@ -99,6 +100,7 @@ export class McpExtras {
       templates: [],
       prompts: [],
       timers: {},
+      versions: { resources: 0, prompts: 0 },
       ready: Promise.resolve(),
     };
     this.entries.set(server.id, entry);
@@ -146,6 +148,7 @@ export class McpExtras {
     uri: string,
     signal?: AbortSignal,
   ): Promise<unknown> {
+    signal?.throwIfAborted();
     const entry = this.running(serverId);
     return entry.client.readResource(
       { uri },
@@ -164,6 +167,7 @@ export class McpExtras {
     args: Record<string, string>,
     signal?: AbortSignal,
   ): Promise<unknown> {
+    signal?.throwIfAborted();
     const entry = this.running(serverId);
     return entry.client.getPrompt(
       { name, arguments: args },
@@ -180,13 +184,15 @@ export class McpExtras {
     ref: CompletionRef,
     argument: { name: string; value: string },
     context: Record<string, string>,
+    signal?: AbortSignal,
   ): Promise<string[]> {
+    if (signal?.aborted) return [];
     const entry = this.entries.get(serverId);
     if (!entry?.capabilities?.completions) return [];
     try {
       const result = await entry.client.complete(
         { ref, argument, context: { arguments: context } },
-        { timeout: COMPLETE_TIMEOUT_MS },
+        { signal, timeout: COMPLETE_TIMEOUT_MS },
       );
       const values = Array.isArray(result.completion?.values)
         ? result.completion.values
@@ -220,6 +226,10 @@ export class McpExtras {
   }
 
   private async refresh(entry: Entry, kind: ListKind): Promise<void> {
+    const version = ++entry.versions[kind];
+    const current = () =>
+      this.entries.get(entry.server.id) === entry &&
+      entry.versions[kind] === version;
     const { client } = entry;
     const options = { timeout: LIST_TIMEOUT_MS };
     try {
@@ -240,7 +250,7 @@ export class McpExtras {
             return { items: r.resourceTemplates, nextCursor: r.nextCursor };
           }, MAX_TEMPLATES).catch(() => [] as unknown[]),
         ]);
-        if (this.entries.get(entry.server.id) !== entry) return;
+        if (!current()) return;
         entry.resources = cleanResources(resources);
         entry.templates = cleanTemplates(templates, templateVariables);
       } else {
@@ -251,12 +261,12 @@ export class McpExtras {
           );
           return { items: r.prompts, nextCursor: r.nextCursor };
         }, MAX_PROMPTS);
-        if (this.entries.get(entry.server.id) !== entry) return;
+        if (!current()) return;
         entry.prompts = cleanPrompts(prompts);
       }
       this.publish();
     } catch (error) {
-      if (this.entries.get(entry.server.id) !== entry) return;
+      if (!current()) return;
       void invoke("mcp_log_note", {
         serverId: entry.server.id,
         text: `Could not list its ${kind}: ${message(error)}`,

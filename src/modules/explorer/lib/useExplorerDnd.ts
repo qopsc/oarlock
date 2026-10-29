@@ -1,13 +1,8 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { excludeNestedSources } from "./batchMove";
 import { dirname } from "./treePaths";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 
 export type ExplorerPathDropTarget = {
   updateTarget: (clientX: number, clientY: number) => boolean;
@@ -17,12 +12,14 @@ export type ExplorerPathDropTarget = {
     clientX: number,
     clientY: number,
     isDir?: (path: string) => boolean | undefined,
+    source?: WorkspaceEnv,
   ) => boolean;
   clearTarget: () => void;
 };
 
 type Options = {
   rootPath: string;
+  workspace: WorkspaceEnv;
   isDir: (path: string) => boolean | undefined;
   onMove: (from: string[], toDir: string) => void;
   getSelectedPaths: () => Set<string>;
@@ -64,10 +61,12 @@ export function finishExplorerDrag(
   pathDropTarget: ExplorerPathDropTarget | undefined,
   onMove: (from: string[], toDir: string) => void,
   isDir?: (path: string) => boolean | undefined,
+  source?: WorkspaceEnv,
 ): void {
   const handledByPathTarget =
     commit &&
-    (pathDropTarget?.dropPath(sources, clientX, clientY, isDir) ?? false);
+    (pathDropTarget?.dropPath(sources, clientX, clientY, isDir, source) ??
+      false);
   if (commit && !handledByPathTarget && moveTarget) {
     onMove(sources, moveTarget);
   }
@@ -80,6 +79,7 @@ export function finishExplorerDrag(
 // drop target changes, not on every move.
 export function useExplorerDnd({
   rootPath,
+  workspace,
   isDir,
   onMove,
   getSelectedPaths,
@@ -96,6 +96,7 @@ export function useExplorerDnd({
   const cleanupRef = useRef<(() => void) | null>(null);
   const optsRef = useRef({
     rootPath,
+    workspace,
     isDir,
     onMove,
     getSelectedPaths,
@@ -108,6 +109,7 @@ export function useExplorerDnd({
   useLayoutEffect(() => {
     optsRef.current = {
       rootPath,
+      workspace,
       isDir,
       onMove,
       getSelectedPaths,
@@ -116,6 +118,7 @@ export function useExplorerDnd({
     };
   }, [
     rootPath,
+    workspace,
     isDir,
     onMove,
     getSelectedPaths,
@@ -144,6 +147,7 @@ export function useExplorerDnd({
     if (!source) return;
     const sx = e.clientX;
     const sy = e.clientY;
+    const sourceWorkspace = optsRef.current.workspace;
     let active = false;
     // Decided at drag-activation (not pointerdown), so a plain click that never
     // crosses the threshold never touches selection.
@@ -207,6 +211,7 @@ export function useExplorerDnd({
         optsRef.current.pathDropTarget,
         optsRef.current.onMove,
         optsRef.current.isDir,
+        sourceWorkspace,
       );
       suppressClickRef.current = true;
       setTimeout(() => {
@@ -221,7 +226,7 @@ export function useExplorerDnd({
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", cancel);
-    cleanupRef.current = detach;
+    cleanupRef.current = cancel;
   }, []);
 
   const onClickCapture = useCallback((e: React.MouseEvent) => {
@@ -232,12 +237,13 @@ export function useExplorerDnd({
     }
   }, []);
 
-  useEffect(
+  // biome-ignore lint/correctness/useExhaustiveDependencies: A source-scope change cancels the drag even when its handlers are stable.
+  useLayoutEffect(
     () => () => {
       cleanupRef.current?.();
       optsRef.current.pathDropTarget?.clearTarget();
     },
-    [],
+    [rootPath, workspace],
   );
 
   return { ghostRef, dragLabel, dropTargetDir, onPointerDown, onClickCapture };

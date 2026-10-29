@@ -123,6 +123,8 @@ const LAUNCHER_VARS: &[&str] = &[
     // A parent Oarlock session. Each is set again when it applies to this one;
     // OARLOCK_USER_ZDOTDIR is kept because it names the user's own zsh config.
     "OARLOCK_TERMINAL",
+    "OARLOCK_FISH_INIT",
+    "__OARLOCK_HOOKS_LOADED",
     "OARLOCK_BLOCKS",
     "OARLOCK_CONTROL_ADDR",
     "OARLOCK_CONTROL_TOKEN",

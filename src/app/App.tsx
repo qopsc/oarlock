@@ -1,3 +1,9 @@
+import { authorizeContentHit } from "@/modules/command-palette/hooks/authorizeContentHit";
+import {
+  contentSearchOwnerCurrent,
+  type ContentSearchOwner,
+} from "@/modules/command-palette/hooks/useContentSearch";
+import { workspaceUnavailableReason } from "@/modules/workspace/availability";
 import {
   ResizableHandle,
   ResizablePanel,
@@ -119,6 +125,7 @@ import {
   resizeActivePane,
   scrollFocusedTerminal,
   setTerminalFileOpener,
+  setTerminalLinkNavigation,
   setTerminalPreviewOpener,
   startWindowProgress,
   type TerminalPaneHandle,
@@ -143,6 +150,7 @@ import { UpdaterDialog } from "@/modules/updater";
 import {
   authorizeFileFolder,
   currentWorkspaceEnv,
+  type WorkspaceEnv,
   useWorkspaceEnvStore,
   workspaceScopeKey,
 } from "@/modules/workspace";
@@ -166,14 +174,15 @@ import {
   WorkspaceInputBar,
 } from "./components/WorkspaceInputBar";
 import { WorkspaceSurface } from "./components/WorkspaceSurface";
-import {
-  hasOpenPathTab,
-  renamedPath,
-  spacesEmptiedByTabs,
-} from "./hooks/tabCloseGuards";
+import { hasOpenPathTab, spacesEmptiedByTabs } from "./hooks/tabCloseGuards";
 import { aiToggleAction } from "./hooks/aiToggle";
 import { useAppCloseGuard } from "./hooks/useAppCloseGuard";
 import { useOpenFolder } from "./hooks/useOpenFolder";
+import { useDocumentMutations } from "@/modules/editor/useDocumentMutations";
+import {
+  documentTabsInEnvironment,
+  planDocumentMutation,
+} from "@/modules/editor/lib/documentMutations";
 import { useTabCloseGuards } from "./hooks/useTabCloseGuards";
 import { restartTarget } from "./hooks/terminalRestart";
 import { useTerminalRestart } from "./hooks/useTerminalRestart";
@@ -286,6 +295,11 @@ export default function App() {
 
   const workspaceEnv = useWorkspaceEnvStore((s) => s.env);
   const setWorkspaceEnv = useWorkspaceEnvStore((s) => s.setEnv);
+  const unavailableWorkspace = useSpaces((s) =>
+    workspaceUnavailableReason(
+      s.spaces.find((space) => space.id === s.activeId)?.env ?? workspaceEnv,
+    ),
+  );
   const {
     home,
     launchCwd,
@@ -306,6 +320,11 @@ export default function App() {
     activeIdRef.current = activeId;
     activeSpaceIdRef.current = activeSpaceId;
   }, [tabs, activeId, activeSpaceId]);
+  useLayoutEffect(
+    () =>
+      setTerminalLinkNavigation(activeSpaceId ?? DEFAULT_SPACE_ID, activeId),
+    [activeId, activeSpaceId],
+  );
   const sourceControlSpaceId = activeSpaceId ?? DEFAULT_SPACE_ID;
 
   useSpacesBoot({
@@ -475,6 +494,11 @@ export default function App() {
     [disposeTab, newTabInSpace],
   );
 
+  const editorIsDirty = useCallback(
+    (id: number) => editorRefs.current.get(id)?.hasUnsavedChanges(),
+    [],
+  );
+
   const {
     pendingCloseTab,
     pendingTerminalCloseTab,
@@ -496,13 +520,21 @@ export default function App() {
   } = useTabCloseGuards({
     tabs,
     activeId,
+    editorIsDirty,
     disposeTab,
     disposeDeletedTabs,
     disposeTabs,
   });
 
-  const { pendingAppClose, confirmAppClose, cancelAppClose } =
-    useAppCloseGuard(tabsRef);
+  const editorCloseRevision = useCallback(
+    (id: number) => editorRefs.current.get(id)?.closeRevision(),
+    [],
+  );
+  const { pendingAppClose, confirmAppClose, cancelAppClose } = useAppCloseGuard(
+    tabsRef,
+    editorIsDirty,
+    editorCloseRevision,
+  );
 
   const { pendingRestartLeaf, requestRestart, confirmRestart, cancelRestart } =
     useTerminalRestart();
@@ -825,25 +857,47 @@ export default function App() {
     };
   }, [booted]);
 
-  const handleExplorerPathRenamed = useCallback(
-    (from: string, to: string) => {
-      for (const tab of tabsRef.current) {
-        if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
-        const path = renamedPath(tab.path, from, to);
-        if (path === null) continue;
-        if (tab.kind === "editor" && !tab.cold) noteRetarget(tab.path, path);
-        const i = path.lastIndexOf("/");
-        updateTab(tab.id, {
-          path,
-          title: i === -1 ? path : path.slice(i + 1),
-        });
-      }
+  const handleEditorBindingChange = useCallback(
+    (id: number, path: string, detached: boolean) => {
+      updateTab(id, {
+        path,
+        title: path.split(/[\\/]/).pop() ?? path,
+        detached,
+      });
     },
     [updateTab],
   );
 
+  useDocumentMutations((event) => {
+    const plan = planDocumentMutation(
+      tabsRef.current,
+      useSpaces.getState().spaces,
+      event,
+    );
+    for (const change of plan.renamed) {
+      if (change.preserveBuffer) noteRetarget(change.from, change.path);
+      updateTab(change.id, { path: change.path, title: change.title });
+    }
+    for (const id of plan.deleted) {
+      const editor = editorRefs.current.get(id);
+      if (editor?.hasUnsavedChanges()) editor.detach();
+    }
+    handlePathsDeleted(plan.deleted, (id) =>
+      editorRefs.current.get(id)?.hasUnsavedChanges(),
+    );
+    for (const id of plan.refresh) editorRefs.current.get(id)?.reload();
+  });
+
   const canReplaceExplorerPath = useCallback(
-    (path: string) => !hasOpenPathTab(tabsRef.current, path),
+    (path: string, workspace: WorkspaceEnv) =>
+      !hasOpenPathTab(
+        documentTabsInEnvironment(
+          tabsRef.current,
+          useSpaces.getState().spaces,
+          workspace,
+        ),
+        path,
+      ),
     [],
   );
 
@@ -907,6 +961,7 @@ export default function App() {
   );
   const { sourceControl, toggleSourceControl, openGitGraphFromContext } =
     useSourceControlContext({
+      enabled: !unavailableWorkspace,
       activeTab,
       tabs,
       activeTerminalLeafCwd,
@@ -1557,10 +1612,29 @@ export default function App() {
   const pendingEditorNavigation = useRef<
     Map<number, { line?: number; focus: boolean }>
   >(new Map());
+  const contentRootRef = useRef(explorerRoot);
+  contentRootRef.current = explorerRoot;
   const openContentHit = useCallback(
-    (path: string, line: number) => {
-      void authorizeFileFolder(path);
-      const id = openFileTab(path, true);
+    async (path: string, line: number, owner?: ContentSearchOwner) => {
+      if (owner) {
+        const current = () =>
+          contentSearchOwnerCurrent(owner) &&
+          contentRootRef.current === owner.root;
+        if (
+          !(await authorizeContentHit(
+            path,
+            owner,
+            current,
+            authorizeFileFolder,
+          ))
+        )
+          return;
+      } else void authorizeFileFolder(path);
+      const id = openFileTab(
+        path,
+        true,
+        owner?.spaceId ? { spaceId: owner.spaceId } : undefined,
+      );
       if (id == null) return;
       const h = editorRefs.current.get(id);
       if (h) h.gotoLine(line);
@@ -1572,12 +1646,17 @@ export default function App() {
   // Terminal links to files (paths printed by tools, file:// hyperlinks)
   // open in the editor, at the line when the link names one.
   useEffect(() => {
-    setTerminalFileOpener((path, line) => {
-      if (line !== null) openContentHit(path, line);
-      else openFileTab(path, true);
+    setTerminalFileOpener((path, line, _column, spaceId) => {
+      // The link already authorized its captured environment. Do not authorize
+      // again through the current window, which may now show another space.
+      const id = openFileTab(path, true, { spaceId });
+      if (id == null || line === null) return;
+      const editor = editorRefs.current.get(id);
+      if (editor) editor.gotoLine(line);
+      else pendingEditorNavigation.current.set(id, { line, focus: true });
     });
     return () => setTerminalFileOpener(null);
-  }, [openContentHit, openFileTab]);
+  }, [openFileTab]);
 
   useEffect(() => {
     setTerminalPreviewOpener((url) => {
@@ -1764,7 +1843,14 @@ export default function App() {
                       key={sidebarView}
                       className="min-h-0 flex-1 oarlock-panel-in"
                     >
-                      {sidebarView === "explorer" ? (
+                      {unavailableWorkspace ? (
+                        <p
+                          role="status"
+                          className="p-4 text-xs text-muted-foreground"
+                        >
+                          {unavailableWorkspace}
+                        </p>
+                      ) : sidebarView === "explorer" ? (
                         <FileExplorer
                           ref={explorerRef}
                           rootPath={explorerRoot}
@@ -1773,8 +1859,6 @@ export default function App() {
                           }
                           activeFilePath={explorerActiveFilePath}
                           onOpenFile={handleOpenFile}
-                          onPathRenamed={handleExplorerPathRenamed}
-                          onPathsDeleted={handlePathsDeleted}
                           canReplacePath={canReplaceExplorerPath}
                           onRevealInTerminal={cdInNewTab}
                           onOpenInSourceControl={
@@ -1840,7 +1924,9 @@ export default function App() {
                         onFocusLeaf={handleFocusLeaf}
                         registerEditorHandle={registerEditorHandle}
                         onEditorDirtyChange={handleEditorDirty}
-                        onEditorCloseTab={disposeTab}
+                        onOverrideLanguage={setOverrideLanguage}
+                        onEditorBindingChange={handleEditorBindingChange}
+                        onEditorCloseTab={handleClose}
                         registerPreviewHandle={registerPreviewHandle}
                         onPreviewUrlChange={handlePreviewUrl}
                         onAiDiffAccept={(id) => respondToApproval(id, true)}
@@ -1851,18 +1937,20 @@ export default function App() {
                       />
                     </div>
 
-                    <WorkspaceInputBar
-                      isBlockTab={isBlockTab}
-                      isTerminalTab={isTerminalTab}
-                      activeLeafId={activeLeafId}
-                      cwd={activeCwd}
-                      home={home}
-                      hasComposer={hasComposer}
-                      panelOpen={panelOpen}
-                      keysLoaded={keysLoaded}
-                      onConnect={() => void openSettingsWindow("models")}
-                      onClose={() => useChatStore.getState().closePanel()}
-                    />
+                    {!unavailableWorkspace && (
+                      <WorkspaceInputBar
+                        isBlockTab={isBlockTab}
+                        isTerminalTab={isTerminalTab}
+                        activeLeafId={activeLeafId}
+                        cwd={activeCwd}
+                        home={home}
+                        hasComposer={hasComposer}
+                        panelOpen={panelOpen}
+                        keysLoaded={keysLoaded}
+                        onConnect={() => void openSettingsWindow("models")}
+                        onClose={() => useChatStore.getState().closePanel()}
+                      />
+                    )}
                   </div>
                 </div>
               </ResizablePanel>
@@ -1873,6 +1961,7 @@ export default function App() {
             <StatusBar
               cwd={activeCwd}
               filePath={activeFilePath}
+              overrideLanguage={activeTab?.kind === "editor" ? activeTab.overrideLanguage : null}
               home={home}
               root={explorerRoot}
               onCd={sendCd}
@@ -1901,7 +1990,9 @@ export default function App() {
           />
           <Toaster position="bottom-right" />
           <SkillsBridge
-            root={explorerRoot ?? launchCwd ?? home}
+            root={
+              unavailableWorkspace ? null : (explorerRoot ?? launchCwd ?? home)
+            }
             openFileTab={openFileTab}
           />
 

@@ -144,6 +144,38 @@ describe("read_file", () => {
     expect(second.content).toBeUndefined();
   });
 
+  it("does not hide unread content after a partial read", async () => {
+    textFile("first\nsecond\nthird");
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE, offset: 1, limit: 1 });
+    expect(ctx.readCache.has(FILE)).toBe(true); // Partial reads still permit contextual edits.
+    const full = await run("read_file", ctx, { path: FILE });
+    expect(full.content).toBe("first\nsecond\nthird");
+    expect(full.unchanged).toBeUndefined();
+  });
+
+  it("does not treat a truncated response as a complete file read", async () => {
+    textFile("x".repeat(30 * 1024));
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE });
+    const again = await run("read_file", ctx, { path: FILE });
+    expect(again.content).toBeDefined();
+    expect(again.truncated).toBe(true);
+  });
+
+  it("preserves complete-read knowledge across windows of unchanged content", async () => {
+    textFile("first\nsecond");
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE });
+    await run("read_file", ctx, { path: FILE, offset: 1, limit: 1 });
+    expect((await run("read_file", ctx, { path: FILE })).unchanged).toBe(true);
+    textFile("first\nchanged");
+    await run("read_file", ctx, { path: FILE, offset: 1, limit: 1 });
+    expect((await run("read_file", ctx, { path: FILE })).content).toBe(
+      "first\nchanged",
+    );
+  });
+
   it("truncates a full read past the 2000-line cap", async () => {
     textFile(Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n"));
     const r = await run("read_file", makeContext(), { path: FILE });

@@ -107,9 +107,17 @@ export function useControlBridge({
     if (!ready) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    const requireLiveBridge = () => {
+      if (disposed)
+        throw new RequestError(
+          "frontend_unavailable",
+          "Oarlock UI context closed; retry the request",
+        );
+    };
 
     const handleRequest = async (request: ControlRequest) => {
       try {
+        requireLiveBridge();
         const context = resolveControlContext(
           tabsRef.current ?? [],
           activeTabIdRef.current ?? 0,
@@ -127,12 +135,14 @@ export function useControlBridge({
             const window = getCurrentWindow();
             try {
               await window.show();
+              requireLiveBridge();
               await window.setFocus();
               focused = true;
             } catch (error) {
               console.warn("[oarlock] could not focus control target:", error);
             }
           }
+          requireLiveBridge();
           const tabId = onOpen({ ...open, spaceId: context.space_id });
           if (tabId === null) {
             throw new RequestError(
@@ -140,9 +150,9 @@ export function useControlBridge({
               "Oarlock could not create an editor tab",
             );
           }
-          await new Promise<void>((resolve) =>
-            requestAnimationFrame(() => resolve()),
-          );
+          // onOpen has accepted the tab and queued any editor navigation. A
+          // background window may never paint; protocol completion cannot wait
+          // for a presentation frame.
           await respond(request.id, {
             ok: true,
             result: {

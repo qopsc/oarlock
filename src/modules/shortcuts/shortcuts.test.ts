@@ -6,6 +6,7 @@ import {
   defaultShortcuts,
   matchBinding,
   matchShortcut,
+  SHORTCUT_GROUPS,
   SHORTCUTS,
   type ShortcutId,
   type ShortcutPlatform,
@@ -185,6 +186,15 @@ describe("matchBinding", () => {
 });
 
 describe("SHORTCUTS registry", () => {
+  it("includes space shortcuts in the groups rendered by Settings", () => {
+    const visible = SHORTCUT_GROUPS.flatMap((group) =>
+      SHORTCUTS.filter((shortcut) => shortcut.group === group),
+    ).map((shortcut) => shortcut.id);
+    expect(visible).toEqual(
+      expect.arrayContaining(["space.next", "space.prev", "space.overview"]),
+    );
+  });
+
   it("binds Mod+S to editor.save", () => {
     const save = SHORTCUTS.find((s) => s.id === "editor.save");
     expect(save).toBeDefined();

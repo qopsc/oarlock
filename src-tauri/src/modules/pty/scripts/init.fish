@@ -4,8 +4,8 @@
 # A/B (the `mark-prompt` feature); Oarlock disables it at spawn via
 # fish_features=no-mark-prompt so these markers aren't emitted twice.
 
-# Installed into conf.d, which every fish session sources; only Oarlock-spawned
-# shells (OARLOCK_TERMINAL=1) may get their prompt wrapped.
+# Loaded explicitly after config.fish by Oarlock; never installed into conf.d.
+# Only Oarlock-spawned shells (OARLOCK_TERMINAL=1) may get their prompt wrapped.
 if not set -q OARLOCK_TERMINAL
     exit 0
 end
@@ -20,10 +20,8 @@ if set -q OARLOCK_CLI; and test -x "$OARLOCK_CLI"
     end
 end
 
-# Oarlock is a clean terminal; drop fish's default startup greeting. A user who
-# sets their own in config.fish (sourced after this) keeps it.
-function fish_greeting
-end
+# Spawn supplies an empty fish_greeting variable. Preserve any greeting function
+# or variable the user's config.fish supplied; block mode still suppresses it.
 
 set -g __OARLOCK_HOST (uname -n 2>/dev/null; or echo localhost)
 

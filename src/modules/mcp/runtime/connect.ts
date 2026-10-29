@@ -6,11 +6,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { SignInRequiredError, watchUnauthorized } from "../lib/auth";
-import {
-  isProjectServer,
-  type McpServerConfig,
-  splitValues,
-} from "../lib/config";
+import { isProjectServer, type McpServerConfig } from "../lib/config";
 import { AjvJsonSchemaValidator as PassThroughValidator } from "./ajvProvider";
 import { CLIENT_CAPABILITIES, handleServerRequests } from "./serverRequests";
 import { describeExit, TauriStdioTransport } from "./stdioTransport";
@@ -61,33 +57,27 @@ export async function connectServer(
   let release = async () => {};
   let unauthorized = false;
   if (t.type === "stdio") {
-    const { plain, secret } = splitValues(t.env);
     const stdio = new TauriStdioTransport({
       serverId: server.id,
-      command: t.command,
-      args: t.args,
-      env: plain,
-      secretEnv: secret,
-      cwd: t.cwd,
+      revision: server.secretsRevision,
       shell,
       project,
+      projectKey: server.projectKey,
     });
     transport = stdio;
     endReason = () => (stdio.exit ? describeExit(stdio.exit) : null);
   } else {
-    const { plain, secret } = splitValues(t.headers);
     // A project server's URL and headers are expanded by the backend.
     const { id: session, url: opened } = project
       ? await invoke<{ id: number; url: string }>("mcp_project_http_open", {
           serverId: server.id,
+          projectKey: server.projectKey,
           shell,
         })
       : {
           id: await invoke<number>("mcp_http_open", {
             serverId: server.id,
-            url: t.url,
-            headers: plain,
-            secretHeaders: secret,
+            revision: server.secretsRevision,
           }),
           url: t.url,
         };

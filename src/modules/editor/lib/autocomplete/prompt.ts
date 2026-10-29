@@ -1,4 +1,6 @@
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 export type CompletionRequest = {
+  document?: { workspace: WorkspaceEnv; allowed: boolean };
   prefix: string;
   suffix: string;
   language: string | null;

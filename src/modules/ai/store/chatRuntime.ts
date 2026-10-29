@@ -1,3 +1,5 @@
+import { requireCurrentPreferences } from "@/modules/settings/readiness";
+import { assertChatNotStopping } from "./chatStop";
 import { Chat, type UIMessage } from "@ai-sdk/react";
 import {
   type ChatTransport,
@@ -7,7 +9,10 @@ import { usePreferencesStore } from "@/modules/settings/preferences";
 import { BUILTIN_AGENTS } from "../lib/agents";
 import { useAgentsStore } from "./agentsStore";
 import { usePlanStore } from "./planStore";
-import { denyUnansweredApprovals } from "../lib/toolApprovals";
+import {
+  denyUnansweredApprovals,
+  EXPIRED_APPROVAL_REASON,
+} from "../lib/toolApprovals";
 import { createContextAwareTransport } from "../lib/transport";
 import type { ToolContext } from "../tools/tools";
 import {
@@ -40,8 +45,24 @@ function makeChat(sessionId: string): Chat<UIMessage> {
   };
 
   const transport = createContextAwareTransport({
+    assertReady: requireCurrentPreferences,
     getKeys: () => useChatStore.getState().apiKeys,
     toolContext,
+    captureToolContext: () => {
+      const current = useChatStore.getState().live;
+      const live = current.capture?.() ?? current;
+      return {
+        ...toolContext,
+        spaceId: live.spaceId,
+        getCwd: live.getCwd,
+        getWorkspaceRoot: live.getWorkspaceRoot,
+        getTerminalContext: live.getTerminalContext,
+        isActiveTerminalPrivate: live.isActiveTerminalPrivate,
+        injectIntoActivePty: live.injectIntoActivePty,
+        openPreview: live.openPreview,
+        spawnAgent: (prompt) => live.spawnManagedAgent(prompt, sessionId),
+      };
+    },
     getModelId: () => useChatStore.getState().selectedModelId,
     getCustomInstructions: () =>
       usePreferencesStore.getState().customInstructions,
@@ -67,12 +88,9 @@ function makeChat(sessionId: string): Chat<UIMessage> {
       usePreferencesStore.getState().reasoningEffortByModel[
         useChatStore.getState().selectedModelId
       ],
-    getSkills: async (root) => {
-      const [{ loadAgentSkills }, { currentWorkspaceEnv }] = await Promise.all([
-        import("@/modules/skills/catalog"),
-        import("@/modules/workspace"),
-      ]);
-      return loadAgentSkills(root, currentWorkspaceEnv());
+    getSkills: async (root, workspace) => {
+      const { loadAgentSkills } = await import("@/modules/skills/catalog");
+      return loadAgentSkills(root, workspace);
     },
     getLmstudioBaseURL: () => usePreferencesStore.getState().lmstudioBaseURL,
     getLmstudioModelId: () => usePreferencesStore.getState().lmstudioModelId,
@@ -80,12 +98,6 @@ function makeChat(sessionId: string): Chat<UIMessage> {
     getMlxModelId: () => usePreferencesStore.getState().mlxModelId,
     getOllamaBaseURL: () => usePreferencesStore.getState().ollamaBaseURL,
     getOllamaModelId: () => usePreferencesStore.getState().ollamaModelId,
-    getOpenaiCompatibleBaseURL: () =>
-      usePreferencesStore.getState().openaiCompatibleBaseURL,
-    getOpenaiCompatibleModelId: () =>
-      usePreferencesStore.getState().openaiCompatibleModelId,
-    getOpenaiCompatibleContextLimit: () =>
-      usePreferencesStore.getState().openaiCompatibleContextLimit,
     getOpenrouterModelId: () =>
       usePreferencesStore.getState().openrouterModelId,
     getCustomEndpoints: () => usePreferencesStore.getState().customEndpoints,
@@ -115,7 +127,9 @@ function makeChat(sessionId: string): Chat<UIMessage> {
   return new Chat<UIMessage>({
     id: sessionId,
     transport,
-    messages: initialMessages,
+    messages: initialMessages
+      ? denyUnansweredApprovals(initialMessages, EXPIRED_APPROVAL_REASON)
+      : undefined,
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
     onError: (e) => {
       patchConversationMeta(sessionId, {
@@ -142,13 +156,20 @@ type OutgoingMessage = Parameters<Chat<UIMessage>["sendMessage"]>[0];
 /** Every user message goes through here: it supersedes approvals still
  *  waiting, which are settled as denied first so the request carries a result
  *  for each call. */
-export function sendUserMessage(
+export async function sendUserMessage(
   chat: Chat<UIMessage>,
   message: OutgoingMessage,
+  onAccepted?: () => void,
 ): Promise<void> {
+  // Keep context capture synchronous with submission. The transport checks the
+  // shared native barrier before any work starts, including approval continuations.
+  requireCurrentPreferences();
+  assertChatNotStopping(chat.id);
   const settled = denyUnansweredApprovals(chat.messages);
   if (settled !== chat.messages) chat.messages = settled;
-  return chat.sendMessage(message);
+  const sent = chat.sendMessage(message);
+  onAccepted?.();
+  return sent;
 }
 
 /** Sends `text` in the active session. A model that cannot run (a missing

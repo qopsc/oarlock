@@ -114,6 +114,37 @@ There are no releases yet: until the first one, build Oarlock from source (below
 2. Pick a provider and paste your API key. For local inference, point Oarlock at your LM Studio / MLX / Ollama endpoint.
 3. Keys go to the OS keychain (the macOS Keychain, the Windows Credential Manager); on Linux they go to a file in the app's data folder that only your user can read. They never go to localStorage or the logs.
 
+Custom and local AI requests follow redirects only within the configured URL's
+scheme, host and port. If a redirect is refused, configure the final API endpoint
+URL instead. Native AI, MCP, OAuth, local-model probes and Markdown image requests
+connect directly and ignore environment and OS HTTP proxy settings so their
+validated DNS addresses remain authoritative. Proxy-only networks are currently
+unsupported for those requests. Built-in providers using browser requests retain
+the webview's networking behavior.
+
+Native DNS resolution uses your system configuration and waits up to 10 seconds.
+It allows 8 active lookups and 32 waiting callers, reporting a busy error beyond
+that. Cancelling a request cannot kill a running system lookup; it remains counted
+until it returns.
+
+Connection probes have a 5-second total deadline, preview images 20 seconds,
+and each OAuth HTTP operation 30 seconds. These include DNS, redirects and
+response reads; a probe finishes at response headers. Interactive sign-in still
+allows five minutes for completing the browser flow.
+Endpoint Test probes cancel when you change the URL, retest, collapse or close
+the card, or reload or close Settings. Up to eight run across the app at once;
+additional tests report a busy error without consuming chat request slots.
+Automatic MCP sign-in discovery has its own eight-request limit and a bounded
+Settings queue. Closing Settings, editing or disabling a server, or starting an
+authentication action cancels its unfinished discovery. Failures show Retry
+discovery; temporary server errors are not treated as missing metadata.
+
+Browse Models allows up to 30 seconds for the complete response and rejects lists
+over 4 MiB, 2,000 entries or 1,024 characters per model ID with an explicit error.
+Closing or hiding a Markdown preview releases its remote images and cancels loads
+that no other preview needs. Unused images retain at most 32 entries and 32 MiB of
+encoded image data per window; visible images are not evicted by this idle budget.
+
 ## Build from source
 
 **Prerequisites**
@@ -125,8 +156,15 @@ There are no releases yet: until the first one, build Oarlock from source (below
 ```bash
 bun install
 bun run tauri dev       # development
-bun run tauri build     # production bundle
+bun run tauri build     # local release bundle
 ```
+
+On macOS, local builds without an Apple signing identity include an ad-hoc-signed
+Git helper that refuses execution. Distribution builds must set
+`OARLOCK_DISTRIBUTION_BUILD=1`, provide `APPLE_SIGNING_IDENTITY` and `APPLE_TEAM_ID`,
+and verify the signed app with `scripts/git-worker/verify-app.mjs`. The release
+workflow enforces this policy. Local ad-hoc signing does not enable isolated Git
+execution.
 
 **Checks**
 ```bash

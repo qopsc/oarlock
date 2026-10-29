@@ -1,10 +1,20 @@
+pub(crate) mod access_control;
+pub mod attachment;
 pub mod clipboard;
 pub mod copy;
+mod copy_owned;
+mod destination;
+pub(crate) mod document_save;
 pub mod file;
+pub(crate) mod file_identity;
+pub mod formatter;
 pub mod grep;
 pub mod index;
+pub mod interactive;
 pub mod launch;
 pub mod mutate;
+pub mod mutation_events;
+pub(crate) mod private_staging;
 mod run_prompt;
 pub mod search;
 pub mod supersede;
@@ -16,6 +26,17 @@ use std::path::Path;
 use tauri::Manager;
 
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
+
+/// Refuse operations that cannot yet bind the final directory entry to the
+/// object the user selected. A pinned parent alone does not prevent replacing
+/// that entry immediately before an unlink or rename.
+pub(crate) fn require_owned_entry_operation() -> Result<(), String> {
+    Err("This file operation is unavailable because its target cannot be safely verified. Use a terminal or your system file manager instead.".into())
+}
+
+#[cfg(test)]
+#[path = "entry_operation_guard_tests.rs"]
+mod entry_operation_guard_tests;
 
 /// Runs blocking filesystem work off the async workers and the main thread.
 /// Tauri runs a non-async command inline in the IPC handler (the main thread on
@@ -42,7 +63,7 @@ pub(crate) fn authorized_root(
     let workspace = workspace.cloned().unwrap_or_default();
     app.state::<WorkspaceRegistry>()
         .gates(origin)
-        .authorized_existing(&resolve_path(path, &workspace))
+        .authorized_existing(&resolve_path(path, &workspace)?)
         .map(drop)
 }
 

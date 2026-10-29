@@ -13,7 +13,12 @@ export function pathToFileUri(path: string): string {
 
 export function fileUriToPath(uri: string): string | null {
   if (!uri.startsWith("file://")) return null;
-  let p = decodeURIComponent(uri.slice("file://".length));
+  let p: string;
+  try {
+    p = decodeURIComponent(uri.slice("file://".length));
+  } catch {
+    return null;
+  }
   // Windows drive-letter URIs carry a leading slash (file:///C:/dir), and
   // servers spell the drive either way (pyright sends file:///d%3A/dir).
   if (/^\/[A-Za-z]:\//.test(p)) p = p[1].toUpperCase() + p.slice(2);

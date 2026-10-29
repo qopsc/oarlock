@@ -14,6 +14,9 @@ export type TerminalPromptAnswer = "allow" | "deny";
 
 type PendingPrompt = {
   readonly id: number;
+  readonly owner: AbortSignal;
+  readonly match: string;
+  readonly promise: Promise<TerminalPromptAnswer>;
   readonly request: TerminalPromptRequest;
   readonly resolve: (answer: TerminalPromptAnswer) => void;
 };
@@ -39,43 +42,43 @@ export const useTerminalPromptStore = create<TerminalPromptStore>((set) => ({
     }),
 }));
 
-/**
- * Asks the user; resolves when they answer. Repeated clipboard reads while one
- * is pending share its answer, so a program polling OSC 52 cannot stack
- * dialogs.
- */
+/** Matching reads share one promise only within their live terminal generation. */
 export function requestTerminalPrompt(
   request: TerminalPromptRequest,
+  owner: AbortSignal,
+  match = "",
 ): Promise<TerminalPromptAnswer> {
+  if (owner.aborted) return Promise.resolve("deny");
   const { queue } = useTerminalPromptStore.getState();
   if (request.kind === "clipboard-read") {
     const waiting = queue.find(
-      (entry) => entry.request.kind === "clipboard-read",
+      (entry) =>
+        entry.owner === owner &&
+        entry.match === match &&
+        entry.request.kind === "clipboard-read" &&
+        entry.request.program === request.program,
     );
-    if (waiting) {
-      return new Promise((resolve) => {
-        const original = waiting.resolve;
-        useTerminalPromptStore.setState((state) => ({
-          queue: state.queue.map((entry) =>
-            entry === waiting
-              ? {
-                  ...entry,
-                  resolve: (answer: TerminalPromptAnswer) => {
-                    original(answer);
-                    resolve(answer);
-                  },
-                }
-              : entry,
-          ),
-        }));
-      });
-    }
+    if (waiting) return waiting.promise;
   }
   if (queue.length >= MAX_PENDING) return Promise.resolve("deny");
-  return new Promise((resolve) => {
-    const prompt: PendingPrompt = { id: nextId++, request, resolve };
-    useTerminalPromptStore.setState((state) => ({
-      queue: [...state.queue, prompt],
-    }));
+  const id = nextId++;
+  let settle!: (answer: TerminalPromptAnswer) => void;
+  const promise = new Promise<TerminalPromptAnswer>((resolve) => {
+    settle = resolve;
   });
+  const cancel = () => useTerminalPromptStore.getState().answer(id, "deny");
+  const prompt: PendingPrompt = {
+    id,
+    request,
+    owner,
+    match,
+    promise,
+    resolve: (answer) => {
+      owner.removeEventListener("abort", cancel);
+      settle(owner.aborted ? "deny" : answer);
+    },
+  };
+  owner.addEventListener("abort", cancel, { once: true });
+  useTerminalPromptStore.setState({ queue: [...queue, prompt] });
+  return promise;
 }

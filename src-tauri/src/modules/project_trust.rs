@@ -202,7 +202,7 @@ pub fn join_display(base: &str, relative: &str) -> String {
 /// The project a window names: its real root must be an existing folder.
 pub fn resolve_project(root: &str, workspace: Option<WorkspaceEnv>) -> Result<OpenProject, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
-    let real = std::fs::canonicalize(resolve_path(root, &workspace))
+    let real = std::fs::canonicalize(resolve_path(root, &workspace)?)
         .map_err(|e| format!("project folder not accessible: {e}"))?;
     if !real.is_dir() {
         return Err(format!("not a folder: {root}"));
@@ -1501,7 +1501,10 @@ mod tests {
         apply_decisions(&mut file, &project("/p"), &current, &both, 1).unwrap();
         assert!(revoke_in(&mut file, "/p", Some(ItemKind::ClaudeSkills)));
         assert_eq!(decided(&file, "/p", ItemKind::ClaudeSkills, "a"), None);
-        assert_eq!(decided(&file, "/p", ItemKind::OarlockSkills, "b"), Some(true));
+        assert_eq!(
+            decided(&file, "/p", ItemKind::OarlockSkills, "b"),
+            Some(true)
+        );
         assert!(revoke_in(&mut file, "/p", Some(ItemKind::OarlockSkills)));
         assert!(file.projects.is_empty(), "an empty record is dropped");
         apply_decisions(&mut file, &project("/p"), &current, &both, 1).unwrap();

@@ -47,6 +47,7 @@ function requireArtifact(path, label) {
 }
 
 const target =
+  process.env.TAURI_ENV_TARGET_TRIPLE?.trim() ||
   process.env.OARLOCK_CLI_TARGET?.trim() ||
   process.env.CARGO_BUILD_TARGET?.trim() ||
   hostTriple();
@@ -66,11 +67,32 @@ if (release) cargoArgs.push("--release");
 
 run("cargo", cargoArgs);
 
+const metadata = JSON.parse(
+  run(
+    "cargo",
+    [
+      "metadata",
+      "--locked",
+      "--no-deps",
+      "--format-version",
+      "1",
+      "--manifest-path",
+      join(tauriDir, "Cargo.toml"),
+    ],
+    { capture: true },
+  ),
+);
+if (
+  typeof metadata.target_directory !== "string" ||
+  !metadata.target_directory
+) {
+  throw new Error("Cargo did not report its artifact directory");
+}
+
 const extension = target.includes("windows") ? ".exe" : "";
 const profile = release ? "release" : "debug";
 const source = join(
-  tauriDir,
-  "target",
+  metadata.target_directory,
   target,
   profile,
   `oarlock-cli${extension}`,

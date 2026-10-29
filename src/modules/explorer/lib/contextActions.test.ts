@@ -18,3 +18,10 @@ describe("relativePath", () => {
     expect(relativePath("/a/b", "/x/y")).toBe("/x/y");
   });
 });
+
+it.each([
+  ["/", "/etc/hosts", "etc/hosts"],
+  ["C:/", "C:/Users/me/file.txt", "Users/me/file.txt"],
+])("copies a relative path from filesystem root %s", (root, path, expected) => {
+  expect(relativePath(root, path)).toBe(expected);
+});

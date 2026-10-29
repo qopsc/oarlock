@@ -109,7 +109,8 @@ export const PROVIDERS: readonly ProviderInfo[] = [
     label: "MLX",
     keyringAccount: "",
     keyPrefix: null,
-    consoleUrl: "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/SERVER.md",
+    consoleUrl:
+      "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/SERVER.md",
   },
   {
     id: "ollama",
@@ -129,44 +130,24 @@ export type CustomEndpoint = {
 };
 
 const COMPAT_MODEL_PREFIX = "compat-";
+export const LEGACY_COMPAT_MODEL_ID = "openai-compatible-custom";
+/** Historical references name the native endpoint created by migration. */
+export function canonicalModelId(modelId: string): string {
+  return modelId === LEGACY_COMPAT_MODEL_ID ? "compat-legacy" : modelId;
+}
 
 export function compatModelIdForEndpoint(endpointId: string): string {
   return `${COMPAT_MODEL_PREFIX}${endpointId}`;
 }
 
 export function isCompatModelId(modelId: string): boolean {
-  return modelId.startsWith(COMPAT_MODEL_PREFIX);
+  return canonicalModelId(modelId).startsWith(COMPAT_MODEL_PREFIX);
 }
 
 export function endpointIdFromCompatModel(modelId: string): string {
   return isCompatModelId(modelId)
-    ? modelId.slice(COMPAT_MODEL_PREFIX.length)
+    ? canonicalModelId(modelId).slice(COMPAT_MODEL_PREFIX.length)
     : "";
-}
-
-/** The migrated legacy endpoint is derived again on every load until the list
- *  is first saved, so its id must not change: the default model, favorites
- *  and recents refer to it by `compat-<id>`. */
-export const LEGACY_COMPAT_ENDPOINT_ID = "legacy";
-
-/** Migration of the legacy single OpenAI-compatible config into the
- *  named-endpoint list. Returns one endpoint when the old base URL + model id
- *  were both set, else empty. */
-export function migrateLegacyCompatEndpoint(
-  baseURL: string,
-  modelId: string,
-  contextLimit: number,
-): CustomEndpoint[] {
-  if (!baseURL.trim() || !modelId.trim()) return [];
-  return [
-    {
-      id: LEGACY_COMPAT_ENDPOINT_ID,
-      name: "Custom endpoint",
-      baseURL,
-      modelId,
-      contextLimit,
-    },
-  ];
 }
 
 /** An endpoint the app can build a model for. */
@@ -802,24 +783,21 @@ export function getModelContextLimit(
 ): number {
   if (!modelId) return 128_000;
   if (isCompatModelId(modelId)) return compatOverride ?? 128_000;
-  if (modelId === "openai-compatible-custom" && compatOverride)
-    return compatOverride;
   return MODEL_CONTEXT_LIMITS[modelId] ?? 128_000;
 }
 
-/** Context window of any selectable id: a custom endpoint's own setting, the
- *  legacy single endpoint's, or the catalog's. */
+/** Context window comes from the native endpoint (including legacy aliases)
+ *  or the catalog. Old preference fields never override endpoint metadata. */
 export function resolveContextLimit(
   modelId: string,
   endpoints: readonly CustomEndpoint[],
-  legacyCompatLimit?: number,
 ): number {
   return getModelContextLimit(
     modelId,
     isCompatModelId(modelId)
       ? endpoints.find((e) => e.id === endpointIdFromCompatModel(modelId))
           ?.contextLimit
-      : legacyCompatLimit,
+      : undefined,
   );
 }
 

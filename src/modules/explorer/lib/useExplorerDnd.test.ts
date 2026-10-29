@@ -168,6 +168,7 @@ describe("finishExplorerDrag", () => {
       100,
       200,
       isDir,
+      undefined,
     );
     expect(pathDropTarget.clearTarget).toHaveBeenCalledOnce();
     expect(onMove).not.toHaveBeenCalled();
@@ -184,6 +185,9 @@ describe("finishExplorerDrag", () => {
       undefined,
       onMove,
     );
-    expect(onMove).toHaveBeenCalledWith(["/repo/a.ts", "/repo/b.ts"], "/repo/dest");
+    expect(onMove).toHaveBeenCalledWith(
+      ["/repo/a.ts", "/repo/b.ts"],
+      "/repo/dest",
+    );
   });
 });

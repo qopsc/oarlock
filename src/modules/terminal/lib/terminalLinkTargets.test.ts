@@ -97,3 +97,30 @@ describe("file:// hosts", () => {
     ).toMatchObject({ path: "C:/x/y.rs" });
   });
 });
+
+it("rejects malformed file URI escapes without throwing from a click", () => {
+  expect(resolveTerminalLink("file:///repo/100%.ts", null, null)).toBeNull();
+  expect(resolveTerminalLink("file:///repo/%E0%A4.ts", null, null)).toBeNull();
+});
+it("keeps UNC share roots when resolving relative terminal links", () => {
+  expect(joinPath("\\\\server\\share\\repo", "src\\a.ts")).toBe(
+    "\\\\server\\share\\repo\\src\\a.ts",
+  );
+  expect(joinPath("\\\\server\\share", "a.ts")).toBe("\\\\server\\share\\a.ts");
+  expect(joinPath("\\\\server\\share\\repo", "..\\..\\a.ts")).toBe(
+    "\\\\server\\share\\a.ts",
+  );
+});
+
+it("opens a bare diagnostic filename with line and column as a file", () => {
+  expect(resolveTerminalLink("main.rs:42:7", "/repo", null)).toEqual({
+    kind: "file",
+    path: "/repo/main.rs",
+    line: 42,
+    column: 7,
+  });
+  expect(resolveTerminalLink("tel:12345", "/repo", null)).toEqual({
+    kind: "external",
+    url: "tel:12345",
+  });
+});

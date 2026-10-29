@@ -1,9 +1,9 @@
+import { useOwnedWorkspace } from "./owner";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 import { useAllFolders } from "./allFolders";
 import {
   currentWorkspaceEnv,
-  useWorkspaceEnvStore,
   type WorkspaceEnv,
   workspaceScopeKey,
 } from "./env";
@@ -44,7 +44,7 @@ export async function workspaceAssetUrl(
  * through the asset protocol at once.
  */
 export function useWorkspaceAssetUrl(path: string | null): string | null {
-  const workspace = useWorkspaceEnvStore((s) => s.env);
+  const workspace = useOwnedWorkspace();
   const allFolders = useAllFolders((s) => s.app);
   const key =
     path === null

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SAMPLING_MAX_TOKENS, type SamplingDraft } from "../lib/sampling";
 
 const mocks = vi.hoisted(() => ({
+  ready: true,
   generateText: vi.fn(),
   build: vi.fn(),
   count: vi.fn(),
@@ -21,7 +22,12 @@ vi.mock("@/modules/ai/store/modelConfig", () => ({
 }));
 vi.mock("@/modules/settings/preferences", () => ({
   usePreferencesStore: {
-    getState: () => ({ reasoningEffortByModel: mocks.efforts }),
+    getState: () => ({
+      hydrated: mocks.ready,
+      error: null,
+      syncing: false,
+      reasoningEffortByModel: mocks.efforts,
+    }),
   },
 }));
 
@@ -34,6 +40,7 @@ const draft: SamplingDraft = {
 };
 
 beforeEach(() => {
+  mocks.ready = true;
   mocks.generateText.mockReset();
   mocks.generateText.mockResolvedValue({
     text: "Paris",
@@ -175,3 +182,25 @@ describe("runSampling", () => {
     expect(mocks.count).not.toHaveBeenCalled();
   });
 });
+it.each(["before", "during"])(
+  "refuses sampling when preferences become unresolved %s model loading",
+  async (phase) => {
+    if (phase === "before") mocks.ready = false;
+    else
+      mocks.build.mockImplementationOnce(async () => {
+        mocks.ready = false;
+        return "MODEL";
+      });
+    await expect(
+      runSampling({
+        modelId: "gemini-2.5-pro",
+        draft,
+        temperature: null,
+        stopSequences: [],
+        conversationId: null,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("Preferences");
+    expect(mocks.generateText).not.toHaveBeenCalled();
+  },
+);

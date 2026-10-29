@@ -1,3 +1,4 @@
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   createContext,
   useCallback,
@@ -8,17 +9,12 @@ import {
 } from "react";
 import {
   DEFAULT_THEME_ID,
-  loadPreferences,
-  onPreferencesChange,
   setTheme as persistTheme,
   setThemeId as persistThemeId,
   type ThemePref,
 } from "@/modules/settings/store";
 import { applyTheme, clearTheme } from "./applyTheme";
-import {
-  listCustomThemes,
-  onCustomThemesChange,
-} from "./customThemes";
+import { watchCustomThemes } from "./customThemes";
 import { SurfaceLayer } from "./SurfaceLayer";
 import { getBuiltinTheme, getDefaultTheme } from "./themes";
 import type { Theme } from "./types";
@@ -36,6 +32,9 @@ type ThemeProviderState = {
   themeId: string;
   activeTheme: Theme;
   customThemes: Theme[];
+  customThemesError: string | null;
+  customThemesReady: boolean;
+  retryCustomThemes: () => void;
   setMode: (mode: ThemePref) => void;
   setThemeId: (id: string) => void;
   /** Apply a theme transiently without persisting; null reverts to committed. */
@@ -54,7 +53,11 @@ function readFastMode(fallback: ThemePref): ThemePref {
 }
 
 function writeFastMode(t: ThemePref): void {
-  try { window.localStorage.setItem(FAST_PATH_KEY, t); } catch { /* ignore */ }
+  try {
+    window.localStorage.setItem(FAST_PATH_KEY, t);
+  } catch {
+    /* ignore */
+  }
 }
 
 function readFastThemeId(): string {
@@ -63,18 +66,35 @@ function readFastThemeId(): string {
 }
 
 function writeFastThemeId(id: string): void {
-  try { window.localStorage.setItem(FAST_PATH_THEME_ID, id); } catch { /* ignore */ }
+  try {
+    window.localStorage.setItem(FAST_PATH_THEME_ID, id);
+  } catch {
+    /* ignore */
+  }
 }
 
 function resolveTheme(id: string, custom: Theme[]): Theme {
-  return custom.find((t) => t.id === id) ?? getBuiltinTheme(id) ?? getDefaultTheme();
+  return (
+    custom.find((t) => t.id === id) ?? getBuiltinTheme(id) ?? getDefaultTheme()
+  );
 }
 
-export function ThemeProvider({ children, defaultMode = "system" }: ThemeProviderProps) {
-  const [mode, setModeState] = useState<ThemePref>(() => readFastMode(defaultMode));
+export function ThemeProvider({
+  children,
+  defaultMode = "system",
+}: ThemeProviderProps) {
+  const [mode, setModeState] = useState<ThemePref>(() =>
+    readFastMode(defaultMode),
+  );
   const [themeId, setThemeIdState] = useState<string>(() => readFastThemeId());
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [customThemes, setCustomThemes] = useState<Theme[]>([]);
+  const [customThemesError, setCustomThemesError] = useState<string | null>(
+    null,
+  );
+  const [customThemesReady, setCustomThemesReady] = useState(false);
+  const [themeRetry, setThemeRetry] = useState(0);
+  const retryCustomThemes = useCallback(() => setThemeRetry((n) => n + 1), []);
   const [systemDark, setSystemDark] = useState<boolean>(() =>
     typeof window === "undefined"
       ? true
@@ -82,40 +102,58 @@ export function ThemeProvider({ children, defaultMode = "system" }: ThemeProvide
   );
 
   useEffect(() => {
-    let alive = true;
-    void loadPreferences().then((p) => {
-      if (!alive) return;
-      setModeState(p.theme);
-      setThemeIdState(p.themeId);
-      writeFastMode(p.theme);
-      writeFastThemeId(p.themeId);
-    });
-    const unlistenP = onPreferencesChange((key, value) => {
-      if (key === "theme" && (value === "system" || value === "light" || value === "dark")) {
-        setModeState(value);
-        writeFastMode(value);
-      } else if (key === "themeId" && typeof value === "string") {
-        setThemeIdState(value);
-        writeFastThemeId(value);
+    let mode: ThemePref | undefined;
+    let themeId: string | undefined;
+    const apply = () => {
+      const p = usePreferencesStore.getState();
+      if (!p.hydrated) return;
+      if (mode !== p.theme) {
+        mode = p.theme;
+        setModeState(mode);
+        writeFastMode(mode);
       }
-    });
-    return () => {
-      alive = false;
-      void unlistenP.then((fn) => fn());
+      if (themeId !== p.themeId) {
+        themeId = p.themeId;
+        setThemeIdState(themeId);
+        writeFastThemeId(themeId);
+      }
     };
+    const stop = usePreferencesStore.subscribe(apply);
+    void usePreferencesStore
+      .getState()
+      .init()
+      .catch(() => {});
+    apply();
+    return stop;
   }, []);
 
   useEffect(() => {
+    void themeRetry;
     let alive = true;
-    void listCustomThemes().then((list) => { if (alive) setCustomThemes(list); });
-    const unlisten = onCustomThemesChange(() => {
-      void listCustomThemes().then((list) => setCustomThemes(list));
-    });
+    let stop: (() => void) | undefined;
+    setCustomThemesReady(false);
+    const failed = (error: unknown) => {
+      if (alive) {
+        setCustomThemesError(String(error));
+        setCustomThemesReady(false);
+      }
+    };
+    void watchCustomThemes((snapshot) => {
+      if (!alive) return;
+      setCustomThemes(snapshot.themes);
+      setCustomThemesError(null);
+      setCustomThemesReady(true);
+    }, failed)
+      .then((unlisten) => {
+        if (alive) stop = unlisten;
+        else unlisten();
+      })
+      .catch(failed);
     return () => {
       alive = false;
-      void unlisten.then((fn) => fn());
+      stop?.();
     };
-  }, []);
+  }, [themeRetry]);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -170,6 +208,9 @@ export function ThemeProvider({ children, defaultMode = "system" }: ThemeProvide
       themeId,
       activeTheme,
       customThemes,
+      customThemesError,
+      customThemesReady,
+      retryCustomThemes,
       setMode,
       setThemeId,
       previewThemeId,
@@ -180,6 +221,9 @@ export function ThemeProvider({ children, defaultMode = "system" }: ThemeProvide
       themeId,
       activeTheme,
       customThemes,
+      customThemesError,
+      customThemesReady,
+      retryCustomThemes,
       setMode,
       setThemeId,
       previewThemeId,

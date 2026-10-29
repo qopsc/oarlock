@@ -1,3 +1,4 @@
+import { installClipboardCopyBarrier } from "@/lib/clipboardWrite";
 import "./styles/globals.css";
 
 import { invoke } from "@tauri-apps/api/core";
@@ -14,6 +15,7 @@ if (USE_CUSTOM_WINDOW_CONTROLS) {
   document.documentElement.dataset.chrome = "borderless";
 }
 installNativeContextMenuGuard();
+installClipboardCopyBarrier();
 installWindowFrame();
 
 // Render-instrumentation overlay, opt-in: `VITE_REACT_SCAN=true bun run dev`.

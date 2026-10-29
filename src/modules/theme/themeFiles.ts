@@ -51,7 +51,8 @@ export async function deleteThemeFile(id: string): Promise<void> {
   try {
     const path = await themeFilePath(id);
     await invoke("fs_delete", { path, workspace: LOCAL_WORKSPACE });
-  } catch {
+  } catch (error) {
+    if (String(error).includes("target cannot be safely verified")) throw error;
     /* file may not exist yet — nothing to clean up */
   }
 }

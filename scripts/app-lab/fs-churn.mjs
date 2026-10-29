@@ -26,8 +26,8 @@ if (!mode || !root) {
 
 if (mode === "prepare") {
   const source = rest[0] ?? path.resolve(new URL("../..", import.meta.url).pathname);
-  fs.rmSync(root, { recursive: true, force: true });
-  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(path.dirname(path.resolve(root)), { recursive: true });
+  fs.mkdirSync(root);
   const archive = execFileSync("git", ["-C", source, "archive", "HEAD"], { maxBuffer: 1 << 30 });
   execFileSync("tar", ["-x", "-C", root], { input: archive });
   for (const dir of ["target/debug/build", "node_modules/.cache", "dist/assets"])

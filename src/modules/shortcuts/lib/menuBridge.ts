@@ -43,6 +43,7 @@ export function startMenuBridge(
   let stopped = false;
   void getCurrentWindow()
     .listen<unknown>(MENU_SHORTCUT_EVENT, ({ payload }) => {
+      if (stopped) return;
       const shortcut = parseMenuShortcut(payload);
       if (shortcut) run(shortcut);
     })

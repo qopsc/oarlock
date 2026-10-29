@@ -1,3 +1,4 @@
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { ToolExecutionOptions } from "ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -63,6 +64,12 @@ vi.mock("@tauri-apps/plugin-store", () => ({
     }
   },
 }));
+vi.mock("../store/subagentTasks", () => ({
+  initializeTasks: async () => {},
+  taskOwner: async () => 1,
+  taskCommand: async () => {},
+  registerTask: () => () => {},
+}));
 vi.mock("../lib/native", () => ({ native: {} }));
 vi.mock("../lib/modelPrefs", () => ({ pushRecentModel: vi.fn() }));
 vi.mock("../store/modelConfig", () => ({
@@ -113,6 +120,7 @@ function openConversation(id: string) {
 }
 
 beforeEach(() => {
+  usePreferencesStore.setState({ hydrated: true, syncing: false, error: null });
   provider.steps = [
     [1_000, 800, 50],
     [2_000, 1_500, 70],

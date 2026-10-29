@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 const manager = vi.hoisted(() => ({
+  listen: vi.fn(async () => {}),
   synced: [] as unknown[],
   starting: true,
   waited: 0,
@@ -10,8 +11,10 @@ const manager = vi.hoisted(() => ({
 vi.mock("./manager", () => ({
   McpManager: class {
     extras = { kind: "extras", waitForLists: async () => {} };
-    listen = async () => {};
-    sync = (servers: unknown) => manager.synced.push(servers);
+    listen = manager.listen;
+    refresh = async () => {
+      manager.synced.push([]);
+    };
     hasStarting = () => manager.starting;
     waitForStarting = async () => {
       manager.waited += 1;
@@ -50,7 +53,10 @@ import { extras, prepareExtras, toolsForRun } from "./index";
 describe("toolsForRun", () => {
   it("syncs the window's servers, waits for starting ones and builds agent tools", async () => {
     const onWaiting = vi.fn();
-    const run = await toolsForRun([], { onWaiting });
+    const run = await toolsForRun([], {
+      onWaiting,
+      offeredIds: new Set(["s1"]),
+    });
     expect(manager.synced).toHaveLength(1);
     expect(onWaiting).toHaveBeenCalledTimes(1);
     expect(manager.waited).toBe(1);
@@ -85,7 +91,7 @@ describe("toolsForRun", () => {
   it("does not wait when nothing is starting", async () => {
     manager.starting = false;
     const onWaiting = vi.fn();
-    await toolsForRun([], { onWaiting });
+    await toolsForRun([], { onWaiting, offeredIds: new Set(["s1"]) });
     expect(onWaiting).not.toHaveBeenCalled();
   });
 });
@@ -102,4 +108,21 @@ describe("prepareExtras", () => {
     expect(onWaiting).toHaveBeenCalledTimes(1);
     expect(extras()).toMatchObject({ kind: "extras" });
   });
+});
+
+it("does not start servers when Stop arrives during listener setup", async () => {
+  let ready!: () => void;
+  manager.listen.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        ready = resolve;
+      }),
+  );
+  const controller = new AbortController();
+  const synced = manager.synced.length;
+  const pending = toolsForRun([], { signal: controller.signal });
+  controller.abort();
+  ready();
+  await expect(pending).rejects.toThrow();
+  expect(manager.synced).toHaveLength(synced);
 });

@@ -3,6 +3,7 @@ import { useMcpExtras } from "./lib/extrasCatalog";
 
 const state = vi.hoisted(() => ({
   servers: [] as { enabled: boolean }[],
+  projectServers: [] as { enabled: boolean }[],
   runtimeLoaded: false,
   prepared: 0,
   wait: false,
@@ -12,6 +13,7 @@ const state = vi.hoisted(() => ({
 
 vi.mock("./lib/configStore", () => ({
   loadServers: async () => state.servers,
+  loadWindowServers: async () => [...state.servers, ...state.projectServers],
 }));
 vi.mock("./runtime", async () => {
   state.runtimeLoaded = true;
@@ -45,6 +47,7 @@ import {
 
 beforeEach(() => {
   state.prepared = 0;
+  state.projectServers = [];
   state.wait = false;
   state.fail = false;
   state.startingSeen = [];
@@ -64,6 +67,14 @@ describe("ensureMcpExtras", () => {
         {},
       ),
     ).resolves.toEqual([]);
+  });
+
+  it("starts a project-only server before the first model run", async () => {
+    state.servers = [];
+    state.projectServers = [{ enabled: true }];
+    await ensureMcpExtras(true);
+    expect(state.runtimeLoaded).toBe(true);
+    expect(state.prepared).toBe(1);
   });
 
   it("starts the servers once a server is enabled, saying so while they start", async () => {

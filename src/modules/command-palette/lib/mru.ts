@@ -9,7 +9,17 @@ type MruMap = Record<string, number>;
 function read(): MruMap {
   try {
     const raw = localStorage.getItem(KEY);
-    return raw ? (JSON.parse(raw) as MruMap) : {};
+    const parsed: unknown = raw ? JSON.parse(raw) : {};
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed) ||
+      !Object.values(parsed).every(
+        (value) => typeof value === "number" && Number.isFinite(value),
+      )
+    )
+      return {};
+    return parsed as MruMap;
   } catch {
     return {};
   }

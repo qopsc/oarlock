@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, WebviewWindow};
+use tauri::{AppHandle, Manager, WebviewWindow};
 
 use super::names::{
     secret_account, valid_env_name, valid_header_name, valid_value, SecretKind, SECRET_SERVICE,
@@ -236,7 +236,8 @@ pub fn parse_entry(name: &str, value: &Value) -> RawEntry {
             }
         }
         if obj.contains_key("envFile") {
-            warnings.push("it reads an envFile, which Oarlock does not; add those variables".into());
+            warnings
+                .push("it reads an envFile, which Oarlock does not; add those variables".into());
         }
         entry.transport = Some(RawTransport::Stdio {
             command: command.to_owned(),
@@ -822,8 +823,11 @@ pub async fn mcp_import_secrets(
     picks: Vec<ImportPick>,
 ) -> Result<Vec<PickResult>, String> {
     require_settings(&window)?;
+    let state = app.state::<super::McpState>();
+    let _held = state.settings.lock().await;
     for pick in &picks {
         require_server_id(&pick.server_id)?;
+        super::credentials::require_unconfigured(&app, &pick.server_id)?;
     }
     let wanted: Vec<App> = picks.iter().map(|p| p.app).collect();
     let parsed = crate::modules::fs::blocking(move || {

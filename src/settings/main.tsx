@@ -1,3 +1,4 @@
+import { installClipboardCopyBarrier } from "@/lib/clipboardWrite";
 import "../styles/globals.css";
 
 import { installNativeContextMenuGuard } from "@/lib/nativeContextMenu";
@@ -12,6 +13,7 @@ if (USE_CUSTOM_WINDOW_CONTROLS) {
   document.documentElement.dataset.chrome = "borderless";
 }
 installNativeContextMenuGuard();
+installClipboardCopyBarrier();
 installWindowFrame();
 
 ReactDOM.createRoot(

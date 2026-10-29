@@ -7,7 +7,8 @@
 //! the name is a plain file name in the data folder, or the calling window's own spaces store
 //! (`windows/<label>/oarlock-spaces.json`, `windows.rs`). Every other store command takes the
 //! resource id of a store opened that way. The backend's own stores (`StoreExt`) are not
-//! affected.
+//! affected. Native-owned MCP and endpoint settings are never opened by this plugin, including
+//! case aliases on case-insensitive filesystems.
 
 use serde_json::Value as JsonValue;
 use tauri::ipc::{Invoke, InvokeBody};
@@ -108,10 +109,20 @@ fn refusal(command: &str, payload: &InvokeBody, window: &str) -> Option<String> 
 /// A store file the page in `window` may open: a plain file name, which the plugin resolves in
 /// the app's data folder, or that window's own spaces store when it is an extra app window.
 fn allowed_store_path(path: &str, window: &str) -> bool {
-    is_plain_store_name(path)
-        || (window != windows::MAIN
-            && windows::is_app_window(window)
-            && std::path::Path::new(path) == windows::spaces_store(window))
+    ![
+        "oarlock-mcp.json",
+        "oarlock-endpoints.json",
+        "oarlock-preferences.json",
+        "oarlock-themes.json",
+        "oarlock-custom-themes.json",
+        "oarlock-settings.json",
+    ]
+    .iter()
+    .any(|native| path.eq_ignore_ascii_case(native))
+        && (is_plain_store_name(path)
+            || (window != windows::MAIN
+                && windows::is_app_window(window)
+                && std::path::Path::new(path) == windows::spaces_store(window)))
 }
 
 /// One plain file name the same on every platform: ASCII letters, digits, `-`, `_` and inner
@@ -154,16 +165,38 @@ mod tests {
 
     /// Every store file the page opens (`STORE_PATH` in `src/`, and `spacesStorePath`).
     const APP_STORES: &[&str] = &[
-        "oarlock-settings.json",
         "oarlock-ai-sessions.json",
         "oarlock-ai-snippets.json",
         "oarlock-ai-todos.json",
         "oarlock-ai-agents.json",
-        "oarlock-custom-themes.json",
-        "oarlock-mcp.json",
         "oarlock-spaces.json",
     ];
 
+    #[test]
+    fn native_settings_cannot_be_opened_through_the_store_plugin() {
+        for path in [
+            "oarlock-mcp.json",
+            "OARLOCK-MCP.JSON",
+            "Oarlock-Mcp.Json",
+            "oarlock-endpoints.json",
+            "OARLOCK-ENDPOINTS.JSON",
+            "oarlock-preferences.json",
+            "OARLOCK-PREFERENCES.JSON",
+            "oarlock-themes.json",
+            "OARLOCK-THEMES.JSON",
+            "oarlock-custom-themes.json",
+            "OARLOCK-CUSTOM-THEMES.JSON",
+            "oarlock-settings.json",
+            "OARLOCK-SETTINGS.JSON",
+        ] {
+            for window in ["main", "settings", "quick", "w-1"] {
+                assert!(load(json!(path), window).is_some());
+                assert!(
+                    refusal("get_store", &InvokeBody::Json(json!({"path":path})), window).is_some()
+                );
+            }
+        }
+    }
     #[test]
     fn every_store_the_app_opens_is_allowed_in_every_window() {
         for window in ["main", "w-1", "w-32", "settings", "quick"] {

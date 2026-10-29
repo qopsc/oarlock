@@ -1,3 +1,5 @@
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
+import { useRepositoryOwner } from "@/modules/source-control/useRepositoryOwner";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -8,8 +10,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { type GitLogEntry, native } from "@/modules/ai/lib/native";
-import { useEffect, useState } from "react";
+import { type GitLogEntry, createNative } from "@/modules/ai/lib/native";
+import { useEffect, useMemo, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { showFileError } from "@/modules/mac-privacy";
 
@@ -32,38 +35,71 @@ export function UndoCommitDialog({
   onClose,
   onUndone,
 }: Props) {
+  const workspace = useOwnedWorkspace();
+  const native = useMemo(() => createNative(() => workspace), [workspace]);
+  const owner = useRepositoryOwner(repoRoot);
   const sha = target?.commit.sha ?? null;
-  // undefined while asking git, null when no remote branch has the commit.
-  const [pushedTo, setPushedTo] = useState<string | null | undefined>();
+  const [remoteCheck, setRemoteCheck] = useState<{
+    sha: string;
+    repoRoot: string;
+    remote: string | null;
+    failed: boolean;
+    attempt: number;
+  } | null>(null);
+  const [retry, setRetry] = useState(0);
+  const currentCheck =
+    remoteCheck?.sha === sha &&
+    remoteCheck.repoRoot === repoRoot &&
+    remoteCheck.attempt === retry
+      ? remoteCheck
+      : null;
+  const pushedTo = currentCheck?.remote;
+  const checkReady = currentCheck !== null && !currentCheck.failed;
 
   useEffect(() => {
-    setPushedTo(undefined);
+    setRemoteCheck(null);
     if (!sha) return;
     let alive = true;
     native
       .gitCommitOnRemote(repoRoot, sha)
       .then((remote) => {
-        if (alive) setPushedTo(remote);
+        if (alive)
+          setRemoteCheck({
+            sha,
+            repoRoot,
+            remote,
+            failed: false,
+            attempt: retry,
+          });
       })
       .catch(() => {
-        if (alive) setPushedTo(null);
+        if (alive)
+          setRemoteCheck({
+            sha,
+            repoRoot,
+            remote: null,
+            failed: true,
+            attempt: retry,
+          });
       });
     return () => {
       alive = false;
     };
-  }, [repoRoot, sha]);
+  }, [native, repoRoot, sha, retry]);
 
   const undo = async () => {
-    if (!target) return;
+    if (!target || !checkReady || !owner.isCurrent()) return;
     const { commit, branch } = target;
     onClose();
     try {
-      await native.gitUndoCommit(repoRoot, commit.sha);
+      await native.gitUndoCommit(repoRoot, commit.sha, branch);
+      if (!owner.isCurrent()) return;
       toast.success(`Undid ${commit.shortSha} on ${branch}`, {
         description: "Its changes are staged again.",
       });
       onUndone();
     } catch (e) {
+      if (!owner.isCurrent()) return;
       showFileError("Could not undo the commit", {
         path: repoRoot,
         error: e,
@@ -91,11 +127,26 @@ export function UndoCommitDialog({
               : null}
           </AlertDialogDescription>
         </AlertDialogHeader>
+        {currentCheck?.failed ? (
+          <div role="alert" className="space-y-2 text-sm text-destructive">
+            <p>
+              Could not check whether this commit is shared. Retry before
+              undoing it.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setRetry((value) => value + 1)}
+            >
+              Retry check
+            </Button>
+          </div>
+        ) : null}
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
             variant={pushedTo ? "destructive" : "default"}
-            disabled={pushedTo === undefined}
+            disabled={!checkReady}
             onClick={() => void undo()}
           >
             Undo Commit

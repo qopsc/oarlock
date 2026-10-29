@@ -84,3 +84,33 @@ describe("Markdown preview images", () => {
     expect(render("![x](http://example.com/x.png)")).toContain("not loaded");
   });
 });
+
+it("treats the HTTPS scheme case-insensitively while loading remote images", () => {
+  expect(
+    renderToStaticMarkup(
+      <MarkdownImage src="HTTPS://example.test/logo.png" alt="logo" />,
+    ),
+  ).toBe(
+    renderToStaticMarkup(
+      <MarkdownImage src="https://example.test/logo.png" alt="logo" />,
+    ),
+  );
+});
+
+it.each([
+  [
+    "//server/share/docs",
+    "../../other/pic.png",
+    "//server/share/other/pic.png",
+  ],
+  [
+    String.raw`\\server\share\docs`,
+    String.raw`..\..\..\pic.png`,
+    "//server/share/pic.png",
+  ],
+])(
+  "keeps relative images inside UNC share roots: %s",
+  (dir, relative, expected) => {
+    expect(joinPath(dir, relative)).toBe(expected);
+  },
+);

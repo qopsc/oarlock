@@ -60,6 +60,7 @@ grep-regex = "0.1"
 regex = "1"
 grep-searcher = "0.1"
 globset = "0.4"
+glob = "0.3"
 nucleo-matcher = "0.3"
 shared_child = "1"
 tauri-plugin-log = "2"
@@ -86,6 +87,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Skills: content hashes for project trust, and zip installs (both already in the tree).
 sha2 = "0.10"
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
+# Operation-scoped directory handles for authorized creates, save staging and publication.
+cap-std = { version = "4.0.3", default-features = false }
+sha1 = "0.10.6"
 
 [dev-dependencies]
 proptest = "1"
@@ -108,6 +112,8 @@ keyring-core = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Already used by shared_child; reuse its signal-driven wait without reaping a live job leader.
+sigchld = "0.2.5"
 
 # inotify (Linux) and ReadDirectoryChangesW (Windows). macOS drives FSEvents
 # directly (see fs/watch/macos.rs), which keeps notify out of that build.
@@ -126,12 +132,16 @@ objc2-core-services = { version = "0.3", default-features = false, features = ["
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 window-vibrancy = "0.8"
 
+# Already bundled by the clipboard plugin; direct reads preserve typed absence/errors.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring-core = "1"
 windows-native-keyring-store = "1"
 window-vibrancy = "0.8"
-# The OS-level proxy setting (registry) is read by reqwest only with this
-# feature, and the previous reqwest honoured it unconditionally on Windows.
+# Preserve OS proxy support for dependencies such as the updater. Guarded
+# AI/MCP/OAuth/image clients explicitly disable all proxies to keep DNS pinning.
 reqwest = { version = "0.13", default-features = false, features = ["system-proxy"] }
 windows-sys = { version = "0.61", features = [
 	"Wdk_System_SystemServices",

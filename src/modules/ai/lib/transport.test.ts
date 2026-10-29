@@ -1,3 +1,13 @@
+const mcpMock = vi.hoisted(() =>
+  vi.fn<() => Promise<import("@/modules/mcp").McpRunTools | null>>(
+    async () => null,
+  ),
+);
+vi.mock("@/modules/mcp", () => ({ mcpToolsForRun: mcpMock }));
+const platform = vi.hoisted(() => ({ IS_WINDOWS: true }));
+vi.mock("@/lib/platform", () => platform);
+const stopGate = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../store/chatStop", () => ({ assertChatCanStart: stopGate }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const agentMock = vi.hoisted(() => ({
@@ -10,10 +20,15 @@ const nativeMock = vi.hoisted(() => ({
   readProjectMemory: vi.fn(),
 }));
 
-vi.mock("./native", () => ({ native: nativeMock }));
+vi.mock("./native", () => ({
+  native: nativeMock,
+  createNative: () => nativeMock,
+}));
 
 const aiMock = vi.hoisted(() => ({
-  toUIMessageStream: vi.fn(() => "stream-ok"),
+  toUIMessageStream: vi.fn<() => string | ReadableStream<unknown>>(
+    () => "stream-ok",
+  ),
 }));
 
 vi.mock("ai", async (importOriginal) => ({
@@ -33,8 +48,9 @@ function userMessage(text: string): UIMessage {
 
 function makeDeps(live: Record<string, unknown>, modelId = "gpt-test") {
   return {
+    assertReady: () => {},
     getKeys: () => ({}) as never,
-    toolContext: {} as never,
+    toolContext: { getTerminalContext: () => null } as never,
     getModelId: () => modelId,
     getCustomInstructions: () => "",
     getAgentPersona: () => null,
@@ -51,6 +67,35 @@ async function send(messages: UIMessage[], live: Record<string, unknown>) {
     ][0];
   return call.uiMessages as UIMessage[];
 }
+
+it("refuses a restored approval before capturing the currently selected project", async () => {
+  agentMock.runAgentStream.mockClear();
+  const transport = createContextAwareTransport(
+    makeDeps({ workspaceRoot: "/project-b", cwd: "/project-b" }),
+  );
+  await expect(
+    transport.sendMessages({
+      messages: [
+        userMessage("write in project A"),
+        {
+          id: "approval",
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolName: "shell",
+              toolCallId: "write",
+              state: "approval-responded",
+              input: { command: "touch result.txt" },
+              approval: { id: "approve", approved: true },
+            },
+          ],
+        },
+      ],
+    }),
+  ).rejects.toThrow("approval expired");
+  expect(agentMock.runAgentStream).not.toHaveBeenCalled();
+});
 
 function lastUserText(messages: UIMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -100,7 +145,7 @@ describe("context-aware AI transport", () => {
 
     expect(out).not.toBe(original);
     expect(lastUserText(out)).toBe(
-      '<env>\nworkspace_root: /repo\nactive_terminal_cwd: /repo/sub\nactive_file: /repo/a.ts\nactive_terminal_mode: private\n</env>\n\ndo the thing',
+      "<env>\nworkspace_root: /repo\nactive_terminal_cwd: /repo/sub\nactive_file: /repo/a.ts\nactive_terminal_mode: private\n</env>\n\ndo the thing",
     );
     expect(lastUserText(original)).toBe("do the thing");
     expect(out[0]).toBe(original[0]);
@@ -155,9 +200,7 @@ describe("context-aware AI transport", () => {
 
     const parts = out[0].parts as { type: string; text?: string }[];
     expect(parts[0].type).toBe("text");
-    expect(parts[0].text).toBe(
-      "<env>\nworkspace_root: /repo-prepend\n</env>",
-    );
+    expect(parts[0].text).toBe("<env>\nworkspace_root: /repo-prepend\n</env>");
   });
 
   it("passes messages untouched when no live context exists", async () => {
@@ -266,4 +309,431 @@ describe("context-aware AI transport", () => {
     expect(nativeMock.readProjectMemory).not.toHaveBeenCalled();
     expect(lastCall().projectMemory).toBeNull();
   });
+});
+
+it("keeps tool context and read evidence across an approval continuation after navigation", async () => {
+  const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
+  const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
+  useWorkspaceEnvStore.setState({ env: ubuntu });
+  let live = {
+    cwd: "/original",
+    workspaceRoot: "/original",
+    activeFile: null,
+    terminalPrivate: false,
+  };
+  const deps = { ...makeDeps(live), getLive: () => live };
+  const transport = createContextAwareTransport(deps);
+  await transport.sendMessages({ messages: [userMessage("edit")] });
+  const first =
+    agentMock.runAgentStream.mock.calls[
+      agentMock.runAgentStream.mock.calls.length - 1
+    ][0].toolContext;
+  first.readCache.set("/original/a", { size: 1, hash: 1 });
+  live = { ...live, cwd: "/different", workspaceRoot: "/different" };
+  useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Debian" } });
+  await transport.sendMessages({ messages: [userMessage("edit")] });
+  const resumed =
+    agentMock.runAgentStream.mock.calls[
+      agentMock.runAgentStream.mock.calls.length - 1
+    ][0].toolContext;
+  expect(resumed.getCwd()).toBe("/original");
+  expect(resumed.workspace).toEqual(ubuntu);
+  expect(resumed.readCache.has("/original/a")).toBe(true);
+  await transport.sendMessages({
+    messages: [{ ...userMessage("new turn"), id: "u2" }],
+  });
+  const next =
+    agentMock.runAgentStream.mock.calls[
+      agentMock.runAgentStream.mock.calls.length - 1
+    ][0].toolContext;
+  expect(next.getCwd()).toBe("/different");
+  expect(next.readCache.size).toBe(0);
+});
+
+it("pins the workspace before asynchronous Stop admission and checks approval continuations", async () => {
+  const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
+  const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
+  useWorkspaceEnvStore.setState({ env: ubuntu });
+  let live = {
+    cwd: "/original",
+    workspaceRoot: "/original",
+    activeFile: null,
+    terminalPrivate: false,
+  };
+  const deps = {
+    ...makeDeps(live),
+    getLive: () => live,
+    toolContext: {
+      getTerminalContext: () => null,
+      getSessionId: () => "chat",
+      readCache: new Map(),
+    } as never,
+  };
+  let admit!: () => void;
+  stopGate.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        admit = resolve;
+      }),
+  );
+  const transport = createContextAwareTransport(deps);
+  const pending = transport.sendMessages({ messages: [userMessage("edit")] });
+  live = { ...live, cwd: "/different", workspaceRoot: "/different" };
+  useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Debian" } });
+  admit();
+  await pending;
+  const call =
+    agentMock.runAgentStream.mock.calls[
+      agentMock.runAgentStream.mock.calls.length - 1
+    ][0];
+  expect(call.toolContext.workspace).toEqual(ubuntu);
+  expect(call.toolContext.getCwd()).toBe("/original");
+  agentMock.runAgentStream.mockClear();
+  stopGate.mockRejectedValueOnce(new Error("still stopping"));
+  await expect(
+    transport.sendMessages({ messages: [userMessage("edit")] }),
+  ).rejects.toThrow("still stopping");
+  expect(agentMock.runAgentStream).not.toHaveBeenCalled();
+});
+
+it("rejects an unavailable space before reading project memory or starting a model", async () => {
+  const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
+  const previous = useWorkspaceEnvStore.getState().env;
+  platform.IS_WINDOWS = false;
+  useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Ubuntu" } });
+  agentMock.runAgentStream.mockClear();
+  nativeMock.readProjectMemory.mockClear();
+  const getSkills = vi.fn();
+  try {
+    const transport = createContextAwareTransport({
+      ...makeDeps({ workspaceRoot: "/repo", cwd: "/repo" }),
+      getSkills,
+    });
+    await expect(
+      transport.sendMessages({ messages: [userMessage("hello")] }),
+    ).rejects.toThrow("unavailable");
+    expect(nativeMock.readProjectMemory).not.toHaveBeenCalled();
+    expect(getSkills).not.toHaveBeenCalled();
+    expect(agentMock.runAgentStream).not.toHaveBeenCalled();
+  } finally {
+    platform.IS_WINDOWS = true;
+    useWorkspaceEnvStore.setState({ env: previous });
+  }
+});
+
+it("does not start the model after Stop during project preparation", async () => {
+  const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
+  useWorkspaceEnvStore.setState({ env: { kind: "local" } });
+  let finish!: () => void;
+  const preparation = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  nativeMock.readProjectMemory.mockClear();
+  nativeMock.readProjectMemory.mockImplementationOnce(async () => {
+    await preparation;
+    return null;
+  });
+  agentMock.runAgentStream.mockClear();
+  const controller = new AbortController();
+  const transport = createContextAwareTransport(
+    makeDeps({ workspaceRoot: "/repo", cwd: "/repo" }),
+  );
+  const pending = transport.sendMessages({
+    messages: [userMessage("hello")],
+    abortSignal: controller.signal,
+  });
+  await vi.waitFor(() =>
+    expect(nativeMock.readProjectMemory).toHaveBeenCalled(),
+  );
+  controller.abort();
+  finish();
+  await expect(pending).rejects.toThrow();
+  expect(agentMock.runAgentStream).not.toHaveBeenCalled();
+});
+
+it("retains MCP ownership until the model stream finishes", async () => {
+  const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
+  useWorkspaceEnvStore.setState({ env: { kind: "local" } });
+  const release = vi.fn(async () => {});
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  const source = new ReadableStream({
+    start(c) {
+      c.enqueue("answer");
+      c.close();
+    },
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(source);
+  const transport = createContextAwareTransport(
+    makeDeps({ workspaceRoot: "/original", cwd: "/original" }),
+  );
+  const stream = await transport.sendMessages({
+    messages: [userMessage("hello")],
+  });
+  expect(release).not.toHaveBeenCalled();
+  const reader = stream.getReader();
+  expect((await reader.read()).value).toBe("answer");
+  expect((await reader.read()).done).toBe(true);
+  expect(release).toHaveBeenCalledOnce();
+  expect(mcpMock).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      root: "/original",
+      workspace: { kind: "local" },
+    }),
+  );
+});
+it("releases MCP ownership if model preparation throws", async () => {
+  const release = vi.fn(async () => {});
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  agentMock.runAgentStream.mockRejectedValueOnce(
+    new Error("model unavailable"),
+  );
+  const transport = createContextAwareTransport(
+    makeDeps({ workspaceRoot: "/original", cwd: "/original" }),
+  );
+  await expect(
+    transport.sendMessages({ messages: [userMessage("hello")] }),
+  ).rejects.toThrow("model unavailable");
+  expect(release).toHaveBeenCalledOnce();
+});
+
+it("keeps Stop blocked until a stalled stream's MCP release finishes", async () => {
+  const { drainChatWork } = await import("./chatWork");
+  let finish!: () => void;
+  const release = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(new ReadableStream());
+  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
+  deps.toolContext = {
+    getTerminalContext: () => null,
+    getSessionId: () => "mcp-release-stop",
+  } as never;
+  const controller = new AbortController();
+  const stream = await createContextAwareTransport(deps).sendMessages({
+    messages: [userMessage("hello")],
+    abortSignal: controller.signal,
+  });
+  controller.abort();
+  let drained = false;
+  const pending = drainChatWork("mcp-release-stop").then(() => {
+    drained = true;
+  });
+  await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
+  expect(drained).toBe(false);
+  finish();
+  await pending;
+  expect(drained).toBe(true);
+  await stream.cancel();
+});
+
+async function drain(stream: ReadableStream<unknown>) {
+  const reader = stream.getReader();
+  while (!(await reader.read()).done) {
+    /* consume */
+  }
+}
+function approvalStream(failed = false) {
+  return new ReadableStream({
+    start(c) {
+      c.enqueue({
+        type: "tool-approval-request",
+        approvalId: "approval",
+        toolCallId: "call",
+      });
+      if (failed) c.enqueue({ type: "error", errorText: "failed" });
+      c.close();
+    },
+  });
+}
+it("keeps a paused approval's MCP server until its continuation has acquired ownership", async () => {
+  const { hasMcpRunLeases } = await import("./mcpRunLeases");
+  const first = vi.fn(async () => {}),
+    second = vi.fn(async () => {});
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release: first,
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
+  const live = { workspaceRoot: "/original", cwd: "/original" };
+  const deps = makeDeps(live);
+  deps.toolContext = {
+    getTerminalContext: () => null,
+    getSessionId: () => "approval-turn",
+  } as never;
+  const transport = createContextAwareTransport(deps);
+  await drain(
+    await transport.sendMessages({ messages: [userMessage("hello")] }),
+  );
+  expect(first).not.toHaveBeenCalled();
+  expect(hasMcpRunLeases("approval-turn")).toBe(true);
+  live.workspaceRoot = "/other";
+  live.cwd = "/other";
+  mcpMock.mockImplementationOnce(async () => {
+    expect(first).not.toHaveBeenCalled();
+    return { tools: {}, access: {}, instructions: [], release: second };
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(
+    new ReadableStream({
+      start(c) {
+        c.close();
+      },
+    }),
+  );
+  await drain(
+    await transport.sendMessages({ messages: [userMessage("hello")] }),
+  );
+  expect(mcpMock).toHaveBeenLastCalledWith(
+    expect.objectContaining({ root: "/original" }),
+  );
+  expect(first).toHaveBeenCalledOnce();
+  expect(second).toHaveBeenCalledOnce();
+  expect(hasMcpRunLeases("approval-turn")).toBe(false);
+});
+it("releases pending approvals on Stop even when their SDK stream already finished", async () => {
+  const { releaseChatMcpRuns, hasMcpRunLeases } = await import(
+    "./mcpRunLeases"
+  );
+  const { drainChatWork } = await import("./chatWork");
+  const release = vi.fn(async () => {});
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
+  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
+  deps.toolContext = {
+    getTerminalContext: () => null,
+    getSessionId: () => "paused-stop",
+  } as never;
+  await drain(
+    await createContextAwareTransport(deps).sendMessages({
+      messages: [userMessage("hello")],
+    }),
+  );
+  await drainChatWork("paused-stop");
+  expect(release).not.toHaveBeenCalled();
+  await releaseChatMcpRuns("paused-stop");
+  expect(release).toHaveBeenCalledOnce();
+  expect(hasMcpRunLeases("paused-stop")).toBe(false);
+});
+it("does not retain a stream that reports an error after requesting approval", async () => {
+  const release = vi.fn(async () => {});
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream(true));
+  await drain(
+    await createContextAwareTransport(
+      makeDeps({ workspaceRoot: "/original" }),
+    ).sendMessages({ messages: [userMessage("hello")] }),
+  );
+  expect(release).toHaveBeenCalledOnce();
+});
+
+it("releases the superseded approval even when the next message fails before model setup", async () => {
+  const { hasMcpRunLeases } = await import("./mcpRunLeases");
+  const release = vi.fn(async () => {});
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
+  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
+  deps.toolContext = {
+    getTerminalContext: () => null,
+    getSessionId: () => "superseded-approval",
+  } as never;
+  const transport = createContextAwareTransport(deps);
+  await drain(
+    await transport.sendMessages({ messages: [userMessage("hello")] }),
+  );
+  deps.getLive = () => {
+    throw new Error("context unavailable");
+  };
+  await expect(
+    transport.sendMessages({ messages: [{ ...userMessage("new"), id: "u2" }] }),
+  ).rejects.toThrow("context unavailable");
+  expect(release).toHaveBeenCalledOnce();
+  expect(hasMcpRunLeases("superseded-approval")).toBe(false);
+});
+it("rejects an approval continuation before releasing its pending MCP lease", async () => {
+  const { releaseChatMcpRuns } = await import("./mcpRunLeases");
+  const release = vi.fn(async () => {});
+  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
+  deps.toolContext = {
+    getTerminalContext: () => null,
+    getSessionId: () => "prefs-approval",
+  } as never;
+  let ready = true;
+  deps.assertReady = () => {
+    if (!ready) throw new Error("Preferences unavailable");
+  };
+  mcpMock.mockResolvedValueOnce({
+    tools: {},
+    access: {},
+    instructions: [],
+    release,
+  });
+  aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
+  const transport = createContextAwareTransport(deps);
+  await drain(
+    await transport.sendMessages({ messages: [userMessage("hello")] }),
+  );
+  const calls = agentMock.runAgentStream.mock.calls.length;
+  ready = false;
+  await expect(
+    transport.sendMessages({ messages: [userMessage("hello")] }),
+  ).rejects.toThrow("Preferences");
+  expect(agentMock.runAgentStream).toHaveBeenCalledTimes(calls);
+  expect(release).not.toHaveBeenCalled();
+  await releaseChatMcpRuns("prefs-approval");
+  expect(release).toHaveBeenCalledOnce();
+});
+it("rechecks preferences after asynchronous MCP preparation and releases prepared resources", async () => {
+  let ready = true;
+  const release = vi.fn(async () => {});
+  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
+  deps.assertReady = () => {
+    if (!ready) throw new Error("Preferences unavailable");
+  };
+  mcpMock.mockImplementationOnce(async () => {
+    ready = false;
+    return { tools: {}, access: {}, instructions: [], release };
+  });
+  agentMock.runAgentStream.mockClear();
+  await expect(
+    createContextAwareTransport(deps).sendMessages({
+      messages: [userMessage("hello")],
+    }),
+  ).rejects.toThrow("Preferences");
+  expect(agentMock.runAgentStream).not.toHaveBeenCalled();
+  expect(release).toHaveBeenCalledOnce();
 });

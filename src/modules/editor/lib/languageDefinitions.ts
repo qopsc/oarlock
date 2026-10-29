@@ -351,10 +351,7 @@ export const LANGUAGES: LanguageDefinition[] = [
       "props",
       "targets",
     ],
-    loader: () =>
-      defineLanguage(
-        import("@codemirror/legacy-modes/mode/xml").then((m) => m.xml),
-      ),
+    loader: () => import("@codemirror/lang-xml").then((m) => m.xml()),
     userSelectable: true,
   },
   {

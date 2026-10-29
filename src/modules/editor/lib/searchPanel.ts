@@ -1,17 +1,23 @@
+import {
+  getEditorQuery,
+  sameQuery,
+  queryEffects,
+  regexQuery,
+  interceptRegex,
+  type EditorQuery,
+} from "../search/regexState";
+import {
+  editorRegex,
+  safeSearchKeymap,
+  safeFindNext as findNext,
+  safeFindPrevious as findPrevious,
+  safeReplaceNext as replaceNext,
+  safeReplaceAll as replaceAll,
+  safeSelectMatches as selectMatches,
+} from "../search/regexView";
 import { isImeKeyEvent } from "@/lib/ime";
 import { formatMatchCount } from "@/lib/matchCount";
-import {
-  closeSearchPanel,
-  findNext,
-  findPrevious,
-  getSearchQuery,
-  replaceAll,
-  replaceNext,
-  SearchQuery,
-  search,
-  selectMatches,
-  setSearchQuery,
-} from "@codemirror/search";
+import { closeSearchPanel, search } from "@codemirror/search";
 import type { Extension } from "@codemirror/state";
 import {
   type EditorView,
@@ -45,13 +51,14 @@ function element<K extends keyof HTMLElementTagNameMap>(
 class CountedSearchPanel implements Panel {
   readonly dom: HTMLElement;
   readonly top: boolean;
-  private query: SearchQuery;
+  private query: EditorQuery;
   private readonly searchField: HTMLInputElement;
   private readonly replaceField: HTMLInputElement;
   private readonly caseField: HTMLInputElement;
   private readonly reField: HTMLInputElement;
   private readonly wordField: HTMLInputElement;
   private readonly countField: HTMLElement;
+  private retryButton: HTMLButtonElement;
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -60,7 +67,7 @@ class CountedSearchPanel implements Panel {
   ) {
     this.top = top;
     const phrase = (text: string) => view.state.phrase(text);
-    const query = getSearchQuery(view.state);
+    const query = getEditorQuery(view.state);
     this.query = query;
     const commit = () => this.commit();
     const field = (name: string, value: string, label: string) => {
@@ -101,6 +108,10 @@ class CountedSearchPanel implements Panel {
     this.wordField = checkbox("word", query.wholeWord);
     this.countField = element("span", { class: "cm-search-count" });
 
+    this.retryButton = button("retry", "Retry", () =>
+      view.plugin(editorRegex)?.retry(),
+    );
+    this.retryButton.hidden = true;
     const close = element(
       "button",
       { name: "close", "aria-label": phrase("close"), type: "button" },
@@ -111,6 +122,7 @@ class CountedSearchPanel implements Panel {
     this.dom = element("div", { class: "cm-search" }, [
       this.searchField,
       this.countField,
+      this.retryButton,
       button("next", "next", () => findNext(view)),
       button("prev", "previous", () => findPrevious(view)),
       button("select", "all", () => selectMatches(view)),
@@ -135,20 +147,19 @@ class CountedSearchPanel implements Panel {
     const hub = this.view.plugin(searchCounter)?.hub;
     if (!hub) return;
     const show = () => {
-      this.countField.textContent = formatMatchCount(hub.get());
+      const count = hub.get();
+      this.countField.textContent = formatMatchCount(count);
+      this.countField.title = count?.error ?? "";
+      this.retryButton.hidden = !count?.error;
+      this.retryButton.title = count?.error ?? "";
     };
     this.unsubscribe = hub.subscribe(show);
     show();
   }
 
   update(update: ViewUpdate): void {
-    for (const tr of update.transactions) {
-      for (const effect of tr.effects) {
-        if (effect.is(setSearchQuery) && !effect.value.eq(this.query)) {
-          this.setQuery(effect.value);
-        }
-      }
-    }
+    const query = getEditorQuery(update.state);
+    if (!sameQuery(query, this.query)) this.setQuery(query);
   }
 
   destroy(): void {
@@ -157,19 +168,21 @@ class CountedSearchPanel implements Panel {
   }
 
   private commit(): void {
-    const query = new SearchQuery({
+    const query: EditorQuery = {
+      literal: false,
       search: this.searchField.value,
       caseSensitive: this.caseField.checked,
       regexp: this.reField.checked,
       wholeWord: this.wordField.checked,
       replace: this.replaceField.value,
-    });
-    if (query.eq(this.query)) return;
+    };
+    if (sameQuery(query, this.query)) return;
     this.query = query;
-    this.view.dispatch({ effects: setSearchQuery.of(query) });
+    this.view.dispatch({ effects: queryEffects(query) });
   }
 
   private keydown(event: KeyboardEvent): void {
+    if (isImeKeyEvent(event)) return;
     if (runScopeHandlers(this.view, event, "search-panel")) {
       event.preventDefault();
       return;
@@ -185,7 +198,7 @@ class CountedSearchPanel implements Panel {
     }
   }
 
-  private setQuery(query: SearchQuery): void {
+  private setQuery(query: EditorQuery): void {
     this.query = query;
     this.searchField.value = query.search;
     this.replaceField.value = query.replace;
@@ -202,6 +215,10 @@ export function countedSearch(config: { top: boolean }): Extension {
       top: config.top,
       createPanel: (view) => new CountedSearchPanel(view, config.top),
     }),
+    regexQuery,
+    interceptRegex,
     searchCounter,
+    editorRegex,
+    safeSearchKeymap,
   ];
 }

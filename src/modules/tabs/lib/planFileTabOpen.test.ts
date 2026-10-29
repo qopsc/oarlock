@@ -210,3 +210,49 @@ describe("planMarkdownTabOpen", () => {
     expect(plan).toEqual({ tabs, tabId: 3 });
   });
 });
+
+describe("detached drafts", () => {
+  it.each([true, false])(
+    "opens the replacement independently (pinned %s)",
+    (pin) => {
+      const draft = {
+        ...editor(3, "/repo/main.rs", "one", false),
+        dirty: true,
+        detached: true,
+      };
+      const plan = planFileTabOpen(
+        [terminal, draft],
+        draft.path,
+        pin,
+        "one",
+        () => 4,
+      );
+      expect(plan.tabId).toBe(4);
+      expect(plan.tabs).toContain(draft);
+      expect(plan.tabs.find((tab) => tab.id === 4)).toMatchObject({
+        kind: "editor",
+        path: draft.path,
+        dirty: false,
+      });
+      expect(
+        planFileTabOpen(plan.tabs, draft.path, true, "one", () => 5).tabId,
+      ).toBe(4);
+    },
+  );
+
+  it("never recycles a detached preview draft for another path", () => {
+    const draft = {
+      ...editor(3, "/repo/old.rs", "one", true),
+      dirty: true,
+      detached: true,
+    };
+    const plan = planFileTabOpen(
+      [draft],
+      "/repo/new.rs",
+      false,
+      "one",
+      () => 4,
+    );
+    expect(plan.tabs).toContain(draft);
+  });
+});

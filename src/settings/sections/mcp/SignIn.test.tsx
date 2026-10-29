@@ -35,6 +35,22 @@ function render(value: AuthStatus | undefined, error?: string): string {
 }
 
 describe("SignInRow", () => {
+  it("offers an explicit retry for discovery failure without relabelling sign-in", () => {
+    const html = renderToStaticMarkup(
+      <SignInRow
+        status={status()}
+        error={undefined}
+        discoveryError="HTTP 503"
+        onRetryDiscovery={() => {}}
+        onSignIn={() => {}}
+        onSignOut={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect(html).toContain("Sign-in discovery failed: HTTP 503");
+    expect(html).toContain("Retry discovery");
+    expect(html).not.toContain("Sign in required");
+  });
   it("offers sign-in when the server asks for it", () => {
     const html = render(status({ state: "required", reason: "unauthorized" }));
     expect(html).toContain("Sign in required");
@@ -63,5 +79,13 @@ describe("SignInRow", () => {
 
   it("says plainly where the tokens are kept", () => {
     expect(render(undefined)).toContain("system keychain");
+  });
+
+  it("shows the commit phase without offering cancellation or another sign-in", () => {
+    const html = render(status({ signingIn: true, saving: true }));
+    expect(html).toContain("Saving sign-in…");
+    expect(html).toContain("disabled");
+    expect(html).not.toContain("Cancel");
+    expect(html).not.toContain(">Sign in<");
   });
 });

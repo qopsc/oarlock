@@ -14,21 +14,23 @@
 //!   back to in that scenario; user-only file permissions provide the
 //!   isolation the secret-service collection would have otherwise.
 //!
-//! A value is one item, exactly as `keyring` 3 wrote it, unless the store
-//! cannot hold it in one: Credential Manager keeps at most 2,560 bytes of
-//! UTF-16 per item. A longer value is split: its first item holds a head
-//! (`HEAD`, the item count and a digest of the value) and the value's start,
-//! items `<account>:1` to `<account>:<count - 1>` the rest. Every read and
-//! write goes through `read_value` and `write_value`, so callers never see
-//! chunks. A set that lost a chunk or mixes two writes fails the digest and
-//! reads as missing, never as another value. A value is at most 32 KiB
-//! (`MAX_VALUE_BYTES`) on every platform.
+//! Plain values retain the keyring 3 layout. Windows values that need chunks
+//! stage into one of two bounded generation slots, then atomically publish a
+//! head pointing to that slot. Failed writes preserve the previous readable
+//! value. Legacy inline heads remain readable without migration writes. All
+//! values are bounded to 32 KiB of UTF-8 (`MAX_VALUE_BYTES`).
 //!
 //! The frontend talks to `secrets_get`, `secrets_set`, `secrets_delete`,
 //! and `secrets_get_all` — no platform branching in JS.
 //!
 //! All commands take `&AppHandle` so we can resolve the data directory
 //! once via Tauri's path API.
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod file;
+mod generations;
+#[cfg(target_os = "linux")]
+pub(crate) use file::{read_store_at, write_store_at};
 
 use std::sync::Mutex;
 
@@ -141,6 +143,12 @@ enum Head<'a> {
         digest: &'a str,
         data: &'a str,
     },
+    /// A published staged generation.
+    Generation {
+        slot: u8,
+        count: usize,
+        digest: &'a str,
+    },
     /// A head that cannot be read.
     Damaged,
 }
@@ -149,19 +157,38 @@ fn parse_head(first: &str) -> Head<'_> {
     let Some(rest) = first.strip_prefix(HEAD) else {
         return Head::Whole;
     };
+    if let Some(rest) = rest.strip_prefix("g:") {
+        let mut parts = rest.split(':');
+        let slot = match parts.next() {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => return Head::Damaged,
+        };
+        let (Some(count), Some(digest)) = (parts.next(), parts.next()) else {
+            return Head::Damaged;
+        };
+        let parsed = count
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_CHUNKS).contains(n) && n.to_string() == count);
+        return match parsed {
+            Some(count) if valid_digest(digest) && parts.next().is_none() => Head::Generation {
+                slot,
+                count,
+                digest,
+            },
+            _ => Head::Damaged,
+        };
+    }
     let mut parts = rest.splitn(3, ':');
-    let (Some(count), Some(digest), Some(data)) = (parts.next(), parts.next(), parts.next())
-    else {
+    let (Some(count), Some(digest), Some(data)) = (parts.next(), parts.next(), parts.next()) else {
         return Head::Damaged;
     };
     let count = count
         .parse::<usize>()
         .ok()
         .filter(|n| (1..=MAX_CHUNKS).contains(n) && n.to_string() == count);
-    let digest_ok = digest.len() == DIGEST_HEX
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let digest_ok = valid_digest(digest);
     match count {
         Some(count) if digest_ok => Head::Split {
             count,
@@ -170,6 +197,13 @@ fn parse_head(first: &str) -> Head<'_> {
         },
         _ => Head::Damaged,
     }
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == DIGEST_HEX
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The value a head's data and the chunks after it make, or None when one
@@ -191,16 +225,27 @@ trait Items {
     fn delete(&mut self, account: &str) -> Result<(), String>;
 }
 
+#[cfg(test)]
 fn read_value(items: &mut impl Items, account: &str) -> Result<Option<String>, String> {
+    read_value_with_policy(items, account, false)
+}
+
+fn read_value_with_policy(
+    items: &mut impl Items,
+    account: &str,
+    strict: bool,
+) -> Result<Option<String>, String> {
     let Some(first) = items.get(account)? else {
         return Ok(None);
     };
-    match parse_head(&first) {
-        Head::Whole => {}
-        Head::Damaged => {
-            log::warn!("secrets: {account} is damaged; it reads as not set");
-            return Ok(None);
-        }
+    let value = match parse_head(&first) {
+        Head::Generation {
+            slot,
+            count,
+            digest,
+        } => generations::read(items, account, slot, count, digest)?,
+        Head::Whole => Some(first),
+        Head::Damaged => None,
         Head::Split {
             count,
             digest,
@@ -209,31 +254,19 @@ fn read_value(items: &mut impl Items, account: &str) -> Result<Option<String>, S
             let rest = (1..count)
                 .map(|i| items.get(&chunk_account(account, i)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let value = join_value(digest, data, rest);
-            if value.is_none() {
-                log::warn!("secrets: {account} is incomplete; it reads as not set");
-            }
-            return Ok(value);
+            join_value(digest, data, rest)
         }
+    };
+    if value.is_none() || (strict && value.as_deref() == Some("")) {
+        if strict {
+            return Err("secrets: stored credential is damaged or incomplete; re-enter or remove it in Settings".into());
+        }
+        log::warn!("secrets: {account} is damaged or incomplete; it reads as not set");
     }
-    Ok(Some(first))
+    Ok(value)
 }
 
-/// How many chunk items `account` has. Writes add chunks in ascending order
-/// and every removal goes in descending order, so they always form a run
-/// from `:1`, even after an interrupted write.
-fn stored_chunks(items: &mut impl Items, account: &str) -> Result<usize, String> {
-    let mut count = 0;
-    while count + 1 < MAX_CHUNKS && items.get(&chunk_account(account, count + 1))?.is_some() {
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// Replaces what `account` holds with `value`. The head goes last, after the
-/// new chunks are written and stale ones removed, so a reader finds the old
-/// value or, while the chunks belong to two writes, nothing. A store that
-/// never splits has no chunks to look for.
+/// A limited store stages long values; unlimited stores keep the single-item layout.
 fn write_value(
     items: &mut impl Items,
     account: &str,
@@ -241,33 +274,25 @@ fn write_value(
     item_units: Option<usize>,
 ) -> Result<(), String> {
     let chunks = split_value(value, item_units)?;
-    let stored = match item_units {
-        Some(_) => stored_chunks(items, account)?,
-        None => 0,
-    };
-    for (i, chunk) in chunks.iter().enumerate().skip(1) {
-        items.set(&chunk_account(account, i), chunk)?;
+    if item_units.is_some() {
+        generations::write(items, account, value, &chunks)
+    } else {
+        items.set(account, &chunks[0])
     }
-    for i in (chunks.len()..=stored).rev() {
-        items.delete(&chunk_account(account, i))?;
-    }
-    items.set(account, &chunks[0])
 }
 
-/// Removes `account` and its chunks, the head last.
+/// Removes the publication point before retiring chunks, so failures never
+/// destroy part of a value while the caller still considers it active.
 fn delete_value(
     items: &mut impl Items,
     account: &str,
     item_units: Option<usize>,
 ) -> Result<(), String> {
-    let stored = match item_units {
-        Some(_) => stored_chunks(items, account)?,
-        None => 0,
-    };
-    for i in (1..=stored).rev() {
-        items.delete(&chunk_account(account, i))?;
+    if item_units.is_some() {
+        generations::delete(items, account)
+    } else {
+        items.delete(account)
     }
-    items.delete(account)
 }
 
 #[cfg(target_os = "linux")]
@@ -288,7 +313,8 @@ impl Items for FileItems<'_> {
     }
 
     fn set(&mut self, account: &str, value: &str) -> Result<(), String> {
-        self.map.insert(key(self.service, account), value.to_owned());
+        self.map
+            .insert(key(self.service, account), value.to_owned());
         Ok(())
     }
 
@@ -311,42 +337,8 @@ fn read_store(app: &AppHandle) -> Result<HashMap<String, String>, String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn read_store_at(path: &std::path::Path) -> Result<HashMap<String, String>, String> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    serde_json::from_slice::<HashMap<String, String>>(&bytes).map_err(|e| e.to_string())
-}
-
-#[cfg(target_os = "linux")]
 fn write_store(app: &AppHandle, map: &HashMap<String, String>) -> Result<(), String> {
     write_store_at(&store_path(app)?, map)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn write_store_at(
-    path: &std::path::Path,
-    map: &HashMap<String, String>,
-) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(map).map_err(|e| e.to_string())?;
-
-    // 0600: only the owning user can read or write the secrets file.
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| e.to_string())?;
-    f.write_all(&bytes).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -456,17 +448,38 @@ fn busy(state: &SecretsState) -> std::sync::MutexGuard<'_, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Whether a page may use the `secrets_*` commands on `service` and
-/// `account`. MCP secrets (`mcp::SECRET_SERVICE`) are written through
-/// `mcp_secret_set` and read only by the backend, when it starts a server or
-/// sends a request, so no page can read them back. Chunks of a long value
-/// are the backend's.
+/// Pages use only the AI-key service. An allow-list is essential: Windows
+/// target names are case-insensitive account.service strings, so denying one
+/// literal service still permits aliases of backend-only MCP credentials.
 fn page_may_use(service: &str, account: &str) -> Result<(), String> {
-    if service == crate::modules::mcp::SECRET_SERVICE {
+    if service != "oarlock-ai" {
         return Err("secrets: this service is not readable from the page".into());
     }
-    if is_chunk_account(account) {
+    if account.contains('\0') || is_chunk_account(account) {
         return Err(format!("secrets: invalid account {account:?}"));
+    }
+    Ok(())
+}
+
+fn page_may_write(service: &str, account: &str) -> Result<(), String> {
+    page_may_use(service, account)?;
+    // Only fixed provider accounts remain writable through generic IPC.
+    // Exact names also reject platform-specific case/Unicode aliases of
+    // endpoint accounts, which must pass through the endpoint gate.
+    if !matches!(
+        account,
+        "openai-api-key"
+            | "anthropic-api-key"
+            | "google-api-key"
+            | "xai-api-key"
+            | "cerebras-api-key"
+            | "groq-api-key"
+            | "deepseek-api-key"
+            | "mistral-api-key"
+            | "openrouter-api-key"
+            | "openai-compatible-api-key"
+    ) {
+        return Err("endpoint credentials must be changed through endpoint transactions".into());
     }
     Ok(())
 }
@@ -480,7 +493,7 @@ pub(crate) async fn backend_get(
     blocking_secret(app, move |app, state| {
         accounts
             .iter()
-            .map(|account| get_secret(app, state, service, account))
+            .map(|account| get_secret(app, state, service, account, false))
             .collect()
     })
     .await
@@ -528,10 +541,11 @@ pub async fn secrets_get(
     app: AppHandle,
     service: String,
     account: String,
+    strict: Option<bool>,
 ) -> Result<Option<String>, String> {
     page_may_use(&service, &account)?;
     blocking_secret(app, move |app, state| {
-        get_secret(app, state, &service, &account)
+        get_secret(app, state, &service, &account, strict.unwrap_or(false))
     })
     .await
 }
@@ -541,18 +555,19 @@ fn get_secret(
     state: &SecretsState,
     service: &str,
     account: &str,
+    strict: bool,
 ) -> Result<Option<String>, String> {
     #[cfg(target_os = "linux")]
     {
         with_store(app, state, |map| {
-            read_value(&mut FileItems { map, service }, account)
+            read_value_with_policy(&mut FileItems { map, service }, account, strict)
         })?
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = app;
         let _busy = busy(state);
-        read_value(&mut keychain(service)?, account)
+        let service = super::profile::secret_service(&app.config().identifier, service);
+        read_value_with_policy(&mut keychain(&service)?, account, strict)
     }
 }
 
@@ -563,14 +578,14 @@ pub async fn secrets_set(
     account: String,
     password: String,
 ) -> Result<(), String> {
-    page_may_use(&service, &account)?;
+    page_may_write(&service, &account)?;
     blocking_secret(app, move |app, state| {
         set_secret(app, state, &service, &account, password)
     })
     .await
 }
 
-fn set_secret(
+pub(super) fn set_secret(
     app: &AppHandle,
     state: &SecretsState,
     service: &str,
@@ -580,14 +595,19 @@ fn set_secret(
     #[cfg(target_os = "linux")]
     {
         update_store(app, state, |map| {
-            write_value(&mut FileItems { map, service }, account, &password, ITEM_UNITS)
+            write_value(
+                &mut FileItems { map, service },
+                account,
+                &password,
+                ITEM_UNITS,
+            )
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = app;
         let _busy = busy(state);
-        write_value(&mut keychain(service)?, account, &password, ITEM_UNITS)
+        let service = super::profile::secret_service(&app.config().identifier, service);
+        write_value(&mut keychain(&service)?, account, &password, ITEM_UNITS)
     }
 }
 
@@ -597,14 +617,14 @@ pub async fn secrets_delete(
     service: String,
     account: String,
 ) -> Result<(), String> {
-    page_may_use(&service, &account)?;
+    page_may_write(&service, &account)?;
     blocking_secret(app, move |app, state| {
         delete_secret(app, state, &service, &account)
     })
     .await
 }
 
-fn delete_secret(
+pub(super) fn delete_secret(
     app: &AppHandle,
     state: &SecretsState,
     service: &str,
@@ -618,9 +638,9 @@ fn delete_secret(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = app;
         let _busy = busy(state);
-        delete_value(&mut keychain(service)?, account, ITEM_UNITS)
+        let service = super::profile::secret_service(&app.config().identifier, service);
+        delete_value(&mut keychain(&service)?, account, ITEM_UNITS)
     }
 }
 
@@ -718,7 +738,10 @@ mod tests {
         write_value(&mut items, "b", "sk-plain", ITEM_UNITS).unwrap();
         let head_like = format!("{HEAD}1:0123456789abcdef:x");
         write_value(&mut items, "c", &head_like, ITEM_UNITS).unwrap();
-        assert_eq!(read_value(&mut items, "a").unwrap().as_deref(), Some(&*long));
+        assert_eq!(
+            read_value(&mut items, "a").unwrap().as_deref(),
+            Some(&*long)
+        );
         assert_eq!(read_value(&mut items, "c").unwrap(), Some(head_like));
         assert_eq!(map.len(), 3);
         assert_eq!(map[&key("svc", "a")], long);
@@ -743,6 +766,15 @@ mod keychain_compat {
 
     impl Drop for Cleanup {
         fn drop(&mut self) {
+            for slot in 0..2 {
+                for index in 0..MAX_CHUNKS {
+                    if let Ok(item) =
+                        keyring3::Entry::new(&self.0, &format!("{}:gen:{slot}:{index}", self.1))
+                    {
+                        let _ = item.delete_credential();
+                    }
+                }
+            }
             for index in 0..MAX_CHUNKS {
                 let account = match index {
                     0 => self.1.clone(),
@@ -819,7 +851,7 @@ mod keychain_compat {
         let first = old.get_password().unwrap();
         if cfg!(target_os = "windows") {
             assert!(first.starts_with(HEAD));
-            let second = keyring3::Entry::new(service, &chunk_account(account, 1)).unwrap();
+            let second = keyring3::Entry::new(service, &format!("{account}:gen:0:1")).unwrap();
             assert!(second.get_password().is_ok());
         } else {
             assert_eq!(first, long);
@@ -827,7 +859,7 @@ mod keychain_compat {
 
         write_value(&mut items, account, "sk-short", ITEM_UNITS).unwrap();
         assert_eq!(old.get_password().unwrap(), "sk-short");
-        let second = keyring3::Entry::new(service, &chunk_account(account, 1)).unwrap();
+        let second = keyring3::Entry::new(service, &format!("{account}:gen:0:1")).unwrap();
         assert!(matches!(
             second.get_password(),
             Err(keyring3::Error::NoEntry)
@@ -843,13 +875,27 @@ mod keychain_compat {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum SecretRead {
+    Ready { value: Option<String> },
+    Failed { error: String },
+}
+
+fn read_status(items: &mut impl Items, account: &str) -> SecretRead {
+    match read_value_with_policy(items, account, true) {
+        Ok(value) => SecretRead::Ready { value },
+        Err(error) => SecretRead::Failed { error },
+    }
+}
+
 /// Batch read — single IPC roundtrip for the cold-boot fan-out.
 #[tauri::command]
 pub async fn secrets_get_all(
     app: AppHandle,
     service: String,
     accounts: Vec<String>,
-) -> Result<Vec<Option<String>>, String> {
+) -> Result<Vec<SecretRead>, String> {
     for account in &accounts {
         page_may_use(&service, account)?;
     }
@@ -864,47 +910,97 @@ fn get_all_secrets(
     state: &SecretsState,
     service: &str,
     accounts: Vec<String>,
-) -> Result<Vec<Option<String>>, String> {
+) -> Result<Vec<SecretRead>, String> {
     #[cfg(target_os = "linux")]
     {
         with_store(app, state, |map| {
             let mut items = FileItems { map, service };
             accounts
                 .iter()
-                .map(|a| read_value(&mut items, a).ok().flatten())
+                .map(|a| read_status(&mut items, a))
                 .collect()
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = app;
         let _busy = busy(state);
-        let Ok(mut items) = keychain(service) else {
-            return Ok(vec![None; accounts.len()]);
-        };
+        let service = super::profile::secret_service(&app.config().identifier, service);
+        let mut items = keychain(&service)?;
         Ok(accounts
             .iter()
-            .map(|a| read_value(&mut items, a).ok().flatten())
+            .map(|a| read_status(&mut items, a))
             .collect())
     }
 }
 
 #[cfg(test)]
 mod page_access {
-    use super::page_may_use;
+    use super::{page_may_use, page_may_write};
+    #[test]
+    fn endpoint_writes_cannot_bypass_the_native_transaction_gate() {
+        for account in [
+            "compat-a-api-key",
+            "COMPAT-A-API-KEY",
+            "Compat-legacy-Api-Key",
+            "compat-a-apı-key",
+        ] {
+            assert!(page_may_use("oarlock-ai", account).is_ok());
+            assert!(page_may_write("oarlock-ai", account).is_err());
+        }
+        assert!(page_may_write("oarlock-ai", "openai-api-key").is_ok());
+        assert!(page_may_write("oarlock-ai", "openai-compatible-api-key").is_ok());
+    }
 
     #[test]
     fn pages_cannot_use_the_mcp_secret_service() {
         assert!(page_may_use("oarlock-ai", "openai-api-key").is_ok());
         assert!(page_may_use(crate::modules::mcp::SECRET_SERVICE, "s/env/A").is_err());
+        assert!(page_may_use("oarlock-mcp@consulting.quantumops.oarlock.dev", "s/env/A").is_err());
     }
 
     #[test]
     fn pages_cannot_name_a_chunk_of_a_long_value() {
         assert!(page_may_use("oarlock-ai", "openai-api-key:1").is_err());
         assert!(page_may_use("oarlock-ai", "openai-api-key:12").is_err());
+        assert!(page_may_use("oarlock-ai", "openai-api-key:gen:0:1").is_err());
+        assert!(page_may_use("oarlock-ai", "openai-api-key:gen:1:0").is_err());
         assert!(page_may_use("oarlock-ai", "compat-1a2b3c4d-api-key").is_ok());
         assert!(page_may_use("oarlock-ai", "a:b").is_ok());
+    }
+
+    #[test]
+    fn windows_target_aliases_cannot_bypass_backend_only_services() {
+        // Credential Manager names are account.service, case-insensitive and
+        // passed to Win32 as NUL-terminated strings. Match these aliases without
+        // needing access to a real user's Credential Manager.
+        for (service, account, protected) in [
+            (
+                "OARLOCK-MCP",
+                "server/oauth/tokens",
+                "server/oauth/tokens.oarlock-mcp",
+            ),
+            (
+                "foo.oarlock-mcp",
+                "server/header/x",
+                "server/header/x.foo.oarlock-mcp",
+            ),
+            (
+                "oarlock-ai",
+                "server/oauth/tokens.oarlock-mcp\0ignored",
+                "server/oauth/tokens.oarlock-mcp",
+            ),
+        ] {
+            let target = format!("{account}.{service}");
+            assert!(target
+                .split('\0')
+                .next()
+                .unwrap()
+                .eq_ignore_ascii_case(protected));
+            assert!(
+                page_may_use(service, account).is_err(),
+                "accepted alias {service}"
+            );
+        }
     }
 }
 
@@ -933,9 +1029,13 @@ mod chunks {
                 data,
             } => {
                 assert_eq!(count, chunks.len());
-                join_value(digest, data, chunks[1..].iter().cloned().map(Some).collect())
+                join_value(
+                    digest,
+                    data,
+                    chunks[1..].iter().cloned().map(Some).collect(),
+                )
             }
-            Head::Damaged => None,
+            Head::Damaged | Head::Generation { .. } => None,
         }
     }
 
@@ -1086,6 +1186,90 @@ mod chunks {
     }
 
     #[test]
+    fn bulk_reads_preserve_each_credentials_status_on_the_wire() {
+        let store = mock();
+        let mut items = items(&store);
+        items.set("valid", "saved-key").unwrap();
+        items.set("damaged", &format!("{HEAD}invalid")).unwrap();
+        items.set("empty", "").unwrap();
+        let statuses: Vec<_> = ["valid", "absent", "damaged", "empty"]
+            .iter()
+            .map(|account| read_status(&mut items, account))
+            .collect();
+        let wire = serde_json::to_value(statuses).unwrap();
+        assert_eq!(
+            wire[0],
+            serde_json::json!({"status":"ready","value":"saved-key"})
+        );
+        assert_eq!(wire[1], serde_json::json!({"status":"ready","value":null}));
+        for index in [2, 3] {
+            assert_eq!(wire[index]["status"], "failed");
+            assert!(wire[index]["error"].is_string());
+            assert!(wire[index].get("value").is_none());
+        }
+        assert!(items.get("damaged").unwrap().is_some());
+    }
+
+    #[test]
+    fn strict_reads_reject_an_empty_entry_without_deleting_it() {
+        let store = mock();
+        let mut items = items(&store);
+        items.set("acct", "").unwrap();
+        assert!(read_value_with_policy(&mut items, "acct", true).is_err());
+        assert_eq!(items.get("acct").unwrap(), Some(String::new()));
+        assert_eq!(read_value(&mut items, "acct").unwrap(), Some(String::new()));
+        items.delete("acct").unwrap();
+        assert_eq!(
+            read_value_with_policy(&mut items, "acct", true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn strict_reads_distinguish_absent_from_damaged_and_incomplete_credentials() {
+        let store = mock();
+        let mut items = items(&store);
+        assert_eq!(
+            read_value_with_policy(&mut items, "acct", true).unwrap(),
+            None
+        );
+        items.set("acct", &format!("{HEAD}invalid")).unwrap();
+        assert!(read_value_with_policy(&mut items, "acct", true).is_err());
+        assert_eq!(read_value(&mut items, "acct").unwrap(), None);
+
+        // A published staged generation with missing or altered chunks is not keyless.
+        let value = "secret".repeat(400);
+        write_value(&mut items, "acct", &value, WINDOWS).unwrap();
+        let first = items.get("acct").unwrap().unwrap();
+        let Head::Generation { slot, .. } = parse_head(&first) else {
+            panic!("expected generation");
+        };
+        let chunk = format!("acct:gen:{slot}:1");
+        let original = items.get(&chunk).unwrap().unwrap();
+        items.delete(&chunk).unwrap();
+        assert!(read_value_with_policy(&mut items, "acct", true).is_err());
+        items.set(&chunk, "wrong").unwrap();
+        assert!(read_value_with_policy(&mut items, "acct", true).is_err());
+        items.set(&chunk, &original).unwrap();
+        assert_eq!(
+            read_value_with_policy(&mut items, "acct", true).unwrap(),
+            Some(value.clone())
+        );
+
+        // Old split records receive the same validation, preserving legacy reads.
+        let chunks = split_value(&value, WINDOWS).unwrap();
+        items.set("old", &chunks[0]).unwrap();
+        assert!(read_value_with_policy(&mut items, "old", true).is_err());
+        for (index, chunk) in chunks.iter().enumerate().skip(1) {
+            items.set(&chunk_account("old", index), chunk).unwrap();
+        }
+        assert_eq!(
+            read_value_with_policy(&mut items, "old", true).unwrap(),
+            Some(value)
+        );
+    }
+
+    #[test]
     fn the_windows_store_reads_back_what_it_wrote() {
         let store = mock();
         let mut items = items(&store);
@@ -1098,67 +1282,16 @@ mod chunks {
         ] {
             write_value(&mut items, "acct", &value, WINDOWS).unwrap();
             assert_eq!(read_value(&mut items, "acct").unwrap(), Some(value.clone()));
-            let mut index = 0;
-            while let Some(item) = items
-                .get(&match index {
-                    0 => "acct".to_owned(),
-                    i => chunk_account("acct", i),
-                })
-                .unwrap()
-            {
-                assert!(units(&item) <= 1280);
-                index += 1;
+            let head = items.get("acct").unwrap().unwrap();
+            assert!(units(&head) <= 1280);
+            if let Head::Generation { slot, count, .. } = parse_head(&head) {
+                for i in 0..count {
+                    let chunk = items.get(&format!("acct:gen:{slot}:{i}")).unwrap().unwrap();
+                    assert!(units(&chunk) <= 1280);
+                }
             }
-            assert_eq!(index, split_value(&value, WINDOWS).unwrap().len());
         }
         assert!(read_value(&mut items, "other").unwrap().is_none());
-    }
-
-    #[test]
-    fn shrinking_and_deleting_remove_every_stale_chunk() {
-        let store = mock();
-        let mut items = items(&store);
-        write_value(&mut items, "acct", &"q".repeat(MAX_VALUE_BYTES), WINDOWS).unwrap();
-        assert_eq!(stored_chunks(&mut items, "acct").unwrap(), 25);
-
-        write_value(&mut items, "acct", &"q".repeat(3000), WINDOWS).unwrap();
-        assert_eq!(stored_chunks(&mut items, "acct").unwrap(), 2);
-        write_value(&mut items, "acct", "sk-short", WINDOWS).unwrap();
-        assert_eq!(stored_chunks(&mut items, "acct").unwrap(), 0);
-        // A single item again, as an earlier release wrote it.
-        assert_eq!(items.get("acct").unwrap().as_deref(), Some("sk-short"));
-
-        write_value(&mut items, "acct", &"q".repeat(3000), WINDOWS).unwrap();
-        delete_value(&mut items, "acct", WINDOWS).unwrap();
-        assert!(items.get("acct").unwrap().is_none());
-        assert_eq!(stored_chunks(&mut items, "acct").unwrap(), 0);
-        delete_value(&mut items, "acct", WINDOWS).unwrap();
-    }
-
-    #[test]
-    fn an_interrupted_write_never_reads_as_another_value() {
-        let store = mock();
-        let mut items = items(&store);
-        let old = "o".repeat(3000);
-        let new = "n".repeat(3000);
-        write_value(&mut items, "acct", &old, WINDOWS).unwrap();
-        // The new chunks landed, the new head did not.
-        let chunks = split_value(&new, WINDOWS).unwrap();
-        items.set(&chunk_account("acct", 1), &chunks[1]).unwrap();
-        assert_eq!(read_value(&mut items, "acct").unwrap(), None);
-
-        // A short value whose longer successor only got its chunks written.
-        write_value(&mut items, "acct", "sk-old", WINDOWS).unwrap();
-        for (i, chunk) in chunks.iter().enumerate().skip(1) {
-            items.set(&chunk_account("acct", i), chunk).unwrap();
-        }
-        assert_eq!(
-            read_value(&mut items, "acct").unwrap().as_deref(),
-            Some("sk-old")
-        );
-        // The next write clears what was left.
-        write_value(&mut items, "acct", "sk-new", WINDOWS).unwrap();
-        assert_eq!(stored_chunks(&mut items, "acct").unwrap(), 0);
     }
 
     #[test]

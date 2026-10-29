@@ -37,7 +37,7 @@ export function missingArguments(
   fields: readonly ArgumentField[],
   values: Record<string, string>,
 ): Record<string, string> {
-  const errors: Record<string, string> = {};
+  const errors: Record<string, string> = Object.create(null);
   for (const field of fields) {
     if (field.required && !(values[field.name] ?? "").trim()) {
       errors[field.name] = "This is required.";
@@ -51,7 +51,7 @@ export function filledArguments(
   fields: readonly ArgumentField[],
   values: Record<string, string>,
 ): Record<string, string> {
-  const out: Record<string, string> = {};
+  const out: Record<string, string> = Object.create(null);
   for (const field of fields) {
     const value = values[field.name] ?? "";
     if (value.trim()) out[field.name] = value;

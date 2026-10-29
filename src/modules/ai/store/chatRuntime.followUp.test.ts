@@ -1,6 +1,7 @@
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import { Chat } from "@ai-sdk/react";
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../lib/native", () => ({ native: {} }));
 vi.mock("@/modules/workspace", () => ({
@@ -83,3 +84,15 @@ describe("sendMessage", () => {
     });
   });
 });
+
+vi.mock("./chatStop", () => ({
+  assertChatCanStart: vi.fn(async () => {}),
+  assertChatNotStopping: vi.fn(),
+  stopChat: vi.fn(async (_id, _options, stop) => {
+    await stop?.();
+  }),
+}));
+
+beforeEach(() =>
+  usePreferencesStore.setState({ hydrated: true, error: null, syncing: false }),
+);

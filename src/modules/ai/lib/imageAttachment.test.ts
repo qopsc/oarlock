@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   fitWithin,
   imageNeedsEncoding,
@@ -94,4 +94,32 @@ describe("messageImages", () => {
       ]),
     ).toEqual([]);
   });
+});
+
+it("closes a late bitmap without encoding after the owning import is cancelled", async () => {
+  const { encodeForSending } = await import("./imageAttachment");
+  let finish!: (bitmap: object) => void;
+  const close = vi.fn();
+  vi.stubGlobal(
+    "createImageBitmap",
+    vi.fn(
+      () =>
+        new Promise((r) => {
+          finish = r;
+        }),
+    ),
+  );
+  const controller = new AbortController();
+  try {
+    const encoding = encodeForSending(new Blob(["image"]), controller.signal);
+    const rejected = expect(encoding).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    controller.abort();
+    finish({ width: 10, height: 10, close });
+    await rejected;
+    expect(close).toHaveBeenCalledOnce();
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

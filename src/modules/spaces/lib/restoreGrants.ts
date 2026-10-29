@@ -52,11 +52,13 @@ export function planRestoreGrants(
   const later = new Map<string, RestoredGrant[]>();
   const add = (spaceId: string, path: string, file: boolean) => {
     const env = envOf.get(spaceId) ?? LOCAL_WORKSPACE;
-    const key = `${workspaceScopeKey(env)}\u0000${file}\u0000${path}`;
+    const immediate = env.kind === "local" || spaceId === activeId;
+    const owner = immediate ? "now" : spaceId;
+    const key = `${owner}\u0000${workspaceScopeKey(env)}\u0000${file}\u0000${path}`;
     if (seen.has(key)) return;
     seen.add(key);
     const grant = { path, file, env };
-    if (env.kind === "local" || spaceId === activeId) {
+    if (immediate) {
       now.push(grant);
       return;
     }

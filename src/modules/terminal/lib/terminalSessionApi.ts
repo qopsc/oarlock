@@ -1,6 +1,7 @@
 import type { BlockMode } from "@/modules/terminal/block/lib/modeMachine";
 import {
   clearGhosttySession,
+  captureGhosttyCompletionOwner,
   disposeGhosttySession,
   dropOnGhosttySession,
   focusGhosttySession,
@@ -18,6 +19,7 @@ import {
   leaveGhosttySessionDrag,
   offerDragToGhosttySession,
   pasteIntoGhosttySession,
+  dropPathsIntoGhosttySession,
   restartGhosttySession,
   scrollGhosttySession,
   submitToGhosttySession,
@@ -34,6 +36,7 @@ import { forgetLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
 import { useTerminalFontOffsets } from "@/modules/terminal/lib/terminalFontOffsets";
 import { useTerminalStatusStore } from "@/modules/terminal/lib/terminalStatus";
 import type { WatermarkState } from "@/modules/terminal/ghostty/ghosttyBlockSessions";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 
 export async function whenSessionReady(
   leafId: number,
@@ -66,6 +69,22 @@ export function pasteIntoSession(leafId: number, text: string): boolean {
   return pasteIntoGhosttySession(leafId, text);
 }
 
+export function dropPathsIntoSession(
+  leafId: number,
+  paths: readonly string[],
+  source: WorkspaceEnv,
+): boolean {
+  return dropPathsIntoGhosttySession(leafId, paths, source);
+}
+
+export function setLeafPathInsertion(
+  leafId: number,
+  capture: (() => ((text: string) => boolean) | null) | null,
+): void {
+  const state = capture ? ensureGhosttyBlocks(leafId) : ghosttyBlocks(leafId);
+  if (state) state.pathInsertion = capture;
+}
+
 /**
  * Offers a drag of files over the leaf to the program running there; false
  * when it did not register for drops (Kitty OSC 72), so the drop pastes.
@@ -96,6 +115,8 @@ export function leaveSessionDrag(leafId: number): void {
 export function leafCwd(leafId: number): string | null {
   return ghosttyCwdForLeaf(leafId);
 }
+
+export { captureGhosttyCompletionOwner };
 
 export function navigateFocusedBlocks(direction: -1 | 1): boolean {
   const leaf = ghosttyFocusedLeaf();

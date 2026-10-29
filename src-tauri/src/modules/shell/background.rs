@@ -34,14 +34,21 @@ fn pump(mut pipe: impl Read, proc: &BackgroundProc) {
 }
 
 pub struct BackgroundProc {
+    pub chat_id: Option<String>,
     pub command: String,
     pub cwd: Option<String>,
     pub started_at_ms: u64,
-    pub child: Arc<SharedChild>,
+    #[cfg(windows)]
+    child: Arc<SharedChild>,
+    #[cfg(unix)]
+    tree: Arc<crate::modules::proc::group::ProcessTree>,
     pub buffer: Mutex<BoundedRingBuffer>,
     pub exited: AtomicBool,
+    killing: AtomicBool,
     pub exit_code: AtomicI32,
     pub exit_unknown: AtomicBool,
+    stdin_control: bool,
+    control: Mutex<Option<std::process::ChildStdin>>,
     /// Holds the process tree: closing it kills everything still inside.
     #[cfg(windows)]
     job: Mutex<Option<crate::modules::proc::job::ProcessJob>>,
@@ -89,28 +96,35 @@ impl BackgroundProc {
     /// process leads its own group, which gets SIGTERM and, after
     /// `TERM_GRACE`, SIGKILL; on Windows its job is closed.
     pub fn kill(&self) {
-        // Once reaped, the leader's id may name another process's group.
-        #[cfg(unix)]
-        if !self.exited.load(Ordering::Acquire) {
-            use crate::modules::proc::capture::TERM_GRACE;
-            let group = self.child.id() as libc::pid_t;
-            // SAFETY: plain syscalls on the group this process leads; the
-            // leader is not reaped before the wait below returns, and a group
-            // id is not reused while any member lives.
-            unsafe { libc::killpg(group, libc::SIGTERM) };
-            let child = self.child.clone();
-            let escalate = move || {
-                let _ = child.wait_timeout(TERM_GRACE);
-                unsafe { libc::killpg(group, libc::SIGKILL) };
-            };
-            if spawn_thread("oarlock-bg-kill", escalate).is_err() {
-                unsafe { libc::killpg(group, libc::SIGKILL) };
-            }
+        if self.exited.load(Ordering::Acquire) || self.killing.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if self.stdin_control {
+            drop(
+                self.control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let tree = self.tree.clone();
+            if spawn_thread("oarlock-bg-kill", move || tree.stop()).is_err() {
+                self.tree.stop();
+            }
         }
         #[cfg(windows)]
         drop(self.job.lock().unwrap().take());
+        #[cfg(windows)]
         let _ = self.child.kill();
+    }
+
+    /// App exit cannot leave the asynchronous kill worker behind.
+    #[cfg(unix)]
+    pub fn finish_kill(&self) {
+        self.tree.stop();
     }
 
     pub fn info(&self, handle: u32) -> BackgroundProcInfo {
@@ -142,23 +156,47 @@ pub fn spawn(
     cwd: Option<String>,
     workspace: WorkspaceEnv,
 ) -> Result<Arc<BackgroundProc>, String> {
+    spawn_owned(command, cwd, workspace, None)
+}
+
+pub fn spawn_owned(
+    command: String,
+    cwd: Option<String>,
+    workspace: WorkspaceEnv,
+    chat_id: Option<String>,
+) -> Result<Arc<BackgroundProc>, String> {
+    spawn_notifying(command, cwd, workspace, chat_id, || {})
+}
+
+pub(super) fn spawn_notifying(
+    command: String,
+    cwd: Option<String>,
+    workspace: WorkspaceEnv,
+    chat_id: Option<String>,
+    on_exit: impl FnOnce() + Send + 'static,
+) -> Result<Arc<BackgroundProc>, String> {
     let trimmed = command.trim().to_string();
     if trimmed.is_empty() {
         return Err("empty command".into());
     }
     if let Some(ref dir) = cwd {
-        if !resolve_path(dir, &workspace).is_dir() {
+        if !resolve_path(dir, &workspace)?.is_dir() {
             return Err(format!("cwd is not a directory: {dir}"));
         }
     }
 
-    let mut cmd = super::build_oneshot_command(&trimmed, &workspace, cwd.as_deref())?;
+    let (mut cmd, stdin_control) =
+        super::build_managed_command(&trimmed, &workspace, cwd.as_deref(), true)?;
     if let (WorkspaceEnv::Local, Some(ref dir)) = (&workspace, &cwd) {
         cmd.current_dir(dir);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if stdin_control {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     crate::modules::proc::hide_console(&mut cmd);
     #[cfg(unix)]
     {
@@ -166,14 +204,18 @@ pub fn spawn(
         cmd.process_group(0);
     }
 
+    #[cfg(not(windows))]
     let shared = Arc::new(SharedChild::spawn(&mut cmd).map_err(|e| e.to_string())?);
     #[cfg(windows)]
-    let job = match crate::modules::proc::job::ProcessJob::create_for(shared.id()) {
-        Ok(job) => Some(job),
-        Err(e) => {
-            log::warn!("background job-object setup failed: {e}");
-            None
-        }
+    let (shared, job) = if stdin_control {
+        (
+            Arc::new(SharedChild::spawn(&mut cmd).map_err(|e| e.to_string())?),
+            None,
+        )
+    } else {
+        let (child, job) =
+            crate::modules::proc::job::spawn_tree(&mut cmd).map_err(|e| e.to_string())?;
+        (Arc::new(child), Some(job))
     };
     let kill_on_fail = || {
         let _ = shared.kill();
@@ -193,13 +235,25 @@ pub fn spawn(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let control = if stdin_control {
+        child.take_stdin()
+    } else {
+        None
+    };
     let proc = Arc::new(BackgroundProc {
+        chat_id,
+        stdin_control,
+        control: Mutex::new(control),
         command: trimmed,
         cwd,
         started_at_ms,
+        #[cfg(unix)]
+        tree: Arc::new(crate::modules::proc::group::ProcessTree::new(child.clone())),
+        #[cfg(windows)]
         child,
         buffer: Mutex::new(BoundedRingBuffer::new(RING_CAP)),
         exited: AtomicBool::new(false),
+        killing: AtomicBool::new(false),
         exit_code: AtomicI32::new(0),
         exit_unknown: AtomicBool::new(false),
         #[cfg(windows)]
@@ -208,8 +262,13 @@ pub fn spawn(
 
     let fail = |error: String| {
         proc.kill();
+        #[cfg(unix)]
+        let _ = proc.tree.foreground(std::time::Duration::ZERO);
+        #[cfg(windows)]
+        let _ = proc.child.wait();
         error
     };
+    let mut drained = Vec::with_capacity(2);
     for (name, pipe) in [
         (
             "oarlock-bg-out",
@@ -221,20 +280,59 @@ pub fn spawn(
         ),
     ] {
         let proc_ref = proc.clone();
-        spawn_thread(name, move || pump(pipe, &proc_ref)).map_err(fail)?;
+        let (done, receiver) = std::sync::mpsc::channel();
+        spawn_thread(name, move || {
+            pump(pipe, &proc_ref);
+            let _ = done.send(());
+        })
+        .map_err(fail)?;
+        drained.push(receiver);
     }
     {
         let proc_ref = proc.clone();
+        #[cfg(windows)]
         let child_for_wait = proc.child.clone();
         spawn_thread("oarlock-bg-wait", move || {
-            match child_for_wait.wait() {
+            #[cfg(unix)]
+            let result = proc_ref.tree.background();
+            #[cfg(windows)]
+            let result = child_for_wait.wait().and_then(|status| {
+                loop {
+                    let active = proc_ref
+                        .job
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|job| job.active_processes())
+                        .transpose()?
+                        .unwrap_or(0);
+                    if active == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(status)
+            });
+            match result {
                 Ok(status) => match status.code() {
                     Some(code) => proc_ref.exit_code.store(code, Ordering::Release),
                     None => proc_ref.exit_unknown.store(true, Ordering::Release),
                 },
-                Err(_) => proc_ref.exit_unknown.store(true, Ordering::Release),
+                Err(_) => {
+                    proc_ref.kill();
+                    proc_ref.exit_unknown.store(true, Ordering::Release);
+                }
+            }
+            // A caller stops polling when exited becomes true. Publish it only
+            // after the final pipe bytes reach the log buffer. Escaped programs
+            // holding a pipe cannot keep the managed job open forever.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+            for receiver in drained {
+                let _ = receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
             }
             proc_ref.exited.store(true, Ordering::Release);
+            on_exit();
         })
         .map_err(fail)?;
     }
@@ -253,6 +351,68 @@ mod tests {
             assert!(Instant::now() < deadline, "the process outlived kill");
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn exited_shell_keeps_its_descendants_managed_and_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let proc = spawn(
+            format!(
+                "(sleep 2; touch '{}') & printf ready; exit 7",
+                marker.display()
+            ),
+            None,
+            WorkspaceEnv::Local,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !proc.read_logs(0).bytes.contains("ready") {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            !proc.read_logs(0).exited,
+            "the child still belongs to this job"
+        );
+        proc.kill();
+        wait_for_exit(&proc);
+        thread::sleep(Duration::from_millis(2100));
+        assert!(!marker.exists(), "the orphaned child survived cancellation");
+    }
+
+    #[test]
+    fn completion_waits_for_the_last_log_bytes() {
+        let proc = spawn(
+            "sleep 0.1; printf last-line".into(),
+            None,
+            WorkspaceEnv::Local,
+        )
+        .unwrap();
+        let buffer = proc.buffer.lock().unwrap();
+        thread::sleep(Duration::from_millis(350));
+        assert!(
+            !proc.exited.load(Ordering::Acquire),
+            "exit raced ahead of the blocked log reader"
+        );
+        drop(buffer);
+        wait_for_exit(&proc);
+        assert!(proc.read_logs(0).bytes.contains("last-line"));
+    }
+
+    #[test]
+    fn background_finishes_only_after_descendants_and_preserves_shell_status() {
+        let proc = spawn(
+            "(sleep 0.4; printf finished) & exit 7".into(),
+            None,
+            WorkspaceEnv::Local,
+        )
+        .unwrap();
+        wait_for_exit(&proc);
+        assert_eq!(proc.read_logs(0).exit_code, Some(7));
+        assert!(proc.read_logs(0).bytes.contains("finished"));
+        proc.kill(); // A completed job never signals its old process group.
     }
 
     #[test]

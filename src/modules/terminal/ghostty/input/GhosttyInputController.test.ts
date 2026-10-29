@@ -4,12 +4,27 @@ import { OarlockGhostty } from "@oarlock/ghostty-core/adapted";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { FakeElement, FakeTextArea } from "./fakeTextArea";
 import { AdaptedGhosttyTerminalModel } from "../AdaptedGhosttyTerminalModel";
-import { baseCharacter, GhosttyInputController } from "./GhosttyInputController";
+import {
+  baseCharacter,
+  GhosttyInputController,
+} from "./GhosttyInputController";
 import { supportedKittyKeyboardFlags } from "./terminalInputEncoding";
 
-const clipboard = vi.hoisted(() => ({ text: "" }));
+const clipboard = vi.hoisted(() => ({
+  text: "",
+  pending: null as Promise<string> | null,
+  image: false,
+  snapshots: 0,
+}));
 vi.mock("@/modules/terminal/lib/terminalClipboard", () => ({
-  readTerminalClipboard: async () => clipboard.text,
+  readTerminalClipboardSnapshot: async () => {
+    clipboard.snapshots += 1;
+    return {
+      revision: "1",
+      text: await (clipboard.pending ?? clipboard.text),
+      image: clipboard.image ? Uint8Array.of(1) : null,
+    };
+  },
 }));
 
 describe("baseCharacter", () => {
@@ -35,7 +50,9 @@ describe("GhosttyInputController", () => {
           import.meta.url,
         ),
       );
-      const core = await OarlockGhostty.loadBytes(Uint8Array.from(bytes).buffer);
+      const core = await OarlockGhostty.loadBytes(
+        Uint8Array.from(bytes).buffer,
+      );
       const terminal = core.createTerminal(80, 24);
       const input = new FakeTextArea();
       const onData = vi.fn();
@@ -140,7 +157,9 @@ describe("GhosttyInputController", () => {
           import.meta.url,
         ),
       );
-      const core = await OarlockGhostty.loadBytes(Uint8Array.from(bytes).buffer);
+      const core = await OarlockGhostty.loadBytes(
+        Uint8Array.from(bytes).buffer,
+      );
       const terminal = core.createTerminal(80, 24);
       const input = new FakeTextArea();
       const onData = vi.fn();
@@ -407,7 +426,6 @@ describe("GhosttyInputController", () => {
     expect(new TextDecoder().decode(onData.mock.calls[0][0])).toBe("å");
     controller.dispose();
   });
-
 });
 
 describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
@@ -615,10 +633,16 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
 
     // crynta/terax-ai#1381: Neovim pushes flags 3, and Shift+; must type ":".
     it.each([
+      [false, 0],
       [false, 1],
       [false, 3],
+      [false, 5],
+      [false, 7],
+      [true, 0],
       [true, 1],
       [true, 3],
+      [true, 5],
+      [true, 7],
     ])(
       "types Shift text as text in Kitty modes below report-all (macOS %s, flags %i)",
       (isMac, flags) => {
@@ -649,7 +673,10 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
             ctrlKey: true,
           }),
         );
-        expect(sent).toEqual(["\x1b[32;2u", "\x1b[97;6u"]);
+        expect(sent).toEqual([
+          flags === 0 ? " " : "\x1b[32;2u",
+          flags & 4 ? "\x1b[97:65;6u" : "\x1b[97;6u",
+        ]);
         dispose();
       },
     );
@@ -695,8 +722,9 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
       expect(press({ key: "Insert", code: "Insert", shiftKey: true })).toBe(
         true,
       );
-      expect(press({ key: "V", code: "KeyV", ctrlKey: true, shiftKey: true }))
-        .toBe(true);
+      expect(
+        press({ key: "V", code: "KeyV", ctrlKey: true, shiftKey: true }),
+      ).toBe(true);
       await vi.waitFor(() =>
         expect(sent.splice(0)).toEqual([
           "\x1b[200~x\x1b[201~",
@@ -719,13 +747,21 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
 
     // crynta/terax-ai#192: agents read a clipboard image on Ctrl+V.
     it.each([
-      ["macOS Cmd+V", { isMac: true }, { key: "v", code: "KeyV", metaKey: true }],
+      [
+        "macOS Cmd+V",
+        { isMac: true },
+        { key: "v", code: "KeyV", metaKey: true },
+      ],
       [
         "Linux Ctrl+Shift+V",
         {},
         { key: "V", code: "KeyV", ctrlKey: true, shiftKey: true },
       ],
-      ["Linux Shift+Insert", {}, { key: "Insert", code: "Insert", shiftKey: true }],
+      [
+        "Linux Shift+Insert",
+        {},
+        { key: "Insert", code: "Insert", shiftKey: true },
+      ],
       [
         "Windows Ctrl+Shift+V",
         { isWindows: true },
@@ -740,10 +776,10 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
       "sends Ctrl+V for %s when the clipboard holds only an image",
       async (_name, platform, chord) => {
         let image = true;
-        const clipboardHasImage = vi.fn(async () => image);
+        clipboard.image = image;
+        clipboard.snapshots = 0;
         const { input, sent, model, replies, write, dispose } = setup({
           ...platform,
-          clipboardHasImage,
         });
         clipboard.text = "";
         const paste = () => input.dispatchEvent(keyboardEvent(chord));
@@ -758,12 +794,14 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
         write("\x1b[<u");
         // An empty clipboard pastes nothing.
         image = false;
+        clipboard.image = image;
         paste();
-        await vi.waitFor(() => expect(clipboardHasImage).toHaveBeenCalledTimes(3));
+        await vi.waitFor(() => expect(clipboard.snapshots).toBe(3));
         await Promise.resolve();
         expect(sent).toEqual([]);
         // A program taking Kitty paste events is offered the image instead.
         image = true;
+        clipboard.image = image;
         model.setClipboardPolicy({ readsToHost: true, writesAllowed: true });
         write("\x1b[?5522h");
         paste();
@@ -771,9 +809,32 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
           expect(replies.join("")).toContain("\x1b]5522;type=read:status=OK"),
         );
         expect(sent).toEqual([]);
+        clipboard.image = false;
         dispose();
       },
     );
+
+    it("offers native menu image files without rereading a newer clipboard", async () => {
+      const reads = clipboard.snapshots;
+      const { input, model, replies, write, dispose } = setup();
+      model.setClipboardPolicy({ readsToHost: true, writesAllowed: true });
+      write("\x1b[?5522h");
+      const event = new Event("paste", { cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: {
+          getData: () => "",
+          types: ["Files"],
+          items: [{ type: "image/png" }],
+        },
+      });
+      input.dispatchEvent(event);
+      await vi.waitFor(() =>
+        expect(replies.join("")).toContain("\x1b]5522;type=read:status=OK"),
+      );
+      expect(event.defaultPrevented).toBe(true);
+      expect(clipboard.snapshots).toBe(reads);
+      dispose();
+    });
 
     it("keeps Ctrl+C and Ctrl+V for the program on Linux", async () => {
       const onCopy = vi.fn(() => true);
@@ -954,11 +1015,9 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
     });
 
     it("tells a program with Kitty paste events of clipboard pastes, not their text", async () => {
-      let image = true;
-      const clipboardHasImage = vi.fn(async () => image);
-      const { controller, model, sent, replies, write, dispose } = setup({
-        clipboardHasImage,
-      });
+      const reads = clipboard.snapshots;
+      const { controller, input, model, sent, replies, write, dispose } =
+        setup();
       /** The MIME types the next paste event lists. */
       const listed = async () => {
         await vi.waitFor(() => expect(replies.length).toBeGreaterThan(0));
@@ -966,14 +1025,16 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
         expect(event).toMatch(
           /^\x1b\]5522;type=read:status=OK(:loc=primary)?:pw=[A-Za-z0-9+/]+=*\x1b\\/,
         );
-        const listing = /status=DATA:mime=Lg==(?::loc=primary)?:pw=[^;]+;([^\x1b]*)/.exec(event)?.[1];
+        const listing =
+          /status=DATA:mime=Lg==(?::loc=primary)?:pw=[^;]+;([^\x1b]*)/.exec(
+            event,
+          )?.[1];
         return listing === undefined ? null : atob(listing);
       };
       model.setClipboardPolicy({ readsToHost: true, writesAllowed: true });
       controller.pasteFromClipboard("one");
       expect(sent.splice(0)).toEqual(["one"]);
-      // The clipboard is looked at only for a program taking paste events.
-      expect(clipboardHasImage).not.toHaveBeenCalled();
+      expect(clipboard.snapshots).toBe(reads);
 
       write("\x1b[?5522h");
       controller.pasteFromClipboard("two", true);
@@ -983,18 +1044,27 @@ describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
       // The primary selection holds text only.
       expect(await listed()).toBe("text/plain\n");
       // A clipboard image is offered as PNG, alone when there is no text.
-      controller.pasteFromClipboard("");
+      controller.pasteFromClipboard("", false, true);
       expect(await listed()).toBe("image/png\n");
-      controller.pasteFromClipboard("four");
+      controller.pasteFromClipboard("four", false, true);
       expect(await listed()).toBe("text/plain image/png\n");
       expect(sent).toEqual([]);
       // An empty clipboard pastes nothing.
-      image = false;
       controller.pasteFromClipboard("");
-      await vi.waitFor(() => expect(clipboardHasImage).toHaveBeenCalledTimes(3));
       await Promise.resolve();
       expect(replies).toEqual([]);
       expect(sent).toEqual([]);
+
+      // beforeinput carries text only; do not combine it with a newer OS image.
+      input.dispatchEvent(
+        Object.assign(new Event("beforeinput", { cancelable: true }), {
+          inputType: "insertFromPaste",
+          data: "menu text",
+          isComposing: false,
+        }),
+      );
+      expect(await listed()).toBe("text/plain\n");
+      expect(clipboard.snapshots).toBe(reads);
 
       // Without the host serving reads the program could not fetch it.
       model.setClipboardPolicy({ readsToHost: false, writesAllowed: true });
@@ -1087,3 +1157,53 @@ function mouseEvent(type: string, values: Partial<MouseEvent>): MouseEvent {
     ...values,
   }) as MouseEvent;
 }
+
+it("does not inspect a disposed model when a delayed empty clipboard read finishes", async () => {
+  let finish!: (text: string) => void;
+  clipboard.pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const input = new FakeTextArea();
+  const pasteEventsWanted = vi.fn(() => false);
+  const controller = new GhosttyInputController({
+    model: { ...inputModel(), pasteEventsWanted },
+    input: input as unknown as HTMLTextAreaElement,
+    pointerTarget: new FakeElement() as unknown as HTMLElement,
+    cellSize: () => ({ width: 10, height: 20 }),
+    isMac: true,
+    onCopy: () => false,
+    onData: vi.fn(),
+  });
+  input.dispatchEvent(keyboardEvent({ key: "v", code: "KeyV", metaKey: true }));
+  controller.dispose();
+  pasteEventsWanted.mockClear();
+  finish("");
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  clipboard.pending = null;
+  expect(pasteEventsWanted).not.toHaveBeenCalled();
+});
+
+it("reports a failed snapshot without forwarding Ctrl+V to the program", async () => {
+  clipboard.pending = Promise.reject(new Error("Clipboard changed"));
+  const onData = vi.fn();
+  const onClipboardError = vi.fn();
+  const input = new FakeTextArea();
+  const controller = new GhosttyInputController({
+    model: inputModel(),
+    input: input as unknown as HTMLTextAreaElement,
+    pointerTarget: new FakeElement() as unknown as HTMLElement,
+    cellSize: () => ({ width: 10, height: 20 }),
+    isWindows: true,
+    smartCopyPaste: () => true,
+    onCopy: () => false,
+    onData,
+    onClipboardError,
+  });
+  input.dispatchEvent(keyboardEvent({ key: "v", code: "KeyV", ctrlKey: true }));
+  await vi.waitFor(() => expect(onClipboardError).toHaveBeenCalledOnce());
+  expect(onData).not.toHaveBeenCalled();
+  clipboard.pending = null;
+  controller.dispose();
+});

@@ -1,3 +1,14 @@
+import {
+  editorQuitSealed,
+  sealEditors,
+  releaseEditors,
+} from "@/modules/editor/lib/quitBarrier";
+import {
+  hasNewEdits,
+  QuitApproval,
+  type QuitRequest,
+  type QuitResume,
+} from "./quitApproval";
 import { toast } from "sonner";
 import { flushPersist } from "@/modules/ai/store/chatStore";
 import {
@@ -86,29 +97,109 @@ export type PendingAppClose = AppCloseBlocker & {
   quits: boolean;
   /** The quit request this answers (`windows.rs`); null for a close. */
   quitRound: number | null;
+  quitRequest?: QuitRequest;
 };
-
-function answerQuit(round: number, ok: boolean): void {
-  void invoke("app_quit_ready", { round, ok }).catch(() => {});
-}
 
 /**
  * Guards closing this window and quitting Oarlock (asked of each window in turn
  * by `windows.rs`): running commands and unsaved files are confirmed first,
  * then chat history, scrollback and spaces are saved.
  */
-export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
+export function useAppCloseGuard(
+  tabsRef: RefObject<Tab[]>,
+  editorIsDirty?: (id: number) => boolean | undefined,
+  editorCloseRevision?: (id: number) => string | undefined,
+) {
   const [pendingAppClose, setPendingAppClose] =
     useState<PendingAppClose | null>(null);
+  const pending = useRef<{
+    request: PendingAppClose;
+    revisions: Map<number, unknown>;
+  } | null>(null);
+  const attempt = useRef(0);
+  const dirtyRevisions = useCallback(() => {
+    const revisions = new Map<number, unknown>();
+    for (const tab of tabsRef.current) {
+      if (tab.kind === "editor" && (editorIsDirty?.(tab.id) ?? tab.dirty)) {
+        revisions.set(tab.id, editorCloseRevision?.(tab.id) ?? tab);
+      }
+    }
+    return revisions;
+  }, [tabsRef, editorIsDirty, editorCloseRevision]);
+  const readRevisions = useRef(dirtyRevisions);
+  readRevisions.current = dirtyRevisions;
+  const approvalRef = useRef<QuitApproval | null>(null);
+  if (!approvalRef.current)
+    approvalRef.current = new QuitApproval({
+      read: () => readRevisions.current(),
+      flush: async () => {
+        const flush = await saveState();
+        if (closeAfterFlush(flush, warned.current) === "close") return true;
+        warned.current = true;
+        toast.error("Could not save chat history", {
+          id: "close-save-failed",
+          duration: Number.POSITIVE_INFINITY,
+          description: "The latest messages may be lost.",
+          action: { label: "Quit anyway", onClick: () => void quitApp() },
+        });
+        return false;
+      },
+      answer: (request, ok) =>
+        invoke("app_quit_ready", {
+          round: request.round,
+          ticket: request.ticket,
+          ok,
+        }),
+      changed: (request) =>
+        invoke("app_quit_changed", {
+          round: request.round,
+          ticket: request.ticket,
+        }),
+      cancel: (round) => invoke<boolean>("app_quit_cancel", { round }),
+      resumed: (cancelled) => {
+        if (!cancelled) return;
+        attempt.current += 1;
+        if (pending.current?.request.quitRound !== null) {
+          pending.current = null;
+          setPendingAppClose(null);
+        }
+      },
+      interrupted: () =>
+        toast.info("Quit cancelled because files changed", {
+          id: "quit-files-changed",
+          description:
+            "Document updates are being applied. You can quit again when ready.",
+        }),
+      failed: () =>
+        toast.error("Could not finish quitting", {
+          id: "quit-check-failed",
+          description:
+            "Your documents are still open. Please try quitting again.",
+        }),
+    });
+  const approval = approvalRef.current;
+  const ask = useCallback(
+    (request: PendingAppClose) => {
+      const revisions = dirtyRevisions();
+      request = { ...request, dirtyEditors: revisions.size };
+      pending.current = { request, revisions };
+      setPendingAppClose(request);
+    },
+    [dirtyRevisions],
+  );
   const forceClose = useRef(false);
   const closing = useRef(false);
+  const closeIdle = useRef<Promise<void>>(Promise.resolve());
   const warned = useRef(false);
   const closeWindow = useCallback(async () => {
+    const seal = `window-close:${attempt.current}`;
+    if (!sealEditors(seal)) return;
     forceClose.current = true;
     try {
       await getCurrentWindow().close();
     } catch (error) {
       forceClose.current = false;
+      releaseEditors(seal);
       toast.error("Could not close the window", {
         description: String(error),
       });
@@ -122,12 +213,12 @@ export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
       (await anyTerminalBusy(tabsRef.current));
     // Count after the await so edits made during the IPC check are seen.
     const dirtyEditors = tabsRef.current.filter(
-      (t) => t.kind === "editor" && t.dirty,
+      (t) => t.kind === "editor" && (editorIsDirty?.(t.id) ?? t.dirty),
     ).length;
     return dirtyEditors > 0 || busyTerminal
       ? { dirtyEditors, busyTerminal }
       : null;
-  }, [tabsRef]);
+  }, [tabsRef, editorIsDirty]);
   /** Saves chat history, scrollback and spaces; reports the chat flush. */
   const saveState = useCallback(async () => {
     flushPersist();
@@ -137,72 +228,109 @@ export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
     ]);
     return flush;
   }, []);
-  const finishClose = useCallback(async () => {
-    if (closing.current) return;
-    closing.current = true;
-    try {
-      const flush = await saveState();
-      if (closeAfterFlush(flush, warned.current) === "warn") {
-        warned.current = true;
-        toast.error("Could not save chat history", {
-          id: "close-save-failed",
-          duration: Number.POSITIVE_INFINITY,
-          description: flush.timedOut
-            ? "Saving is taking too long. The latest messages may be lost."
-            : "The latest messages may be lost.",
-          action: {
-            label: "Close anyway",
-            onClick: () => void closeWindow(),
-          },
-        });
+  const finish = useCallback(
+    async (
+      request: QuitRequest | null,
+      approved = new Map<number, unknown>(),
+      quits = request !== null,
+    ) => {
+      if (closing.current) {
+        await closeIdle.current;
+        if (request && approval.isCurrent(request))
+          return finish(request, approved, quits);
         return;
       }
-      await closeWindow();
-    } finally {
-      closing.current = false;
-    }
-  }, [closeWindow, saveState]);
-  const finishQuit = useCallback(
-    async (round: number) => {
-      if (closing.current) return;
+      const round = request?.round ?? null;
       closing.current = true;
+      let complete!: () => void;
+      closeIdle.current = new Promise<void>((resolve) => {
+        complete = resolve;
+      });
+      const generation = ++attempt.current;
       try {
         const flush = await saveState();
+        if (
+          generation !== attempt.current ||
+          (request && !approval.isCurrent(request))
+        )
+          return;
+        const current = dirtyRevisions();
+        if (hasNewEdits(current, approved)) {
+          ask({
+            dirtyEditors: current.size,
+            busyTerminal: false,
+            quits,
+            quitRound: round,
+            quitRequest: request ?? undefined,
+          });
+          return;
+        }
         if (closeAfterFlush(flush, warned.current) === "warn") {
           warned.current = true;
-          answerQuit(round, false);
+          if (round !== null) void approval.abort(round);
           toast.error("Could not save chat history", {
             id: "close-save-failed",
             duration: Number.POSITIVE_INFINITY,
             description: flush.timedOut
               ? "Saving is taking too long. The latest messages may be lost."
               : "The latest messages may be lost.",
-            action: { label: "Quit anyway", onClick: () => void quitApp() },
+            action: {
+              label: round === null ? "Close anyway" : "Quit anyway",
+              // A toast can remain visible while more edits arrive. Re-enter the
+              // guard instead of bypassing the document revision check.
+              onClick: () => {
+                // Restart the native protocol after a failed quit flush; its
+                // aborted ticket can never be reused for approval.
+                if (round !== null) {
+                  void quitApp();
+                  return;
+                }
+                if (generation !== attempt.current) return;
+                void finish(null, approved, quits);
+              },
+            },
           });
           return;
         }
-        answerQuit(round, true);
+        if (round === null) await closeWindow();
+        else if (request) approval.approve(request, current);
       } finally {
         closing.current = false;
+        complete();
       }
     },
-    [saveState],
+    [closeWindow, saveState, dirtyRevisions, ask, approval],
   );
+
+  useEffect(() => {
+    approval.activate();
+    return () => {
+      attempt.current += 1;
+      approval.dispose();
+    };
+  }, [approval]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void getCurrentWindow()
       .onCloseRequested(async (event) => {
-        if (forceClose.current) return;
+        if (disposed || forceClose.current) return;
         event.preventDefault();
+        if (editorQuitSealed() || closing.current || pending.current) return;
+        const generation = ++attempt.current;
+        const current = () =>
+          !disposed &&
+          generation === attempt.current &&
+          !editorQuitSealed() &&
+          !closing.current &&
+          !pending.current;
         const found = await blocker();
-        if (found) {
-          const quits = (await openAppWindowCount()) <= 1;
-          setPendingAppClose({ ...found, quits, quitRound: null });
-        } else {
-          void finishClose();
-        }
+        if (!current()) return;
+        const quits = (await openAppWindowCount()) <= 1;
+        if (!current()) return;
+        if (found) ask({ ...found, quits, quitRound: null });
+        else void finish(null, undefined, quits);
       })
       .then((un) => {
         if (disposed) un();
@@ -212,52 +340,85 @@ export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
       disposed = true;
       unlisten?.();
     };
-  }, [blocker, finishClose]);
+  }, [blocker, finish, ask]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
     let disposed = false;
     const window = getCurrentWindow();
-    void window
-      .listen<number>("oarlock:quit-requested", async ({ payload: round }) => {
-        const found = await blocker();
-        if (!found) {
-          void finishQuit(round);
-          return;
-        }
-        // The user answers here, so this window comes forward.
-        await window.unminimize().catch(() => {});
-        await window.show().catch(() => {});
-        await window.setFocus().catch(() => {});
-        setPendingAppClose({ ...found, quits: true, quitRound: round });
+    const registrations = [
+      window.listen<QuitResume>("oarlock:quit-resume", ({ payload }) => {
+        approval.resume(payload);
+        if (payload.message)
+          toast.error("Could not finish quitting", {
+            id: "quit-check-failed",
+            description: payload.message,
+          });
+      }),
+      window.listen<QuitRequest>(
+        "oarlock:quit-requested",
+        async ({ payload: request }) => {
+          if (disposed || !approval.begin(request)) return;
+          // Accepted native requests supersede local preflight checks, including
+          // ones still awaiting process inspection or the open-window count.
+          attempt.current += 1;
+          if (request.verify) {
+            void approval.verify(request);
+            return;
+          }
+          const found = await blocker();
+          if (disposed || !approval.isCurrent(request)) return;
+          if (!found) {
+            void finish(request);
+            return;
+          }
+          await window.unminimize().catch(() => {});
+          await window.show().catch(() => {});
+          await window.setFocus().catch(() => {});
+          if (!disposed && approval.isCurrent(request))
+            ask({
+              ...found,
+              quits: true,
+              quitRound: request.round,
+              quitRequest: request,
+            });
+        },
+      ),
+    ];
+    void Promise.all(registrations)
+      .then(() => {
+        if (!disposed) void invoke("app_window_ready").catch(() => {});
       })
-      .then((un) => {
-        if (disposed) {
-          un();
-          return;
-        }
-        unlisten = un;
-        // Only now can this window be asked before quitting.
-        void invoke("app_window_ready").catch(() => {});
-      });
+      .catch(() => toast.error("Could not install the quit guard"));
     return () => {
       disposed = true;
-      unlisten?.();
+      for (const registration of registrations)
+        void registration.then((unlisten) => unlisten()).catch(() => {});
     };
-  }, [blocker, finishQuit]);
+  }, [blocker, finish, ask, approval]);
 
-  const confirmAppClose = useCallback(() => {
-    const round = pendingAppClose?.quitRound ?? null;
-    setPendingAppClose(null);
-    if (round === null) void finishClose();
-    else void finishQuit(round);
-  }, [pendingAppClose, finishClose, finishQuit]);
+  const confirmAppClose = useCallback(
+    (expected?: PendingAppClose) => {
+      const accepted = pending.current;
+      if (!accepted || (expected && accepted.request !== expected)) return;
+      pending.current = null;
+      setPendingAppClose(null);
+      void finish(
+        accepted.request.quitRequest ?? null,
+        accepted.revisions,
+        accepted.request.quits,
+      );
+    },
+    [finish],
+  );
 
   const cancelAppClose = useCallback(() => {
-    const round = pendingAppClose?.quitRound ?? null;
-    if (round !== null) answerQuit(round, false);
+    if (!pending.current) return;
+    attempt.current += 1;
+    const round = pending.current?.request.quitRound ?? null;
+    if (round !== null) void approval.abort(round);
+    pending.current = null;
     setPendingAppClose(null);
-  }, [pendingAppClose]);
+  }, [approval]);
 
   return { pendingAppClose, confirmAppClose, cancelAppClose };
 }

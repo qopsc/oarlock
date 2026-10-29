@@ -417,6 +417,12 @@ export function ServerDialog({
                 />
               </Field>
               <SignInClient draft={draft} error={shown.oauth} patch={patch} />
+              {initial.base && (
+                <p className="text-[11px] text-muted-foreground">
+                  Changing connection settings or credentials clears any existing
+                  sign-in.
+                </p>
+              )}
             </>
           )}
         </form>

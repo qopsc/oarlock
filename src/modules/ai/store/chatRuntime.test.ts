@@ -11,7 +11,11 @@ const aiSdkReact = vi.hoisted(() => {
     id: string;
     transport: unknown;
     messages: unknown[];
-    constructor(opts: { id: string; messages?: unknown[]; transport: unknown }) {
+    constructor(opts: {
+      id: string;
+      messages?: unknown[];
+      transport: unknown;
+    }) {
       this.id = opts.id;
       this.transport = opts.transport;
       this.messages = opts.messages ?? [];
@@ -38,7 +42,9 @@ const configMock = vi.hoisted(() => ({
 vi.mock("../config", () => configMock);
 
 vi.mock("@/modules/settings/preferences", () => ({
-  usePreferencesStore: { getState: () => ({}) },
+  usePreferencesStore: {
+    getState: () => ({ hydrated: true, error: null, syncing: false }),
+  },
 }));
 
 vi.mock("../lib/agents", () => ({
@@ -142,4 +148,47 @@ describe("chat runtime", () => {
     expect(aiSdkReact.constructed[0].messages).toBe(seeded);
     expect(chatStore.state.seeds.has("session-1")).toBe(false);
   });
+
+  it("expires restored approvals but preserves approvals of a live runtime", () => {
+    const parts = [
+      "approval-requested",
+      "approval-responded",
+      "output-available",
+    ].map((state, i) => ({
+      type: "dynamic-tool",
+      toolName: "shell",
+      toolCallId: `call-${i}`,
+      state,
+      input: { command: "touch result.txt" },
+      approval: { id: `approval-${i}`, approved: true },
+    }));
+    chatStore.state.seeds.set("session-1", [
+      { id: "a", role: "assistant", parts },
+    ]);
+    const restored = getOrCreateChat("session-1");
+    expect(restored.messages[0].parts.slice(0, 2)).toEqual(
+      parts.slice(0, 2).map((part) => ({
+        ...part,
+        state: "output-denied",
+        approval: {
+          ...part.approval,
+          approved: false,
+          reason: expect.stringContaining("approval expired"),
+        },
+      })),
+    );
+    expect(restored.messages[0].parts[2]).toBe(parts[2]);
+    restored.messages = [
+      { id: "live", role: "assistant", parts: [parts[0]] },
+    ] as never;
+    expect(getOrCreateChat("session-1").messages[0].parts[0]).toBe(parts[0]);
+  });
 });
+
+vi.mock("./chatStop", () => ({
+  assertChatCanStart: vi.fn(async () => {}),
+  assertChatNotStopping: vi.fn(),
+  stopChat: vi.fn(async (_id, _options, stop) => {
+    await stop?.();
+  }),
+}));

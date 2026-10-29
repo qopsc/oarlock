@@ -11,6 +11,8 @@ import { SignInRequiredError } from "../lib/auth";
 import type { McpServerConfig } from "../lib/config";
 import { toToolOutput } from "../lib/results";
 
+vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "test-page" }));
+
 const host = vi.hoisted(() => {
   type Channel = { id: number; onmessage: (value: unknown) => void };
   return {
@@ -120,9 +122,7 @@ describe("connectServer over the stdio host", () => {
     const connection = await connectServer(stdioServer(), "/bin/zsh");
     expect(spawned[0]).toMatchObject({
       serverId: "s1",
-      command: "demo",
-      env: {},
-      secretEnv: ["TOKEN"],
+      revision: 0,
       shell: "/bin/zsh",
     });
     expect(connection.remote).toBe(false);
@@ -307,9 +307,7 @@ describe("connectServer over HTTP through the backend proxy", () => {
     );
     expect(opened[0]).toEqual({
       serverId: "s1",
-      url: `${origin}/mcp`,
-      headers: { "X-Team": "core" },
-      secretHeaders: ["Authorization"],
+      revision: 0,
     });
     expect(connection.remote).toBe(true);
     const result = await connection.client.callTool({
@@ -435,6 +433,7 @@ describe("project servers", () => {
     expect(Object.keys(spawned[0]).sort()).toEqual([
       "onExit",
       "onMessage",
+      "projectKey",
       "serverId",
       "shell",
     ]);

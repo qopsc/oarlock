@@ -8,6 +8,7 @@ import { runScopeHandlers } from "@codemirror/view";
 import { useFontFeatureStack } from "../lib/fontFeatures";
 import {
   clearLeafBlockSelection,
+  captureGhosttyCompletionOwner,
   getLeafDraft,
   leafGridSelection,
   setLeafDraft,
@@ -15,7 +16,9 @@ import {
   setLeafInputFocus,
   setLeafInputKeyDown,
   setLeafInputPaste,
+  setLeafPathInsertion,
 } from "../lib/terminalSessionApi";
+import { captureDropInsertion } from "../lib/shellDropInsertion";
 import { useTerminalFont } from "../lib/useTerminalFont";
 import {
   historyCommands,
@@ -51,6 +54,10 @@ export default function ShellInput({
   cbRef.current = { onSubmit, onInterrupt, getCwd };
   const leafIdRef = useRef(leafId);
   leafIdRef.current = leafId;
+  const completionLifetime = useRef({ leafId, mode, focused, revision: 0 });
+  if (completionLifetime.current.leafId !== leafId || completionLifetime.current.mode !== mode || completionLifetime.current.focused !== focused) {
+    completionLifetime.current = { leafId, mode, focused, revision: completionLifetime.current.revision + 1 };
+  }
   const atPrompt = mode === "prompt";
   const focusableRef = useRef(false);
   focusableRef.current = focused && atPrompt;
@@ -91,6 +98,12 @@ export default function ShellInput({
       placeholderText: `Run a command  -  ↑ history  ${shortcutText("terminal.toggleInput")} switch to AI`,
       commandNames: () => commandsRef.current,
       getCwd: () => cbRef.current.getCwd(),
+      completionOwner: () => {
+        const leaf = leafIdRef.current;
+        const owner = captureGhosttyCompletionOwner(leaf);
+        const revision = completionLifetime.current.revision;
+        return owner && { ...owner, active: () => completionLifetime.current.revision === revision && leafIdRef.current === leaf && focusableRef.current && owner.active() };
+      },
       onChange: (text) =>
         setLeafInputActivity(leafIdRef.current, text.length > 0),
       suggest: historySuggest,
@@ -137,6 +150,21 @@ export default function ShellInput({
       view.dispatch(view.state.replaceSelection(text));
       view.focus();
     });
+    setLeafPathInsertion(leafId, () => {
+      const view = handleRef.current?.view;
+      if (!view || leafIdRef.current !== leafId || !focusableRef.current)
+        return null;
+      return captureDropInsertion(
+        view.state,
+        () => handleRef.current?.view?.state,
+        view.state.doc.toString(),
+        view.state.selection.ranges,
+        (text) => {
+          view.dispatch(view.state.replaceSelection(text));
+          view.focus();
+        },
+      );
+    });
     handleRef.current?.setValue(getLeafDraft(leafId));
     requestAnimationFrame(() => {
       if (focusableRef.current && leafIdRef.current === leafId) {
@@ -150,6 +178,7 @@ export default function ShellInput({
       setLeafInputFocus(leafId, null);
       setLeafInputKeyDown(leafId, null);
       setLeafInputPaste(leafId, null);
+      setLeafPathInsertion(leafId, null);
     };
   }, [leafId]);
 

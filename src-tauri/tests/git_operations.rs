@@ -1,12 +1,12 @@
 mod common;
 
 use common::{git_available, GitRepoFixture};
-use tempfile::TempDir;
 use oarlock_lib::modules::fs::to_canon;
 use oarlock_lib::modules::git::errors::GitError;
 use oarlock_lib::modules::git::operations;
 use oarlock_lib::modules::git::types::DiscardEntry;
 use oarlock_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
+use tempfile::TempDir;
 
 fn skip_if_no_git() -> bool {
     if !git_available() {
@@ -885,7 +885,7 @@ fn undo_last_commit_moves_its_changes_back_to_the_index() {
     commit_file(&fx, "second");
     let second = head_sha(&fx);
 
-    operations::undo_last_commit(&fx.registry, &fx.repo_str(), &second, &fx.workspace)
+    operations::undo_last_commit(&fx.registry, &fx.repo_str(), &second, "main", &fx.workspace)
         .expect("undo");
     assert_eq!(head_sha(&fx), first);
     assert_eq!(git_stdout(&fx, &["rev-parse", "ORIG_HEAD"]), vec![second]);
@@ -911,15 +911,21 @@ fn undo_last_commit_refuses_a_commit_that_is_no_longer_head() {
     commit_file(&fx, "third");
     let third = head_sha(&fx);
 
-    let err = operations::undo_last_commit(&fx.registry, &fx.repo_str(), &chosen, &fx.workspace)
-        .expect_err("a stale HEAD must not be undone");
+    let err =
+        operations::undo_last_commit(&fx.registry, &fx.repo_str(), &chosen, "main", &fx.workspace)
+            .expect_err("a stale HEAD must not be undone");
     assert!(err.to_string().contains("HEAD moved"));
     assert_eq!(head_sha(&fx), third, "history is untouched");
 
     for bad in ["not-a-sha", "abc123", ""] {
-        assert!(
-            operations::undo_last_commit(&fx.registry, &fx.repo_str(), bad, &fx.workspace).is_err()
-        );
+        assert!(operations::undo_last_commit(
+            &fx.registry,
+            &fx.repo_str(),
+            bad,
+            "main",
+            &fx.workspace
+        )
+        .is_err());
     }
     assert_eq!(head_sha(&fx), third);
 }
@@ -932,8 +938,9 @@ fn undo_last_commit_refuses_the_first_commit() {
     let fx = GitRepoFixture::new();
     commit_file(&fx, "first");
     let first = head_sha(&fx);
-    let err = operations::undo_last_commit(&fx.registry, &fx.repo_str(), &first, &fx.workspace)
-        .expect_err("the root commit has no parent to go back to");
+    let err =
+        operations::undo_last_commit(&fx.registry, &fx.repo_str(), &first, "main", &fx.workspace)
+            .expect_err("the root commit has no parent to go back to");
     assert!(err.to_string().contains("first commit"));
     assert_eq!(head_sha(&fx), first);
 }
@@ -1036,4 +1043,729 @@ fn discover_repos_finds_projects_in_a_folder_that_is_not_one() {
     let with_slash =
         operations::discover_repos(&registry, &format!("{base}/"), &WorkspaceEnv::Local).unwrap();
     assert_eq!(with_slash, found);
+}
+
+#[test]
+fn live_staged_diff_refreshes_its_rename_source_from_the_index() {
+    let r = GitRepoFixture::new();
+    r.write_file("a.txt", "first source\n");
+    r.write_file("b.txt", "second source\n");
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    r.run_git(&["mv", "a.txt", "new.txt"]);
+    let first = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "new.txt",
+        true,
+        Some("a.txt"),
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(first.original_content, "first source\n");
+    r.run_git(&["reset", "--hard", "HEAD"]);
+    r.run_git(&["mv", "b.txt", "new.txt"]);
+    let refreshed = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "new.txt",
+        true,
+        Some("a.txt"),
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(refreshed.original_content, "second source\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn discard_symlink_preserves_target_edits() {
+    let r = GitRepoFixture::new();
+    r.write_file("a.txt", "original a\n");
+    r.write_file("b.txt", "original b\n");
+    let link = r.repo_path.join("link");
+    std::os::unix::fs::symlink("a.txt", &link).unwrap();
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("b.txt", &link).unwrap();
+    r.write_file("b.txt", "precious unsaved edits\n");
+    operations::discard(
+        &r.registry,
+        &r.repo_str(),
+        &[DiscardEntry {
+            path: "link".into(),
+            untracked: false,
+        }],
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(r.repo_path.join("b.txt")).unwrap(),
+        "precious unsaved edits\n"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("a.txt")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_stage_unstage_and_previews_keep_the_entry_identity() {
+    let r = GitRepoFixture::new();
+    r.write_file("a.txt", "contents of a\n");
+    r.write_file("b.txt", "contents of b\n");
+    let link = r.repo_path.join("link");
+    std::os::unix::fs::symlink("a.txt", &link).unwrap();
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("b.txt", &link).unwrap();
+    r.write_file("b.txt", "unrelated target edits\n");
+    let working = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "link",
+        false,
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(working.original_content, "a.txt");
+    assert_eq!(working.modified_content, "b.txt");
+    operations::stage(&r.registry, &r.repo_str(), &["link".into()], &r.workspace).unwrap();
+    let staged =
+        operations::diff_content(&r.registry, &r.repo_str(), "link", true, None, &r.workspace)
+            .unwrap();
+    assert_eq!(staged.original_content, "a.txt");
+    assert_eq!(staged.modified_content, "b.txt");
+    let target = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "b.txt",
+        true,
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(target.original_content, target.modified_content);
+    operations::unstage(&r.registry, &r.repo_str(), &["link".into()], &r.workspace).unwrap();
+    let unstaged =
+        operations::diff_content(&r.registry, &r.repo_str(), "link", true, None, &r.workspace)
+            .unwrap();
+    assert_eq!(unstaged.original_content, unstaged.modified_content);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_and_external_symlinks_are_entries_and_never_read_the_target() {
+    let r = GitRepoFixture::new();
+    r.write_file("seed", "seed");
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    let outside = TempDir::new().unwrap();
+    let target = outside.path().join("secret");
+    std::fs::write(&target, "must not be read").unwrap();
+    for (name, destination) in [
+        ("external", target.to_string_lossy().into_owned()),
+        ("dangling", "missing-target".into()),
+    ] {
+        std::os::unix::fs::symlink(&destination, r.repo_path.join(name)).unwrap();
+        let diff =
+            operations::diff_content(&r.registry, &r.repo_str(), name, false, None, &r.workspace)
+                .unwrap();
+        assert_eq!(diff.modified_content, destination);
+        operations::stage(&r.registry, &r.repo_str(), &[name.into()], &r.workspace).unwrap();
+        let staged =
+            operations::diff_content(&r.registry, &r.repo_str(), name, true, None, &r.workspace)
+                .unwrap();
+        assert_eq!(staged.modified_content, destination);
+        operations::unstage(&r.registry, &r.repo_str(), &[name.into()], &r.workspace).unwrap();
+        operations::discard(
+            &r.registry,
+            &r.repo_str(),
+            &[DiscardEntry {
+                path: name.into(),
+                untracked: true,
+            }],
+            &r.workspace,
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(r.repo_path.join(name)).is_err());
+    }
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "must not be read");
+}
+
+#[cfg(unix)]
+#[test]
+fn history_uses_stored_entries_even_when_an_ancestor_is_now_a_symlink() {
+    let r = GitRepoFixture::new();
+    r.write_file("folder/file", "historical");
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&r.repo_path)
+        .output()
+        .unwrap();
+    let sha = String::from_utf8(sha.stdout).unwrap();
+    std::fs::remove_dir_all(r.repo_path.join("folder")).unwrap();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(outside.path().join("file"), "external edits").unwrap();
+    std::os::unix::fs::symlink(outside.path(), r.repo_path.join("folder")).unwrap();
+    let diff = operations::commit_file_diff(
+        &r.registry,
+        &r.repo_str(),
+        sha.trim(),
+        "folder/file",
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(diff.modified_content, "historical");
+    assert!(operations::stage(
+        &r.registry,
+        &r.repo_str(),
+        &["folder/file".into()],
+        &r.workspace
+    )
+    .is_err());
+    assert!(operations::discard(
+        &r.registry,
+        &r.repo_str(),
+        &[DiscardEntry {
+            path: "folder/file".into(),
+            untracked: false
+        }],
+        &r.workspace
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("file")).unwrap(),
+        "external edits"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_previews_do_not_execute_repository_text_converters() {
+    let r = GitRepoFixture::new();
+    r.write_file(".gitattributes", "a.txt diff=custom\n");
+    r.write_file("a.txt", "before\n");
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    r.write_file("converter.sh", "echo invoked > converter-ran\ncat \"$1\"\n");
+    r.run_git(&["config", "diff.custom.textconv", "sh converter.sh"]);
+    r.write_file("a.txt", "after\n");
+    assert!(operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "a.txt",
+        false,
+        None,
+        &r.workspace,
+    )
+    .is_err());
+    assert!(
+        !r.repo_path.join("converter-ran").exists(),
+        "viewing a working diff ran a repository-configured command"
+    );
+    r.run_git(&["add", "a.txt"]);
+    r.run_git(&["commit", "-qm", "change"]);
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&r.repo_path)
+        .output()
+        .unwrap();
+    assert!(operations::commit_file_diff(
+        &r.registry,
+        &r.repo_str(),
+        String::from_utf8(sha.stdout).unwrap().trim(),
+        "a.txt",
+        None,
+        &r.workspace,
+    )
+    .is_err());
+    assert!(
+        !r.repo_path.join("converter-ran").exists(),
+        "viewing history ran a repository-configured command"
+    );
+}
+
+#[test]
+fn working_diff_accepts_index_spelling_on_case_insensitive_filesystems() {
+    let r = GitRepoFixture::new();
+    r.write_file("lower.txt", "before\n");
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    std::fs::rename(r.repo_path.join("lower.txt"), r.repo_path.join("LOWER.txt")).unwrap();
+    if !r.repo_path.join("lower.txt").exists() {
+        return;
+    }
+    r.write_file("LOWER.txt", "after\n");
+    let diff = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "lower.txt",
+        false,
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(diff.original_content, "before\n");
+    assert_eq!(diff.modified_content, "after\n");
+}
+
+#[test]
+fn discard_treats_selected_entry_as_literal_not_a_pattern() {
+    let r = GitRepoFixture::new();
+    for path in ["file[1].txt", "file1.txt"] {
+        r.write_file(path, "original\n");
+    }
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    for path in ["file[1].txt", "file1.txt"] {
+        r.write_file(path, "valuable edits\n");
+    }
+    operations::discard(
+        &r.registry,
+        &r.repo_str(),
+        &[DiscardEntry {
+            path: "file[1].txt".into(),
+            untracked: false,
+        }],
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(r.repo_path.join("file[1].txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.repo_path.join("file1.txt")).unwrap(),
+        "valuable edits\n"
+    );
+}
+
+#[test]
+fn staging_and_unstaging_keep_glob_named_entries_literal() {
+    let r = GitRepoFixture::new();
+    for path in ["file[1].txt", "file1.txt"] {
+        r.write_file(path, "original\n");
+    }
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    for path in ["file[1].txt", "file1.txt"] {
+        r.write_file(path, "changes\n");
+    }
+    operations::stage(
+        &r.registry,
+        &r.repo_str(),
+        &["file[1].txt".into()],
+        &r.workspace,
+    )
+    .unwrap();
+    let other = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "file1.txt",
+        true,
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        other.original_content, other.modified_content,
+        "staging selected another file"
+    );
+    r.run_git(&["add", "."]);
+    operations::unstage(
+        &r.registry,
+        &r.repo_str(),
+        &["file[1].txt".into()],
+        &r.workspace,
+    )
+    .unwrap();
+    let other = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "file1.txt",
+        true,
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert_ne!(
+        other.original_content, other.modified_content,
+        "unstaging selected another file"
+    );
+}
+
+#[test]
+fn working_and_history_patches_do_not_include_glob_matches() {
+    let r = GitRepoFixture::new();
+    for path in ["file[1].txt", "file1.txt"] {
+        r.write_file(path, "original\n");
+    }
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "initial"]);
+    for path in ["file[1].txt", "file1.txt"] {
+        r.write_file(path, "changes\n");
+    }
+    let working = operations::diff_content(
+        &r.registry,
+        &r.repo_str(),
+        "file[1].txt",
+        false,
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert!(working.fallback_patch.contains("file[1].txt"));
+    assert!(!working.fallback_patch.contains("file1.txt"));
+    r.run_git(&["add", "."]);
+    r.run_git(&["commit", "-qm", "change"]);
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&r.repo_path)
+        .output()
+        .unwrap();
+    let historical = operations::commit_file_diff(
+        &r.registry,
+        &r.repo_str(),
+        String::from_utf8(sha.stdout).unwrap().trim(),
+        "file[1].txt",
+        None,
+        &r.workspace,
+    )
+    .unwrap();
+    assert!(historical.fallback_patch.contains("file[1].txt"));
+    assert!(!historical.fallback_patch.contains("file1.txt"));
+}
+
+#[test]
+fn inherited_git_environment_cannot_redirect_discard() {
+    if let Ok(root) = std::env::var("OARLOCK_TEST_GIT_OWNER") {
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(std::path::Path::new(&root)).unwrap();
+        operations::discard(
+            &registry,
+            &root,
+            &[DiscardEntry {
+                path: "file.txt".into(),
+                untracked: false,
+            }],
+            &WorkspaceEnv::Local,
+        )
+        .unwrap();
+        return;
+    }
+    let a = GitRepoFixture::new();
+    let b = GitRepoFixture::new();
+    for repo in [&a, &b] {
+        repo.write_file("file.txt", "original\n");
+        repo.run_git(&["add", "."]);
+        repo.run_git(&["commit", "-qm", "initial"]);
+        repo.write_file("file.txt", "valuable edits\n");
+    }
+    // Distinct index/blob content also detects accidental use of B's index or objects.
+    b.write_file("file.txt", "B staged content\n");
+    b.run_git(&["add", "file.txt"]);
+    b.write_file("file.txt", "valuable edits\n");
+    for override_kind in ["repository", "index-and-objects", "config"] {
+        a.write_file("file.txt", "valuable edits\n");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "inherited_git_environment_cannot_redirect_discard",
+                "--nocapture",
+            ])
+            .env("OARLOCK_TEST_GIT_OWNER", a.repo_str());
+        match override_kind {
+            "repository" => {
+                command
+                    .env("GIT_DIR", b.repo_path.join(".git"))
+                    .env("GIT_WORK_TREE", &b.repo_path);
+            }
+            "index-and-objects" => {
+                command
+                    .env("GIT_INDEX_FILE", b.repo_path.join(".git/index"))
+                    .env("GIT_OBJECT_DIRECTORY", b.repo_path.join(".git/objects"));
+            }
+            _ => {
+                command
+                    .env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "core.worktree")
+                    .env("GIT_CONFIG_VALUE_0", &b.repo_path);
+            }
+        }
+        let child = command.output().unwrap();
+        assert!(
+            child.status.success(),
+            "{override_kind}: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.repo_path.join("file.txt")).unwrap(),
+            "valuable edits\n",
+            "Discard for A changed B with {override_kind}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(a.repo_path.join("file.txt")).unwrap(),
+            "original\n",
+            "Discard used the wrong context with {override_kind}"
+        );
+    }
+}
+
+#[test]
+fn undo_rejects_a_branch_switch_even_when_both_branches_have_the_confirmed_tip() {
+    let fx = GitRepoFixture::new();
+    commit_file(&fx, "first");
+    commit_file(&fx, "second");
+    let chosen = head_sha(&fx);
+    fx.run_git(&["switch", "-c", "sibling"]);
+    let err =
+        operations::undo_last_commit(&fx.registry, &fx.repo_str(), &chosen, "main", &fx.workspace)
+            .unwrap_err();
+    assert!(err.to_string().contains("branch changed"));
+    assert_eq!(
+        git_stdout(&fx, &["rev-parse", "main"]),
+        vec![chosen.clone()]
+    );
+    assert_eq!(head_sha(&fx), chosen);
+}
+#[test]
+fn undo_rejects_detached_head_and_ref_syntax_in_the_confirmed_branch() {
+    let fx = GitRepoFixture::new();
+    commit_file(&fx, "first");
+    commit_file(&fx, "second");
+    let chosen = head_sha(&fx);
+    for branch in ["-f", "HEAD", "main~1", "main\nother", ""] {
+        assert!(operations::undo_last_commit(
+            &fx.registry,
+            &fx.repo_str(),
+            &chosen,
+            branch,
+            &fx.workspace
+        )
+        .is_err());
+        assert_eq!(head_sha(&fx), chosen);
+    }
+    fx.run_git(&["checkout", "--detach"]);
+    assert!(operations::undo_last_commit(
+        &fx.registry,
+        &fx.repo_str(),
+        &chosen,
+        "main",
+        &fx.workspace
+    )
+    .is_err());
+    assert_eq!(head_sha(&fx), chosen);
+}
+
+#[test]
+fn commit_file_list_includes_root_files_and_line_counts() {
+    let fx = GitRepoFixture::new();
+    fx.write_file("a.txt", "one\ntwo\n");
+    fx.run_git(&["add", "a.txt"]);
+    fx.run_git(&["commit", "-qm", "root"]);
+    let root = head_sha(&fx);
+    let files =
+        operations::commit_files(&fx.registry, &fx.repo_str(), &root, &fx.workspace).unwrap();
+    assert_eq!(files.len(), 1, "root commit contents disappeared");
+    assert_eq!((files[0].added, files[0].removed), (2, 0));
+    fx.write_file("a.txt", "one\nthree\nfour\n");
+    fx.run_git(&["add", "a.txt"]);
+    fx.run_git(&["commit", "-qm", "change"]);
+    let files =
+        operations::commit_files(&fx.registry, &fx.repo_str(), &head_sha(&fx), &fx.workspace)
+            .unwrap();
+    assert_eq!((files[0].added, files[0].removed), (2, 1));
+}
+
+#[test]
+fn commit_file_list_uses_the_same_first_parent_as_the_merge_preview() {
+    let fx = GitRepoFixture::new();
+    commit_file(&fx, "root");
+    fx.run_git(&["switch", "-c", "feature"]);
+    commit_file(&fx, "feature");
+    fx.run_git(&["switch", "main"]);
+    fx.run_git(&["merge", "--no-ff", "-m", "merge", "feature"]);
+    let sha = head_sha(&fx);
+    let files =
+        operations::commit_files(&fx.registry, &fx.repo_str(), &sha, &fx.workspace).unwrap();
+    assert_eq!(files.len(), 1, "merge contents disappeared");
+    assert_eq!(files[0].path, "feature.txt");
+    assert_eq!((files[0].added, files[0].removed), (1, 0));
+    let diff = operations::commit_file_diff(
+        &fx.registry,
+        &fx.repo_str(),
+        &sha,
+        "feature.txt",
+        None,
+        &fx.workspace,
+    )
+    .unwrap();
+    assert_eq!(diff.original_content, "");
+    assert_eq!(diff.modified_content, "x\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn whole_commit_previews_never_execute_text_converters() {
+    let fx = GitRepoFixture::new();
+    fx.write_file(".gitattributes", "a.txt diff=custom\n");
+    fx.write_file("a.txt", "before\n");
+    fx.run_git(&["add", "."]);
+    fx.run_git(&["commit", "-qm", "root"]);
+    fx.write_file("a.txt", "after\n");
+    fx.run_git(&["add", "a.txt"]);
+    fx.run_git(&["commit", "-qm", "change"]);
+    fx.write_file("converter.sh", "echo invoked > converter-ran\ncat \"$1\"\n");
+    fx.run_git(&["config", "diff.custom.textconv", "sh converter.sh"]);
+    assert!(operations::show_commit_diff(
+        &fx.registry,
+        &fx.repo_str(),
+        &head_sha(&fx),
+        &fx.workspace
+    )
+    .is_err());
+    assert!(
+        !fx.repo_path.join("converter-ran").exists(),
+        "preview executed repository code"
+    );
+}
+
+#[test]
+fn commit_file_list_preserves_renames_binary_counts_and_delimited_paths() {
+    let fx = GitRepoFixture::new();
+    // Tabs/newlines are ordinary filename bytes on Unix; Windows forbids them.
+    let (old, new) = if cfg!(windows) {
+        ("old.txt", "new.txt")
+    } else {
+        ("old\tname.txt", "new\nname.txt")
+    };
+    fx.write_file(old, "unchanged text\n");
+    fx.write_file("binary", "before\0data");
+    fx.run_git(&["add", "."]);
+    fx.run_git(&["commit", "-qm", "root"]);
+    fx.run_git(&["mv", old, new]);
+    fx.write_file("binary", "after\0data");
+    fx.run_git(&["add", "."]);
+    fx.run_git(&["commit", "-qm", "change"]);
+    let files =
+        operations::commit_files(&fx.registry, &fx.repo_str(), &head_sha(&fx), &fx.workspace)
+            .unwrap();
+    assert_eq!(files.len(), 2);
+    let renamed = files.iter().find(|f| f.path == new).unwrap();
+    assert_eq!(renamed.original_path.as_deref(), Some(old));
+    assert_eq!(renamed.status, "R");
+    assert_eq!((renamed.added, renamed.removed), (0, 0));
+    assert!(files.iter().find(|f| f.path == "binary").unwrap().is_binary);
+}
+
+#[cfg(unix)]
+#[test]
+fn history_reads_do_not_launch_configured_signature_verifiers() {
+    use std::{
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+    };
+    let fx = GitRepoFixture::new();
+    commit_file(&fx, "root");
+    let raw = Command::new("git")
+        .args(["cat-file", "commit", "HEAD"])
+        .current_dir(&fx.repo_path)
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+    let raw = String::from_utf8(raw.stdout).unwrap().replacen("\n\n", "\ngpgsig -----BEGIN PGP SIGNATURE-----\n synthetic-test-signature\n -----END PGP SIGNATURE-----\n\n", 1);
+    let mut child = Command::new("git")
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .current_dir(&fx.repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(raw.as_bytes())
+        .unwrap();
+    let hashed = child.wait_with_output().unwrap();
+    assert!(hashed.status.success());
+    let sha = String::from_utf8(hashed.stdout).unwrap();
+    fx.run_git(&["update-ref", "HEAD", sha.trim()]);
+    fx.write_file(
+        "verifier.sh",
+        "#!/bin/sh\necho invoked > verifier-ran\nexit 1\n",
+    );
+    let verifier = fx.repo_path.join("verifier.sh");
+    std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fx.run_git(&["config", "log.showSignature", "true"]);
+    fx.run_git(&["config", "gpg.program", verifier.to_str().unwrap()]);
+    assert!(operations::log(&fx.registry, &fx.repo_str(), 30, 0, None, &fx.workspace).is_err());
+    assert!(
+        !fx.repo_path.join("verifier-ran").exists(),
+        "reading history launched a verifier"
+    );
+    assert!(
+        operations::show_commit_diff(&fx.registry, &fx.repo_str(), sha.trim(), &fx.workspace)
+            .is_err()
+    );
+    assert!(
+        !fx.repo_path.join("verifier-ran").exists(),
+        "whole-commit preview launched a verifier"
+    );
+    assert!(operations::commit_file_diff(
+        &fx.registry,
+        &fx.repo_str(),
+        sha.trim(),
+        "root.txt",
+        None,
+        &fx.workspace,
+    )
+    .is_err());
+    assert!(
+        !fx.repo_path.join("verifier-ran").exists(),
+        "file preview launched a verifier"
+    );
+}
+
+#[test]
+fn discovery_must_not_authorize_a_redirected_worktree() {
+    let allowed = GitRepoFixture::new();
+    let other = GitRepoFixture::new();
+    allowed.run_git(&["config", "core.worktree", &other.repo_str()]);
+    assert!(!allowed.registry.is_authorized(&other.repo_path));
+    assert!(
+        operations::panel_snapshot(&allowed.registry, &allowed.repo_str(), &allowed.workspace)
+            .is_err()
+    );
+    assert!(
+        operations::resolve_repo(&allowed.registry, &allowed.repo_str(), &allowed.workspace)
+            .is_err()
+    );
+    assert!(
+        !allowed.registry.is_authorized(&other.repo_path),
+        "discovery granted access to an unrelated worktree"
+    );
+}
+
+#[test]
+fn discovery_from_an_authorized_subdirectory_keeps_normal_repository_access() {
+    let repo = GitRepoFixture::new();
+    let child = repo.repo_path.join("subdirectory");
+    std::fs::create_dir(&child).unwrap();
+    let registry = WorkspaceRegistry::default();
+    registry.authorize(&child).unwrap();
+    let result =
+        operations::panel_snapshot(&registry, child.to_str().unwrap(), &repo.workspace).unwrap();
+    assert_eq!(result.repo.unwrap().repo_root, repo.repo_str());
+    assert!(registry.is_authorized(&repo.repo_path));
 }

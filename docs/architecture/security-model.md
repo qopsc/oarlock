@@ -46,7 +46,7 @@ Every Tauri command that reads, writes, lists, stats, searches or watches a path
 
 - `authorized_existing`: the path, links followed and `..` resolved, lies in an authorized folder (`fs_read_file`, `fs_read_dir`, `list_subdirs`, `fs_stat`, `fs_canonicalize`, `fs_host_path` for WSL, the roots of `fs_search`, `fs_list_files`, `fs_grep`, `fs_grep_interactive` and `fs_glob`, `fs_open_default`, `lsp_resolve_root`).
 - `authorized_write_target`: `fs_write_file` writes through a link only to an authorized file, a dangling link is an error, a new file needs an authorized folder.
-- `authorized_new`: `fs_create_file` and `fs_create_dir` need the nearest existing ancestor authorized and plain names below it, so neither a link nor `..` leads out.
+- `authorized_new`: `fs_create_file` and `fs_create_dir` need the nearest existing ancestor authorized and plain names below it, so neither a link nor `..` leads out. File creation uses an exclusive native create, so an occupied leaf (including a dangling symlink) is refused rather than followed or truncated. Nested folder creation builds the parent chain, then creates the requested leaf exclusively; concurrent calls cannot both claim that leaf.
 - `authorized_entry`: `fs_rename`, `fs_delete` and the sources of `fs_copy` act on the entry itself (a link, not what it points to) in an authorized folder; `..` and an authorized folder itself are refused. `fs_move` and `fs_delete_batch` also keep both ends under the explorer's authorized root.
 
 A missing path outside reads as outside, so a refusal never says whether something exists there, and relative paths are refused. A WSL path is judged by its host path (the `\\wsl.localhost` share or the drive of `/mnt/<drive>`). `fs_watch_add` drops folders and files outside; `lsp_resolve_root` only looks into authorized folders, for markers that are plain names. Searches walk without following links, so a link inside a root never leads a search out.
@@ -61,7 +61,7 @@ One limit remains: `workspace_authorize` is itself a command the page can call, 
 
 Settings, General, Folder access has two switches, both off by default and labelled "At your own risk": **Allow the app to access all folders** and **Allow AI tools to access all folders**. They are independent: each widens one side and never the other.
 
-- The backend holds them (`WorkspaceRegistry::set_all_folders`, both off until told). Every window sends the stored values when its preferences load and each change it sees, whichever window made it (`src/modules/workspace/allFolders.ts`, from `usePreferencesStore.init`), so the gates follow a switch from the next command on.
+- The backend initializes both gates from native preferences and updates them only after a successful preference commit (`modules/preferences.rs`). Windows cannot set these gates independently; `src/modules/workspace/allFolders.ts` is a UI mirror. Failed initial reads leave access denied and preserve the settings file for recovery.
 - A command that both sides use takes an `origin` (`Origin`, `app` or `ai`): `fs_read_file`, `fs_write_file`, `fs_canonicalize`, `fs_create_dir`, `fs_read_dir`, `fs_grep`, `fs_glob`, `shell_run_command` (its cwd), `shell_session_open`, `shell_session_run` and `shell_bg_spawn`. A call that leaves it out is the app's. The AI tools' wrappers (`src/modules/ai/lib/native.ts`) send `ai` on every file and shell call, so the agent never gets the app's access, and a test checks that each command they tag takes the parameter (otherwise the tag would be dropped silently). Every other file command is the app's alone.
 - The command takes its gates once (`registry.gates(origin)`): the authorized folders, or every folder while that origin's switch is on. The gates still require an absolute path judged on its real path, plain names for new entries and below an explorer root, and still read a missing path as outside while closed. Turning a switch off refuses the next command.
 - A switch authorizes nothing: no root is added, so the other side, the asset protocol's grants, git, language servers (`lsp_resolve_root`, spawn cwd), terminal folders (`pty_authorize_cwd`) and `oarlock open` keep the authorized folders (`registry.authorized_gates()`, `is_authorized`). The page still authorizes what the user opens, as with the switches off, so turning one off leaves what the user chose reachable.
@@ -70,9 +70,28 @@ Settings, General, Folder access has two switches, both off by default and label
 
 This is the allow side of the file-system boundary. Any new command that takes a path must pass it through one of these gates.
 
+New File, New Folder, conditional editor saves and `fs_write_file` acquire an
+operation-scoped directory capability (`fs/destination.rs`, `cap-std`). The
+actual directory handle's path is authorized before any staging bytes or
+missing parent directories are created. Creation, staging, publication and
+cleanup use that capability, so replacing a parent path cannot redirect them.
+Nested folder creation acquires and validates each parent before proceeding.
+Regular-file comparison checks the opened file's actual path before reading;
+symlinks to another entry and nonregular files are refused. Existing-file saves
+publish with a relative atomic rename and apply permissions before publication;
+new-file saves publish with an atomic no-clobber hard link. Filesystems lacking
+that operation report a save failure, never fall back to an unsafe copy.
+Handles and staging files live only for the operation; there is no idle watch,
+cache or IPC request. These handles bind directory objects, not permanent path
+reservations: another process can still rename an acquired directory. Detected
+moves fail, and operations racing a move remain bound to the acquired object.
+Conditional saves retain their final file-identity/change-stamp recheck, which
+is not a filesystem compare-and-swap against unrelated programs.
+
+
 ## Settings store
 
-The page keeps its settings, preferences, chat list, snippets, todos, agents, custom themes and spaces in JSON stores through `tauri-plugin-store` (`store:default`). The plugin joins the path the page gives it to the app data folder, so an absolute path or `..` would read or write JSON anywhere, and it has no option to stop that. `src-tauri/src/modules/store_scope.rs` registers the plugin inside a thin wrapper that forwards every hook unchanged (stores, resource ids, the `store://change` events that keep windows in sync, file names) and refuses, before the plugin sees them, the two commands that name a file (`load`, `get_store`) unless the name is a plain file name: ASCII letters, digits, `-`, `_` and inner dots, no separator, drive, `..`, leading or trailing dot, or Windows device name (`CON`, `NUL.json`). The only nested name allowed is an extra window's own spaces store, `windows/<label>/oarlock-spaces.json`, from that window alone. Every other store command takes the resource id of a store opened that way. A test lists every store the page opens (each `STORE_PATH` in `src/`) and checks that each is allowed. The backend's own stores (`StoreExt`) are not affected.
+Ordinary preferences, MCP settings and custom AI endpoints have native owners; their files and the legacy preferences migration source cannot be opened by the page through the store plugin. Other page data, including snippets, todos, agents, custom themes and spaces, uses JSON stores through `tauri-plugin-store` (`store:default`). The plugin joins the path the page gives it to the app data folder, so an absolute path or `..` would read or write JSON anywhere, and it has no option to stop that. `src-tauri/src/modules/store_scope.rs` registers the plugin inside a thin wrapper that forwards every hook unchanged (stores, resource ids, the `store://change` events that keep windows in sync, file names) and refuses, before the plugin sees them, the two commands that name a file (`load`, `get_store`) unless the name is a plain file name: ASCII letters, digits, `-`, `_` and inner dots, no separator, drive, `..`, leading or trailing dot, or Windows device name (`CON`, `NUL.json`). The only nested name allowed is an extra window's own spaces store, `windows/<label>/oarlock-spaces.json`, from that window alone. Every other store command takes the resource id of a store opened that way. A test lists every store the page opens (each `STORE_PATH` in `src/`) and checks that each is allowed. The backend's own stores (`StoreExt`) are not affected.
 
 ## Asset protocol scope
 
@@ -127,6 +146,59 @@ Skills (`src-tauri/src/modules/skills/`, `src/modules/skills/`) are folders with
 4. Pin reqwest to the resolved IPs so a second DNS lookup cannot return a different address (DNS rebinding).
 
 Local LLM endpoints are explicitly allowed because the user opted in by pointing Oarlock at them, but they are still classified and logged.
+
+AI, MCP HTTP and preview-image requests also carry a native-issued page generation
+(`net/page.rs`). Native retires the previous generation on navigation and removes
+it on window destruction, cancelling registered requests under the same lock as
+admission. Native delivers the replacement token only when the document finishes
+loading; an old page cannot query a replacement through delayed IPC. Start, cancel
+and credit commands require the current token and calling window. Frontend waits
+are abortable and fail visibly after 30 seconds if initialization never arrives.
+This prevents queued work from a retired page from registering; it does not make
+already-dispatched network effects reversible or terminate an OS DNS resolver
+thread that has already started.
+
+Guarded native hostname resolution uses the system resolver, preserving system
+hosts files, VPN and split-DNS configuration. A shared gate permits 8 active OS
+lookups and 32 waiting callers; further calls fail with a busy error. Each DNS
+caller has a 10-second deadline covering its queue wait and lookup. Cancellation
+or timeout removes queued work, but a running OS lookup retains its slot until
+it exits. This bounds retained resolver work without pretending it is forcibly
+cancellable. IP literals bypass the resolver. No additional DNS cache or resolver
+dependency is used; returned addresses still undergo classification and pinning.
+
+Non-streaming native operations have total deadlines: 5 seconds for connection
+probes, 20 seconds for preview images and 30 seconds per OAuth HTTP operation.
+One deadline covers DNS queueing/resolution, redirects, headers and body reads;
+probes finish at headers. Expiry drops the request future and response body,
+while a running OS lookup retains its DNS permit until it exits. The separate
+five-minute interactive sign-in allowance is unchanged. AI and MCP event streams
+retain their streaming lifecycle rather than inheriting these total deadlines.
+
+Endpoint Test probes also require the native page generation. They register before
+starting DNS or HTTP work and share a separate eight-probe app-wide limit, with no
+waiting queue. URL edits, retesting and card collapse/unmount cancel the exact
+probe; native reload/close cleanup retires the page and cancels its probes.
+Registration acknowledgment is separate from completion, allowing cancellation
+that overtook admission to be repeated immediately after admission.
+
+Automatic MCP OAuth metadata discovery uses its own eight-request app-wide gate
+and page-generation ownership. Settings tracks at most 256 current candidates,
+matching the native status-query limit, and starts at most eight at once. Cancelled
+work retains its running slot until it settles. Page retirement, server edits or
+disablement and sign-in/sign-out cancel the affected discovery; queued stale pages
+cannot register. Native configuration validation rejects disabled or stale global
+servers and revalidates project trust/entry identity before publishing metadata.
+Publication and cancellation share the probe registry lock. Configuration updates
+also cancel native discoveries independently of UI event delivery. Errors are
+scoped to their configuration and offer explicit Retry. HTTP 5xx and 429 responses
+fail discovery rather than being cached as absence; 404 keeps its absence behavior.
+Interactive sign-in and token refresh remain separate from this automatic gate.
+
+AI and MCP reserve their existing request slots and validate page ownership before
+copying uploads out of the IPC buffer. Body-decoding failures release that slot.
+This bounds the native handoff copies; it does not cap Tauri's incoming IPC buffers
+or frontend request-body preparation before native admission.
 
 The Markdown preview's remote images go through the same checks (`net/image.rs`): https only, public addresses only, and redirects are followed by hand so every hop is validated, classified and pinned again. The webview's CSP loads no remote images at all, because AI chat Markdown renders in the same webview and an image URL in a prompt-injected answer would send data out without a click; only the preview of a file the user opened asks the backend for its images.
 

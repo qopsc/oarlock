@@ -13,47 +13,7 @@ const MAX_RELATIVE_PATH: usize = 1024;
 /// Text files the model may read; larger ones are refused.
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 
-fn readable(path: &Path) -> bool {
-    use std::sync::OnceLock;
-    #[derive(serde::Deserialize)]
-    struct Rules {
-        basenames: Vec<String>,
-        directories: Vec<String>,
-    }
-    static RULES: OnceLock<(regex::RegexSet, Vec<String>)> = OnceLock::new();
-    let (basenames, directories) = RULES.get_or_init(|| {
-        let rules: Rules = serde_json::from_str(include_str!(
-            "../../../../src/modules/ai/lib/secretPaths.json"
-        ))
-        .expect("valid shared secret path rules");
-        let patterns = regex::RegexSetBuilder::new(&rules.basenames)
-            .case_insensitive(true)
-            .build()
-            .expect("valid shared secret basename patterns");
-        (patterns, rules.directories)
-    });
-    let path = path.to_string_lossy().replace('\\', "/");
-    if path.chars().any(char::is_control)
-        || basenames.is_match(path.rsplit('/').next().unwrap_or(""))
-    {
-        return false;
-    }
-    let comparison = path
-        .split('/')
-        .map(|part| {
-            part.split(':')
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
-                .to_lowercase()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-        + "/";
-    !directories
-        .iter()
-        .any(|dir| comparison.contains(&format!("{dir}/")))
-}
+use crate::modules::secret_paths::readable;
 
 /// The file at `relative` inside `real_dir` (the skill's canonical folder), as it really is.
 pub fn resolve_inside(real_dir: &Path, relative: &str) -> Result<PathBuf, String> {

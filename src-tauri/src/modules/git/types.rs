@@ -63,7 +63,7 @@ pub struct GitPanelSnapshot {
     pub status: Option<GitStatusSnapshot>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscardEntry {
     pub path: String,

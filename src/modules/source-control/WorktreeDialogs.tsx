@@ -18,7 +18,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { IS_WINDOWS } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 import type { GitBranchEntry, GitWorktreeEntry } from "@/modules/ai/lib/native";
-import { currentWorkspaceEnv } from "@/modules/workspace";
+import { useRepositoryOwner } from "./useRepositoryOwner";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import {
   ArrowDown01Icon,
   FolderAddIcon,
@@ -26,7 +27,7 @@ import {
   Tick02Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { type ReactNode, useId, useMemo, useState } from "react";
+import { type ReactNode, useId, useMemo, useRef, useState } from "react";
 import {
   gitWorktreeAdd,
   gitWorktreeRemove,
@@ -48,10 +49,8 @@ import {
 /** No branch can be called `HEAD`, so it stands for "based on HEAD" among them. */
 const BASE_HEAD = "HEAD";
 
-function workspacePathStyle(): PathStyle {
-  return currentWorkspaceEnv().kind === "local" && IS_WINDOWS
-    ? "windows"
-    : "posix";
+function workspacePathStyle(workspace: WorkspaceEnv): PathStyle {
+  return workspace.kind === "local" && IS_WINDOWS ? "windows" : "posix";
 }
 
 function Field({
@@ -249,8 +248,10 @@ function NewWorktreeForm({
   onBusyChange: (busy: boolean) => void;
   onCancel: () => void;
 }) {
+  const owner = useRepositoryOwner(repoRoot);
+  const inFlight = useRef(false);
   const ids = useId();
-  const style = useMemo(workspacePathStyle, []);
+  const style = workspacePathStyle(owner.workspace);
   const localNames = useMemo(
     () => branches.filter((b) => !b.isDetached).map((b) => b.name),
     [branches],
@@ -301,7 +302,8 @@ function NewWorktreeForm({
   };
 
   const submit = async () => {
-    if (!canCreate) return;
+    if (!canCreate || inFlight.current || !owner.isCurrent()) return;
+    inFlight.current = true;
     setWorking(true);
     setError(null);
     try {
@@ -315,12 +317,17 @@ function NewWorktreeForm({
             }
           : { kind: "existing", name: branchName },
         folder.trim(),
+        owner.workspace,
       );
+      if (!owner.isCurrent()) return;
       setWorking(false);
       onCreated(result);
     } catch (e) {
+      if (!owner.isCurrent()) return;
       setWorking(false);
       setError(String(e));
+    } finally {
+      inFlight.current = false;
     }
   };
 
@@ -548,6 +555,8 @@ function RemoveWorktreeForm({
   onBusyChange: (busy: boolean) => void;
   onCancel: () => void;
 }) {
+  const owner = useRepositoryOwner(repoRoot);
+  const inFlight = useRef(false);
   const group = useId();
   const [selected, setSelected] = useState<string | null>(
     () => worktrees.find((wt) => !worktreeRemoveBlocker(wt))?.path ?? null,
@@ -559,12 +568,19 @@ function RemoveWorktreeForm({
   const target = worktrees.find((wt) => wt.path === selected) ?? null;
 
   const remove = async (force: boolean) => {
-    if (!target || busy) return;
+    if (!target || busy || inFlight.current || !owner.isCurrent()) return;
+    inFlight.current = true;
     setBusy(true);
     onBusyChange(true);
     setError(null);
     try {
-      const result = await gitWorktreeRemove(repoRoot, target.path, force);
+      const result = await gitWorktreeRemove(
+        repoRoot,
+        target.path,
+        force,
+        owner.workspace,
+      );
+      if (!owner.isCurrent()) return;
       setBusy(false);
       onBusyChange(false);
       if (result.removed) {
@@ -573,9 +589,12 @@ function RemoveWorktreeForm({
         setChanges(result.changes);
       }
     } catch (e) {
+      if (!owner.isCurrent()) return;
       setBusy(false);
       onBusyChange(false);
       setError(String(e));
+    } finally {
+      inFlight.current = false;
     }
   };
 

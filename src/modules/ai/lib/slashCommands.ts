@@ -1,5 +1,7 @@
+import { useChatStore } from "../store/chatStore";
 import {
   CheckListIcon,
+  StopCircleIcon,
   ClaudeIcon,
   SparklesIcon,
 } from "@hugeicons/core-free-icons";
@@ -52,6 +54,12 @@ export type SlashCommandMeta = {
 };
 
 export const SLASH_COMMANDS: Record<string, SlashCommandMeta> = {
+  stop: {
+    name: "stop",
+    invocation: "/stop",
+    label: "Stop chat and reset its shells",
+    icon: StopCircleIcon,
+  },
   init: {
     name: "init",
     invocation: "/init",
@@ -81,6 +89,12 @@ export function tryRunSlashCommand(input: string): SlashOutcome {
   const tail = rest.join(" ").trim();
 
   switch (head) {
+    case "stop": {
+      const store = useChatStore.getState();
+      if (store.activeSessionId)
+        void store.stopSession(store.activeSessionId).catch(() => {});
+      return { kind: "handled" };
+    }
     case "plan": {
       const store = usePlanStore.getState();
       if (tail === "off" || tail === "exit") {

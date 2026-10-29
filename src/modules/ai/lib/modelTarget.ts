@@ -1,4 +1,10 @@
 import {
+  credentialProblem,
+  credentialUnavailable,
+  readyKey,
+} from "./credentialState";
+import { endpointKeyFor } from "./endpointCredentials";
+import {
   type CustomEndpoint,
   endpointIdFromCompatModel,
   isCompatModelId,
@@ -30,8 +36,6 @@ export type LocalProviderConfig = {
   mlxModelId?: string;
   ollamaBaseURL?: string;
   ollamaModelId?: string;
-  openaiCompatibleBaseURL?: string;
-  openaiCompatibleModelId?: string;
   openrouterModelId?: string;
   customEndpoints?: readonly CustomEndpoint[];
   customEndpointKeys?: CustomEndpointKeys;
@@ -58,11 +62,22 @@ export function resolveModelTarget(
     if (!ep.modelId.trim()) {
       throw new Error(`${ep.name}: no model id set. Open Settings → Models.`);
     }
+    const credential = local.customEndpointKeys?.[eid];
+    const problem = credentialProblem(credential);
+    if (problem) throw new Error(`${ep.name}: ${problem}`);
+    if (credentialUnavailable(credential))
+      throw new Error("Credential unavailable");
+    const endpointKey = endpointKeyFor(credential, ep.baseURL);
+    if (credential && !endpointKey) {
+      throw new Error(
+        `${ep.name}: re-enter the API key for this server in Settings → Models.`,
+      );
+    }
     return {
       provider: "openai-compatible",
       modelId: ep.modelId.trim(),
       options: { openaiCompatibleBaseURL: ep.baseURL },
-      endpointKey: local.customEndpointKeys?.[eid],
+      endpointKey,
     };
   }
   const m = resolveModel(modelId);
@@ -88,13 +103,6 @@ export function resolveModelTarget(
       );
     }
     resolvedId = local.ollamaModelId.trim();
-  } else if (m.id === "openai-compatible-custom") {
-    if (!local.openaiCompatibleModelId?.trim()) {
-      throw new Error(
-        "OpenAI-compatible: no model id set. Open Settings → Models.",
-      );
-    }
-    resolvedId = local.openaiCompatibleModelId.trim();
   } else if (m.id === "openrouter-custom") {
     if (!local.openrouterModelId?.trim()) {
       throw new Error(
@@ -110,7 +118,6 @@ export function resolveModelTarget(
       lmstudioBaseURL: local.lmstudioBaseURL,
       mlxBaseURL: local.mlxBaseURL,
       ollamaBaseURL: local.ollamaBaseURL,
-      openaiCompatibleBaseURL: local.openaiCompatibleBaseURL,
     },
   };
 }
@@ -125,9 +132,11 @@ export function modelConfigProblem(
 ): string | null {
   try {
     const { provider } = resolveModelTarget(modelId, local);
-    return providerNeedsKey(provider) && !keys[provider]
-      ? missingKeyMessage(provider)
-      : null;
+    if (!providerNeedsKey(provider)) return null;
+    return (
+      credentialProblem(keys[provider]) ??
+      (!readyKey(keys[provider]) ? missingKeyMessage(provider) : null)
+    );
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }

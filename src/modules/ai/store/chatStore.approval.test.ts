@@ -124,6 +124,7 @@ describe("conversation approval modes", () => {
     expect(a?.updatedAt).toBe(2);
     expect(sessions.saveSessionsList).toHaveBeenLastCalledWith(
       useChatStore.getState().sessions,
+      [meta("a", "A"), meta("b", "B")],
     );
 
     // Turning it off again is one call, and a repeat writes nothing.

@@ -19,6 +19,7 @@ import {
   denyUnansweredApprovals,
   pendingApprovalIds,
   SUPERSEDED_APPROVAL_REASON,
+  EXPIRED_APPROVAL_REASON,
 } from "./toolApprovals";
 
 const user = (id: string, text = "hi"): UIMessage => ({
@@ -52,6 +53,22 @@ const assistant = (
 });
 
 describe("denyUnansweredApprovals", () => {
+  it("does not claim an approved tool never ran when its result was lost", () => {
+    const pending = [
+      assistant(
+        "a",
+        toolCall("call", "approval-responded", {
+          id: "approval",
+          approved: true,
+        }),
+      ),
+    ];
+    const expired = denyUnansweredApprovals(pending, EXPIRED_APPROVAL_REASON);
+    const part = expired[0].parts[1] as { approval: { reason: string } };
+    expect(part.approval.reason).toContain("may have started");
+    expect(part.approval.reason).not.toContain("Not run");
+    expect(part.approval.reason).toContain("expired");
+  });
   it("denies waiting and approved-but-unrun calls in new message objects", () => {
     const waiting = assistant("a1", toolCall("call_1", "approval-requested"));
     const approved = assistant(

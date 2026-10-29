@@ -1,4 +1,7 @@
 import { generateText, type UIMessage } from "ai";
+
+vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "test-page" }));
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolContext } from "../tools/context";
 
@@ -38,7 +41,9 @@ const proxy = vi.hoisted(() => {
       options?: { headers?: Record<string, string> },
     ) => {
       if (command !== "ai_http_stream") return undefined;
-      const meta = JSON.parse(options?.headers?.["x-oarlock-ai-request"] ?? "{}");
+      const meta = JSON.parse(
+        options?.headers?.["x-oarlock-ai-request"] ?? "{}",
+      );
       requests.push({ url: meta.url, headers: meta.headers ?? {} });
       const channel = channels[channels.length - 1];
       queueMicrotask(() => {
@@ -119,6 +124,7 @@ async function startRun(extra: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  proxy.requests.length = 0;
   streamTextMock.mockClear();
 });
 
@@ -289,7 +295,9 @@ describe("the project's AGENTS.md in a run", () => {
       modelId,
       projectMemory: { size: text.length, text },
     });
-    expect(systemText(options)).toContain(`## PROJECT INSTRUCTIONS (AGENTS.md)\n${text.trim()}`);
+    expect(systemText(options)).toContain(
+      `## PROJECT INSTRUCTIONS (AGENTS.md)\n${text.trim()}`,
+    );
   });
 
   it("fails before reaching the provider when the file cannot fit the model", async () => {
@@ -327,6 +335,7 @@ describe("the project's AGENTS.md in a run", () => {
     // About 87,500 tokens of AGENTS.md: with it, the same history crosses
     // what compaction allows, so the older read result is elided.
     streamTextMock.mockClear();
+    toolContext.readCache.set("/workspace/file.txt", { size: 1, hash: 1 });
     const onCompact = vi.fn();
     const text = "z".repeat(350_000);
     const large = await startRun({
@@ -337,6 +346,7 @@ describe("the project's AGENTS.md in a run", () => {
     });
     expect(readResultOutput(large.options)).toMatchObject({ __elided: true });
     expect(onCompact).toHaveBeenCalledWith({ droppedCount: 1 });
+    expect(toolContext.readCache.size).toBe(0);
   });
 });
 
@@ -481,7 +491,9 @@ describe("skills in a run", () => {
     const system = JSON.stringify(options.instructions);
     expect(system).toContain("## AVAILABLE SKILLS");
     expect(system).toContain("- pdf: Fill PDF forms.");
-    expect(options.activeTools).toBeUndefined();
+    expect(options.activeTools).toContain("use_skill");
+    expect(options.activeTools).toContain("read_skill_file");
+    expect(options.activeTools).not.toContain("bash_detach");
   });
 
   it("never lists a skill only the user may call", async () => {
@@ -492,7 +504,9 @@ describe("skills in a run", () => {
       "AVAILABLE SKILLS",
     );
     // Its files stay readable for a message that invoked it.
-    expect(options.activeTools).toBeUndefined();
+    expect(options.activeTools).toContain("use_skill");
+    expect(options.activeTools).toContain("read_skill_file");
+    expect(options.activeTools).not.toContain("bash_detach");
   });
 
   it("offers no skill tools to a run without skills", async () => {
@@ -538,9 +552,48 @@ describe("buildLanguageModel", () => {
 
     const request = new Request(...webviewFetch.mock.calls[0]);
     expect(request.url).toBe("https://api.anthropic.com/v1/messages");
-    expect(request.headers.get("anthropic-dangerous-direct-browser-access")).toBe(
-      "true",
-    );
+    expect(
+      request.headers.get("anthropic-dangerous-direct-browser-access"),
+    ).toBe("true");
+  });
+
+  it("never falls back to a legacy provider key for a named endpoint, including a cached model", async () => {
+    proxy.reply.body = JSON.stringify({
+      id: "c1",
+      object: "chat.completion",
+      created: 0,
+      model: "m",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "hi" },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    const keys = {
+      ...EMPTY_PROVIDER_KEYS,
+      "openai-compatible": "legacy-secret",
+    };
+    const baseURL = "https://binding.example/v1";
+    const legacy = await buildLanguageModel("openai-compatible", keys, "m", {
+      openaiCompatibleBaseURL: baseURL,
+    });
+    await generateText({ model: legacy, prompt: "hi" });
+    expect(
+      proxy.requests[proxy.requests.length - 1]?.headers,
+    ).not.toHaveProperty("authorization");
+    const model = await buildConfiguredLanguageModel("compat-new", keys, {
+      customEndpointKeys: { new: null },
+      customEndpoints: [
+        { id: "new", name: "New", baseURL, modelId: "m", contextLimit: 64000 },
+      ],
+    });
+    await generateText({ model, prompt: "hi" });
+    expect(
+      proxy.requests[proxy.requests.length - 1]?.headers,
+    ).not.toHaveProperty("authorization");
   });
 
   it("sends OpenCode's session header to an OpenCode custom endpoint, through the native proxy", async () => {
@@ -580,7 +633,12 @@ describe("buildLanguageModel", () => {
         EMPTY_PROVIDER_KEYS,
         {
           customEndpoints: endpoints,
-          customEndpointKeys: { [endpoint.id]: "sk-endpoint" },
+          customEndpointKeys: {
+            [endpoint.id]: {
+              origin: new URL(endpoint.baseURL).origin,
+              key: "sk-endpoint",
+            },
+          },
         },
       );
       await generateText({ model, prompt: "hello" });
@@ -622,10 +680,96 @@ describe("buildLanguageModel", () => {
     const model = await buildConfiguredLanguageModel(
       compatModelIdForEndpoint(endpoint.id),
       EMPTY_PROVIDER_KEYS,
-      { customEndpoints: [endpoint] },
+      {
+        customEndpoints: [endpoint],
+        customEndpointKeys: { [endpoint.id]: null },
+      },
     );
     const result = await generateText({ model, prompt: "hi" });
     expect(result.text).toBe("Hello!");
     expect(result.reasoningText).toBe("plan the reply");
   });
+});
+
+it("only offers unmanaged launching after its explicit opt-in", () => {
+  const tools = ["read_file", "bash_detach", "use_skill"];
+  expect(activeToolNames(tools, undefined)).toEqual(["read_file"]);
+  expect(activeToolNames(tools, undefined, true)).toEqual([
+    "read_file",
+    "bash_detach",
+  ]);
+});
+
+it("does not reuse a model when spaces make different configuration tuples look alike", async () => {
+  const first = await buildLanguageModel(
+    "lmstudio",
+    EMPTY_PROVIDER_KEYS,
+    "cache-boundary",
+    {
+      lmstudioBaseURL: "https://first.example/path https://second.example/v1",
+    },
+  );
+  const second = await buildLanguageModel(
+    "lmstudio",
+    EMPTY_PROVIDER_KEYS,
+    "cache-boundary https://first.example/path",
+    {
+      lmstudioBaseURL: "https://second.example/v1",
+    },
+  );
+  expect(second).not.toBe(first);
+  expect(
+    await buildLanguageModel(
+      "lmstudio",
+      EMPTY_PROVIDER_KEYS,
+      "cache-boundary https://first.example/path",
+      {
+        lmstudioBaseURL: "https://second.example/v1",
+      },
+    ),
+  ).toBe(second);
+  proxy.reply.body = JSON.stringify({
+    id: "cache-test",
+    object: "chat.completion",
+    created: 0,
+    model: "m",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "hi" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  await generateText({ model: second, prompt: "hi" });
+  expect(proxy.requests[proxy.requests.length - 1]?.url).toBe(
+    "https://second.example/v1/chat/completions",
+  );
+});
+
+it.each(["loading", "failed"] as const)(
+  "does not build or stream using %s cloud credentials",
+  async (status) => {
+    await expect(
+      buildLanguageModel(
+        "openai",
+        { ...EMPTY_PROVIDER_KEYS, openai: { status } },
+        "gpt-5.4-mini",
+      ),
+    ).rejects.toThrow(/loading|Could not read/);
+    expect(streamTextMock).not.toHaveBeenCalled();
+    expect(proxy.requests).toHaveLength(0);
+  },
+);
+it("rechecks admission after model loading before starting the model stream", async () => {
+  let checks = 0;
+  await expect(
+    startRun({
+      assertReady: () => {
+        if (++checks === 2) throw new Error("Preferences unavailable");
+      },
+    }),
+  ).rejects.toThrow("Preferences");
+  expect(streamTextMock).not.toHaveBeenCalled();
 });

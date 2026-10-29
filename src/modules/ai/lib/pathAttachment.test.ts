@@ -1,161 +1,62 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const calls = vi.hoisted(() => [] as [string, Record<string, unknown>][]);
+import { beforeEach, expect, it, vi } from "vitest";
 const backend = vi.hoisted(() => ({
-  /** Real paths, as `fs_canonicalize` answers; a missing key is refused. */
-  real: new Map<string, string>(),
-  authorized: [] as string[],
+  invoke: vi.fn(),
+  env: { kind: "local" } as object,
 }));
-
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (command: string, args: Record<string, unknown>) => {
-    calls.push([command, args]);
-    if (command === "fs_canonicalize") {
-      const real = backend.real.get(args.path as string);
-      if (!real) throw "path is outside the authorized folders";
-      return real;
-    }
-    if (command === "fs_read_file") {
-      return { kind: "text", content: `text of ${args.path}`, size: 10 };
-    }
-    return undefined;
-  }),
-}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: backend.invoke }));
 vi.mock("@/modules/workspace", () => ({
-  currentWorkspaceEnv: () => ({ kind: "local" }),
-  authorizationSettled: async () => undefined,
-  authorizeFileFolder: async (path: string) => {
-    backend.authorized.push(path);
-    return true;
-  },
+  currentWorkspaceEnv: () => backend.env,
 }));
-
 import {
-  agentReadRefusal,
-  attachableText,
   attachmentName,
-  MAX_TEXT_ATTACHMENT_BYTES,
-  readDroppedFile,
   readPickedFile,
+  readDroppedFile,
+  textTooLarge,
 } from "./pathAttachment";
-
 beforeEach(() => {
-  calls.length = 0;
-  backend.real.clear();
-  backend.authorized = [];
-});
-
-describe("attachableText", () => {
-  it("attaches text up to the size every attachment is capped at", () => {
-    const text = "x".repeat(MAX_TEXT_ATTACHMENT_BYTES);
-    expect(
-      attachableText({
-        kind: "text",
-        content: text,
-        size: MAX_TEXT_ATTACHMENT_BYTES,
-      }),
-    ).toEqual({ ok: true, text, size: MAX_TEXT_ATTACHMENT_BYTES });
+  backend.invoke.mockReset().mockResolvedValue({
+    kind: "text",
+    name: "a.md",
+    content: "safe text",
+    size: 9,
   });
-
-  it("refuses binary and larger files", () => {
-    expect(attachableText({ kind: "binary", size: 5 })).toEqual({
-      ok: false,
-      reason: "It is not a text file.",
+  backend.env = { kind: "local" };
+});
+it.each([true, false])(
+  "imports picked=%s through native validation instead of raw file reads",
+  async (picked) => {
+    await (picked ? readPickedFile : readDroppedFile)("/repo/a.md");
+    expect(backend.invoke).toHaveBeenCalledExactlyOnceWith(
+      "ai_import_attachment",
+      { path: "/repo/a.md", workspace: { kind: "local" }, picked },
+    );
+  },
+);
+it.each([true, false])(
+  "preserves the captured workspace for picked=%s",
+  async (picked) => {
+    backend.env = { kind: "wsl", distro: "Ubuntu" };
+    const read = (picked ? readPickedFile : readDroppedFile)("/repo/a.md");
+    backend.env = { kind: "wsl", distro: "Debian" };
+    await read;
+    expect(backend.invoke.mock.calls[0][1].workspace).toEqual({
+      kind: "wsl",
+      distro: "Ubuntu",
     });
-    expect(
-      attachableText({
-        kind: "text",
-        content: "",
-        size: MAX_TEXT_ATTACHMENT_BYTES + 1,
-      }),
-    ).toEqual({
-      ok: false,
-      reason: "It is 201 KB; a text attachment holds up to 200 KB.",
-    });
-    expect(
-      attachableText({ kind: "toolarge", size: 20 * 1024 * 1024, limit: 1 }),
-    ).toMatchObject({ ok: false });
-  });
+  },
+);
+it("an explicit host picker environment overrides the selected WSL environment", async () => {
+  backend.env = { kind: "wsl", distro: "Ubuntu" };
+  await readPickedFile("C:/docs/a.txt", { kind: "local" });
+  expect(backend.invoke.mock.calls[0][1].workspace).toEqual({ kind: "local" });
 });
-
-describe("attachmentName", () => {
-  it("is the last segment with either separator", () => {
-    expect(attachmentName("/repo/src/a.ts")).toBe("a.ts");
-    expect(attachmentName("C:/repo/b.md")).toBe("b.md");
-    expect(attachmentName("C:\\repo\\c.txt")).toBe("c.txt");
-  });
+it("does not fall back to raw reads after native secret-path rejection", async () => {
+  backend.invoke.mockRejectedValue(new Error("Refused: sensitive attachment"));
+  await expect(readPickedFile("/repo/.env")).rejects.toThrow("sensitive");
+  expect(backend.invoke).toHaveBeenCalledOnce();
 });
-
-describe("agentReadRefusal", () => {
-  it("words the agent's refusal for the user", () => {
-    expect(
-      agentReadRefusal('Refused: ".env" matches a sensitive-file pattern.'),
-    ).toBe(
-      'The agent may not read it: ".env" matches a sensitive-file pattern.',
-    );
-    expect(
-      agentReadRefusal("Refused: path is inside a protected directory (.ssh)."),
-    ).toBe(
-      "The agent may not read it: path is inside a protected directory (.ssh).",
-    );
-  });
-});
-
-// crynta/terax-ai#230: nothing dropped may bypass the AI's folder limits.
-describe("readDroppedFile", () => {
-  it("reads as the agent's tools do and authorizes nothing", async () => {
-    backend.real.set("/repo/link.md", "/repo/notes.md");
-    await expect(readDroppedFile("/repo/link.md")).resolves.toEqual({
-      kind: "text",
-      content: "text of /repo/notes.md",
-      size: 10,
-    });
-    expect(calls).toEqual([
-      [
-        "fs_canonicalize",
-        { path: "/repo/link.md", workspace: { kind: "local" }, origin: "ai" },
-      ],
-      [
-        "fs_read_file",
-        { path: "/repo/notes.md", workspace: { kind: "local" }, origin: "ai" },
-      ],
-    ]);
-    expect(backend.authorized).toEqual([]);
-  });
-
-  it("refuses what the AI's folder limits refuse", async () => {
-    await expect(readDroppedFile("/elsewhere/a.md")).rejects.toThrow(
-      /^The agent may not read it: could not resolve \/elsewhere\/a\.md/,
-    );
-    expect(calls.map(([command]) => command)).toEqual(["fs_canonicalize"]);
-    expect(backend.authorized).toEqual([]);
-  });
-
-  it("refuses secret paths, also behind a link", async () => {
-    await expect(readDroppedFile("/repo/.env")).rejects.toThrow(
-      "sensitive-file pattern",
-    );
-    expect(calls).toEqual([]);
-
-    backend.real.set("/repo/key.txt", "/home/me/.ssh/id_ed25519");
-    await expect(readDroppedFile("/repo/key.txt")).rejects.toThrow(
-      "The agent may not read it",
-    );
-    expect(calls.map(([command]) => command)).toEqual(["fs_canonicalize"]);
-  });
-});
-
-describe("readPickedFile", () => {
-  it("authorizes the folder of a file the user picked, as opening it does", async () => {
-    await expect(readPickedFile("/elsewhere/a.md")).resolves.toMatchObject({
-      kind: "text",
-    });
-    expect(backend.authorized).toEqual(["/elsewhere/a.md"]);
-    expect(calls).toEqual([
-      [
-        "fs_read_file",
-        { path: "/elsewhere/a.md", workspace: { kind: "local" } },
-      ],
-    ]);
-  });
+it("labels paths across platforms and reports the shared text limit", () => {
+  expect(attachmentName("C:\\repo\\a.txt")).toBe("a.txt");
+  expect(attachmentName("/repo/a.txt")).toBe("a.txt");
+  expect(textTooLarge(200001)).toContain("200 KB");
 });

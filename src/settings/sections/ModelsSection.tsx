@@ -18,10 +18,6 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import {
-  getBindingTokens,
-  SHORTCUTS,
-} from "@/modules/shortcuts/shortcuts";
-import {
   type CustomEndpoint,
   compatModelIdForEndpoint,
   DEFAULT_MODEL_ID,
@@ -42,30 +38,50 @@ import {
   WHISPERCPP_DEFAULT_BASE_URL,
 } from "@/modules/ai/config";
 import {
-  type CustomEndpointKeys,
-  clearCustomEndpointKey,
-  clearKey,
-  getAllCustomEndpointKeys,
-  getAllKeys,
-  setCustomEndpointKey,
-  setKey,
-} from "@/modules/ai/lib/keyring";
+  credentialProblem,
+  credentialUnavailable,
+  credentialValue,
+  readyKey,
+} from "@/modules/ai/lib/credentialState";
+import {
+  type EndpointCredential,
+  endpointKeyFor,
+} from "@/modules/ai/lib/endpointCredentials";
 import {
   ENDPOINT_PRESETS,
   type EndpointPreset,
   endpointPresetFor,
   newCustomEndpoint,
 } from "@/modules/ai/lib/endpointPresets";
+import {
+  type CustomEndpointKeys,
+  clearCustomEndpointKey,
+  clearKey,
+  getAllCustomEndpointKeys,
+  getAllKeys,
+  type ProviderKeys,
+  pendingEndpointKeys,
+  pendingProviderKeys,
+  setCustomEndpointKey,
+  setKey,
+} from "@/modules/ai/lib/keyring";
+import { maskKey } from "@/modules/ai/lib/maskKey";
 import { useChatStore } from "@/modules/ai/store/chatStore";
+import {
+  createCustomEndpoint,
+  deleteCustomEndpoint,
+  retryCustomEndpoints,
+  updateCustomEndpoint,
+} from "@/modules/settings/endpoints";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   type AutocompleteTrigger,
   emitKeysChanged,
+  onKeysChanged,
   setAutocompleteEnabled,
   setAutocompleteModelId,
   setAutocompleteProvider,
   setAutocompleteTrigger,
-  setCustomEndpoints,
   setDefaultModel,
   setFavoriteModelIds,
   setGroqSttModel,
@@ -83,6 +99,7 @@ import {
   setSttProvider,
   setWhispercppBaseURL,
 } from "@/modules/settings/store";
+import { getBindingTokens, SHORTCUTS } from "@/modules/shortcuts/shortcuts";
 import {
   Add01Icon,
   ArrowDown01Icon,
@@ -93,15 +110,16 @@ import {
   Mic01Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { type PingState, pingEndpoint } from "./endpointPing";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CredentialRecovery } from "../components/CredentialRecovery";
 import { ModelBrowseButton } from "../components/ModelBrowseButton";
 import { ProviderIcon } from "../components/ProviderIcon";
 import { ProviderKeyCard } from "../components/ProviderKeyCard";
 import { SectionHeader } from "../components/SectionHeader";
+import { type PingState, useEndpointPing } from "./endpointPing";
 
-type KeysMap = Record<ProviderId, string | null>;
+type KeysMap = ProviderKeys;
 
 const isLocalProvider = (id: ProviderId): boolean => !providerNeedsKey(id);
 
@@ -157,9 +175,12 @@ const LOCAL_META: Partial<Record<ProviderId, LocalMeta>> = {
 };
 
 export function ModelsSection() {
+  const [removalError, setRemovalError] = useState("");
   const [keys, setKeys] = useState<KeysMap | null>(null);
   const [epKeys, setEpKeys] = useState<CustomEndpointKeys>({});
   const [adding, setAdding] = useState<Set<ProviderId>>(new Set());
+  const endpointRead = useRef(0);
+  const retryKeys = useRef<() => Promise<void>>(async () => {});
 
   const defaultModel = usePreferencesStore((s) => s.defaultModelId);
   const lmstudioBaseURL = usePreferencesStore((s) => s.lmstudioBaseURL);
@@ -175,14 +196,73 @@ export function ModelsSection() {
   );
   const openrouterModelId = usePreferencesStore((s) => s.openrouterModelId);
   const customEndpoints = usePreferencesStore((s) => s.customEndpoints);
+  const endpointsError = usePreferencesStore((s) => s.customEndpointsError);
 
   useEffect(() => {
-    void getAllKeys().then(setKeys);
-  }, []);
-
-  useEffect(() => {
-    void getAllCustomEndpointKeys(customEndpoints).then(setEpKeys);
+    let alive = true;
+    let stop: (() => void) | undefined;
+    let connecting: Promise<void> | undefined;
+    const connect = (): Promise<void> => {
+      if (stop) return Promise.resolve();
+      connecting ??= onKeysChanged(() => void reload())
+        .then((unlisten) => {
+          if (alive) stop = unlisten;
+          else unlisten();
+        })
+        .finally(() => {
+          connecting = undefined;
+        });
+      return connecting;
+    };
+    const reload = async () => {
+      if (!alive) return;
+      const request = ++endpointRead.current;
+      setKeys(pendingProviderKeys());
+      setEpKeys(pendingEndpointKeys(customEndpoints));
+      try {
+        await connect();
+        if (!alive || request !== endpointRead.current) return;
+        const [providers, endpoints] = await Promise.all([
+          getAllKeys(),
+          getAllCustomEndpointKeys(customEndpoints),
+        ]);
+        if (alive && request === endpointRead.current) {
+          setKeys(providers);
+          setEpKeys(endpoints);
+        }
+      } catch (error) {
+        if (alive && request === endpointRead.current) {
+          const failed = { status: "failed" as const, error: String(error) };
+          setKeys(pendingProviderKeys(failed));
+          setEpKeys(pendingEndpointKeys(customEndpoints, failed));
+        }
+      }
+    };
+    retryKeys.current = async () => {
+      try {
+        await connect();
+        if (alive) await emitKeysChanged();
+      } catch (error) {
+        if (alive)
+          setRemovalError(`Could not retry credential reads: ${String(error)}`);
+      }
+    };
+    void reload();
+    return () => {
+      alive = false;
+      ++endpointRead.current;
+      stop?.();
+    };
   }, [customEndpoints]);
+
+  const remove = async (action: Promise<void>) => {
+    setRemovalError("");
+    try {
+      await action;
+    } catch (error) {
+      setRemovalError(`Could not save Models settings: ${String(error)}`);
+    }
+  };
 
   const onSaveKey = async (provider: ProviderId, value: string) => {
     await setKey(provider, value);
@@ -196,34 +276,21 @@ export function ModelsSection() {
     await emitKeysChanged();
   };
 
-  const onSaveEndpointKey = async (endpointId: string, value: string) => {
-    await setCustomEndpointKey(endpointId, value);
-    setEpKeys((prev) => ({ ...prev, [endpointId]: value }));
-    await emitKeysChanged();
+  const onSaveEndpointKey = async (endpoint: CustomEndpoint, value: string) => {
+    await setCustomEndpointKey(endpoint.id, endpoint.baseURL, value);
   };
 
   const onClearEndpointKey = async (endpointId: string) => {
     await clearCustomEndpointKey(endpointId);
-    setEpKeys((prev) => ({ ...prev, [endpointId]: null }));
-    await emitKeysChanged();
   };
 
   const addCustomEndpoint = async (preset?: EndpointPreset) => {
-    const ep = newCustomEndpoint(crypto.randomUUID().slice(0, 8), preset);
-    await setCustomEndpoints([...customEndpoints, ep]);
-  };
-
-  const updateCustomEndpoint = async (
-    id: string,
-    patch: Partial<CustomEndpoint>,
-  ) => {
-    await setCustomEndpoints(
-      customEndpoints.map((e) => (e.id === id ? { ...e, ...patch } : e)),
-    );
+    await createCustomEndpoint(newCustomEndpoint("", preset));
   };
 
   const removeCustomEndpoint = async (id: string) => {
-    await clearCustomEndpointKey(id);
+    // Native deletion owns key cleanup and must succeed before selection edits.
+    await deleteCustomEndpoint(id);
     setEpKeys((prev) => {
       const next = { ...prev };
       delete next[id];
@@ -248,7 +315,9 @@ export function ModelsSection() {
     // If the deleted endpoint was the active model, the selection would dangle
     // and the next send throws "Custom endpoint not found". Fall back to another
     // endpoint when one remains, else the default model.
-    const remaining = customEndpoints.filter((e) => e.id !== id);
+    const remaining = usePreferencesStore
+      .getState()
+      .customEndpoints.filter((e) => e.id !== id);
     const { selectedModelId, setSelectedModelId } = useChatStore.getState();
     if (selectedModelId === deadModelId) {
       setSelectedModelId(
@@ -257,8 +326,6 @@ export function ModelsSection() {
           : DEFAULT_MODEL_ID,
       );
     }
-
-    await setCustomEndpoints(remaining);
   };
 
   const localConfig = (id: ProviderId): LocalConfig | null => {
@@ -307,13 +374,14 @@ export function ModelsSection() {
   };
 
   const isConfigured = (id: ProviderId): boolean => {
-    if (id === "openrouter") return !!keys?.[id] && !!openrouterModelId.trim();
+    if (id === "openrouter")
+      return !!readyKey(keys?.[id]) && !!openrouterModelId.trim();
     // Configured per endpoint (the legacy single endpoint is migrated into
     // the list), never through this provider's own fields.
     if (id === "openai-compatible") {
       return customEndpoints.some(isCompleteEndpoint);
     }
-    if (!isLocalProvider(id)) return !!keys?.[id];
+    if (!isLocalProvider(id)) return !!readyKey(keys?.[id]);
     const cfg = localConfig(id);
     if (!cfg) return false;
     return !!cfg.modelId.trim();
@@ -328,6 +396,8 @@ export function ModelsSection() {
   );
   const visibleIds = new Set<ProviderId>(configuredIds);
   for (const id of adding) visibleIds.add(id);
+  for (const p of PROVIDERS)
+    if (credentialUnavailable(keys[p.id])) visibleIds.add(p.id);
   const visibleProviders = PROVIDERS.filter(
     (p) => p.id !== "openai-compatible" && visibleIds.has(p.id),
   );
@@ -335,19 +405,17 @@ export function ModelsSection() {
     (p) => p.id !== "openai-compatible" && !visibleIds.has(p.id),
   );
 
-  const removeProvider = (id: ProviderId) => {
+  const removeProvider = async (id: ProviderId) => {
+    if (!isLocalProvider(id) || id === "openai-compatible")
+      await onClearKey(id);
     if (id === "openrouter") {
-      void setOpenrouterModelId("");
-      void onClearKey(id);
+      await setOpenrouterModelId("");
     } else if (isLocalProvider(id)) {
       const cfg = localConfig(id);
       if (cfg) {
-        void cfg.setModelId("");
-        if (id === "openai-compatible") void cfg.setBaseURL("");
+        await cfg.setModelId("");
+        if (id === "openai-compatible") await cfg.setBaseURL("");
       }
-      if (id === "openai-compatible") void onClearKey(id);
-    } else {
-      void onClearKey(id);
     }
     setAdding((prev) => {
       const next = new Set(prev);
@@ -362,6 +430,23 @@ export function ModelsSection() {
 
   return (
     <div className="flex flex-col gap-7">
+      {removalError && (
+        <p role="alert" className="text-xs text-destructive">
+          {removalError}
+        </p>
+      )}
+      {endpointsError && (
+        <p role="alert" className="text-xs text-destructive">
+          {endpointsError}{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => void remove(retryCustomEndpoints())}
+          >
+            Retry
+          </button>
+        </p>
+      )}
       <SectionHeader
         title="Models"
         description="Connect the providers you use. Keys live in your OS keychain and are used only by Oarlock."
@@ -382,7 +467,7 @@ export function ModelsSection() {
           <AddProviderMenu
             providers={addableProviders}
             onAdd={addProvider}
-            onAddCompat={(preset) => void addCustomEndpoint(preset)}
+            onAddCompat={(preset) => void remove(addCustomEndpoint(preset))}
           />
         </div>
 
@@ -405,10 +490,12 @@ export function ModelsSection() {
                   configured={configuredIds.has(p.id)}
                   config={localConfig(p.id)!}
                   meta={LOCAL_META[p.id]!}
-                  compatKey={keys[p.id]}
+                  compatKey={readyKey(keys[p.id])}
+                  credentialIssue={credentialProblem(keys[p.id])}
+                  onRetryKey={() => retryKeys.current()}
                   onSaveKey={(v) => onSaveKey(p.id, v)}
-                  onClearKey={() => onClearKey(p.id)}
-                  onRemove={() => removeProvider(p.id)}
+                  onClearKey={() => remove(onClearKey(p.id))}
+                  onRemove={() => remove(removeProvider(p.id))}
                 />
               ) : isLocalProvider(p.id) ? (
                 <LocalProviderCard
@@ -418,17 +505,19 @@ export function ModelsSection() {
                   config={localConfig(p.id)!}
                   meta={LOCAL_META[p.id]!}
                   onSaveKey={(v) => onSaveKey(p.id, v)}
-                  onClearKey={() => onClearKey(p.id)}
-                  onRemove={() => removeProvider(p.id)}
+                  onClearKey={() => remove(onClearKey(p.id))}
+                  onRemove={() => remove(removeProvider(p.id))}
                 />
               ) : (
                 <ProviderKeyCard
                   key={p.id}
                   provider={p}
-                  currentKey={keys[p.id]}
+                  currentKey={readyKey(keys[p.id])}
+                  credentialIssue={credentialProblem(keys[p.id])}
+                  onRetryKey={() => retryKeys.current()}
                   onSave={(v) => onSaveKey(p.id, v)}
-                  onClear={() => onClearKey(p.id)}
-                  onRemove={() => removeProvider(p.id)}
+                  onClear={() => remove(onClearKey(p.id))}
+                  onRemove={() => remove(removeProvider(p.id))}
                 />
               ),
             )}
@@ -436,11 +525,13 @@ export function ModelsSection() {
               <CustomEndpointCard
                 key={ep.id}
                 endpoint={ep}
-                endpointKey={epKeys[ep.id] ?? null}
-                onSaveKey={(v) => onSaveEndpointKey(ep.id, v)}
-                onClearKey={() => onClearEndpointKey(ep.id)}
-                onUpdate={(patch) => updateCustomEndpoint(ep.id, patch)}
-                onRemove={() => removeCustomEndpoint(ep.id)}
+                endpointKey={credentialValue(epKeys[ep.id])}
+                credentialIssue={credentialProblem(epKeys[ep.id])}
+                onRetryKey={() => retryKeys.current()}
+                onSaveKey={(v) => onSaveEndpointKey(ep, v)}
+                onClearKey={() => remove(onClearEndpointKey(ep.id))}
+                onUpdate={(patch) => remove(updateCustomEndpoint(ep.id, patch))}
+                onRemove={() => remove(removeCustomEndpoint(ep.id))}
               />
             ))}
           </div>
@@ -738,7 +829,7 @@ function AutocompleteRow({
     return map;
   }, [items]);
 
-  const hasKey = providerNeedsKey(provider) ? !!keys[provider] : true;
+  const hasKey = providerNeedsKey(provider) ? !!readyKey(keys[provider]) : true;
 
   return (
     <>
@@ -853,6 +944,8 @@ function LocalProviderCard({
   compatKey,
   onSaveKey,
   onClearKey,
+  credentialIssue,
+  onRetryKey,
   onRemove,
 }: {
   provider: ProviderInfo;
@@ -862,6 +955,8 @@ function LocalProviderCard({
   compatKey?: string | null;
   onSaveKey: (v: string) => Promise<void>;
   onClearKey: () => Promise<void>;
+  credentialIssue?: string | null;
+  onRetryKey?: () => Promise<void>;
   onRemove: () => void;
 }) {
   const {
@@ -877,7 +972,7 @@ function LocalProviderCard({
   const [modelDraft, setModelDraft] = useState(modelId);
   const [contextDraft, setContextDraft] = useState(String(contextLimit ?? ""));
   const [keyDraft, setKeyDraft] = useState("");
-  const [testStatus, setTestStatus] = useState<PingState>({ status: "idle" });
+  const { test, testStatus } = useEndpointPing(urlDraft);
 
   useEffect(() => setUrlDraft(baseURL), [baseURL]);
   useEffect(() => setModelDraft(modelId), [modelId]);
@@ -885,11 +980,6 @@ function LocalProviderCard({
 
   const supportsKey =
     provider.id === "openai-compatible" || provider.id === "openrouter";
-
-  const test = async () => {
-    setTestStatus({ status: "testing" });
-    setTestStatus(await pingEndpoint(urlDraft));
-  };
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-card/60 px-3 py-2.5">
@@ -1012,12 +1102,17 @@ function LocalProviderCard({
           </FieldRow>
         ) : null}
 
+        <CredentialRecovery
+          problem={credentialIssue}
+          onRetry={onRetryKey}
+          onRemove={onClearKey}
+        />
         {supportsKey ? (
           <FieldRow label="API key">
             {compatKey ? (
               <div className="flex flex-1 items-center gap-1.5">
                 <code className="flex-1 truncate rounded bg-muted/40 px-2 py-1 font-mono text-[11px] text-muted-foreground">
-                  {`${compatKey.slice(0, 4)}${"•".repeat(8)}${compatKey.slice(-4)}`}
+                  {maskKey(compatKey)}
                 </code>
                 <Button
                   size="icon"
@@ -1075,16 +1170,20 @@ function LocalProviderCard({
 
 function CustomEndpointCard({
   endpoint,
-  endpointKey,
+  endpointKey: credential,
   onSaveKey,
   onClearKey,
+  credentialIssue,
+  onRetryKey,
   onUpdate,
   onRemove,
 }: {
   endpoint: CustomEndpoint;
-  endpointKey: string | null;
+  endpointKey: EndpointCredential | null;
   onSaveKey: (v: string) => Promise<void>;
   onClearKey: () => Promise<void>;
+  credentialIssue?: string | null;
+  onRetryKey?: () => Promise<void>;
   onUpdate: (patch: Partial<CustomEndpoint>) => Promise<void>;
   onRemove: () => void;
 }) {
@@ -1096,7 +1195,8 @@ function CustomEndpointCard({
     String(endpoint.contextLimit ?? ""),
   );
   const [keyDraft, setKeyDraft] = useState("");
-  const [testStatus, setTestStatus] = useState<PingState>({ status: "idle" });
+  const [keyError, setKeyError] = useState("");
+  const { test, testStatus } = useEndpointPing(urlDraft, expanded);
 
   useEffect(() => setNameDraft(endpoint.name), [endpoint.name]);
   useEffect(() => setUrlDraft(endpoint.baseURL), [endpoint.baseURL]);
@@ -1106,13 +1206,9 @@ function CustomEndpointCard({
     [endpoint.contextLimit],
   );
 
+  const endpointKey = endpointKeyFor(credential, urlDraft);
   const configured = !!endpoint.baseURL.trim() && !!endpoint.modelId.trim();
   const preset = endpointPresetFor(endpoint.baseURL);
-
-  const test = async () => {
-    setTestStatus({ status: "testing" });
-    setTestStatus(await pingEndpoint(urlDraft));
-  };
 
   return (
     <div className="flex flex-col rounded-lg border border-border/60 bg-card/60">
@@ -1139,7 +1235,12 @@ function CustomEndpointCard({
             {endpoint.modelId}
           </span>
         )}
-        {configured ? (
+        {credentialIssue && (
+          <span className="text-xs text-destructive" title={credentialIssue}>
+            Key unavailable
+          </span>
+        )}
+        {configured && !credentialIssue ? (
           <Badge
             variant="outline"
             className="ml-1 h-4 gap-1 border-border/60 bg-muted/40 px-1.5 text-[10px] font-normal text-muted-foreground"
@@ -1238,6 +1339,7 @@ function CustomEndpointCard({
                 className="h-8 font-mono text-[11.5px]"
               />
               <ModelBrowseButton
+                disabled={!!credentialIssue || (!!credential && !endpointKey)}
                 baseURL={urlDraft}
                 apiKey={endpointKey}
                 onSelect={(id) => {
@@ -1269,11 +1371,16 @@ function CustomEndpointCard({
             </div>
           </FieldRow>
 
+          <CredentialRecovery
+            problem={credentialIssue}
+            onRetry={onRetryKey}
+            onRemove={onClearKey}
+          />
           <FieldRow label="API key">
             {endpointKey ? (
               <div className="flex flex-1 items-center gap-1.5">
                 <code className="flex-1 truncate rounded bg-muted/40 px-2 py-1 font-mono text-[11px] text-muted-foreground">
-                  {`${endpointKey.slice(0, 4)}${"•".repeat(8)}${endpointKey.slice(-4)}`}
+                  {maskKey(endpointKey)}
                 </code>
                 <Button
                   size="icon"
@@ -1308,10 +1415,17 @@ function CustomEndpointCard({
                   onClick={async () => {
                     const v = keyDraft.trim();
                     if (!v) return;
-                    await onSaveKey(v);
-                    setKeyDraft("");
+                    setKeyError("");
+                    try {
+                      await onSaveKey(v);
+                      setKeyDraft("");
+                    } catch (error) {
+                      setKeyError(String(error));
+                    }
                   }}
-                  disabled={!keyDraft.trim()}
+                  disabled={
+                    !keyDraft.trim() || urlDraft.trim() !== endpoint.baseURL
+                  }
                   className="h-8 px-3 text-[11px]"
                 >
                   Save
@@ -1320,6 +1434,24 @@ function CustomEndpointCard({
             )}
           </FieldRow>
 
+          {keyError && (
+            <p role="alert" className="text-xs text-destructive">
+              {keyError}
+            </p>
+          )}
+          {credential && !endpointKey && (
+            <p className="text-xs text-muted-foreground">
+              Re-enter the API key for this server. The stored key belongs to
+              another or unverified origin.{" "}
+              <button
+                type="button"
+                className="underline"
+                onClick={() => void onClearKey()}
+              >
+                Remove stored key
+              </button>
+            </p>
+          )}
           <StatusLine state={testStatus} />
         </div>
       )}

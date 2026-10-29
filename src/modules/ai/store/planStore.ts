@@ -1,8 +1,13 @@
+import {
+  currentWorkspaceEnv,
+  type WorkspaceEnv,
+} from "@/modules/workspace/env";
 import { create } from "zustand";
-import { native } from "../lib/native";
+import { native, createNative } from "../lib/native";
 import { checkWritableCanonical } from "../lib/security";
 
 export type QueuedEdit = {
+  workspace?: WorkspaceEnv;
   id: string;
   /** Tool that produced the queued mutation. */
   kind: "write_file" | "edit" | "multi_edit" | "create_directory";
@@ -47,7 +52,13 @@ export const usePlanStore = create<PlanState>((set, get) => ({
     set((s) => ({ active: !s.active, queue: s.active ? [] : s.queue })),
   enable: () => set({ active: true }),
   disable: () => set({ active: false, queue: [] }),
-  enqueue: (q) => set((s) => ({ queue: [...s.queue, q] })),
+  enqueue: (q) =>
+    set((s) => ({
+      queue: [
+        ...s.queue,
+        { ...q, workspace: q.workspace ?? currentWorkspaceEnv() },
+      ],
+    })),
   removeOne: (id) =>
     set((s) => ({ queue: s.queue.filter((q) => q.id !== id) })),
   clear: () => set({ queue: [] }),
@@ -59,20 +70,24 @@ export const usePlanStore = create<PlanState>((set, get) => ({
       if (!get().queue.some((x) => x.id === q.id)) continue;
       processed.add(q.id);
       try {
+        const workspace = q.workspace;
+        const client = workspace ? createNative(() => workspace) : native;
         // Checked again where the write happens: a link on the path may
         // have changed since the edit was queued.
         const safety = await checkWritableCanonical(
           q.path,
-          native.canonicalize,
+          client.canonicalize,
         );
+        // Rejection may arrive while native path validation is pending.
+        if (!get().queue.some((x) => x.id === q.id)) continue;
         if (!safety.ok) {
           results.push({ id: q.id, ok: false, error: safety.reason });
           continue;
         }
         if (q.kind === "create_directory") {
-          await native.createDir(safety.canonical);
+          await client.createDir(safety.canonical);
         } else {
-          await native.writeFile(safety.canonical, q.proposedContent);
+          await client.writeFile(safety.canonical, q.proposedContent);
         }
         results.push({ id: q.id, ok: true });
       } catch (e) {

@@ -213,3 +213,19 @@ describe("isPasteShortcut", () => {
     expect(isPasteShortcut(key({ key: "V", metaKey: true }), true)).toBe(true);
   });
 });
+
+it("cancels before copy if the workspace changes while source authorization is pending", async () => {
+  const authorization = deferred<boolean>();
+  authorizeFolder.mockReturnValueOnce(authorization.promise);
+  invoke
+    .mockResolvedValueOnce(["/tmp/a"])
+    .mockResolvedValueOnce({ created: [], failed: [] });
+  const opts = options();
+  const paste = pasteClipboardFiles("/repo", opts);
+  await vi.waitFor(() => expect(authorizeFolder).toHaveBeenCalledOnce());
+  opts.isCurrent.mockReturnValue(false);
+  authorization.resolve(true);
+  expect(await paste).toEqual([]);
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(opts.refresh).not.toHaveBeenCalled();
+});

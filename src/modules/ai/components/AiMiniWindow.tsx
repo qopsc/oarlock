@@ -1,3 +1,4 @@
+import { useChatStop } from "../store/chatStop";
 import {
   Context,
   ContextContent,
@@ -44,6 +45,7 @@ import { McpElicitations } from "@/modules/mcp/components/McpElicitations";
 import { AgentSwitcher } from "./AgentSwitcher";
 import { AiChatView } from "./AiChat";
 import { PlanDiffReview } from "./PlanDiffReview";
+import { SubagentTasksButton } from "./SubagentTasksButton";
 import { TodoStrip } from "./TodoStrip";
 
 const SUGGESTIONS = [
@@ -159,7 +161,10 @@ function ResizeHandle({
     <div
       data-no-drag
       onPointerDown={onPointerDown}
-      className={cn("absolute z-50 touch-none select-none", RESIZE_HANDLE_CLASS[dir])}
+      className={cn(
+        "absolute z-50 touch-none select-none",
+        RESIZE_HANDLE_CLASS[dir],
+      )}
     />
   );
 }
@@ -176,17 +181,26 @@ function Body({
   onHeaderPointerDown: (e: React.PointerEvent) => void;
 }) {
   const focusInput = useChatStore((s) => s.focusInput);
+  const stopState = useChatStop((s) => s.states[sessionId]);
   const step = useChatStore((s) => s.agentMeta.step);
 
   const chat = useMemo(() => getOrCreateChat(sessionId), [sessionId]);
   const helpers = useChat<UIMessage>({ chat });
   const isBusy =
-    helpers.status === "submitted" || helpers.status === "streaming";
+    stopState?.blocked === true ||
+    helpers.status === "submitted" ||
+    helpers.status === "streaming";
 
   return (
     <>
       <Header
-        step={step}
+        step={
+          stopState?.blocked
+            ? stopState.error
+              ? "Stop failed; retry Stop"
+              : "Stopping…"
+            : step
+        }
         isBusy={isBusy}
         onClose={onClose}
         onExpand={onExpand}
@@ -334,6 +348,7 @@ function Header({
             <span className="max-w-32 truncate">{step ?? "Thinking…"}</span>
           </span>
         ) : null}
+        <SubagentTasksButton />
         <SessionPicker />
         <Button
           type="button"
@@ -387,15 +402,8 @@ function ContextIndicator({ messages }: { messages: UIMessage[] }) {
   const estimated = useMemo(() => estimateTokens(messages), [messages]);
   const used = lastInput > 0 ? lastInput : estimated;
   const reported = tokens.inputTokens + tokens.outputTokens;
-  const openaiCompatibleContextLimit = usePreferencesStore(
-    (s) => s.openaiCompatibleContextLimit,
-  );
   const customEndpoints = usePreferencesStore((s) => s.customEndpoints);
-  const max = resolveContextLimit(
-    modelId,
-    customEndpoints,
-    openaiCompatibleContextLimit,
-  );
+  const max = resolveContextLimit(modelId, customEndpoints);
   const modelLabel = useMemo(() => {
     try {
       return resolveModel(modelId, customEndpoints).label;
@@ -450,7 +458,9 @@ function ContextIndicator({ messages }: { messages: UIMessage[] }) {
               {tokens.cachedInputTokens > 0 && (
                 <div className="flex items-center justify-between text-muted-foreground">
                   <span>Cache hit</span>
-                  <span className="font-mono text-foreground">{cacheRate}%</span>
+                  <span className="font-mono text-foreground">
+                    {cacheRate}%
+                  </span>
                 </div>
               )}
               {cost != null && (

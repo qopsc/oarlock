@@ -1,6 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { runSubagent } from "../agents/runSubagent";
+import { runTrackedSubagent } from "../agents/trackedSubagent";
 import { SUBAGENTS, type SubagentType } from "../agents/registry";
 import {
   countConversationUsage,
@@ -33,11 +33,17 @@ Auto-executes (no approval) — subagents are read-only by design.`,
           .optional()
           .describe("Short label shown in the chat UI for the spawn card."),
       }),
-      execute: async ({ type, prompt, description }) => {
+      execute: async ({ type, prompt, description }, { abortSignal }) => {
         const { apiKeys, selectedModelId } = useChatStore.getState();
         const sessionId = ctx.getSessionId();
         try {
-          const r = await runSubagent({
+          abortSignal?.throwIfAborted();
+          if (!sessionId)
+            throw new Error("A conversation is required to start a subagent");
+          const r = await runTrackedSubagent({
+            sessionId,
+            title: description || type,
+            abortSignal,
             type,
             prompt,
             keys: apiKeys,
@@ -59,6 +65,7 @@ Auto-executes (no approval) — subagents are read-only by design.`,
             summary: r.summary,
             stepCount: r.stepCount,
             durationMs: r.durationMs,
+            taskId: r.taskId,
           };
         } catch (e) {
           return { error: String(e), type };

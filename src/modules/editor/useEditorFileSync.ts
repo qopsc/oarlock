@@ -1,13 +1,19 @@
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import {
+  LOCAL_WORKSPACE,
+  workspaceEnvForPath,
+  workspaceScopeKey,
+  type WorkspaceEnv,
+} from "@/modules/workspace/env";
 import {
   listenFsChanged,
-  watchAdd,
-  watchRemove,
+  createFileWatchClient,
 } from "@/modules/explorer/lib/watch";
 import type { Tab } from "@/modules/tabs";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { type RefObject, useEffect, useRef } from "react";
 import type { EditorPaneHandle } from "./EditorPane";
-import { editorTabsUnder, onFilesDiscarded } from "./lib/gitSignals";
+import { installDiscardCoordinator } from "./lib/discardBridge";
 import { fileWatchTargets } from "./lib/fileWatchTargets";
 
 type Params = {
@@ -63,34 +69,70 @@ export function useEditorFileSync({ tabs, tabsRef, editorRefs }: Params) {
     };
   }, [tabsRef, editorRefs]);
 
-  // A discard is the user throwing edits away: reload even dirty buffers.
-  useEffect(
-    () =>
-      onFilesDiscarded((paths) => {
-        for (const id of editorTabsUnder(tabsRef.current, paths)) {
-          editorRefs.current.get(id)?.reload({ force: true });
-        }
-      }),
-    [tabsRef, editorRefs],
+  useEffect(installDiscardCoordinator, []);
+
+  const spaces = useSpaces((s) => s.spaces);
+  const watches = useRef(
+    new Map<
+      string,
+      {
+        env: WorkspaceEnv;
+        tabs: Tab[];
+        client: ReturnType<typeof createFileWatchClient>;
+      }
+    >(),
   );
 
-  const editorWatchRef = useRef<Set<string>>(new Set());
-  const editorFilesRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const { dirs: wantDirs, files: wantFiles } = fileWatchTargets(tabs);
-    const prevDirs = editorWatchRef.current;
-    const prevFiles = editorFilesRef.current;
-    watchAdd(
-      [...wantDirs].filter((d) => !prevDirs.has(d)),
-      [...wantFiles].filter((f) => !prevFiles.has(f)),
-    );
-    watchRemove(
-      [...prevDirs].filter((d) => !wantDirs.has(d)),
-      [...prevFiles].filter((f) => !wantFiles.has(f)),
-    );
-    editorWatchRef.current = wantDirs;
-    editorFilesRef.current = wantFiles;
-  }, [tabs]);
+    const next = new Map<
+      string,
+      {
+        env: WorkspaceEnv;
+        tabs: Tab[];
+        client: ReturnType<typeof createFileWatchClient>;
+      }
+    >();
+    for (const tab of tabs) {
+      if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
+      const env = workspaceEnvForPath(
+        tab.path,
+        spaces.find((s) => s.id === tab.spaceId)?.env ?? LOCAL_WORKSPACE,
+      );
+      const key = workspaceScopeKey(env);
+      const group = next.get(key) ?? {
+        env,
+        tabs: [],
+        client:
+          watches.current.get(key)?.client ?? createFileWatchClient(() => env),
+      };
+      group.tabs.push(tab);
+      next.set(key, group);
+    }
+    for (const key of new Set([...next.keys(), ...watches.current.keys()])) {
+      const before = watches.current.get(key);
+      const after = next.get(key);
+      const group = after ?? before;
+      if (!group) continue;
+      const prev = fileWatchTargets(before?.tabs ?? []);
+      const want = fileWatchTargets(after?.tabs ?? []);
+      group.client.add(
+        [...want.dirs].filter((p) => !prev.dirs.has(p)),
+        [...want.files].filter((p) => !prev.files.has(p)),
+      );
+      group.client.remove(
+        [...prev.dirs].filter((p) => !want.dirs.has(p)),
+        [...prev.files].filter((p) => !want.files.has(p)),
+      );
+    }
+    watches.current = next;
+  }, [tabs, spaces]);
+  useEffect(
+    () => () => {
+      for (const { client } of watches.current.values()) client.dispose();
+      watches.current.clear();
+    },
+    [],
+  );
 
   useEffect(() => {
     let alive = true;

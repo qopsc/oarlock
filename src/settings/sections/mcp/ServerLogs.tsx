@@ -1,3 +1,4 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
@@ -71,7 +72,7 @@ export function ServerLogs({ serverId }: { serverId: string }) {
     const text = lines
       .map((l) => `${time(l.atMs)} ${l.stream} ${l.text}`)
       .join("\n");
-    void navigator.clipboard.writeText(text).catch(() => {});
+    void writeClipboardText(text).catch(() => {});
   };
 
   const clear = () => {

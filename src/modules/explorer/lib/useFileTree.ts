@@ -1,3 +1,4 @@
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { invoke } from "@tauri-apps/api/core";
 import {
   useCallback,
@@ -10,11 +11,10 @@ import { toast } from "sonner";
 import {
   authorizationSettled,
   authorizeFolder,
-  currentWorkspaceEnv,
   useWorkspaceEnvStore,
   workspaceScopeKey,
 } from "@/modules/workspace";
-import { showPrivacyRefusal } from "@/modules/mac-privacy";
+import { showFileError, showPrivacyRefusal } from "@/modules/mac-privacy";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   executeBatchMove,
@@ -23,7 +23,7 @@ import {
 } from "./batchMove";
 import { refreshTargets } from "./refreshTargets";
 import { dirname } from "./treePaths";
-import { listenFsChanged, watchAdd, watchRemove } from "./watch";
+import { listenFsChanged, createFileWatchClient } from "./watch";
 import { createWatchRegistry, planVisibilityEdge } from "./watchRegistry";
 
 export type DirEntry = {
@@ -95,9 +95,7 @@ function sameDirListing(a: DirEntry[], b: DirEntry[]): boolean {
 }
 
 type Options = {
-  onPathRenamed?: (from: string, to: string) => void;
-  onPathsDeleted?: (paths: string[]) => void;
-  canReplacePath?: (path: string) => boolean;
+  canReplacePath?: (path: string, workspace: WorkspaceEnv) => boolean;
   /**
    * The explorer is on screen (default true). While false it holds no native
    * watchers, ignores `fs:changed` and skips reloads; showing it again
@@ -126,7 +124,7 @@ export function useFileTree(rootPath: string | null, options?: Options) {
   const staleRef = useRef(false);
   const rootPathRef = useRef(rootPath);
   const [watches] = useState(() =>
-    createWatchRegistry({ add: watchAdd, remove: watchRemove }, active),
+    createWatchRegistry(createFileWatchClient(), active),
   );
   const expandedRef = useRef(expanded);
   const nodesRef = useRef(nodes);
@@ -464,7 +462,7 @@ export function useFileTree(rootPath: string | null, options?: Options) {
       const cmd =
         pendingCreate.kind === "dir" ? "fs_create_dir" : "fs_create_file";
       try {
-        await invoke(cmd, { path, workspace: currentWorkspaceEnv() });
+        await invoke(cmd, { path, workspace });
         await fetchChildren(pendingCreate.parentPath);
       } catch (e) {
         console.error(`${cmd} failed:`, e);
@@ -476,7 +474,7 @@ export function useFileTree(rootPath: string | null, options?: Options) {
         setPendingCreate(null);
       }
     },
-    [pendingCreate, fetchChildren],
+    [pendingCreate, workspace, fetchChildren],
   );
 
   const beginRename = useCallback((path: string) => {
@@ -503,13 +501,13 @@ export function useFileTree(rootPath: string | null, options?: Options) {
           to,
           workspace,
         });
-        optionsRef.current?.onPathRenamed?.(renaming, to);
         if (scopeKeyRef.current === scopeKey) await fetchChildren(parent);
       } catch (e) {
         console.error("fs_rename failed:", e);
-        showPrivacyRefusal(`Could not rename ${oldName}`, {
+        showFileError(`Could not rename ${oldName}`, {
           path: renaming,
           error: e,
+          description: String(e),
         });
       } finally {
         setRenaming(null);
@@ -522,16 +520,19 @@ export function useFileTree(rootPath: string | null, options?: Options) {
     async (path: string) => {
       try {
         await invoke("fs_delete", { path, workspace });
-        optionsRef.current?.onPathsDeleted?.([path]);
         if (scopeKeyRef.current === scopeKey) {
           await fetchChildren(dirname(path));
         }
       } catch (e) {
         console.error("fs_delete failed:", e);
-        showPrivacyRefusal(`Could not delete ${path.slice(path.lastIndexOf("/") + 1)}`, {
-          path,
-          error: e,
-        });
+        showFileError(
+          `Could not delete ${path.slice(path.lastIndexOf("/") + 1)}`,
+          {
+            path,
+            error: e,
+            description: String(e),
+          },
+        );
       }
     },
     [workspace, scopeKey, fetchChildren],
@@ -547,16 +548,21 @@ export function useFileTree(rootPath: string | null, options?: Options) {
           "fs_delete_batch",
           { paths: topLevelPaths, root: rootPath ?? "", workspace },
         );
-        if (deleted.length > 0) {
-          optionsRef.current?.onPathsDeleted?.(deleted);
-        }
         if (scopeKeyRef.current === scopeKey) {
           const parents = new Set(deleted.map(dirname));
           await Promise.all([...parents].map((path) => fetchChildren(path)));
         }
         if (failed > 0) toast.error("Delete failed for one or more items");
       };
-      await run();
+      try {
+        await run();
+      } catch (error) {
+        showFileError("Delete failed", {
+          path: topLevelPaths,
+          error,
+          description: String(error),
+        });
+      }
     },
     [workspace, rootPath, scopeKey, fetchChildren],
   );
@@ -593,21 +599,27 @@ export function useFileTree(rootPath: string | null, options?: Options) {
       const run = async () => {
         if (scopeKeyRef.current !== scopeKey) return;
         const parents = new Set<string>([toDir]);
+        let firstError: unknown;
         const outcome = await executeBatchMove(sources, toDir, {
-          move: (item, expectedConflict) =>
-            invoke<FsMoveResult>("fs_move", {
-              from: item.from,
-              to: item.to,
-              root: rootPath ?? "",
-              expectedConflict,
-              workspace,
-            }),
+          move: async (item, expectedConflict) => {
+            try {
+              return await invoke<FsMoveResult>("fs_move", {
+                from: item.from,
+                to: item.to,
+                root: rootPath ?? "",
+                expectedConflict,
+                workspace,
+              });
+            } catch (error) {
+              firstError ??= error;
+              throw error;
+            }
+          },
           resolveConflict: (item) => resolveMoveConflict(item.name),
           canReplace: (item) =>
-            optionsRef.current?.canReplacePath?.(item.to) ?? true,
+            optionsRef.current?.canReplacePath?.(item.to, workspace) ?? true,
           onMoved: (item) => {
             parents.add(dirname(item.from));
-            optionsRef.current?.onPathRenamed?.(item.from, item.to);
           },
           isCurrent: () => scopeKeyRef.current === scopeKey,
         });
@@ -621,6 +633,9 @@ export function useFileTree(rootPath: string | null, options?: Options) {
         if (outcome.failures > 0) {
           toast.error(
             outcome.moved > 0 ? "Some items could not be moved" : "Move failed",
+            firstError === undefined
+              ? undefined
+              : { description: String(firstError) },
           );
         }
       };

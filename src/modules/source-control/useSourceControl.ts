@@ -1,5 +1,6 @@
+import { workspaceUnavailableReason } from "@/modules/workspace/availability";
 import {
-  native,
+  createNative,
   type GitRepoInfo,
   type GitStatusSnapshot,
 } from "@/modules/ai/lib/native";
@@ -12,7 +13,7 @@ import {
   workspaceScopeKey,
 } from "@/modules/workspace";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { gitWatchAdd, gitWatchRemove, listenGitChanged } from "./gitWatch";
+import { gitWatchAdd, listenGitChanged } from "./gitWatch";
 import {
   createRefreshCoalescer,
   finishedCommandLeaves,
@@ -30,9 +31,7 @@ const SIGNAL_MAX_WAIT_MS = 1500;
 
 type SourceControlRefreshMode = "auto" | "always" | "never";
 type SourceControlRemoteAction = "fetch" | "pull" | "push";
-type SourceControlRemoteActionMode =
-  | "contextual"
-  | SourceControlRemoteAction;
+type SourceControlRemoteActionMode = "contextual" | SourceControlRemoteAction;
 
 type SourceControlRemoteActionResult = {
   ok: boolean;
@@ -57,9 +56,7 @@ export type SourceControlSummary = {
   applyStatus: (
     updater: (status: GitStatusSnapshot) => GitStatusSnapshot,
   ) => void;
-  refresh: (options?: {
-    remote?: SourceControlRefreshMode;
-  }) => Promise<void>;
+  refresh: (options?: { remote?: SourceControlRefreshMode }) => Promise<void>;
   runRemoteAction: (
     mode?: SourceControlRemoteActionMode,
   ) => Promise<SourceControlRemoteActionResult>;
@@ -256,7 +253,12 @@ export function useSourceControl(
   { live = true, leafCwd }: UseSourceControlOptions = {},
 ): SourceControlSummary {
   const workspaceEnv = useWorkspaceEnvStore((s) => s.env);
+  enabled = enabled && !workspaceUnavailableReason(workspaceEnv);
   const workspaceKey = workspaceScopeKey(workspaceEnv);
+  const native = useMemo(
+    () => createNative(() => workspaceEnv),
+    [workspaceEnv],
+  );
   const [state, setState] = useState<SourceControlSummaryState>({
     contextPath: null,
     repo: null,
@@ -319,10 +321,7 @@ export function useSourceControl(
   const doRefresh = useCallback(
     async (remoteMode: SourceControlRefreshMode): Promise<void> => {
       const refreshContextKey = contextKey;
-      if (
-        !enabledRef.current ||
-        refreshContextKey !== contextKeyRef.current
-      ) {
+      if (!enabledRef.current || refreshContextKey !== contextKeyRef.current) {
         return;
       }
       const requestId = ++requestIdRef.current;
@@ -425,8 +424,7 @@ export function useSourceControl(
           repo.upstream &&
           remoteMode !== "never" &&
           (remoteMode === "always" ||
-            Date.now() -
-              (autoFetchByRepoRef.current.get(repo.repoRoot) ?? 0) >=
+            Date.now() - (autoFetchByRepoRef.current.get(repo.repoRoot) ?? 0) >=
               AUTO_FETCH_THROTTLE_MS);
 
         if (shouldAutoFetch) {
@@ -468,7 +466,7 @@ export function useSourceControl(
         }
       }
     },
-    [contextKey, contextPath],
+    [contextKey, contextPath, native],
   );
 
   const refresh = useCallback(
@@ -512,8 +510,7 @@ export function useSourceControl(
 
       setState((current) => ({ ...current, busyAction: action }));
       const actionContextKey = contextKeyRef.current;
-      const isCurrentContext = () =>
-        actionContextKey === contextKeyRef.current;
+      const isCurrentContext = () => actionContextKey === contextKeyRef.current;
 
       try {
         if (action === "fetch") {
@@ -544,10 +541,11 @@ export function useSourceControl(
         }
         return { ok: false, action, error: message };
       } finally {
-        setState((current) => ({ ...current, busyAction: null }));
+        if (isCurrentContext())
+          setState((current) => ({ ...current, busyAction: null }));
       }
     },
-    [refresh],
+    [refresh, native],
   );
 
   useEffect(() => {
@@ -635,7 +633,7 @@ export function useSourceControl(
         await refreshRef.current({ remote: "never" });
       },
     });
-    gitWatchAdd(repoRoot, workspace);
+    const releaseWatch = gitWatchAdd(repoRoot, workspace);
     let alive = true;
     let unlisten: (() => void) | undefined;
     void listenGitChanged((roots) => {
@@ -664,7 +662,7 @@ export function useSourceControl(
       unlisten?.();
       unsubscribe();
       coalescer.dispose();
-      gitWatchRemove(repoRoot, workspace);
+      releaseWatch();
     };
   }, [enabled, live, repoRoot]);
 

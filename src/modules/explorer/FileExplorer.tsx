@@ -1,3 +1,4 @@
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -78,9 +79,7 @@ type Props = {
   rootPath: string | null;
   activeFilePath?: string | null;
   onOpenFile: (path: string, pin?: boolean) => void;
-  onPathRenamed?: (from: string, to: string) => void;
-  onPathsDeleted?: (paths: string[]) => void;
-  canReplacePath?: (path: string) => boolean;
+  canReplacePath?: (path: string, workspace: WorkspaceEnv) => boolean;
   onRevealInTerminal?: (path: string) => void;
   onOpenInSourceControl?: (path: string) => void;
   onOpenGitHistory?: (path: string) => void;
@@ -225,8 +224,6 @@ export const FileExplorer = memo(
       rootPath,
       activeFilePath,
       onOpenFile,
-      onPathRenamed,
-      onPathsDeleted,
       canReplacePath,
       onRevealInTerminal,
       onOpenInSourceControl,
@@ -240,8 +237,6 @@ export const FileExplorer = memo(
     ref,
   ) {
     const tree = useFileTree(rootPath, {
-      onPathRenamed,
-      onPathsDeleted,
       canReplacePath,
       active: visible,
     });
@@ -389,6 +384,7 @@ export const FileExplorer = memo(
       [entryIndexByPath, rows],
     );
     const dnd = useExplorerDnd({
+      workspace,
       rootPath: rootPath ?? "",
       isDir: isDirAt,
       onMove: tree.movePaths,

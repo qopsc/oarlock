@@ -1,3 +1,13 @@
+import { holdMcpRun, type RunLease } from "./mcpRunLeases";
+import {
+  denyUnansweredApprovals,
+  EXPIRED_APPROVAL_REASON,
+} from "./toolApprovals";
+import { ownedStream } from "./ownedStream";
+import { beginChatWork } from "./chatWork";
+import { assertWorkspaceAvailable } from "@/modules/workspace/availability";
+import { assertChatCanStart } from "../store/chatStop";
+import { currentWorkspaceEnv } from "@/modules/workspace/env";
 import { mcpToolsForRun } from "@/modules/mcp";
 import type { UIMessage } from "@ai-sdk/react";
 import { toUIMessageStream } from "ai";
@@ -8,7 +18,7 @@ import { maxMemoryBytes } from "./compact";
 import type { ProviderKeys, CustomEndpointKeys } from "./keyring";
 import { formatAiError } from "./errors";
 import { pathText } from "./messageBlocks";
-import { native, type ProjectMemory } from "./native";
+import { native, createNative, type ProjectMemory } from "./native";
 import type { ToolContext } from "../tools/tools";
 import type { ApprovalMode } from "./approvalMode";
 import type { ReasoningEffort } from "./reasoningEffort";
@@ -24,10 +34,11 @@ import type { ReasoningEffort } from "./reasoningEffort";
 async function readAgentsMd(
   workspaceRoot: string | null,
   limit: number,
+  client = native,
 ): Promise<ProjectMemory | null> {
   if (!workspaceRoot) return null;
   try {
-    return await native.readProjectMemory(workspaceRoot, limit);
+    return await client.readProjectMemory(workspaceRoot, limit);
   } catch {
     return null;
   }
@@ -41,8 +52,10 @@ type LiveSnapshot = {
 };
 
 type Deps = {
+  assertReady: () => void;
   getKeys: () => ProviderKeys;
   toolContext: ToolContext;
+  captureToolContext?: () => ToolContext;
   getModelId: () => string;
   getCustomInstructions: () => string;
   getAgentPersona: () => { name: string; instructions: string } | null;
@@ -53,9 +66,6 @@ type Deps = {
   getMlxModelId?: () => string | undefined;
   getOllamaBaseURL?: () => string | undefined;
   getOllamaModelId?: () => string | undefined;
-  getOpenaiCompatibleBaseURL?: () => string | undefined;
-  getOpenaiCompatibleModelId?: () => string | undefined;
-  getOpenaiCompatibleContextLimit?: () => number | undefined;
   getOpenrouterModelId?: () => string | undefined;
   getCustomEndpoints?: () => readonly CustomEndpoint[];
   getCustomEndpointKeys?: () => CustomEndpointKeys;
@@ -69,7 +79,10 @@ type Deps = {
   /** The effort remembered for the run's model, if one was chosen. */
   getReasoningEffort?: () => ReasoningEffort | undefined;
   /** The skills a run in this workspace may use. */
-  getSkills?: (workspaceRoot: string | null) => Promise<AgentSkills>;
+  getSkills?: (
+    workspaceRoot: string | null,
+    workspace: import("@/modules/workspace/env").WorkspaceEnv,
+  ) => Promise<AgentSkills>;
 };
 
 type SendOptions = {
@@ -79,65 +92,193 @@ type SendOptions = {
 };
 
 export function createContextAwareTransport(deps: Deps) {
+  let pendingApprovalLease: RunLease | undefined;
+  let cacheScope = "";
+  let readCache = deps.toolContext.readCache;
+  let binding:
+    | {
+        userId: string | undefined;
+        live: LiveSnapshot;
+        toolContext: ToolContext &
+          Required<Pick<ToolContext, "native" | "workspace">>;
+      }
+    | undefined;
   const run = async (options: SendOptions) => {
-    const live = deps.getLive();
-    const contextLimit = resolveContextLimit(
-      deps.getModelId(),
-      deps.getCustomEndpoints?.() ?? [],
-      deps.getOpenaiCompatibleContextLimit?.(),
-    );
-    const [projectMemory, mcp, skills] = await Promise.all([
-      readAgentsMd(live.workspaceRoot, maxMemoryBytes(contextLimit)),
-      mcpToolsForRun({
+    // Keep a waiting approval lease intact when admission is refused.
+    deps.assertReady();
+    const chatId = deps.toolContext.getSessionId?.();
+    const previousLease = pendingApprovalLease;
+    pendingApprovalLease = undefined;
+    let lease: RunLease | undefined;
+    let mcpPromise: ReturnType<typeof mcpToolsForRun> | undefined;
+    let transferred = false;
+    const finishRunWork = beginChatWork(chatId ?? null);
+    try {
+      const last = options.messages[options.messages.length - 1];
+      if (!binding && last?.role === "assistant") {
+        const tail = [last];
+        if (denyUnansweredApprovals(tail) !== tail)
+          throw new Error(EXPIRED_APPROVAL_REASON);
+      }
+      const userId = [...options.messages]
+        .reverse()
+        .find((m) => m.role === "user")?.id;
+      if (!binding || binding.userId !== userId) {
+        const live = { ...deps.getLive() };
+        const workspace = currentWorkspaceEnv();
+        const scope = JSON.stringify([workspace, live.workspaceRoot]);
+        if (scope !== cacheScope) {
+          cacheScope = scope;
+          readCache = new Map();
+        }
+        const captured = deps.captureToolContext?.() ?? deps.toolContext;
+        const terminal = captured.getTerminalContext();
+        binding = {
+          userId,
+          live,
+          toolContext: {
+            ...captured,
+            native: createNative(() => workspace),
+            workspace,
+            getCwd: () => live.cwd,
+            getWorkspaceRoot: () => live.workspaceRoot,
+            getTerminalContext: deps.captureToolContext
+              ? captured.getTerminalContext
+              : () => terminal,
+            isActiveTerminalPrivate: deps.captureToolContext
+              ? captured.isActiveTerminalPrivate
+              : () => live.terminalPrivate,
+            readCache,
+          },
+        };
+      }
+      // Approval continuations belong to the original user turn, even after navigation.
+      const { live, toolContext } = binding;
+      const workspace = toolContext.workspace;
+      assertWorkspaceAvailable(workspace);
+      const client = toolContext.native;
+      const contextLimit = resolveContextLimit(
+        deps.getModelId(),
+        deps.getCustomEndpoints?.() ?? [],
+      );
+      // A continuation cannot replace the original project's MCP tools with those
+      // of a newly selected space. Dispatch still rechecks current permissions.
+      const admission = chatId ? assertChatCanStart(chatId) : Promise.resolve();
+      mcpPromise = mcpToolsForRun({
+        root: live.workspaceRoot,
+        workspace,
+        admission,
+        ownLease: (release) => {
+          lease = holdMcpRun(chatId ?? null, release);
+          return lease.release;
+        },
         signal: options.abortSignal,
         onWaiting: () => deps.onStep?.("Starting MCP servers"),
-      }),
-      deps.getSkills?.(live.workspaceRoot),
-    ]);
-    const envBlock = formatEnvBlock(live);
-    const messagesForRun = envBlock
-      ? injectEnvIntoLastUser(options.messages, envBlock)
-      : options.messages;
-    const run = await runAgentStream({
-      keys: deps.getKeys(),
-      modelId: deps.getModelId(),
-      customInstructions: deps.getCustomInstructions(),
-      agentPersona: deps.getAgentPersona(),
-      toolContext: deps.toolContext,
-      onStep: deps.onStep,
-      onUsage: deps.onUsage,
-      onCompact: deps.onCompact,
-      onFinishMeta: deps.onFinishMeta,
-      lmstudioBaseURL: deps.getLmstudioBaseURL?.(),
-      lmstudioModelId: deps.getLmstudioModelId?.(),
-      mlxBaseURL: deps.getMlxBaseURL?.(),
-      mlxModelId: deps.getMlxModelId?.(),
-      ollamaBaseURL: deps.getOllamaBaseURL?.(),
-      ollamaModelId: deps.getOllamaModelId?.(),
-      openaiCompatibleBaseURL: deps.getOpenaiCompatibleBaseURL?.(),
-      openaiCompatibleModelId: deps.getOpenaiCompatibleModelId?.(),
-      openaiCompatibleContextLimit: deps.getOpenaiCompatibleContextLimit?.(),
-      openrouterModelId: deps.getOpenrouterModelId?.(),
-      customEndpoints: deps.getCustomEndpoints?.(),
-      customEndpointKeys: deps.getCustomEndpointKeys?.(),
-      planMode: deps.getPlanMode?.(),
-      approvalState: () => ({
-        mode: deps.getApprovalMode?.() ?? "ask",
-        planMode: deps.getPlanMode?.() ?? false,
-      }),
-      reasoningEffort: deps.getReasoningEffort?.(),
-      projectMemory,
-      mcp,
-      skills,
-      uiMessages: messagesForRun,
-      abortSignal: options.abortSignal,
-    });
-    return toUIMessageStream({
-      stream: run.stream,
-      tools: run.tools,
-      originalMessages: options.messages,
-      onError: formatAiError,
-    });
+      });
+      await admission;
+      options.abortSignal?.throwIfAborted();
+      deps.assertReady();
+      const [projectMemory, mcp, skills] = await Promise.all([
+        readAgentsMd(live.workspaceRoot, maxMemoryBytes(contextLimit), client),
+        mcpPromise,
+        deps.getSkills?.(live.workspaceRoot, workspace),
+      ]);
+      if (mcp?.release) lease ??= holdMcpRun(chatId ?? null, mcp.release);
+      // Acquire the continuation's lease before releasing the approval pause's.
+      await previousLease?.release();
+      options.abortSignal?.throwIfAborted();
+      deps.assertReady();
+      const envBlock = formatEnvBlock(live);
+      const messagesForRun = envBlock
+        ? injectEnvIntoLastUser(options.messages, envBlock)
+        : options.messages;
+      const run = await runAgentStream({
+        assertReady: deps.assertReady,
+        keys: deps.getKeys(),
+        modelId: deps.getModelId(),
+        customInstructions: deps.getCustomInstructions(),
+        agentPersona: deps.getAgentPersona(),
+        toolContext,
+        onStep: deps.onStep,
+        onUsage: deps.onUsage,
+        onCompact: deps.onCompact,
+        onFinishMeta: deps.onFinishMeta,
+        lmstudioBaseURL: deps.getLmstudioBaseURL?.(),
+        lmstudioModelId: deps.getLmstudioModelId?.(),
+        mlxBaseURL: deps.getMlxBaseURL?.(),
+        mlxModelId: deps.getMlxModelId?.(),
+        ollamaBaseURL: deps.getOllamaBaseURL?.(),
+        ollamaModelId: deps.getOllamaModelId?.(),
+        openrouterModelId: deps.getOpenrouterModelId?.(),
+        customEndpoints: deps.getCustomEndpoints?.(),
+        customEndpointKeys: deps.getCustomEndpointKeys?.(),
+        planMode: deps.getPlanMode?.(),
+        approvalState: () => ({
+          mode: deps.getApprovalMode?.() ?? "ask",
+          planMode: deps.getPlanMode?.() ?? false,
+        }),
+        reasoningEffort: deps.getReasoningEffort?.(),
+        projectMemory,
+        mcp,
+        skills,
+        uiMessages: messagesForRun,
+        abortSignal: options.abortSignal,
+      });
+      const stream = toUIMessageStream({
+        stream: run.stream,
+        tools: run.tools,
+        originalMessages: options.messages,
+        onError: formatAiError,
+      });
+      if (!mcp?.release || !lease) return stream;
+      const ownedLease = lease;
+      const approvals = new Set<string>();
+      let failed = false;
+      const owned = ownedStream(
+        stream,
+        async (reason) => {
+          try {
+            if (
+              reason === "complete" &&
+              approvals.size &&
+              !failed &&
+              !options.abortSignal?.aborted
+            ) {
+              pendingApprovalLease = ownedLease;
+            } else await ownedLease.release();
+          } finally {
+            finishRunWork();
+          }
+        },
+        options.abortSignal,
+        (chunk) => {
+          if (chunk.type === "tool-approval-request")
+            approvals.add(chunk.toolCallId);
+          else if (
+            chunk.type === "tool-output-available" ||
+            chunk.type === "tool-output-error" ||
+            chunk.type === "tool-output-denied"
+          )
+            approvals.delete(chunk.toolCallId);
+          else if (chunk.type === "error" || chunk.type === "abort")
+            failed = true;
+        },
+      );
+      transferred = true;
+      return owned;
+    } finally {
+      try {
+        if (!transferred) {
+          const prepared = await mcpPromise;
+          lease ??= prepared?.release
+            ? holdMcpRun(chatId ?? null, prepared.release)
+            : undefined;
+          await Promise.all([lease?.release(), previousLease?.release()]);
+        }
+      } finally {
+        if (!transferred) finishRunWork();
+      }
+    }
   };
 
   return {

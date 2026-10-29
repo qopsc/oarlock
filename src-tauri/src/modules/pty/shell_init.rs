@@ -1,3 +1,5 @@
+#[path = "fish_legacy.rs"]
+mod fish_legacy;
 use std::path::PathBuf;
 
 use portable_pty::CommandBuilder;
@@ -18,8 +20,8 @@ const ZLOGIN_SCRIPT: &str = include_str!("scripts/zlogin.zsh");
 const ZSHRC_SCRIPT: &str = include_str!("scripts/zshrc.zsh");
 #[cfg(windows)]
 const FISH_INIT_SCRIPT: &str = include_str!("scripts/init.fish");
-const FISH_REINSTALL_PROMPT: &str =
-    "functions -q __oarlock_install_prompt; and __oarlock_install_prompt";
+// Suppress old conf.d hooks until config.fish is finished, then load this profile.
+const FISH_INIT_COMMAND: &str = "set -e __OARLOCK_HOOKS_LOADED; source \"$OARLOCK_FISH_INIT\"";
 
 #[cfg(windows)]
 fn bashrc_script() -> &'static str {
@@ -58,6 +60,7 @@ pub fn build_command(
     shell: Option<String>,
     control: Option<ShellControlEnv>,
 ) -> Result<CommandBuilder, String> {
+    workspace.validate_supported()?;
     let shell = sanitize_shell_override(shell);
     #[cfg(unix)]
     {
@@ -226,7 +229,7 @@ fn apply_common(
 
 #[cfg(unix)]
 mod unix {
-    use std::ffi::OsString;
+    use super::write_if_changed;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -344,11 +347,13 @@ mod unix {
             Shell::Zsh => {
                 match prepare_zdotdir() {
                     Ok(zdotdir) => {
-                        // Guard against Oarlock-in-Oarlock :)
-                        if let Ok(user_zd) = std::env::var("ZDOTDIR") {
-                            if Path::new(&user_zd) != zdotdir.as_path() {
-                                cmd.env("OARLOCK_USER_ZDOTDIR", user_zd);
-                            }
+                        let inherited = std::env::var_os("ZDOTDIR").map(PathBuf::from);
+                        let saved = std::env::var_os("OARLOCK_USER_ZDOTDIR").map(PathBuf::from);
+                        cmd.env_remove("OARLOCK_USER_ZDOTDIR");
+                        if let Some(user) =
+                            user_zdotdir(&zdotdir, inherited.as_deref(), saved.as_deref())
+                        {
+                            cmd.env("OARLOCK_USER_ZDOTDIR", user);
                         }
                         cmd.env("ZDOTDIR", &zdotdir);
                     }
@@ -375,20 +380,15 @@ mod unix {
                 cmd.arg("-i");
             }
             Shell::Fish => {
-                if let Err(e) = prepare_fish_conf_d() {
-                    log::warn!("fish shell integration disabled: {e}");
+                // This command is also built without filesystem writes in tests.
+                match prepare_fish_init() {
+                    Ok(path) => apply_fish_init(cmd, &path),
+                    Err(e) => {
+                        log::warn!("fish shell integration disabled: {e}");
+                        cmd.arg("-l");
+                        cmd.arg("-i");
+                    }
                 }
-                // fish 4.0+ writes its own OSC 133 A/B; ours would double it.
-                cmd.env("fish_features", "no-mark-prompt");
-                // Login shell like zsh: fish runs its path_helper emulation
-                // (/etc/paths, /etc/paths.d, Homebrew) only when it is one.
-                cmd.arg("-l");
-                cmd.arg("-i");
-                // Re-assert our prompt after config.fish (-C runs last), so a
-                // framework prompt (starship etc.) loaded there can't override
-                // the markers and break cwd tracking.
-                cmd.arg("-C");
-                cmd.arg(super::FISH_REINSTALL_PROMPT);
             }
             Shell::Other => {
                 log::info!(
@@ -401,9 +401,37 @@ mod unix {
 
     fn integration_root() -> Result<PathBuf, String> {
         let home = dirs::home_dir().ok_or_else(|| "could not resolve home dir".to_string())?;
-        let root = home.join(".cache").join("oarlock").join("shell-integration");
+        let root = home
+            .join(".cache")
+            .join(crate::modules::profile::shell_cache_directory(cfg!(
+                debug_assertions
+            )))
+            .join("shell-integration");
         fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
         Ok(root)
+    }
+
+    fn user_zdotdir<'a>(
+        ours: &Path,
+        inherited: Option<&'a Path>,
+        saved: Option<&'a Path>,
+    ) -> Option<&'a Path> {
+        let is_wrapper = |path: &Path| {
+            path == ours
+                || ours.ancestors().nth(3).is_some_and(|cache| {
+                    [false, true].into_iter().any(|dev| {
+                        path == cache
+                            .join(crate::modules::profile::shell_cache_directory(dev))
+                            .join("shell-integration/zsh")
+                    })
+                })
+        };
+        let inherited = inherited?;
+        if is_wrapper(inherited) {
+            saved.filter(|path| !is_wrapper(path))
+        } else {
+            Some(inherited)
+        }
     }
 
     fn prepare_zdotdir() -> Result<PathBuf, String> {
@@ -424,34 +452,45 @@ mod unix {
         Ok(rc)
     }
 
-    fn prepare_fish_conf_d() -> Result<(), String> {
-        let home = dirs::home_dir().ok_or_else(|| "could not resolve home dir".to_string())?;
-        let dir = home.join(".config").join("fish").join("conf.d");
-        fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        write_if_changed(&dir.join("oarlock.fish"), FISH_INIT)?;
-        Ok(())
+    fn apply_fish_init(cmd: &mut CommandBuilder, path: &Path) {
+        cmd.env("__OARLOCK_HOOKS_LOADED", "1");
+        cmd.env("OARLOCK_FISH_INIT", path);
+        cmd.env("fish_features", "no-mark-prompt");
+        cmd.env("fish_greeting", "");
+        cmd.arg("-l");
+        cmd.arg("-i");
+        cmd.arg("-C");
+        cmd.arg(super::FISH_INIT_COMMAND);
     }
 
-    fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
-        if let Ok(existing) = fs::read_to_string(path) {
-            if existing == content {
-                return Ok(());
-            }
-        }
-        // Atomic replace: a parallel shell startup must never source a half-written file.
-        let mut tmp: OsString = path.as_os_str().to_owned();
-        tmp.push(".__oarlock_tmp__");
-        let tmp = PathBuf::from(tmp);
-        fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, path).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("rename {} -> {}: {e}", tmp.display(), path.display())
-        })
+    fn prepare_fish_init() -> Result<PathBuf, String> {
+        let path = integration_root()?.join("init.fish");
+        write_if_changed(&path, FISH_INIT)?;
+        let home = dirs::home_dir().ok_or("could not resolve home dir")?;
+        super::fish_legacy::retire(&home.join(".config/fish/conf.d/oarlock.fish"))?;
+        Ok(path)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn shell_script_staging_never_follows_a_leftover_symlink() {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("init.fish");
+            let unrelated = dir.path().join("user-config");
+            fs::write(&unrelated, "user configuration").unwrap();
+            std::os::unix::fs::symlink(&unrelated, dir.path().join("init.fish.__oarlock_tmp__"))
+                .unwrap();
+            write_if_changed(&script, "new integration").unwrap();
+            assert_eq!(
+                fs::read_to_string(&unrelated).unwrap(),
+                "user configuration"
+            );
+            assert!(!fs::symlink_metadata(&script).unwrap().is_symlink());
+            assert_eq!(fs::read_to_string(script).unwrap(), "new integration");
+        }
 
         #[test]
         fn classify_maps_known_shells() {
@@ -488,9 +527,28 @@ mod unix {
         }
 
         #[test]
-        fn builds_unix_fish_launch_with_post_config_rewrap() {
+        fn zsh_profile_switch_preserves_user_config_without_treating_wrappers_as_user_files() {
+            let release = Path::new("/home/me/.cache/oarlock/shell-integration/zsh");
+            let dev = Path::new("/home/me/.cache/oarlock-dev/shell-integration/zsh");
+            let user = Path::new("/home/me/.config/zsh");
+            for (ours, inherited) in [(release, dev), (dev, release), (dev, dev)] {
+                assert_eq!(user_zdotdir(ours, Some(inherited), Some(user)), Some(user));
+                assert_eq!(user_zdotdir(ours, Some(inherited), None), None);
+                assert_eq!(user_zdotdir(ours, Some(inherited), Some(inherited)), None);
+                assert_eq!(user_zdotdir(ours, Some(user), Some(inherited)), Some(user));
+                assert_eq!(user_zdotdir(ours, None, Some(user)), None);
+            }
+        }
+
+        #[test]
+        fn builds_unix_fish_launch_with_a_profile_script_after_user_config() {
             let mut cmd = CommandBuilder::new("/usr/bin/fish");
-            apply_shell_init(&mut cmd, &Shell::Fish, "/usr/bin/fish");
+            apply_fish_init(&mut cmd, Path::new("/profile with spaces/init.fish"));
+            assert_eq!(
+                cmd.get_env("OARLOCK_FISH_INIT").unwrap(),
+                "/profile with spaces/init.fish"
+            );
+            assert_eq!(cmd.get_env("__OARLOCK_HOOKS_LOADED").unwrap(), "1");
             let argv: Vec<_> = cmd
                 .get_argv()
                 .iter()
@@ -503,9 +561,51 @@ mod unix {
                     "-l".to_string(),
                     "-i".to_string(),
                     "-C".to_string(),
-                    super::super::FISH_REINSTALL_PROMPT.to_string(),
+                    super::super::FISH_INIT_COMMAND.to_string(),
                 ]
             );
+        }
+
+        #[test]
+        fn fish_launch_keeps_user_config_and_nested_shells_do_not_load_our_hooks() {
+            if std::process::Command::new("fish")
+                .arg("--version")
+                .output()
+                .is_err()
+            {
+                eprintln!("skipping fish launch integration: fish not installed");
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("config/fish");
+            fs::create_dir_all(config.join("conf.d")).unwrap();
+            let legacy = config.join("conf.d/oarlock.fish");
+            fs::write(&legacy, include_str!("scripts/init.legacy.fish")).unwrap();
+            super::super::fish_legacy::retire(&legacy).unwrap();
+            fs::write(config.join("config.fish"), "function fish_prompt; printf USER_PROMPT; end\nfunction fish_greeting; printf USER_GREETING; end\n").unwrap();
+            let init = temp.path().join("profile with spaces.fish");
+            fs::write(&init, FISH_INIT).unwrap();
+            let output = std::process::Command::new("fish")
+                .args(["-i", "-C", super::super::FISH_INIT_COMMAND, "-c", "fish_prompt; fish_greeting; fish -c 'functions -q __oarlock_install_prompt; and echo NESTED_HOOKS; true'"])
+                .env("HOME", temp.path())
+                .env("XDG_CONFIG_HOME", temp.path().join("config"))
+                .env("OARLOCK_TERMINAL", "1")
+                .env("__OARLOCK_HOOKS_LOADED", "1")
+                .env("OARLOCK_FISH_INIT", init)
+                .env("fish_features", "no-mark-prompt")
+                .env("TERM", "xterm-256color")
+                .env_remove("OARLOCK_BLOCKS")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("USER_PROMPT"));
+            assert!(text.contains("USER_GREETING"));
+            assert_eq!(text.matches("133;A").count(), 1, "{text}");
+            assert!(!text.contains("NESTED_HOOKS"));
         }
 
         /// A zsh started the way `apply_shell_init` starts it (login and
@@ -623,6 +723,23 @@ mod unix {
         }
 
         #[test]
+        fn zsh_started_from_the_other_profile_reads_the_real_user_startup_once() {
+            let Some(zsh) = ZshLaunch::new() else { return };
+            let dev = zsh.home.join(".cache/oarlock-dev/shell-integration/zsh");
+            zsh.write(".cache/oarlock-dev/shell-integration/zsh/.zshenv", ZSHENV);
+            zsh.write(".zshenv", "print USER_STARTUP >> \"$HOME/startups\"\n");
+            let selected = user_zdotdir(&zsh.wrapper, Some(&dev), None);
+            let env: Vec<_> = selected
+                .map(|p| ("OARLOCK_USER_ZDOTDIR", p))
+                .into_iter()
+                .collect();
+            let stderr = zsh.run(&env, "print READY > \"$HOME/result\"\n");
+            assert!(!stderr.contains("recursion"), "{stderr}");
+            assert_eq!(zsh.read("startups"), "USER_STARTUP\n");
+            assert_eq!(zsh.read("result").trim(), "READY");
+        }
+
+        #[test]
         fn zsh_zdotdir_set_by_the_users_zshenv_keeps_the_integration() {
             // The XDG layout: ~/.zshenv moves the rest of the config.
             let Some(zsh) = ZshLaunch::new() else { return };
@@ -704,7 +821,7 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use std::ffi::OsString;
+    use super::write_if_changed;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -742,7 +859,9 @@ mod windows {
         Bash {
             rcfile: String,
         },
-        Fish,
+        Fish {
+            init: String,
+        },
         None,
     }
 
@@ -861,8 +980,8 @@ mod windows {
                     WslShellIntegration::None
                 }
             },
-            ShellKind::Fish => match prepare_wsl_fish_conf_d(&distro) {
-                Ok(()) => WslShellIntegration::Fish,
+            ShellKind::Fish => match prepare_wsl_fish_init(&distro) {
+                Ok(init) => WslShellIntegration::Fish { init },
                 Err(e) => {
                     log::warn!("WSL fish shell integration disabled for {distro}: {e}");
                     WslShellIntegration::None
@@ -883,10 +1002,38 @@ mod windows {
             shell_kind,
             integration,
         );
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy)
+            .map_err(|e| format!("Cannot create WSL terminal identity: {e}"))?;
+        let token = entropy
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let mut cmd = CommandBuilder::new("wsl.exe");
-        for arg in &spec.args {
+        // Preserve the exact launch arguments, with a PID-bound environment
+        // marker in the exec'd Linux shell. Descendants cannot be mistaken for
+        // the original shell when preparing a later path drop.
+        let exec = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--exec")
+            .ok_or("Invalid WSL launch")?;
+        for arg in &spec.args[..=exec] {
             cmd.arg(arg);
         }
+        cmd.args([
+            "/bin/sh",
+            "-c",
+            "OARLOCK_DROP_OWNER=\"$1:$$\"; export OARLOCK_DROP_OWNER; shift; exec \"$@\"",
+            "oarlock-shell",
+            &token,
+        ]);
+        for arg in &spec.args[exec + 1..] {
+            cmd.arg(arg);
+        }
+        cmd.env("OARLOCK_DROP_DISTRO", &distro);
+        cmd.env("OARLOCK_DROP_SHELL", &shell_path);
+        cmd.env("OARLOCK_DROP_TOKEN", &token);
         super::apply_terminal_identity(&mut cmd);
         // A distro receives only the Windows variables WSLENV names.
         let identity = super::terminal_env::IDENTITY.map(|(key, _)| key);
@@ -936,14 +1083,17 @@ mod windows {
                 args.push(rcfile);
                 args.push("-i".to_string());
             }
-            (ShellKind::Fish, WslShellIntegration::Fish) => {
+            (ShellKind::Fish, WslShellIntegration::Fish { init }) => {
                 args.push("env".to_string());
                 args.push("fish_features=no-mark-prompt".to_string());
+                args.push("fish_greeting=".to_string());
+                args.push("__OARLOCK_HOOKS_LOADED=1".to_string());
+                args.push(format!("OARLOCK_FISH_INIT={init}"));
                 args.push(shell_path.to_string());
                 args.push("-l".to_string());
                 args.push("-i".to_string());
                 args.push("-C".to_string());
-                args.push(super::FISH_REINSTALL_PROMPT.to_string());
+                args.push(super::FISH_INIT_COMMAND.to_string());
             }
             (ShellKind::Zsh, WslShellIntegration::None) => {
                 args.push(shell_path.to_string());
@@ -978,8 +1128,9 @@ mod windows {
     fn prepare_wsl_integration_dir(distro: &str, shell: &str) -> Result<(String, PathBuf), String> {
         let home = crate::modules::workspace::wsl_home(distro.to_string())?;
         let linux_dir = format!(
-            "{}/.cache/oarlock/shell-integration/{shell}",
-            home.trim_end_matches('/')
+            "{}/.cache/{}/shell-integration/{shell}",
+            home.trim_end_matches('/'),
+            crate::modules::profile::shell_cache_directory(cfg!(debug_assertions))
         );
         let unc_dir = crate::modules::workspace::wsl_path_to_unc(distro, &linux_dir);
         fs::create_dir_all(&unc_dir).map_err(|e| format!("create {}: {e}", unc_dir.display()))?;
@@ -1020,20 +1171,27 @@ mod windows {
         Ok(linux_rc)
     }
 
-    fn prepare_wsl_fish_conf_d(distro: &str) -> Result<(), String> {
-        let home = crate::modules::workspace::wsl_home(distro.to_string())?;
-        let linux_dir = format!("{}/.config/fish/conf.d", home.trim_end_matches('/'));
-        let unc_dir = crate::modules::workspace::wsl_path_to_unc(distro, &linux_dir);
-        fs::create_dir_all(&unc_dir).map_err(|e| format!("create {}: {e}", unc_dir.display()))?;
-        let unc_file = unc_dir.join("oarlock.fish");
+    fn prepare_wsl_fish_init(distro: &str) -> Result<String, String> {
+        let (linux_dir, unc_dir) = prepare_wsl_integration_dir(distro, "fish")?;
         let content = normalize_script(super::fish_init_script());
-        write_if_changed(&unc_file, &content)?;
-        Ok(())
+        write_if_changed(&unc_dir.join("init.fish"), &content)?;
+        let home = crate::modules::workspace::wsl_home(distro.to_string())?;
+        let legacy = format!(
+            "{}/.config/fish/conf.d/oarlock.fish",
+            home.trim_end_matches('/')
+        );
+        super::fish_legacy::retire(&crate::modules::workspace::wsl_path_to_unc(distro, &legacy))?;
+        Ok(format!("{linux_dir}/init.fish"))
     }
 
     fn integration_root() -> Result<PathBuf, String> {
         let home = dirs::home_dir().ok_or_else(|| "could not resolve home dir".to_string())?;
-        let root = home.join(".cache").join("oarlock").join("shell-integration");
+        let root = home
+            .join(".cache")
+            .join(crate::modules::profile::shell_cache_directory(cfg!(
+                debug_assertions
+            )))
+            .join("shell-integration");
         fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
         Ok(root)
     }
@@ -1124,22 +1282,6 @@ mod windows {
         // A portable or custom-located Git on PATH.
         super::which_in_path("git.exe")
             .and_then(|git| super::git_bash_beside(&git, |path| path.is_file()))
-    }
-
-    fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
-        if let Ok(existing) = fs::read_to_string(path) {
-            if existing == content {
-                return Ok(());
-            }
-        }
-        let mut tmp: OsString = path.as_os_str().to_owned();
-        tmp.push(".__oarlock_tmp__");
-        let tmp = PathBuf::from(tmp);
-        fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, path).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("rename {} -> {}: {e}", tmp.display(), path.display())
-        })
     }
 
     #[cfg(test)]
@@ -1254,13 +1396,15 @@ mod windows {
         }
 
         #[test]
-        fn builds_wsl_fish_launch_spec_without_init_command() {
+        fn builds_wsl_fish_launch_spec_with_a_profile_script() {
             let spec = build_wsl_launch_spec(
                 Some("/home/vinicios/repo"),
                 "Ubuntu",
                 "/usr/bin/fish",
                 ShellKind::Fish,
-                WslShellIntegration::Fish,
+                WslShellIntegration::Fish {
+                    init: "/home/user name/.cache/oarlock-dev/init.fish".into(),
+                },
             );
             assert_eq!(
                 spec.args,
@@ -1272,11 +1416,14 @@ mod windows {
                     "--exec".to_string(),
                     "env".to_string(),
                     "fish_features=no-mark-prompt".to_string(),
+                    "fish_greeting=".to_string(),
+                    "__OARLOCK_HOOKS_LOADED=1".to_string(),
+                    "OARLOCK_FISH_INIT=/home/user name/.cache/oarlock-dev/init.fish".to_string(),
                     "/usr/bin/fish".to_string(),
                     "-l".to_string(),
                     "-i".to_string(),
                     "-C".to_string(),
-                    super::super::FISH_REINSTALL_PROMPT.to_string(),
+                    super::super::FISH_INIT_COMMAND.to_string(),
                 ]
             );
         }
@@ -1404,6 +1551,21 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unavailable_workspace_cannot_build_a_host_terminal() {
+        assert!(super::build_command(
+            None,
+            crate::modules::workspace::WorkspaceEnv::Wsl {
+                distro: "Ubuntu".into()
+            },
+            false,
+            None,
+            None,
+        )
+        .is_err());
+    }
     use std::ffi::OsStr;
 
     use portable_pty::CommandBuilder;
@@ -1556,7 +1718,10 @@ mod tests {
         .collect();
         assert!(marks.windows(2).all(|w| w[0] < w[1]), "{prompt}");
         // No preexec hook: block tabs keep cmd's own prompt.
-        assert!(prompt.ends_with("]133;B;oarlock_blocks=0$E\\\""), "{prompt}");
+        assert!(
+            prompt.ends_with("]133;B;oarlock_blocks=0$E\\\""),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -1623,6 +1788,73 @@ $codes += Code $p
             stdout.trim(),
             "markers=True codes=0,0,3,1,0 kept=3 added=False",
             "{stderr}"
+        );
+    }
+}
+
+// Shell startup may prepare the same script concurrently for several panes.
+// Each writer owns its staging file until one atomic replacement publishes it.
+fn write_if_changed(path: &std::path::Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or("shell integration: missing directory")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("stage {}: {e}", path.display()))?;
+    staged
+        .write_all(content.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    staged
+        .persist(path)
+        .map_err(|e| format!("publish {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod script_write_tests {
+    use super::write_if_changed;
+    use std::{fs, sync::Barrier};
+
+    #[test]
+    fn parallel_shell_startups_publish_only_complete_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script");
+        let versions = ["a".repeat(64 * 1024), "b".repeat(64 * 1024)];
+        write_if_changed(&path, &versions[0]).unwrap();
+        let start = Barrier::new(9);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let (path, versions, start) = (&path, &versions, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..30 {
+                        write_if_changed(path, &versions[(writer + i) % 2]).unwrap();
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..200 {
+                let observed = fs::read_to_string(&path).unwrap();
+                assert!(versions.contains(&observed), "partially published script");
+            }
+        });
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_script_publication_removes_its_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("user-file"), "untouched").unwrap();
+        assert!(write_if_changed(&path, "integration").is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_to_string(path.join("user-file")).unwrap(),
+            "untouched"
         );
     }
 }

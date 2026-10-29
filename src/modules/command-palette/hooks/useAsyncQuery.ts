@@ -5,7 +5,8 @@ type Params<R> = {
   term: string;
   minLength: number;
   debounceMs: number;
-  run: (term: string) => Promise<R>;
+  run: (term: string, signal: AbortSignal) => Promise<R>;
+  scopeKey?: string;
   /** The result while disabled, searching or after a failure; keep it stable. */
   empty: R;
   /** Keep showing the last results while the next query runs. */
@@ -27,55 +28,90 @@ export function useAsyncQuery<R>({
   run,
   empty,
   keepPrevious = false,
+  scopeKey = "",
 }: Params<R>): AsyncQueryState<R> {
-  const [results, setResults] = useState<R>(empty);
+  const [results, setResults] = useState<{ value: R; scope: string }>({
+    value: empty,
+    scope: scopeKey,
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
+  const controllerRef = useRef<AbortController | null>(null);
+  const timerRef = useRef<number | null>(null);
   const emptyRef = useRef(empty);
   emptyRef.current = empty;
 
+  const cancel = useCallback(() => {
+    requestIdRef.current += 1;
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }, []);
+
   const execute = useCallback(
-    (q: string, runner: (term: string) => Promise<R>) => {
-      const requestId = ++requestIdRef.current;
+    (q: string, runner: (term: string, signal: AbortSignal) => Promise<R>) => {
+      cancel();
+      const requestId = requestIdRef.current;
+      const controller = new AbortController();
+      controllerRef.current = controller;
       setLoading(true);
       setError(null);
-      runner(q)
-        .then((hits) => {
+      void (async () => {
+        try {
+          const hits = await runner(q, controller.signal);
           if (requestId !== requestIdRef.current) return;
-          setResults(hits);
-        })
-        .catch((e) => {
+          setResults({ value: hits, scope: scopeKey });
+        } catch (e) {
           if (requestId !== requestIdRef.current) return;
-          setResults(emptyRef.current);
+          setResults({ value: emptyRef.current, scope: scopeKey });
           setError(String(e));
-        })
-        .finally(() => {
+        } finally {
           if (requestId === requestIdRef.current) setLoading(false);
-        });
+        }
+      })();
     },
-    [],
+    [cancel, scopeKey],
   );
 
   useEffect(() => {
-    requestIdRef.current += 1;
+    cancel();
     if (!enabled || term.length < minLength) {
-      setResults(emptyRef.current);
+      setResults({ value: emptyRef.current, scope: scopeKey });
       setLoading(false);
       setError(null);
-      return;
+      return cancel;
     }
-    if (!keepPrevious) setResults(emptyRef.current);
+    if (!keepPrevious) setResults({ value: emptyRef.current, scope: scopeKey });
     setLoading(true);
     setError(null);
     // A new `run` (another folder to search) runs the query again.
-    const handle = window.setTimeout(() => execute(term, run), debounceMs);
-    return () => window.clearTimeout(handle);
-  }, [enabled, term, minLength, debounceMs, execute, keepPrevious, run]);
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      execute(term, run);
+    }, debounceMs);
+    return cancel;
+  }, [
+    enabled,
+    term,
+    minLength,
+    debounceMs,
+    execute,
+    keepPrevious,
+    run,
+    cancel,
+    scopeKey,
+  ]);
 
   const retry = useCallback(() => {
     if (enabled && term.length >= minLength) execute(term, run);
   }, [enabled, term, minLength, execute, run]);
 
-  return { results, loading, error, retry };
+  return {
+    results: results.scope === scopeKey ? results.value : empty,
+    loading,
+    error,
+    retry,
+  };
 }

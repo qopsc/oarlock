@@ -5,7 +5,7 @@ import {
   terminalReadlineSequence,
   type TerminalPlatform,
 } from "@/modules/terminal/lib/keymap";
-import { readTerminalClipboard } from "@/modules/terminal/lib/terminalClipboard";
+import { readTerminalClipboardSnapshot } from "@/modules/terminal/lib/terminalClipboard";
 import {
   Key,
   KeyAction,
@@ -165,6 +165,7 @@ export type GhosttyInputControllerOptions = {
    * cleared, so pressing the key again (Ctrl+C) interrupts.
    */
   readonly onCopy: (clearSelection: boolean) => boolean;
+  readonly onClipboardError?: (error: unknown) => void;
   readonly getSelection?: () => string | null;
   readonly onPaste?: (text: string) => boolean;
   readonly onText?: (text: string) => boolean;
@@ -182,11 +183,6 @@ export type GhosttyInputControllerOptions = {
   readonly onSelectionFinished?: () => void;
   /** Middle click the program does not track; true when handled (a paste). */
   readonly onMiddleClick?: () => boolean;
-  /**
-   * Whether the clipboard holds an image: a Kitty paste event then offers it
-   * as `image/png`, and a paste key with no text sends the program Ctrl+V.
-   */
-  readonly clipboardHasImage?: () => Promise<boolean>;
   readonly isMac?: boolean;
   readonly isWindows?: boolean;
   /** Windows: plain Ctrl+C copies a selection and Ctrl+V pastes. */
@@ -212,6 +208,7 @@ export class GhosttyInputController {
   /** Option keys held, by side (macOS Option-as-Alt is per side). */
   private readonly optionKeys = new Set<"AltLeft" | "AltRight">();
   private disposed = false;
+  private readonly clipboardLifetime = new AbortController();
 
   constructor(private readonly options: GhosttyInputControllerOptions) {
     this.isMac = options.isMac ?? /Mac|iPhone|iPad/.test(navigator.userAgent);
@@ -264,11 +261,15 @@ export class GhosttyInputController {
    * a program that set mode 5522 is sent a Kitty paste event and reads the
    * clipboard itself; anything else gets the text.
    */
-  pasteFromClipboard(text: string, primary = false): void {
-    this.deliverPaste(text, primary);
+  pasteFromClipboard(text: string, primary = false, image = false): void {
+    this.deliverPaste(text, primary, image);
   }
 
-  private deliverPaste(text: string, clipboard: boolean | null): void {
+  private deliverPaste(
+    text: string,
+    clipboard: boolean | null,
+    image?: boolean,
+  ): void {
     if (this.disposed) return;
     // A clipboard holding only an image is pasted as a paste event alone.
     const event =
@@ -277,7 +278,7 @@ export class GhosttyInputController {
     this.nativeSelection?.reset();
     if (text && this.options.onPaste?.(text)) return;
     if (clipboard !== null && event) {
-      void this.sendPasteEvent(text, clipboard);
+      this.sendPasteEvent(text, clipboard, image);
       return;
     }
     this.pasteText(text);
@@ -288,10 +289,12 @@ export class GhosttyInputController {
    * clipboard holds, an image included, and reads it itself; the text is
    * pasted when no event could be sent.
    */
-  private async sendPasteEvent(text: string, primary: boolean): Promise<void> {
-    const image =
-      !primary &&
-      (await this.options.clipboardHasImage?.().catch(() => false)) === true;
+  private sendPasteEvent(
+    text: string,
+    primary: boolean,
+    capturedImage = false,
+  ): void {
+    const image = !primary && capturedImage;
     if (this.disposed || this.options.model.isDisposed?.()) return;
     const mimes = text ? ["text/plain"] : [];
     if (image) mimes.push("image/png");
@@ -307,7 +310,10 @@ export class GhosttyInputController {
         // Bracketed paste may have changed while the user decided.
         if (confirmed && !this.disposed) {
           this.emitText(
-            encodeTerminalPaste(text, this.options.model.modes().bracketedPaste),
+            encodeTerminalPaste(
+              text,
+              this.options.model.modes().bracketedPaste,
+            ),
             "paste",
             false,
           );
@@ -321,6 +327,7 @@ export class GhosttyInputController {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.clipboardLifetime.abort();
     this.nativeSelection?.dispose();
     this.proxy.dispose();
     this.pressedKeys.clear();
@@ -349,7 +356,11 @@ export class GhosttyInputController {
     if (event.code === "AltLeft" || event.code === "AltRight") {
       this.optionKeys.add(event.code);
     }
-    if (!event.defaultPrevented && !this.composing && this.optionTypesAlt(event)) {
+    if (
+      !event.defaultPrevented &&
+      !this.composing &&
+      this.optionTypesAlt(event)
+    ) {
       if (this.encodeOptionAsAlt(event)) {
         consume(event);
         return;
@@ -364,22 +375,26 @@ export class GhosttyInputController {
     });
     if (clipboard === "paste" || clipboard === "pasteText") {
       consume(event);
-      void readTerminalClipboard().then(async (text) => {
-        if (text || this.options.model.pasteEventsWanted?.()) {
-          this.pasteFromClipboard(text);
-        } else if (clipboard === "pasteText") {
-          // No text: the program gets the key and reads the clipboard
-          // itself (agents paste an image on Ctrl+V).
-          this.sendHeldKey(event);
-        } else if (
-          (await this.options.clipboardHasImage?.().catch(() => false)) ===
-          true
-        ) {
-          // Only an image: agents (Claude Code, Codex) read it themselves
-          // when they get Ctrl+V.
-          this.sendControlV();
-        }
-      });
+      const images = this.options.model.pasteEventsWanted?.()
+        ? "always"
+        : "if-empty";
+      void readTerminalClipboardSnapshot(
+        images,
+        false,
+        this.clipboardLifetime.signal,
+      )
+        .then((snapshot) => {
+          if (this.disposed || this.options.model.isDisposed?.()) return;
+          const text = snapshot.text ?? "";
+          if (text || this.options.model.pasteEventsWanted?.()) {
+            this.pasteFromClipboard(text, false, snapshot.image !== null);
+          } else if (clipboard === "pasteText") {
+            this.sendHeldKey(event);
+          } else if (snapshot.image !== null) this.sendControlV();
+        })
+        .catch((error) => {
+          if (!this.disposed) this.options.onClipboardError?.(error);
+        });
       return;
     }
     if (
@@ -510,7 +525,8 @@ export class GhosttyInputController {
 
   /** macOS Option-as-Alt applies to this key event (side-aware). */
   private optionTypesAlt(event: KeyboardEvent): boolean {
-    if (!this.isMac || !event.altKey || event.ctrlKey || event.metaKey) return false;
+    if (!this.isMac || !event.altKey || event.ctrlKey || event.metaKey)
+      return false;
     const setting = this.options.optionAsAlt?.() ?? "off";
     if (setting === "off") return false;
     if (setting === "both") return true;
@@ -620,19 +636,18 @@ export class GhosttyInputController {
 
   private readonly handlePaste = (event: ClipboardEvent): void => {
     const text = event.clipboardData?.getData("text/plain") ?? "";
+    const image =
+      Array.from(event.clipboardData?.items ?? []).some((item) =>
+        item.type.toLowerCase().startsWith("image/"),
+      ) ||
+      (event.clipboardData?.types?.some((type) =>
+        type.toLowerCase().startsWith("image/"),
+      ) ??
+        false);
     // An image alone is pasted only as a paste event (mode 5522).
-    if (
-      !text &&
-      !(
-        this.options.model.pasteEventsWanted?.() &&
-        event.clipboardData?.types?.some((type) =>
-          type.toLowerCase().startsWith("image/"),
-        )
-      )
-    )
-      return;
+    if (!text && !(this.options.model.pasteEventsWanted?.() && image)) return;
     consume(event);
-    this.pasteFromClipboard(text);
+    this.pasteFromClipboard(text, false, image);
   };
 
   private readonly handleFocus = (): void => {

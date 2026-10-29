@@ -1,15 +1,33 @@
-import { IS_WINDOWS } from "@/lib/platform";
+export type DropShell = "posix" | "fish" | "powershell" | "cmd";
 
-// Quote only when needed, so a clean path stays verbatim for bracketed paste
-// (Claude resolves an image path to "[Image #N]"); spaced/special paths quote.
-const SAFE_PATH = /^[A-Za-z0-9_@%+=:,./\\-]+$/;
-
-export function quoteShellPath(p: string): string {
-  if (SAFE_PATH.test(p)) return p;
-  if (IS_WINDOWS) return `"${p.replace(/"/g, '""')}"`;
-  return `'${p.replace(/'/g, `'\\''`)}'`;
+/** Literal argument, at an unquoted argument boundary. Never guess from host OS. */
+export function quoteShellPath(p: string, shell: DropShell): string {
+  if (!p || /[\u0000-\u001f\u007f]/.test(p))
+    throw new Error("Cannot insert a path containing control characters.");
+  switch (shell) {
+    case "posix":
+      return `'${p.replace(/'/g, `'\\''`)}'`;
+    case "fish":
+      return `'${p.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+    case "powershell":
+      return `'${p.replace(/'/g, "''")}'`;
+    case "cmd":
+      // Percent expansion and delayed ! expansion occur even inside quotes.
+      // A literal double quote cannot occur in a Windows filename.
+      if (/["%!]/.test(p))
+        throw new Error(
+          "This filename cannot be safely inserted into cmd.exe.",
+        );
+      return `"${p}"`;
+    default:
+      throw new Error("The terminal's shell is unknown.");
+  }
 }
 
-export function formatDroppedPaths(paths: string[]): string {
-  return `${paths.map(quoteShellPath).join(" ")} `;
+export function formatDroppedPaths(
+  paths: readonly string[],
+  shell: DropShell,
+): string {
+  if (!paths.length) throw new Error("No paths to insert.");
+  return `${paths.map((path) => quoteShellPath(path, shell)).join(" ")} `;
 }

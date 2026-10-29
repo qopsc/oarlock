@@ -2,7 +2,10 @@ import { useWorkspaceAssetUrl } from "@/modules/workspace";
 import {
   type ComponentProps,
   type CSSProperties,
+  createContext,
+  useContext,
   useEffect,
+  useMemo,
   useState,
 } from "react";
 import { LOCAL_IMAGE_PATH } from "./localImages";
@@ -18,29 +21,36 @@ type Remote =
   | { status: "ready"; url: string }
   | { status: "failed" };
 
+export const PreviewImagesVisible = createContext(true);
+
 function useRemoteImage(url: string | null): Remote {
+  const visible = useContext(PreviewImagesVisible);
+  // Returning to a URL must not display a revoked object URL from an older lease.
+  const owner = useMemo(() => ({ url, visible }), [url, visible]);
   const [loaded, setLoaded] = useState<{
-    src: string;
+    owner: typeof owner;
     url: string | null;
   } | null>(null);
   useEffect(() => {
-    if (url === null) return;
+    if (owner.url === null || !owner.visible) return;
     let alive = true;
-    remoteImages.acquire(url).then(
+    const lease = remoteImages.acquire(owner.url);
+    lease.url.then(
       (objectUrl) => {
-        if (alive) setLoaded({ src: url, url: objectUrl });
+        if (alive) setLoaded({ owner, url: objectUrl });
       },
       (e) => {
-        console.warn("[markdown] image not loaded", url, e);
-        if (alive) setLoaded({ src: url, url: null });
+        if (!alive) return;
+        console.warn("[markdown] image not loaded", owner.url, e);
+        setLoaded({ owner, url: null });
       },
     );
     return () => {
       alive = false;
-      remoteImages.release(url);
+      lease.release();
     };
-  }, [url]);
-  if (loaded?.src !== url) return { status: "loading" };
+  }, [owner]);
+  if (!visible || loaded?.owner !== owner) return { status: "loading" };
   return loaded.url === null
     ? { status: "failed" }
     : { status: "ready", url: loaded.url };
@@ -71,7 +81,8 @@ export function MarkdownImage({ node: _node, src, alt, ...props }: Props) {
       ? src
       : null;
   const localUrl = useWorkspaceAssetUrl(localPath);
-  const image = useRemoteImage(remote?.startsWith("https:") ? remote : null);
+  const secureRemote = remote !== null && /^https:/i.test(remote);
+  const image = useRemoteImage(secureRemote ? remote : null);
   const style = imageHeightStyle(props.height);
 
   if (localPath !== null) {
@@ -82,7 +93,7 @@ export function MarkdownImage({ node: _node, src, alt, ...props }: Props) {
   if (remote === null) {
     return <img {...props} style={style} src={src} alt={alt} />;
   }
-  if (remote.startsWith("https:") && image.status !== "failed") {
+  if (secureRemote && image.status !== "failed") {
     return image.status === "ready" ? (
       <img {...props} style={style} src={image.url} alt={alt} />
     ) : null;

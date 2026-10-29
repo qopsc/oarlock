@@ -1,4 +1,4 @@
-import { loadServers } from "./lib/configStore";
+import { loadWindowServers } from "./lib/configStore";
 import { useMcpExtras } from "./lib/extrasCatalog";
 import type { CompletionRef } from "./runtime";
 
@@ -31,7 +31,7 @@ export function ensureMcpExtras(strict = false): Promise<void> {
   preparing ??= (async () => {
     const { setStarting } = useMcpExtras.getState();
     try {
-      const servers = await loadServers();
+      const servers = await loadWindowServers();
       if (!runtime && !servers.some((s) => s.enabled)) return;
       await (await loadRuntime()).prepareExtras(servers, () =>
         setStarting(true),
@@ -50,8 +50,12 @@ export function ensureMcpExtras(strict = false): Promise<void> {
 export async function readMcpResource(
   serverId: string,
   uri: string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  return (await loadRuntime()).extras().read(serverId, uri);
+  signal?.throwIfAborted();
+  const runtime = await loadRuntime();
+  signal?.throwIfAborted();
+  return runtime.extras().read(serverId, uri, signal);
 }
 
 /** Fills in a resource template and reads what it names. */
@@ -59,18 +63,25 @@ export async function readMcpTemplate(
   serverId: string,
   uriTemplate: string,
   values: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<{ uri: string; result: unknown }> {
+  signal?.throwIfAborted();
   const extras = (await loadRuntime()).extras();
+  signal?.throwIfAborted();
   const uri = extras.expand(uriTemplate, values);
-  return { uri, result: await extras.read(serverId, uri) };
+  return { uri, result: await extras.read(serverId, uri, signal) };
 }
 
 export async function getMcpPrompt(
   serverId: string,
   name: string,
   args: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  return (await loadRuntime()).extras().getPrompt(serverId, name, args);
+  signal?.throwIfAborted();
+  const runtime = await loadRuntime();
+  signal?.throwIfAborted();
+  return runtime.extras().getPrompt(serverId, name, args, signal);
 }
 
 export async function completeMcpArgument(
@@ -78,7 +89,10 @@ export async function completeMcpArgument(
   ref: CompletionRef,
   argument: { name: string; value: string },
   context: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<string[]> {
-  if (!runtime) return [];
-  return (await runtime).extras().complete(serverId, ref, argument, context);
+  if (!runtime || signal?.aborted) return [];
+  const loaded = await runtime;
+  if (signal?.aborted) return [];
+  return loaded.extras().complete(serverId, ref, argument, context, signal);
 }

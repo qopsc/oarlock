@@ -26,7 +26,7 @@ import {
   type SnippetTrigger,
 } from "../lib/composerTriggers";
 import {
-  pastedImages,
+  createPasteSource,
   pasteKeepsText,
   pasteNeedsClipboardImage,
 } from "../lib/pastedImages";
@@ -220,37 +220,37 @@ export function AiComposerInput() {
       ? `${workspaceRoot}${filePath}`
       : `${workspaceRoot}/${filePath}`;
     await c.attachFileByPath(fullPath);
-    requestAnimationFrame(() => {
-      const el = c.textareaRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(before.length, before.length);
-    });
   };
 
   /** A resource is read and attached; a template opens its form first. */
   const onPickMcp = async (item: McpPickerItem) => {
     if (!fileTrigger) return;
+    c.mcpForm?.cancel();
+    const work = c.beginImport();
+    if (!work) return;
+    let waitingForForm = false;
     const before = c.value.slice(0, fileTrigger.start);
     const after = c.value.slice(fileTrigger.end);
     c.setValue(`${before}${after}`);
     setFileTrigger(null);
     setActiveIndex(0);
-    const refocus = () =>
-      requestAnimationFrame(() => {
-        const el = c.textareaRef.current;
-        if (!el) return;
-        el.focus();
-        el.setSelectionRange(before.length, before.length);
-      });
+    const refocus = () => {
+      if (!work.active()) return;
+      const el = c.textareaRef.current;
+      el?.focus();
+      el?.setSelectionRange(before.length, before.length);
+    };
     const label =
       item.kind === "resource"
         ? (item.resource.title ?? item.resource.name)
         : (item.template.title ?? item.template.name);
     try {
+      await work.admission;
+      work.signal.throwIfAborted();
       const { resourceFiles, templateForm } = await import(
         "@/modules/mcp/composer"
       );
+      work.signal.throwIfAborted();
       const attach = ({
         files,
         refused,
@@ -258,7 +258,8 @@ export function AiComposerInput() {
         files: Parameters<typeof c.attachFiles>[0];
         refused: string[];
       }) => {
-        c.attachFiles(files);
+        if (!work.active()) return;
+        c.attachFiles(files, work);
         if (refused.length > 0) {
           toast.error(
             files.length > 0
@@ -270,33 +271,42 @@ export function AiComposerInput() {
       };
       if (item.kind === "resource") {
         attach(
-          await resourceFiles(item.serverId, item.serverName, {
-            uri: item.resource.uri,
-            name: label,
-          }),
+          await resourceFiles(
+            item.serverId,
+            item.serverName,
+            {
+              uri: item.resource.uri,
+              name: label,
+            },
+            work.signal,
+          ),
         );
         refocus();
         return;
       }
-      c.setMcpForm(
-        templateForm(
-          item,
-          (files) => {
-            c.setMcpForm(null);
-            attach(files);
-            refocus();
-          },
-          () => {
-            c.setMcpForm(null);
-            refocus();
-          },
-        ),
+      const form = templateForm(
+        item,
+        (files) => {
+          attach(files);
+          refocus();
+          work.finish();
+        },
+        () => work.cancel(),
+        work.signal,
       );
+      work.onFinish(() =>
+        c.setMcpForm((current) => (current?.id === form.id ? null : current)),
+      );
+      waitingForForm = true;
+      c.setMcpForm(form);
     } catch (e) {
+      if (!work.active()) return;
       toast.error(`Could not attach ${label}`, {
         description: e instanceof Error ? e.message : String(e),
       });
       refocus();
+    } finally {
+      if (!waitingForForm) work.finish();
     }
   };
 
@@ -315,13 +325,19 @@ export function AiComposerInput() {
     if (it) onPickItem(it);
   };
 
-  const middlePressAt = useRef(Number.NEGATIVE_INFINITY);
+  const pasteSourceRef = useRef<ReturnType<typeof createPasteSource> | null>(
+    null,
+  );
+  if (!pasteSourceRef.current) pasteSourceRef.current = createPasteSource();
+  const pasteSource = pasteSourceRef.current;
 
-  const voiceLabel = c.voice.recording
-    ? "Listening…"
-    : c.voice.transcribing
-      ? "Transcribing…"
-      : null;
+  const voiceLabel = c.voice.acquiring
+    ? "Waiting for microphone permission…"
+    : c.voice.recording
+      ? "Listening…"
+      : c.voice.transcribing
+        ? "Transcribing…"
+        : null;
   const voiceRow = usePresence(Boolean(voiceLabel), 180);
   const lastVoiceLabel = useRef("");
   if (voiceLabel) lastVoiceLabel.current = voiceLabel;
@@ -339,22 +355,18 @@ export function AiComposerInput() {
               onClick={updateTrigger}
               onSelect={updateTrigger}
               onMouseDown={(e) => {
-                if (e.button === 1) middlePressAt.current = e.timeStamp;
+                pasteSource.pointerDown(e.button, e.timeStamp);
               }}
               onPaste={(e) => {
-                const images = pastedImages(e.clipboardData);
-                if (images.length > 0) {
-                  if (!pasteKeepsText(e.clipboardData)) e.preventDefault();
-                  void c.addFiles(images);
-                  return;
-                }
                 // A middle click pastes the primary selection, not the clipboard.
-                const fromPrimary = e.timeStamp - middlePressAt.current < 1000;
+                const fromPrimary = pasteSource.takePrimary(e.timeStamp);
                 if (pasteNeedsClipboardImage(e.clipboardData, fromPrimary)) {
+                  if (!pasteKeepsText(e.clipboardData)) e.preventDefault();
                   void c.pasteClipboardImage();
                 }
               }}
               onKeyDown={(e) => {
+                pasteSource.keyDown();
                 const count = fileTrigger ? atItemCount : filteredItems.length;
                 const action = composerKeyAction(
                   {

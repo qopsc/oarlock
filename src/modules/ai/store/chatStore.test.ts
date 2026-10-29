@@ -125,9 +125,9 @@ describe("chat LRU", () => {
       ...Array.from({ length: 7 }, (_, i) => `other${i + 13}`),
     ]);
     expect(active.stop).not.toHaveBeenCalled();
-    expect(others.filter((c) => vi.mocked(c.stop).mock.calls.length)).toHaveLength(
-      13,
-    );
+    expect(
+      others.filter((c) => vi.mocked(c.stop).mock.calls.length),
+    ).toHaveLength(13);
   });
 
   it("touching an existing chat moves it to the newest slot without stopping it", () => {
@@ -210,7 +210,10 @@ describe("session lifecycle", () => {
 
     useChatStore.getState().deleteSession("second");
 
-    expect(useChatStore.getState().activeSessionId).toBe("first");
+    expect(useChatStore.getState().activeSessionId).toBeNull();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().activeSessionId).toBe("first"),
+    );
     expect(todoStore.spies.clearSession).toHaveBeenCalled();
   });
 });
@@ -240,9 +243,7 @@ describe("auto-title", () => {
     useChatStore.getState().persistMessages("s-1", [userMsg("name this chat")]);
     useChatStore.getState().persistMessages("s-1", [userMsg("more tokens")]);
 
-    const titles = useChatStore
-      .getState()
-      .sessions.map((s) => s.title);
+    const titles = useChatStore.getState().sessions.map((s) => s.title);
     expect(titles).toEqual(["name this chat"]);
     expect(saveSessionsList).toHaveBeenCalledTimes(1);
   });
@@ -261,7 +262,9 @@ describe("auto-title", () => {
     useChatStore
       .getState()
       .persistMessages("s-1", [
-        userMsg(`${marker}\n\nTheir request:\n\n<request>\nship it\n</request>`),
+        userMsg(
+          `${marker}\n\nTheir request:\n\n<request>\nship it\n</request>`,
+        ),
       ]);
     expect(useChatStore.getState().sessions[0]).toMatchObject({
       title: "ship it",
@@ -380,4 +383,10 @@ describe("agent meta and key resolution", () => {
     expect(getChat()).toBe(c);
     expect(getChat("missing")).toBeUndefined();
   });
+});
+
+it("restored legacy model selections use the native endpoint identity in chat and recents", () => {
+  useChatStore.getState().setSelectedModelId("openai-compatible-custom");
+  expect(useChatStore.getState().selectedModelId).toBe("compat-legacy");
+  expect(modelPrefs.pushRecentModel).toHaveBeenLastCalledWith("compat-legacy");
 });

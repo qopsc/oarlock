@@ -13,6 +13,7 @@ import { isStatusLive, statusConsumers } from "./statusConsumers";
 import { useSourceControl } from "./useSourceControl";
 
 type Params = {
+  enabled?: boolean;
   activeTab: Tab | undefined;
   tabs: Tab[];
   activeTerminalLeafCwd: string | null;
@@ -39,6 +40,7 @@ type Params = {
  * per-session path so tab switches / cd don't re-fire git IPC.
  */
 export function useSourceControlContext({
+  enabled = true,
   activeTab,
   tabs,
   activeTerminalLeafCwd,
@@ -104,7 +106,7 @@ export function useSourceControlContext({
     (leafId: number) => terminalLeafCwd(tabsRef.current, leafId),
     [],
   );
-  const sourceControl = useSourceControl(sourceControlPath, true, {
+  const sourceControl = useSourceControl(sourceControlPath, enabled, {
     live,
     leafCwd,
   });

@@ -1,15 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "clipboard",
-  "description": "Native clipboard read/write for terminal copy and paste on desktop platforms.",
-  "platforms": ["linux", "macOS", "windows"],
+  "description": "Clipboard reads and writes use page-owned native commands.",
+  "platforms": [
+    "linux",
+    "macOS",
+    "windows"
+  ],
   "windows": [
     "main",
     "w-*",
     "quick"
   ],
-  "permissions": [
-    "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
-  ]
+  "permissions": []
 }

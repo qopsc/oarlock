@@ -261,11 +261,11 @@ function CustomFormatCommandInput() {
   return (
     <SettingRow
       title="Custom command"
-      description="Runs on the saved file; {file} is replaced with the quoted path (appended when omitted)."
+      description="JSON argument list for a formatter that reads stdin and writes formatted text to stdout. Shell commands, {file}, and in-place editing are unsupported."
     >
       <Input
         value={draft}
-        placeholder="mytool --fix {file}"
+        placeholder={'["mytool", "--stdin"]'}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => {
           if (draft !== stored) void setEditorCustomFormatCommand(draft);

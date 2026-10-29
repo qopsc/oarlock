@@ -99,6 +99,7 @@ export const TOOL_GATES: Readonly<Record<ToolName, ToolGate>> = {
   glob: "none",
   bash_run: "approvable-outside-plan",
   bash_background: "approvable-outside-plan",
+  bash_detach: "approvable-outside-plan",
   bash_logs: "none",
   bash_list: "none",
   bash_kill: "none",

@@ -26,12 +26,18 @@ describe("liveModelConfig", () => {
       customEndpoints: [endpoint],
       ollamaModelId: "qwen3:8b",
     });
-    useChatStore.setState({ customEndpointKeys: { f46e2124: "sk-ep" } });
+    useChatStore.setState({
+      customEndpointKeys: {
+        f46e2124: { origin: "https://llm.example.com", key: "sk-ep" },
+      },
+    });
 
     const config = liveModelConfig();
     expect(config).toMatchObject({
       customEndpoints: [endpoint],
-      customEndpointKeys: { f46e2124: "sk-ep" },
+      customEndpointKeys: {
+        f46e2124: { origin: "https://llm.example.com", key: "sk-ep" },
+      },
       ollamaModelId: "qwen3:8b",
     });
     // Source Control's commit message: "Custom endpoint not found" before.

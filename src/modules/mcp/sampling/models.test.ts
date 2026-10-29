@@ -24,7 +24,7 @@ describe("sampling models", () => {
             contextLimit: 8000,
           },
         ],
-        customEndpointKeys: {},
+        customEndpointKeys: { box: null, half: null },
       },
     );
     const ids = models.map((m) => m.id);

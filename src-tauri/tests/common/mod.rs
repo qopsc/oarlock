@@ -3,9 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tempfile::TempDir;
 use oarlock_lib::modules::fs::to_canon;
 use oarlock_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
+use tempfile::TempDir;
 
 pub struct GitRepoFixture {
     pub registry: WorkspaceRegistry,

@@ -178,6 +178,14 @@ jobs:
         working-directory: src-tauri
         run: cargo nextest run --locked --retries 2
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Sandboxed Git XPC bootstrap and rejection paths
+        if: matrix.os == 'macos'
+        run: bun scripts/git-worker/smoke.mjs
+
       # keychain_compat (secrets.rs) writes real Keychain / Credential Manager
       # items. A throwaway, unlocked default keychain keeps it from depending
       # on (or prompting for) the runner's login keychain.

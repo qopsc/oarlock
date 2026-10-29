@@ -2,17 +2,23 @@ import { nativeDropPoint } from "@/lib/nativeDropPoint";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useEffect } from "react";
 import { useTerminalDropStore } from "./dropStore";
-import { formatDroppedPaths } from "./quoteShellPath";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import {
   dropOnSession,
   leaveSessionDrag,
   offerDragToSession,
-  pasteIntoSession,
+  dropPathsIntoSession,
 } from "./terminalSessionApi";
 
 export type TerminalPathDropTarget = {
   updateTarget: (clientX: number, clientY: number) => boolean;
-  dropPath: (paths: string[], clientX: number, clientY: number) => boolean;
+  dropPath: (
+    paths: string[],
+    clientX: number,
+    clientY: number,
+    isDir?: (path: string) => boolean | undefined,
+    source?: WorkspaceEnv,
+  ) => boolean;
   clearTarget: () => void;
 };
 
@@ -33,7 +39,7 @@ type TerminalProgramDrop = {
 
 type TerminalPathDropDeps = {
   leafIdAtPoint: (clientX: number, clientY: number) => number | null;
-  paste: (leafId: number, text: string) => boolean;
+  paste: (leafId: number, paths: string[], source: WorkspaceEnv) => boolean;
   setTarget: (leafId: number | null) => void;
   program?: TerminalProgramDrop;
 };
@@ -77,7 +83,7 @@ export function createTerminalPathDropTarget({
       setTarget(leafId);
       return leafId !== null;
     },
-    dropPath(paths, clientX, clientY) {
+    dropPath(paths, clientX, clientY, _isDir, source = { kind: "local" }) {
       setTarget(null);
       const leafId = leafIdAtPoint(clientX, clientY);
       leaveProgram(leafId);
@@ -87,7 +93,7 @@ export function createTerminalPathDropTarget({
         return true;
       }
       leaveProgram(null);
-      paste(leafId, formatDroppedPaths(paths));
+      paste(leafId, paths, source);
       return true;
     },
     clearTarget() {
@@ -99,7 +105,7 @@ export function createTerminalPathDropTarget({
 
 const terminalPathDropTarget = createTerminalPathDropTarget({
   leafIdAtPoint: leafIdAt,
-  paste: pasteIntoSession,
+  paste: dropPathsIntoSession,
   setTarget: (leafId) => useTerminalDropStore.getState().setTarget(leafId),
   program: {
     offer: offerDragToSession,
@@ -120,6 +126,7 @@ export function useTerminalFileDrop(): TerminalPathDropTarget {
 
     void getCurrentWebview()
       .onDragDropEvent((e) => {
+        if (disposed) return;
         const p = e.payload;
         if (p.type === "leave") {
           target.clearTarget();

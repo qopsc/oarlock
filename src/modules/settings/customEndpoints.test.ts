@@ -1,99 +1,135 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-// `store` is created at module load, so the plugin mock must be in place
-// before `./store` is imported.
-const entries = vi.hoisted(() => ({ value: [] as [string, unknown][] }));
-
-vi.mock("@tauri-apps/plugin-store", () => ({
-  LazyStore: class {
-    entries = async () => entries.value;
-    get = async () => undefined;
-    set = async () => undefined;
-    save = async () => undefined;
-  },
-  Store: class {},
+import { beforeEach, expect, it, vi } from "vitest";
+const fake = vi.hoisted(() => ({
+  entries: [] as [string, unknown][],
+  endpoints: vi.fn(),
 }));
-vi.mock("@tauri-apps/api/event", () => ({
-  emit: async () => undefined,
-  listen: async () => () => undefined,
+vi.mock("./nativePreferences", () => ({
+  readNativePreferences: async () => ({
+    revision: 0,
+    values: Object.fromEntries(fake.entries),
+  }),
 }));
-
+vi.mock("./endpoints", () => ({
+  loadCustomEndpoints: fake.endpoints,
+  onCustomEndpoints: vi.fn(),
+}));
 const endpoint = {
   id: "ab12cd34",
-  name: "OpenCode Go",
-  baseURL: "https://opencode.ai/zen/go/v1",
-  modelId: "deepseek-v4-pro",
+  name: "Gateway",
+  baseURL: "https://one.example/v1",
+  modelId: "m",
   contextLimit: 128_000,
 };
+import { loadPreferences } from "./store";
+beforeEach(() => {
+  fake.entries = [];
+  fake.endpoints.mockReset().mockResolvedValue([endpoint]);
+});
+it("uses native endpoints for model selections despite a stale plugin list", async () => {
+  fake.entries = [
+    ["customEndpoints", []],
+    ["defaultModelId", "compat-ab12cd34"],
+    ["favoriteModelIds", ["compat-ab12cd34"]],
+    ["recentModelIds", ["compat-ab12cd34"]],
+  ];
+  const prefs = await loadPreferences();
+  expect(prefs.customEndpoints).toEqual([endpoint]);
+  expect(prefs.defaultModelId).toBe("compat-ab12cd34");
+  expect(prefs.favoriteModelIds).toEqual(["compat-ab12cd34"]);
+  expect(prefs.recentModelIds).toEqual(["compat-ab12cd34"]);
+});
+it("never resurrects deleted endpoints from legacy or plugin settings", async () => {
+  fake.endpoints.mockResolvedValue([]);
+  fake.entries = [
+    ["customEndpoints", [endpoint]],
+    ["openaiCompatibleBaseURL", "https://old.example"],
+    ["openaiCompatibleModelId", "old-model"],
+    ["defaultModelId", "compat-ab12cd34"],
+  ];
+  const prefs = await loadPreferences();
+  expect(prefs.customEndpoints).toEqual([]);
+  expect(prefs.defaultModelId).toBe("gpt-5.4-mini");
+});
+it("rejects unfinished or removed models without changing persisted preferences", async () => {
+  fake.endpoints.mockResolvedValue([{ ...endpoint, modelId: "" }]);
+  fake.entries = [
+    ["defaultModelId", "compat-ab12cd34"],
+    ["favoriteModelIds", ["compat-ab12cd34", "gpt-5.4-mini"]],
+  ];
+  const prefs = await loadPreferences();
+  expect(prefs.defaultModelId).toBe("gpt-5.4-mini");
+  expect(prefs.favoriteModelIds).toEqual(["gpt-5.4-mini"]);
+  expect(fake.entries[0][1]).toBe("compat-ab12cd34");
+});
+it("surfaces an unreadable endpoint store and keeps legacy entries disabled", async () => {
+  fake.endpoints.mockRejectedValue(new Error("endpoint file damaged"));
+  fake.entries = [["customEndpoints", [endpoint]]];
+  const prefs = await loadPreferences();
+  expect(prefs.customEndpoints).toEqual([]);
+  expect(prefs.customEndpointsError).toContain("endpoint file damaged");
+});
+it("keeps a saved private model selected and blocked while its endpoint file is unavailable", async () => {
+  fake.endpoints.mockRejectedValue(new Error("temporarily unreadable"));
+  fake.entries = [
+    ["defaultModelId", "compat-ab12cd34"],
+    ["favoriteModelIds", ["compat-ab12cd34", "gpt-5.4-mini"]],
+    ["recentModelIds", ["compat-ab12cd34"]],
+  ];
+  const prefs = await loadPreferences();
+  expect(prefs.defaultModelId).toBe("compat-ab12cd34");
+  expect(prefs.favoriteModelIds).toEqual(["compat-ab12cd34", "gpt-5.4-mini"]);
+  expect(prefs.recentModelIds).toEqual(["compat-ab12cd34"]);
+  const { resolveModelTarget } = await import("@/modules/ai/lib/modelTarget");
+  expect(() =>
+    resolveModelTarget(prefs.defaultModelId, {
+      customEndpoints: prefs.customEndpoints,
+    }),
+  ).toThrow("Custom endpoint not found");
+  // Metadata recovery alone is insufficient until the credential read resolves.
+  expect(() =>
+    resolveModelTarget(prefs.defaultModelId, { customEndpoints: [endpoint] }),
+  ).toThrow(/loading/);
+  // Confirmed keyless readiness makes the same selection usable.
+  expect(
+    resolveModelTarget(prefs.defaultModelId, {
+      customEndpoints: [endpoint],
+      customEndpointKeys: { [endpoint.id]: null },
+    }),
+  ).toMatchObject({ provider: "openai-compatible", modelId: "m" });
+});
 
-async function load() {
-  const { loadPreferences } = await import("./store");
-  return loadPreferences();
-}
-
-describe("custom endpoint preferences across a restart", () => {
-  beforeEach(() => {
-    entries.value = [];
-    vi.resetModules();
-  });
-
-  it("keeps a custom endpoint as the default, a favorite and a recent", async () => {
-    entries.value = [
-      ["customEndpoints", [endpoint]],
-      ["defaultModelId", "compat-ab12cd34"],
-      ["favoriteModelIds", ["compat-ab12cd34", "gpt-5.4-mini"]],
-      ["recentModelIds", ["compat-ab12cd34"]],
-    ];
-    const prefs = await load();
-    expect(prefs.defaultModelId).toBe("compat-ab12cd34");
-    expect(prefs.favoriteModelIds).toEqual(["compat-ab12cd34", "gpt-5.4-mini"]);
-    expect(prefs.recentModelIds).toEqual(["compat-ab12cd34"]);
-  });
-
-  it("drops ids of deleted or unfinished endpoints and unknown models", async () => {
-    entries.value = [
-      ["customEndpoints", [{ ...endpoint, id: "draft001", modelId: "" }]],
-      ["defaultModelId", "compat-ab12cd34"],
-      [
-        "favoriteModelIds",
-        ["compat-draft001", "no-such-model", "gpt-5.4-mini"],
-      ],
-      ["recentModelIds", ["compat-ab12cd34"]],
-    ];
-    const prefs = await load();
-    expect(prefs.defaultModelId).toBe("gpt-5.4-mini");
-    expect(prefs.favoriteModelIds).toEqual(["gpt-5.4-mini"]);
-    expect(prefs.recentModelIds).toEqual([]);
-  });
-
-  it("gives the migrated legacy endpoint the same id on every load", async () => {
-    entries.value = [
-      ["openaiCompatibleBaseURL", "https://llm.example.com/v1"],
-      ["openaiCompatibleModelId", "llama-3.3-70b"],
-    ];
-    const first = await load();
-    expect(first.customEndpoints).toHaveLength(1);
-    const id = `compat-${first.customEndpoints[0].id}`;
-
-    vi.resetModules();
-    entries.value = [
-      ["openaiCompatibleBaseURL", "https://llm.example.com/v1"],
-      ["openaiCompatibleModelId", "llama-3.3-70b"],
-      ["defaultModelId", id],
-      ["recentModelIds", [id]],
-    ];
-    const second = await load();
-    expect(second.customEndpoints).toEqual(first.customEndpoints);
-    expect(second.defaultModelId).toBe(id);
-    expect(second.recentModelIds).toEqual([id]);
-  });
-
-  it("does not bring back a legacy endpoint the user removed", async () => {
-    entries.value = [
-      ["openaiCompatibleBaseURL", "https://llm.example.com/v1"],
-      ["openaiCompatibleModelId", "llama-3.3-70b"],
-      ["customEndpoints", []],
-    ];
-    expect((await load()).customEndpoints).toEqual([]);
-  });
+it("canonicalizes legacy selections and lists against the native endpoint without rewriting old settings", async () => {
+  fake.endpoints.mockResolvedValue([
+    { ...endpoint, id: "legacy", modelId: "current" },
+  ]);
+  fake.entries = [
+    ["defaultModelId", "openai-compatible-custom"],
+    ["autocompleteModelId", "openai-compatible-custom"],
+    ["favoriteModelIds", ["openai-compatible-custom", "compat-legacy"]],
+    ["recentModelIds", ["openai-compatible-custom"]],
+    ["openaiCompatibleBaseURL", "https://retired.example/v1"],
+    ["openaiCompatibleModelId", "retired-model"],
+  ];
+  const prefs = await loadPreferences();
+  expect(prefs.defaultModelId).toBe("compat-legacy");
+  expect(prefs.autocompleteModelId).toBe("compat-legacy");
+  expect(prefs.favoriteModelIds).toEqual(["compat-legacy"]);
+  expect(prefs.recentModelIds).toEqual(["compat-legacy"]);
+  expect(fake.entries[0][1]).toBe("openai-compatible-custom");
+});
+it("a removed legacy endpoint keeps its saved default blocked rather than selecting a cloud provider", async () => {
+  fake.endpoints.mockResolvedValue([]);
+  fake.entries = [
+    ["defaultModelId", "openai-compatible-custom"],
+    ["openaiCompatibleBaseURL", "https://retired.example"],
+    ["openaiCompatibleModelId", "retired"],
+  ];
+  const prefs = await loadPreferences();
+  expect(prefs.defaultModelId).toBe("compat-legacy");
+  const { resolveModelTarget } = await import("@/modules/ai/lib/modelTarget");
+  expect(() =>
+    resolveModelTarget(prefs.defaultModelId, {
+      customEndpoints: prefs.customEndpoints,
+    }),
+  ).toThrow("Custom endpoint not found: legacy");
 });

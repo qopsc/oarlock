@@ -55,14 +55,20 @@ function encode(
  * `MAX_IMAGE_SIDE`, as PNG, or JPEG when the PNG is still too large. Null
  * when the webview cannot decode it or it does not fit.
  */
-export async function encodeForSending(file: Blob): Promise<File | null> {
+export async function encodeForSending(
+  file: Blob,
+  signal?: AbortSignal,
+): Promise<File | null> {
+  signal?.throwIfAborted();
   let bitmap: ImageBitmap;
   try {
     bitmap = await createImageBitmap(file);
   } catch {
+    signal?.throwIfAborted();
     return null;
   }
   try {
+    signal?.throwIfAborted();
     const { width, height } = fitWithin(bitmap.width, bitmap.height);
     const canvas = document.createElement("canvas");
     canvas.width = width;
@@ -72,6 +78,7 @@ export async function encodeForSending(file: Blob): Promise<File | null> {
     context.drawImage(bitmap, 0, 0, width, height);
     const name = file instanceof File ? file.name : "image";
     let blob = await encode(canvas, "image/png");
+    signal?.throwIfAborted();
     let type = "image/png";
     if (!blob || blob.size > MAX_IMAGE_BYTES) {
       // JPEG has no transparency: what was see-through turns white.
@@ -81,6 +88,7 @@ export async function encodeForSending(file: Blob): Promise<File | null> {
       blob = await encode(canvas, "image/jpeg", 0.85);
       type = "image/jpeg";
     }
+    signal?.throwIfAborted();
     if (!blob || blob.size > MAX_IMAGE_BYTES) return null;
     return new File([blob], nameForType(name, type), {
       type,

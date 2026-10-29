@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { isAiComposerTarget } from "./aiSurface";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 
 /** Explorer items dropped on the composer (`DroppedPath[]` as the detail). */
 export const COMPOSER_DROP_EVENT = "oarlock:ai-drop-paths";
@@ -14,6 +15,7 @@ type PathDropTarget = {
     clientX: number,
     clientY: number,
     isDir?: (path: string) => boolean | undefined,
+    source?: WorkspaceEnv,
   ) => boolean;
   clearTarget: () => void;
 };
@@ -61,10 +63,10 @@ export function withComposerDrop(
       deps.setOver(false);
       return fallback.updateTarget(clientX, clientY);
     },
-    dropPath(paths, clientX, clientY, isDir) {
+    dropPath(paths, clientX, clientY, isDir, source) {
       if (!deps.composerAt(clientX, clientY)) {
         deps.setOver(false);
-        return fallback.dropPath(paths, clientX, clientY, isDir);
+        return fallback.dropPath(paths, clientX, clientY, isDir, source);
       }
       deps.setOver(false);
       fallback.clearTarget();

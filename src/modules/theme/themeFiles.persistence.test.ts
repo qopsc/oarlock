@@ -114,6 +114,15 @@ describe("theme file persistence", () => {
     await expect(deleteThemeFile("gone")).resolves.toBeUndefined();
   });
 
+  it("reports when safe deletion is unavailable", async () => {
+    core.invoke.mockRejectedValueOnce(
+      "This file operation is unavailable because its target cannot be safely verified.",
+    );
+    await expect(deleteThemeFile("my-theme")).rejects.toContain(
+      "cannot be safely verified",
+    );
+  });
+
   it("hands theme creation to native window routing instead of broadcasting", async () => {
     const close = vi.fn(async () => {});
     await expect(handOffThemeEdit({ action: "create" }, close)).resolves.toBe(

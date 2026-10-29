@@ -1,5 +1,12 @@
+import { requireCurrentPreferences } from "@/modules/settings/readiness";
 import {
-  native,
+  currentWorkspaceEnv,
+  useWorkspaceEnvStore,
+  workspaceScopeKey,
+} from "@/modules/workspace/env";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import {
+  createNative,
   type GitChangedFile,
   type GitDiscardEntry,
   type GitRepoInfo,
@@ -12,14 +19,10 @@ import {
 } from "@/modules/ai/store/modelConfig";
 import { modelSupportsTemperature, resolveModel } from "@/modules/ai/config";
 import {
-  invalidateDiff,
+  invalidateWorkingDiff,
   invalidateRepoDiffs,
-  workingDiffKey,
 } from "@/modules/editor/lib/diffCache";
-import {
-  notifyFilesDiscarded,
-  notifyHeadMoved,
-} from "@/modules/editor/lib/gitSignals";
+import { notifyHeadMoved } from "@/modules/editor/lib/gitSignals";
 import { showPrivacyRefusal } from "@/modules/mac-privacy";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SourceControlSummary } from "./useSourceControl";
@@ -180,17 +183,6 @@ function sameSelection(
   return !!a && !!b && a.path === b.path && a.mode === b.mode;
 }
 
-function stagedFilesSummary(entries: SourceControlEntry[]): string {
-  return entries
-    .map((entry) => {
-      const status = entry.originalPath
-        ? `R ${entry.originalPath} -> ${entry.path}`
-        : `${entry.statusCode} ${entry.path}`;
-      return `- ${status}`;
-    })
-    .join("\n");
-}
-
 function truncateDiff(diff: string): { text: string; truncated: boolean } {
   if (diff.length <= COMMIT_DIFF_CHAR_LIMIT) {
     return { text: diff, truncated: false };
@@ -215,7 +207,7 @@ function isValidCommitMessage(message: string): boolean {
 }
 
 function buildCommitMessagePrompt(
-  entries: SourceControlEntry[],
+  paths: string[],
   diffText: string,
   truncated: boolean,
 ): string {
@@ -234,7 +226,7 @@ function buildCommitMessagePrompt(
       : "The full staged diff is included below.",
     "",
     "Staged files:",
-    stagedFilesSummary(entries),
+    paths.map((path) => `- ${path}`).join("\n"),
     "",
     "Staged diff:",
     diffText || "(No textual diff available.)",
@@ -243,7 +235,7 @@ function buildCommitMessagePrompt(
 
 function buildRepairCommitMessagePrompt(
   invalidMessage: string,
-  entries: SourceControlEntry[],
+  paths: string[],
 ): string {
   return [
     "Repair this invalid Conventional Commit subject line.",
@@ -253,7 +245,7 @@ function buildRepairCommitMessagePrompt(
     "If the scope is unclear, omit it and use: type: subject",
     "",
     "Staged files:",
-    stagedFilesSummary(entries),
+    paths.map((path) => `- ${path}`).join("\n"),
   ].join("\n");
 }
 
@@ -266,7 +258,8 @@ function optimisticStage(
     if (!paths.has(file.path)) return file;
     if (file.staged && !file.unstaged) return file;
     changed = true;
-    const wt = file.worktreeStatus !== " " ? file.worktreeStatus : file.indexStatus;
+    const wt =
+      file.worktreeStatus !== " " ? file.worktreeStatus : file.indexStatus;
     return {
       ...file,
       indexStatus: wt,
@@ -296,7 +289,8 @@ function optimisticUnstage(
       continue;
     }
     changed = true;
-    const idx = file.indexStatus !== " " ? file.indexStatus : file.worktreeStatus;
+    const idx =
+      file.indexStatus !== " " ? file.indexStatus : file.worktreeStatus;
     if (idx === "R" && file.originalPath) {
       next.push({
         path: file.originalPath,
@@ -374,6 +368,38 @@ export function useSourceControlPanel(
       }) => void)
     | null,
 ): SourceControlPanelState {
+  const workspace = useWorkspaceEnvStore((state) => state.env);
+  const spaceId = useSpaces((state) => state.activeId);
+  const workspaceKey = workspaceScopeKey(workspace);
+  const native = useMemo(() => createNative(() => workspace), [workspace]);
+  // A new owner also invalidates callbacks from A -> B -> A navigation.
+  const ownerKey = JSON.stringify([
+    isOpen,
+    summary.repo?.repoRoot,
+    summary.contextPath,
+    spaceId,
+    workspaceKey,
+  ]);
+  const owner = useMemo(
+    () => ({
+      key: ownerKey,
+      generation: null as AbortController | null,
+      busy: false,
+      closed: false,
+    }),
+    [ownerKey],
+  );
+  const ownerRef = useRef(owner);
+  ownerRef.current = owner;
+  const isCurrent = useCallback(
+    () =>
+      isOpen &&
+      !owner.closed &&
+      ownerRef.current === owner &&
+      workspaceScopeKey(currentWorkspaceEnv()) === workspaceKey &&
+      useSpaces.getState().activeId === spaceId,
+    [isOpen, owner, spaceId, workspaceKey],
+  );
   const selectedModelId = useChatStore((state) => state.selectedModelId);
   const agentStatus = useChatStore((state) => state.agentMeta.status);
   const selectedModelProblem = useSelectedModelProblem();
@@ -388,8 +414,8 @@ export function useSourceControlPanel(
   const [selectionTransition, setSelectionTransition] =
     useState<SelectionTransition>("none");
   const [pendingDiscard, setPendingDiscard] = useState<
-    | { scope: "single"; entry: SourceControlEntry }
-    | { scope: "all"; entries: SourceControlEntry[] }
+    | { scope: "single"; entry: SourceControlEntry; owner: typeof owner }
+    | { scope: "all"; entries: SourceControlEntry[]; owner: typeof owner }
     | null
   >(null);
   const selectedRef = useRef<DiffSelection | null>(null);
@@ -500,14 +526,45 @@ export function useSourceControlPanel(
     cancelReconcile();
     reconcileTimerRef.current = window.setTimeout(() => {
       reconcileTimerRef.current = 0;
-      void summary.refresh({ remote: "never" });
+      if (isCurrent()) void summary.refresh({ remote: "never" });
     }, RECONCILE_DEBOUNCE_MS);
-  }, [cancelReconcile, summary]);
+  }, [cancelReconcile, isCurrent, summary]);
 
-  useEffect(() => () => cancelReconcile(), [cancelReconcile]);
+  useEffect(() => {
+    owner.closed = false;
+    owner.busy = false;
+    setPendingDiscard(null);
+    setLocalActionBusy(null);
+    setActionError(null);
+    setActionMessage(null);
+    return () => {
+      owner.closed = true;
+      owner.generation?.abort();
+      owner.generation = null;
+      cancelReconcile();
+    };
+  }, [owner, cancelReconcile]);
+
+  const editCommitMessage = useCallback(
+    (text: string) => {
+      if (!isCurrent()) return;
+      if (owner.generation) {
+        owner.generation.abort();
+        owner.generation = null;
+        owner.busy = false;
+        setLocalActionBusy(null);
+      }
+      setCommitMessage(text);
+    },
+    [isCurrent, owner],
+  );
 
   const openSelection = useCallback(
-    (sel: DiffSelection, repoRoot: string, file: GitChangedFile | undefined) => {
+    (
+      sel: DiffSelection,
+      repoRoot: string,
+      file: GitChangedFile | undefined,
+    ) => {
       onOpenDiff?.({
         path: sel.path,
         repoRoot,
@@ -524,9 +581,9 @@ export function useSourceControlPanel(
       setSelectionTransition("none");
       return;
     }
-    if (summary.repo) invalidateRepoDiffs(summary.repo.repoRoot);
+    if (summary.repo) invalidateRepoDiffs(summary.repo.repoRoot, workspace);
     await summary.refresh({ remote: "never" });
-  }, [isOpen, summary]);
+  }, [isOpen, summary, workspace]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -605,7 +662,10 @@ export function useSourceControlPanel(
   const selectEntry = useCallback(
     async (entry: SourceControlEntry) => {
       if (!repo) return;
-      const nextSelection: DiffSelection = { path: entry.path, mode: entry.mode };
+      const nextSelection: DiffSelection = {
+        path: entry.path,
+        mode: entry.mode,
+      };
       if (sameSelection(selected, nextSelection)) {
         setActionError(null);
         setActionMessage(null);
@@ -629,19 +689,28 @@ export function useSourceControlPanel(
       ipc: () => Promise<void>,
       affected: string[],
     ) => {
-      if (!repo || summary.busyAction) return;
+      if (
+        !repo ||
+        repo.repoRoot !== summary.repo?.repoRoot ||
+        !isCurrent() ||
+        owner.busy ||
+        summary.busyAction
+      )
+        return;
+      owner.busy = true;
       setLocalActionBusy(busyKey);
       setActionMessage(null);
       setActionError(null);
       if (optimistic) summary.applyStatus(optimistic);
       for (const path of affected) {
-        invalidateDiff(workingDiffKey(repo.repoRoot, path, "+"));
-        invalidateDiff(workingDiffKey(repo.repoRoot, path, "-"));
+        invalidateWorkingDiff(repo.repoRoot, path, "+", workspace);
+        invalidateWorkingDiff(repo.repoRoot, path, "-", workspace);
       }
       try {
         await ipc();
-        scheduleReconcile();
+        if (isCurrent()) scheduleReconcile();
       } catch (error) {
+        if (!isCurrent()) return;
         setActionError(normalizeError(error));
         showPrivacyRefusal("Could not update the repository", {
           path: repo.repoRoot,
@@ -650,10 +719,23 @@ export function useSourceControlPanel(
         cancelReconcile();
         await summary.refresh({ remote: "never" }).catch(() => {});
       } finally {
-        setLocalActionBusy(null);
+        for (const path of affected) {
+          invalidateWorkingDiff(repo.repoRoot, path, "+", workspace);
+          invalidateWorkingDiff(repo.repoRoot, path, "-", workspace);
+        }
+        owner.busy = false;
+        if (isCurrent()) setLocalActionBusy(null);
       }
     },
-    [cancelReconcile, repo, scheduleReconcile, summary],
+    [
+      cancelReconcile,
+      isCurrent,
+      owner,
+      repo,
+      scheduleReconcile,
+      summary,
+      workspace,
+    ],
   );
 
   const stageEntry = useCallback(
@@ -667,7 +749,7 @@ export function useSourceControlPanel(
         [entry.path],
       );
     },
-    [repo, runMutation],
+    [native, repo, runMutation],
   );
 
   const unstageEntry = useCallback(
@@ -681,28 +763,48 @@ export function useSourceControlPanel(
         [entry.path],
       );
     },
-    [repo, runMutation],
+    [native, repo, runMutation],
   );
 
   const requestDiscardEntry = useCallback(
     (entry: SourceControlEntry) => {
-      if (!repo || summary.busyAction) return;
-      setPendingDiscard({ scope: "single", entry });
+      if (
+        !repo ||
+        repo.repoRoot !== summary.repo?.repoRoot ||
+        !isCurrent() ||
+        owner.busy ||
+        summary.busyAction
+      )
+        return;
+      setPendingDiscard({ scope: "single", entry, owner });
     },
-    [repo, summary.busyAction],
+    [isCurrent, owner, repo, summary.busyAction, summary.repo?.repoRoot],
   );
 
   const requestDiscardAll = useCallback(() => {
-    if (!repo || summary.busyAction || unstagedEntries.length === 0) return;
-    setPendingDiscard({ scope: "all", entries: unstagedEntries });
-  }, [repo, summary.busyAction, unstagedEntries]);
+    if (
+      !repo ||
+      !isCurrent() ||
+      owner.busy ||
+      summary.busyAction ||
+      unstagedEntries.length === 0
+    )
+      return;
+    setPendingDiscard({ scope: "all", entries: unstagedEntries, owner });
+  }, [isCurrent, owner, repo, summary.busyAction, unstagedEntries]);
 
   const cancelPendingDiscard = useCallback(() => {
     setPendingDiscard(null);
   }, []);
 
   const confirmPendingDiscard = useCallback(async () => {
-    if (!repo || !pendingDiscard) return;
+    if (
+      !repo ||
+      !pendingDiscard ||
+      pendingDiscard.owner !== owner ||
+      !isCurrent()
+    )
+      return;
     const list =
       pendingDiscard.scope === "single"
         ? [pendingDiscard.entry]
@@ -718,13 +820,10 @@ export function useSourceControlPanel(
         ? `discard:${list[0].path}`
         : "discard:all",
       (s) => optimisticDiscard(s, paths),
-      async () => {
-        await native.gitDiscard(repo.repoRoot, entries);
-        notifyFilesDiscarded(repo.repoRoot, [...paths]);
-      },
+      () => native.gitDiscard(repo.repoRoot, entries),
       [...paths],
     );
-  }, [pendingDiscard, repo, runMutation]);
+  }, [isCurrent, native, owner, pendingDiscard, repo, runMutation]);
 
   const stageAllEntries = useCallback(async () => {
     if (!repo || unstagedEntries.length === 0) return;
@@ -735,7 +834,7 @@ export function useSourceControlPanel(
       () => native.gitStage(repo.repoRoot, [...paths]),
       [...paths],
     );
-  }, [repo, runMutation, unstagedEntries]);
+  }, [native, repo, runMutation, unstagedEntries]);
 
   const unstageAllEntries = useCallback(async () => {
     if (!repo || stagedEntries.length === 0) return;
@@ -746,7 +845,7 @@ export function useSourceControlPanel(
       () => native.gitUnstage(repo.repoRoot, [...paths]),
       [...paths],
     );
-  }, [repo, runMutation, stagedEntries]);
+  }, [native, repo, runMutation, stagedEntries]);
 
   const selectFile = useCallback(
     async (entry: SourceControlFileEntry) => {
@@ -789,7 +888,7 @@ export function useSourceControlPanel(
         );
       }
     },
-    [repo, runMutation],
+    [native, repo, runMutation],
   );
 
   const toggleAll = useCallback(async () => {
@@ -799,8 +898,16 @@ export function useSourceControlPanel(
 
   const requestDiscardFile = useCallback(
     (entry: SourceControlFileEntry) => {
-      if (!repo || summary.busyAction) return;
+      if (
+        !repo ||
+        repo.repoRoot !== summary.repo?.repoRoot ||
+        !isCurrent() ||
+        owner.busy ||
+        summary.busyAction
+      )
+        return;
       setPendingDiscard({
+        owner,
         scope: "single",
         entry: {
           key: `-:${entry.path}`,
@@ -815,11 +922,19 @@ export function useSourceControlPanel(
         },
       });
     },
-    [repo, summary.busyAction],
+    [isCurrent, owner, repo, summary.busyAction, summary.repo?.repoRoot],
   );
 
   const generateCommitMessage = useCallback(async () => {
-    if (!repo || stagedEntries.length === 0) return;
+    if (
+      !repo ||
+      !isCurrent() ||
+      owner.busy ||
+      summary.busyAction ||
+      repo.repoRoot !== summary.repo?.repoRoot ||
+      stagedEntries.length === 0
+    )
+      return;
     if (aiBusy) {
       setActionError("Wait for the current AI action to finish");
       return;
@@ -828,38 +943,60 @@ export function useSourceControlPanel(
       setActionError(aiUnavailableReason);
       return;
     }
+    const controller = new AbortController();
+    owner.generation = controller;
+    owner.busy = true;
+    const current = () =>
+      isCurrent() &&
+      owner.generation === controller &&
+      !controller.signal.aborted;
     setLocalActionBusy("generate-message");
     setActionMessage(null);
     setActionError(null);
     try {
+      requireCurrentPreferences();
       const [{ buildConfiguredLanguageModel }, { generateText }, diff] =
         await Promise.all([
           import("@/modules/ai/lib/agent"),
           import("ai"),
-          native.gitDiff(repo.repoRoot, null, true),
+          native.gitAiStagedDiff(repo.repoRoot),
         ]);
+      if (!current()) return;
+      if (diff.paths.length === 0)
+        throw new Error("Stage changes to generate a commit message");
       const { text: diffText, truncated } = truncateDiff(diff.diffText);
       const model = await buildConfiguredLanguageModel(
         selectedModelId,
         useChatStore.getState().apiKeys,
         liveModelConfig(),
       );
+      if (!current()) return;
+      requireCurrentPreferences();
       const result = await generateText({
+        abortSignal: controller.signal,
         model,
         instructions: COMMIT_MESSAGE_SYSTEM_PROMPT,
-        prompt: buildCommitMessagePrompt(stagedEntries, diffText, truncated),
+        prompt: buildCommitMessagePrompt(
+          diff.paths,
+          diffText,
+          truncated || diff.truncated,
+        ),
         maxOutputTokens: COMMIT_MESSAGE_MAX_OUTPUT_TOKENS,
         ...(selectedModelSupportsTemperature ? { temperature: 0.2 } : {}),
       });
+      if (!current()) return;
       let message = cleanCommitMessage(result.text);
       if (!isValidCommitMessage(message)) {
+        requireCurrentPreferences();
         const repair = await generateText({
+          abortSignal: controller.signal,
           model,
           instructions: COMMIT_MESSAGE_SYSTEM_PROMPT,
-          prompt: buildRepairCommitMessagePrompt(message, stagedEntries),
+          prompt: buildRepairCommitMessagePrompt(message, diff.paths),
           maxOutputTokens: COMMIT_MESSAGE_MAX_OUTPUT_TOKENS,
           ...(selectedModelSupportsTemperature ? { temperature: 0 } : {}),
         });
+        if (!current()) return;
         message = cleanCommitMessage(repair.text);
       }
       if (!isValidCommitMessage(message)) {
@@ -870,11 +1007,20 @@ export function useSourceControlPanel(
       setCommitMessage(message);
       setActionMessage(null);
     } catch (error) {
-      setActionError(normalizeError(error));
+      if (current()) setActionError(normalizeError(error));
     } finally {
-      setLocalActionBusy(null);
+      if (owner.generation === controller) {
+        owner.generation = null;
+        owner.busy = false;
+        if (isCurrent()) setLocalActionBusy(null);
+      }
     }
   }, [
+    isCurrent,
+    native,
+    owner,
+    summary.busyAction,
+    summary.repo?.repoRoot,
     aiUnavailableReason,
     aiBusy,
     repo,
@@ -884,32 +1030,44 @@ export function useSourceControlPanel(
   ]);
 
   const commit = useCallback(async () => {
-    if (!repo || summary.busyAction) return;
+    if (
+      !repo ||
+      repo.repoRoot !== summary.repo?.repoRoot ||
+      !isCurrent() ||
+      owner.busy ||
+      summary.busyAction
+    )
+      return;
+    owner.busy = true;
     setLocalActionBusy("commit");
     setActionMessage(null);
     setActionError(null);
     try {
       const result = await native.gitCommit(repo.repoRoot, commitMessage);
       notifyHeadMoved();
-      setCommitMessage("");
+      invalidateRepoDiffs(repo.repoRoot, workspace);
+      if (!isCurrent()) return;
+      setCommitMessage((draft) => (draft === commitMessage ? "" : draft));
       setActionMessage(
         `Committed ${result.commitSha.slice(0, 7)} ${result.summary}`,
       );
-      invalidateRepoDiffs(repo.repoRoot);
       await summary.refresh({ remote: "never" });
     } catch (error) {
+      if (!isCurrent()) return;
       setActionError(normalizeError(error));
       showPrivacyRefusal("Could not commit", { path: repo.repoRoot, error });
     } finally {
-      setLocalActionBusy(null);
+      owner.busy = false;
+      if (isCurrent()) setLocalActionBusy(null);
     }
-  }, [commitMessage, repo, summary]);
+  }, [commitMessage, isCurrent, native, owner, repo, summary, workspace]);
 
   const push = useCallback(async () => {
-    if (!repo) return;
+    if (!repo || !isCurrent()) return;
     setActionMessage(null);
     setActionError(null);
     const result = await summary.runRemoteAction("push");
+    if (!isCurrent()) return;
     if (result.ok) {
       setActionMessage(
         status?.upstream ? `Pushed to ${status.upstream}` : "Push completed",
@@ -919,10 +1077,11 @@ export function useSourceControlPanel(
     if (result.error) {
       setActionError(result.error);
     }
-  }, [repo, status?.upstream, summary]);
+  }, [isCurrent, repo, status?.upstream, summary]);
 
   const pendingDiscardView = useMemo<PendingDiscard | null>(() => {
-    if (!pendingDiscard) return null;
+    if (!pendingDiscard || pendingDiscard.owner !== owner || !isCurrent())
+      return null;
     if (pendingDiscard.scope === "single") {
       return {
         scope: "single",
@@ -937,7 +1096,7 @@ export function useSourceControlPanel(
         pendingDiscard.entries.length === 1 ? "file" : "files"
       }`,
     };
-  }, [pendingDiscard]);
+  }, [isCurrent, owner, pendingDiscard]);
 
   return {
     panelState,
@@ -963,7 +1122,7 @@ export function useSourceControlPanel(
     stagedEmptyText,
     unstagedEmptyText,
     pendingDiscard: pendingDiscardView,
-    setCommitMessage,
+    setCommitMessage: editCommitMessage,
     refresh,
     selectEntry,
     selectFile,

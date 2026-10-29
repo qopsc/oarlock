@@ -1,3 +1,9 @@
+import { useRepositoryOwner } from "./useRepositoryOwner";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import {
+  useWorkspaceEnvStore,
+  workspaceScopeKey,
+} from "@/modules/workspace/env";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,7 +48,7 @@ import {
   type GitBranchListResult,
   type GitLinkedWorktree,
   type GitWorktreeEntry,
-  native,
+  createNative,
 } from "@/modules/ai/lib/native";
 import {
   copyToClipboard,
@@ -250,6 +256,8 @@ function BranchDropdown({
   onNavigateToPath?: (path: string) => void;
   onRefresh: () => void;
 }) {
+  const owner = useRepositoryOwner(repoRoot);
+  const native = useMemo(() => createNative(() => owner.workspace), [owner]);
   const [open, setOpen] = useState(false);
   const [listing, setListing] = useState<GitBranchListResult>(EMPTY_LISTING);
   const [loading, setLoading] = useState(false);
@@ -265,6 +273,7 @@ function BranchDropdown({
   const dialogAfterClose = useRef<WorktreeDialog | null>(null);
 
   const loadBranches = useCallback(async () => {
+    if (!owner.isCurrent()) return;
     const id = ++requestRef.current;
     if (!repoRoot) {
       setListing(EMPTY_LISTING);
@@ -276,18 +285,18 @@ function BranchDropdown({
     setError(null);
     try {
       const result = await native.gitListBranches(repoRoot);
-      if (id !== requestRef.current) return;
+      if (id !== requestRef.current || !owner.isCurrent()) return;
       setListing(result);
     } catch (e) {
-      if (id !== requestRef.current) return;
+      if (id !== requestRef.current || !owner.isCurrent()) return;
       setError(String(e));
       setListing(EMPTY_LISTING);
     } finally {
-      if (id === requestRef.current) {
+      if (id === requestRef.current && owner.isCurrent()) {
         setLoading(false);
       }
     }
-  }, [repoRoot]);
+  }, [native, owner, repoRoot]);
 
   useEffect(() => {
     if (open) {
@@ -297,22 +306,24 @@ function BranchDropdown({
 
   const handleCheckout = useCallback(
     async (branch: string) => {
-      if (!repoRoot || checkoutInFlight.current) return;
+      if (!repoRoot || checkoutInFlight.current || !owner.isCurrent()) return;
       checkoutInFlight.current = true;
       setCheckingOut(true);
       try {
         await native.gitCheckoutBranch(repoRoot, branch);
+        if (!owner.isCurrent()) return;
         setListing(EMPTY_LISTING);
         setOpen(false);
         onRefresh();
       } catch (e) {
+        if (!owner.isCurrent()) return;
         showFileError(String(e), { path: repoRoot, error: e });
       } finally {
         checkoutInFlight.current = false;
-        setCheckingOut(false);
+        if (owner.isCurrent()) setCheckingOut(false);
       }
     },
-    [repoRoot, onRefresh],
+    [native, owner, repoRoot, onRefresh],
   );
 
   const localBranches = useMemo(
@@ -331,28 +342,35 @@ function BranchDropdown({
 
   const handleWorktreeCreated = useCallback(
     (result: WorktreeAddResult) => {
+      if (!owner.isCurrent()) return;
       setWorktreeDialog(null);
       toast.success(`Created worktree ${worktreeName(result.path)}`, {
         description: `${result.branch} is checked out in ${result.path}.`,
         action: onNavigateToPath
           ? {
               label: "Open in New Tab",
-              onClick: () => onNavigateToPath(result.path),
+              onClick: () => {
+                if (owner.isCurrent()) onNavigateToPath(result.path);
+              },
             }
           : undefined,
       });
     },
-    [onNavigateToPath],
+    [onNavigateToPath, owner],
   );
 
-  const handleWorktreeRemoved = useCallback((worktree: GitWorktreeEntry) => {
-    setWorktreeDialog(null);
-    toast.success(`Removed worktree ${worktreeName(worktree.path)}`, {
-      description: worktree.branch
-        ? `The branch ${worktree.branch} is still in the repository.`
-        : undefined,
-    });
-  }, []);
+  const handleWorktreeRemoved = useCallback(
+    (worktree: GitWorktreeEntry) => {
+      if (!owner.isCurrent()) return;
+      setWorktreeDialog(null);
+      toast.success(`Removed worktree ${worktreeName(worktree.path)}`, {
+        description: worktree.branch
+          ? `The branch ${worktree.branch} is still in the repository.`
+          : undefined,
+      });
+    },
+    [owner],
+  );
 
   return (
     <>
@@ -389,7 +407,9 @@ function BranchDropdown({
             if (!dialog) return;
             event.preventDefault();
             dialogAfterClose.current = null;
-            requestAnimationFrame(() => setWorktreeDialog(dialog));
+            requestAnimationFrame(() => {
+              if (owner.isCurrent()) setWorktreeDialog(dialog);
+            });
           }}
         >
           {displayRepoRoot ? (
@@ -480,7 +500,9 @@ function BranchDropdown({
                             ? `${wt.path} no longer exists`
                             : `Open ${wt.path} in a new terminal tab`
                         }
-                        onSelect={() => onNavigateToPath?.(wt.path)}
+                        onSelect={() => {
+                          if (owner.isCurrent()) onNavigateToPath?.(wt.path);
+                        }}
                         className="flex cursor-pointer items-center gap-2 text-[12px]"
                       >
                         <HugeiconsIcon
@@ -600,6 +622,8 @@ export const SourceControlPanel = memo(function SourceControlPanel({
   onFollowRepositoryContext,
   onOpenRepository,
 }: Props) {
+  const workspace = useWorkspaceEnvStore((state) => state.env);
+  const spaceId = useSpaces((state) => state.activeId);
   const scm = useSourceControlPanel(open, sourceControl, onOpenDiff);
   const statusRefusal = usePrivacyRefusal(
     scm.repo?.repoRoot ?? sourceControl.contextPath,
@@ -991,6 +1015,13 @@ export const SourceControlPanel = memo(function SourceControlPanel({
         <header className="flex shrink-0 items-center justify-between gap-2 border-b border-border/50 px-3 pb-2.5 pt-3">
           <div className="flex min-w-0 items-center gap-1.5">
             <BranchDropdown
+              key={JSON.stringify([
+                spaceId,
+                workspaceScopeKey(workspace),
+                sourceControl.contextPath,
+                scm.repo?.repoRoot,
+                fixedTargetPending,
+              ])}
               repoRoot={
                 fixedTargetPending ? null : (scm.repo?.repoRoot ?? null)
               }

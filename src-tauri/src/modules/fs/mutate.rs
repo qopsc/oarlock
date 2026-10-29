@@ -1,5 +1,6 @@
 use super::blocking;
 use super::index::FileIndexState;
+use super::mutation_events::{self, Change};
 use crate::modules::project_trust::{self, OwnChange};
 use crate::modules::workspace::{
     is_plain_name, resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry,
@@ -60,7 +61,7 @@ fn resolve_authorized_root(
     workspace: &WorkspaceEnv,
     registry: &WorkspaceRegistry,
 ) -> Result<std::path::PathBuf, String> {
-    let resolved = resolve_path(root, workspace);
+    let resolved = resolve_path(root, workspace)?;
     let canonical = registry
         .canonicalize_cached(resolved)
         .map_err(|error| format!("workspace root is not accessible: {error}"))?;
@@ -251,30 +252,57 @@ pub async fn fs_create_file(
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = app
-            .state::<WorkspaceRegistry>()
-            .gates(Origin::App)
-            .authorized_new(&resolve_path(&path, &workspace))?;
+        let requested = resolve_path(&path, &workspace)?;
+        let registry = app.state::<WorkspaceRegistry>();
+        let gates = registry.gates(Origin::App);
+        let p = gates.authorized_new(&requested)?;
         // Oarlock's own new file in a project's trusted item keeps the user's trust in it.
         let change = OwnChange::File {
             target: &p,
             content: &[],
         };
-        project_trust::keeping_trust(&app, change, || create_file(&p))?;
+        project_trust::keeping_trust(&app, change, || {
+            create_checked(&p, false, |opened| {
+                let current = gates.authorized_new(&requested)?;
+                if current != p || opened != p {
+                    return Err("Creation destination changed during operation".into());
+                }
+                Ok(())
+            })
+        })?;
         note_changed(&index, &p);
         Ok(())
     })
     .await
 }
 
+fn create_checked(
+    p: &Path,
+    directory: bool,
+    validate: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let destination = super::destination::Destination::pin(p, directory, &validate)
+        .map_err(|error| creation_error(p, error))?;
+    let result = if directory {
+        destination.create_dir()
+    } else {
+        destination.create_file()
+    };
+    result.map_err(|error| creation_error(p, error))
+}
+
+#[cfg(test)]
 fn create_file(p: &Path) -> Result<(), String> {
-    if p.exists() {
-        return Err(format!("already exists: {}", p.display()));
+    create_checked(p, false, |_| Ok(()))
+}
+
+fn creation_error(path: &Path, error: io::Error) -> String {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        format!("already exists: {}", path.display())
+    } else {
+        log::debug!("create({}) failed: {error}", path.display());
+        error.to_string()
     }
-    std::fs::write(p, "").map_err(|e| {
-        log::debug!("fs_create_file({}) failed: {e}", p.display());
-        e.to_string()
-    })
 }
 
 /// Creates a new directory. Fails if the directory already exists.
@@ -291,27 +319,30 @@ pub async fn fs_create_dir(
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = app
-            .state::<WorkspaceRegistry>()
-            .gates(origin.unwrap_or_default())
-            .authorized_new(&resolve_path(&path, &workspace))?;
+        let requested = resolve_path(&path, &workspace)?;
+        let registry = app.state::<WorkspaceRegistry>();
+        let gates = registry.gates(origin.unwrap_or_default());
+        let p = gates.authorized_new(&requested)?;
         // Oarlock's own new folder in a project's trusted item keeps the user's trust in it.
         let change = OwnChange::Folder { target: &p };
-        project_trust::keeping_trust(&app, change, || create_dir(&p))?;
+        project_trust::keeping_trust(&app, change, || {
+            create_checked(&p, true, |opened| {
+                let current = gates.authorized_new(&requested)?;
+                if current != p || opened != p {
+                    return Err("Creation destination changed during operation".into());
+                }
+                Ok(())
+            })
+        })?;
         note_changed(&index, &p);
         Ok(())
     })
     .await
 }
 
+#[cfg(test)]
 fn create_dir(p: &Path) -> Result<(), String> {
-    if p.exists() {
-        return Err(format!("already exists: {}", p.display()));
-    }
-    std::fs::create_dir_all(p).map_err(|e| {
-        log::debug!("fs_create_dir({}) failed: {e}", p.display());
-        e.to_string()
-    })
+    create_checked(p, true, |_| Ok(()))
 }
 
 /// Renames (or moves) a path. Refuses to overwrite an existing target.
@@ -323,29 +354,38 @@ pub async fn fs_rename(
     to: String,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
+    super::require_owned_entry_operation()?;
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let registry = app.state::<WorkspaceRegistry>();
-        let gates = registry.gates(Origin::App);
-        let from_p = gates.authorized_entry(&resolve_path(&from, &workspace))?;
-        let to_p = gates.authorized_entry(&resolve_path(&to, &workspace))?;
-        rename(&from_p, &to_p)?;
-        note_changed(&index, &from_p);
-        note_changed(&index, &to_p);
-        Ok(())
+        mutation_events::transact(&app, workspace.clone(), &[from.clone(), to.clone()], || {
+            let registry = app.state::<WorkspaceRegistry>();
+            let gates = registry.gates(Origin::App);
+            let from_p = gates.authorized_entry(&resolve_path(&from, &workspace)?)?;
+            let to_p = gates.authorized_entry(&resolve_path(&to, &workspace)?)?;
+            rename(&from_p, &to_p)?;
+            note_changed(&index, &from_p);
+            note_changed(&index, &to_p);
+            Ok(((), Some(Change::Renamed { from, to })))
+        })
     })
     .await
 }
 
 fn rename(from_p: &Path, to_p: &Path) -> Result<(), String> {
-    if !from_p.exists() {
+    if metadata_if_exists(from_p)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
         return Err(format!("not found: {}", from_p.display()));
     }
-    if to_p.exists() {
+    if metadata_if_exists(to_p)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
         return Err(format!("already exists: {}", to_p.display()));
     }
-    std::fs::rename(from_p, to_p).map_err(|e| {
+    rename_no_replace(from_p, to_p).map_err(|e| {
         log::debug!(
             "fs_rename({} -> {}) failed: {e}",
             from_p.display(),
@@ -365,16 +405,22 @@ pub async fn fs_move(
     expected_conflict: Option<String>,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<FsMoveResult, String> {
+    super::require_owned_entry_operation()?;
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let root = resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
-        let moved = fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)?;
-        if moved == FsMoveResult::Moved {
-            let index = app.state::<FileIndexState>();
-            note_changed(&index, &resolve_path(&from, &workspace));
-            note_changed(&index, &resolve_path(&to, &workspace));
-        }
-        Ok(moved)
+        mutation_events::transact(&app, workspace.clone(), &[from.clone(), to.clone()], || {
+            let root =
+                resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
+            let moved = fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)?;
+            if moved == FsMoveResult::Moved {
+                let index = app.state::<FileIndexState>();
+                note_changed(&index, &resolve_path(&from, &workspace)?);
+                note_changed(&index, &resolve_path(&to, &workspace)?);
+            }
+            let event = (moved == FsMoveResult::Moved && from != to)
+                .then_some(Change::Renamed { from, to });
+            Ok((moved, event))
+        })
     })
     .await
 }
@@ -386,8 +432,8 @@ fn fs_move_impl(
     expected_conflict: Option<&str>,
     workspace: &WorkspaceEnv,
 ) -> Result<FsMoveResult, String> {
-    let from_p = resolve_path(from, workspace);
-    let to_p = resolve_path(to, workspace);
+    let from_p = resolve_path(from, workspace)?;
+    let to_p = resolve_path(to, workspace)?;
     authorize_mutation_entry(&from_p, root)?;
     authorize_mutation_entry(&to_p, root)?;
     if from_p == to_p {
@@ -444,16 +490,24 @@ pub async fn fs_delete(
     path: String,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
+    super::require_owned_entry_operation()?;
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = app
-            .state::<WorkspaceRegistry>()
-            .gates(Origin::App)
-            .authorized_entry(&resolve_path(&path, &workspace))?;
-        delete_path(&p)?;
-        note_changed(&index, &p);
-        Ok(())
+        mutation_events::transact(&app, workspace.clone(), std::slice::from_ref(&path), || {
+            let p = app
+                .state::<WorkspaceRegistry>()
+                .gates(Origin::App)
+                .authorized_entry(&resolve_path(&path, &workspace)?)?;
+            delete_path(&p)?;
+            note_changed(&index, &p);
+            Ok((
+                (),
+                Some(Change::Deleted {
+                    paths: vec![path.clone()],
+                }),
+            ))
+        })
     })
     .await
 }
@@ -471,30 +525,45 @@ pub async fn fs_delete_batch(
     paths: Vec<String>,
     root: String,
     workspace: Option<WorkspaceEnv>,
-) -> FsDeleteBatchResult {
+) -> Result<FsDeleteBatchResult, String> {
+    super::require_owned_entry_operation()?;
     let count = paths.len();
-    tauri::async_runtime::spawn_blocking(move || {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let Ok(root) =
-            resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())
-        else {
-            return FsDeleteBatchResult {
-                deleted: Vec::new(),
-                failed: paths.len(),
+        mutation_events::transact(&app, workspace.clone(), &paths.clone(), || {
+            let Ok(root) =
+                resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())
+            else {
+                return Ok((
+                    FsDeleteBatchResult {
+                        deleted: Vec::new(),
+                        failed: paths.len(),
+                    },
+                    None,
+                ));
             };
-        };
-        let result = fs_delete_batch_impl(paths, &root, &workspace);
-        let index = app.state::<FileIndexState>();
-        for deleted in &result.deleted {
-            note_changed(&index, &resolve_path(deleted, &workspace));
-        }
-        result
+            let result = fs_delete_batch_impl(paths, &root, &workspace);
+            let index = app.state::<FileIndexState>();
+            for deleted in &result.deleted {
+                if let Ok(resolved) = resolve_path(deleted, &workspace) {
+                    note_changed(&index, &resolved);
+                }
+            }
+            let event = (!result.deleted.is_empty()).then(|| Change::Deleted {
+                paths: result.deleted.clone(),
+            });
+            Ok((result, event))
+        })
+        .unwrap_or(FsDeleteBatchResult {
+            deleted: Vec::new(),
+            failed: count,
+        })
     })
     .await
     .unwrap_or(FsDeleteBatchResult {
         deleted: Vec::new(),
         failed: count,
-    })
+    }))
 }
 
 fn fs_delete_batch_impl(
@@ -505,7 +574,10 @@ fn fs_delete_batch_impl(
     let mut deleted = Vec::with_capacity(paths.len());
     let mut failed = 0;
     for path in paths {
-        let resolved = resolve_path(&path, workspace);
+        let Ok(resolved) = resolve_path(&path, workspace) else {
+            failed += 1;
+            continue;
+        };
         let result = authorize_mutation_entry(&resolved, root)
             .and_then(|()| remove_path(&resolved).map_err(|error| error.to_string()));
         match result {
@@ -522,6 +594,24 @@ fn fs_delete_batch_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unsupported_environment_batch_delete_never_touches_host_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("keep");
+        std::fs::write(&file, "keep").unwrap();
+        let result = fs_delete_batch_impl(
+            vec![file.to_string_lossy().into()],
+            dir.path(),
+            &WorkspaceEnv::Wsl {
+                distro: "Ubuntu".into(),
+            },
+        );
+        assert_eq!(result.failed, 1);
+        assert!(result.deleted.is_empty());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "keep");
+    }
 
     fn s(p: std::path::PathBuf) -> String {
         p.to_string_lossy().into_owned()
@@ -550,6 +640,36 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn swapped_parent_cannot_redirect_new_files_or_nested_folders() {
+        for directory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("workspace");
+            let parent = root.join("folder");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let registry = WorkspaceRegistry::default();
+            registry.authorize(&root).unwrap();
+            let requested = parent.join(if directory { "nested/new" } else { "new" });
+            let gates = registry.gates(Origin::App);
+            let target = gates.authorized_new(&requested).unwrap();
+            std::fs::rename(&parent, root.join("previous")).unwrap();
+            std::os::unix::fs::symlink(&outside, &parent).unwrap();
+            let result = create_checked(&target, directory, |opened| {
+                let current = gates.authorized_new(&requested)?;
+                if current != target || opened != target {
+                    return Err("destination changed".into());
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(root.join("previous")).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn create_file_makes_empty_and_refuses_to_clobber() {
         let dir = tempfile::tempdir().unwrap();
@@ -563,6 +683,51 @@ mod tests {
         let err = create_file(&f).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(std::fs::read(&f).unwrap(), b"data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_refuses_dangling_links_even_when_the_entry_is_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        let link = root.join("new.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let target = registry.gates(Origin::App).authorized_new(&link).unwrap();
+        assert!(create_file(&target).is_err());
+        assert!(!outside.exists());
+        assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+    }
+
+    #[test]
+    fn concurrent_creates_have_only_one_owner() {
+        for folder in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("parent/new");
+            std::fs::create_dir(path.parent().unwrap()).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    let (path, start) = (path.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        if folder {
+                            create_dir(&path)
+                        } else {
+                            create_file(&path)
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        }
     }
 
     #[test]
@@ -597,6 +762,57 @@ mod tests {
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(std::fs::read(&occupied).unwrap(), b"keep");
         assert!(to.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_preserves_dangling_destination_links_and_can_move_dangling_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let missing = dir.path().join("missing");
+        std::fs::write(&from, b"keep source").unwrap();
+        std::os::unix::fs::symlink(&missing, &to).unwrap();
+        assert!(
+            rename(&from, &to).is_err(),
+            "rename replaced a dangling link"
+        );
+        assert_eq!(std::fs::read_link(&to).unwrap(), missing);
+        assert_eq!(std::fs::read(&from).unwrap(), b"keep source");
+        let moved = dir.path().join("moved-link");
+        rename(&to, &moved).unwrap();
+        assert_eq!(std::fs::read_link(&moved).unwrap(), missing);
+    }
+
+    #[test]
+    fn concurrent_renames_never_replace_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("destination");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for id in 0..4 {
+            let source = dir.path().join(format!("source-{id}"));
+            std::fs::write(&source, id.to_string()).unwrap();
+            let (to, start) = (destination.clone(), barrier.clone());
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                (id, source.clone(), rename(&source, &to))
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, _, r)| r.is_ok()).count(), 1);
+        for (id, source, result) in results {
+            if result.is_ok() {
+                assert!(!source.exists());
+                assert_eq!(
+                    std::fs::read_to_string(&destination).unwrap(),
+                    id.to_string()
+                );
+            } else {
+                assert_eq!(std::fs::read_to_string(source).unwrap(), id.to_string());
+            }
+        }
     }
 
     #[test]

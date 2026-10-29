@@ -15,6 +15,9 @@ type FakeClient = {
 };
 
 const fakes = vi.hoisted(() => ({
+  load: vi.fn(),
+  listen: vi.fn(async () => () => {}),
+  changed: vi.fn(async () => () => {}),
   tools: new Map<string, unknown[]>(),
   failing: new Set<string>(),
   signIn: new Set<string>(),
@@ -75,11 +78,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: async () => () => {},
+  listen: fakes.listen,
 }));
 vi.mock("../lib/configStore", () => ({
-  loadWindowServers: async () => [],
-  onMcpChanged: async () => () => {},
+  loadWindowServers: fakes.load,
+  onMcpChanged: fakes.changed,
   saveKnownTools: async (id: string) => {
     fakes.saved.push(id);
   },
@@ -138,6 +141,8 @@ async function settle(manager: McpManager) {
 }
 
 beforeEach(() => {
+  fakes.listen.mockReset().mockResolvedValue(() => {});
+  fakes.changed.mockReset().mockResolvedValue(() => {});
   fakes.tools.clear();
   fakes.failing.clear();
   fakes.signIn.clear();
@@ -158,6 +163,71 @@ afterEach(() => {
 });
 
 describe("McpManager", () => {
+  it("rechecks tool lists when a notification arrives during initial discovery", async () => {
+    vi.useFakeTimers();
+    fakes.held.add("initial");
+    const manager = new McpManager();
+    manager.sync([server("initial")]);
+    await vi.advanceTimersByTimeAsync(0);
+    const client = fakes.clients.get("initial");
+    if (!client) throw new Error("missing client");
+    client.listTools = vi
+      .fn()
+      .mockResolvedValue({ tools: [tool("added_during_start")] });
+    client.listChanged?.();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(client.listTools).not.toHaveBeenCalled();
+    fakes.releases[0]();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(client.listTools).toHaveBeenCalledOnce();
+    expect(manager.offeredTools().map((t) => t.info.tool)).toEqual([
+      "added_during_start",
+    ]);
+  });
+
+  it("ignores a superseded tool-list reply from the same connection", async () => {
+    const manager = new McpManager();
+    manager.sync([server("lists")]);
+    await settle(manager);
+    const client = fakes.clients.get("lists");
+    if (!client) throw new Error("missing client");
+    let old!: (value: { tools: unknown[] }) => void;
+    client.listTools = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            old = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ tools: [tool("new_tool")] });
+    vi.useFakeTimers();
+    client.listChanged?.();
+    await vi.advanceTimersByTimeAsync(300);
+    client.listChanged?.();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(manager.offeredTools().map((t) => t.info.tool)).toEqual([
+      "new_tool",
+    ]);
+    old({ tools: [tool("removed_tool")] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.offeredTools().map((t) => t.info.tool)).toEqual([
+      "new_tool",
+    ]);
+  });
+
+  it("retries listener setup and releases partial subscriptions after an IPC failure", async () => {
+    const off = vi.fn();
+    fakes.changed.mockResolvedValueOnce(off);
+    fakes.listen.mockRejectedValueOnce(new Error("listener IPC failed"));
+    const manager = new McpManager();
+    await expect(manager.listen()).rejects.toThrow("listener IPC failed");
+    expect(off).toHaveBeenCalledOnce();
+    await expect(manager.listen()).resolves.toBeUndefined();
+    expect(fakes.changed).toHaveBeenCalledTimes(2);
+    expect(fakes.listen).toHaveBeenCalledTimes(2);
+  });
+
   it("starts enabled servers and offers their tools", async () => {
     fakes.tools.set("gh", [tool("create_issue"), tool("search")]);
     const manager = new McpManager();
@@ -464,4 +534,53 @@ describe("otherFeatures", () => {
       otherFeatures({ tools: {}, prompts: {}, resources: { subscribe: true } }),
     ).toEqual(["resources", "prompts"]);
   });
+});
+
+it("keeps a retained project's tools callable without exposing them in the current space", async () => {
+  const manager = new McpManager();
+  fakes.tools.set("a", [tool("echo")]);
+  fakes.tools.set("b", [tool("other")]);
+  manager.sync([server("a")]);
+  await settle(manager);
+  manager.sync([server("a", { retainedOnly: true }), server("b")]);
+  await settle(manager);
+  expect(fakes.closes).not.toContain("a");
+  await expect(manager.callTool("a", "echo", {})).resolves.toMatchObject({
+    kind: "mcp",
+  });
+  expect(
+    Object.values(useMcpCatalog.getState().tools).some(
+      (t) => t.serverId === "a",
+    ),
+  ).toBe(false);
+  expect(manager.instructions(new Set(["a"]))).toEqual([
+    { server: "a", text: "Use a wisely." },
+  ]);
+  manager.sync([server("b")]);
+  expect(fakes.closes).toContain("a");
+  await expect(manager.callTool("a", "echo", {})).rejects.toThrow(
+    "not running",
+  );
+  manager.sync([]);
+});
+
+it("ignores an older config reply after a run retains its project", async () => {
+  const manager = new McpManager();
+  let oldReply!: (servers: McpServerConfig[]) => void;
+  fakes.load
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          oldReply = resolve;
+        }),
+    )
+    .mockResolvedValueOnce([server("a", { retainedOnly: true })]);
+  const old = manager.refresh();
+  await manager.refresh();
+  await manager.waitForStarting();
+  oldReply([]);
+  await old;
+  expect(fakes.connects).toContain("a");
+  expect(fakes.closes).not.toContain("a");
+  manager.sync([]);
 });

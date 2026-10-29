@@ -134,12 +134,12 @@ pub enum RedirectDecision {
     TooMany,
 }
 
-/// Scheme, userinfo and host checks mirror the request validation. Without
-/// `allow_private` a redirect may not leave the host whose addresses were
-/// pinned, so a public API cannot bounce a request onto an internal address.
+/// AI payloads and all headers stay on the original scheme, host and port.
+/// Private-network access permits the configured destination, not redirects to
+/// other origins. Same-origin hops reuse the original pinned resolver.
 pub fn redirect_decision(
     next: &reqwest::Url,
-    last_previous: Option<&reqwest::Url>,
+    original: Option<&reqwest::Url>,
     previous_len: usize,
     allow_private: bool,
 ) -> RedirectDecision {
@@ -151,6 +151,9 @@ pub fn redirect_decision(
         _ => return RedirectDecision::Stop,
     }
     if next.username() != "" || next.password().is_some() {
+        return RedirectDecision::Stop;
+    }
+    if original.is_none_or(|from| next.origin() != from.origin()) {
         return RedirectDecision::Stop;
     }
     let Some(host) = next.host_str() else {
@@ -167,12 +170,6 @@ pub fn redirect_decision(
         if !allow_private && matches!(kind, IpKind::Loopback | IpKind::Private) {
             return RedirectDecision::Stop;
         }
-    } else if !allow_private {
-        if let Some(prev) = last_previous {
-            if prev.host_str() != Some(host) {
-                return RedirectDecision::Stop;
-            }
-        }
     }
     RedirectDecision::Follow
 }
@@ -181,12 +178,14 @@ fn redirect_policy(allow_private: bool) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         match redirect_decision(
             attempt.url(),
-            attempt.previous().last(),
+            attempt.previous().first(),
             attempt.previous().len(),
             allow_private,
         ) {
             RedirectDecision::Follow => attempt.follow(),
-            RedirectDecision::Stop => attempt.stop(),
+            RedirectDecision::Stop => attempt.error(
+                "AI redirect refused: requests must stay on their original origin (scheme, host and port). Configure the final endpoint URL instead",
+            ),
             RedirectDecision::TooMany => attempt.error("too many redirects"),
         }
     })
@@ -194,7 +193,12 @@ fn redirect_policy(allow_private: bool) -> reqwest::redirect::Policy {
 
 fn build_client(key: &ClientKey) -> Result<reqwest::Client, String> {
     ensure_crypto_provider();
-    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
+    // An inherited proxy would resolve/route the destination itself, bypassing
+    // our address classification and pinning. All guarded profiles connect
+    // directly until an explicit trusted-proxy policy is implemented.
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10));
     // Pin the resolver to the addresses that passed classification. Without
     // this, reqwest's own lookup could return a different (private or
     // metadata) address between classify and connect. The port is filled in
@@ -369,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn redirects_stay_on_the_pinned_host_unless_private_access_was_granted() {
+    fn redirects_stay_on_the_original_origin_even_with_private_access() {
         let from = url("https://api.example.com/v1");
         let same = url("https://api.example.com/v2");
         let other = url("https://evil.example.net/");
@@ -383,7 +387,7 @@ mod tests {
         );
         assert_eq!(
             redirect_decision(&other, Some(&from), 1, true),
-            RedirectDecision::Follow
+            RedirectDecision::Stop
         );
     }
 
@@ -414,12 +418,12 @@ mod tests {
         );
         assert_eq!(
             redirect_decision(&url("http://[::1]:8080/"), Some(&from), 1, true),
-            RedirectDecision::Follow
+            RedirectDecision::Stop
         );
         assert_eq!(
             redirect_decision(&url("https://[2606:4700::1111]/"), Some(&from), 1, false),
-            RedirectDecision::Follow,
-            "public IP literals are allowed; only the address class matters"
+            RedirectDecision::Stop,
+            "public IP literals still change the origin"
         );
     }
 
@@ -465,13 +469,56 @@ mod tests {
         ] {
             assert_eq!(
                 redirect_decision(&url(target), Some(&from), 1, true),
-                RedirectDecision::Follow,
+                RedirectDecision::Stop,
                 "{target}"
             );
         }
         assert_eq!(
             redirect_decision(&url("https://[::ffff:8.8.8.8]/"), Some(&from), 1, false),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn redirects_reject_scheme_port_and_host_changes_but_keep_equivalent_origins() {
+        let from = url("https://api.example.com/v1/start");
+        for private in [false, true] {
+            for target in [
+                "http://api.example.com/",
+                "https://api.example.com:8443/",
+                "https://other.example.com/",
+                "https://user@api.example.com/",
+            ] {
+                assert_eq!(
+                    redirect_decision(&url(target), Some(&from), 1, private),
+                    RedirectDecision::Stop,
+                    "{target}"
+                );
+            }
+            assert_eq!(
+                redirect_decision(
+                    &url("https://API.example.com:443/v2?next=1"),
+                    Some(&from),
+                    1,
+                    private
+                ),
+                RedirectDecision::Follow
+            );
+            assert_eq!(
+                redirect_decision(&from, None, 1, private),
+                RedirectDecision::Stop
+            );
+        }
+        let local = url("http://[::1]:1234/start");
+        assert_eq!(
+            redirect_decision(&url("http://[::1]:1234/next"), Some(&local), 1, true),
             RedirectDecision::Follow
+        );
+        let plain = url("http://api.example.com/");
+        assert_eq!(
+            redirect_decision(&from, Some(&plain), 1, true),
+            RedirectDecision::Stop,
+            "An upgrade changes the approved origin too"
         );
     }
 

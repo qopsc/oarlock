@@ -9,6 +9,79 @@ pub struct ResolvedGitDirectory {
     pub workspace: WorkspaceEnv,
     pub git_path: String,
     pub local_path: PathBuf,
+    pub(crate) ownership: Option<std::sync::Arc<super::ownership::RepositoryPin>>,
+}
+
+impl ResolvedGitDirectory {
+    pub(crate) fn run<I, S>(&self, args: I, timeout: u64) -> Result<super::types::GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        super::process::run_git_in(self, args, timeout)
+    }
+    pub(crate) fn line<I, S>(&self, args: I) -> Result<Option<String>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.run(args, super::types::DEFAULT_TIMEOUT_SECS)?;
+        if output.timed_out {
+            return Err(GitError::TimedOut("git command"));
+        }
+        if output.exit_code != Some(0) {
+            return Ok(None);
+        }
+        let line = std::str::from_utf8(&output.stdout)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim();
+        Ok((!line.is_empty()).then(|| line.to_string()))
+    }
+    pub(crate) fn lines<I, S>(&self, args: I) -> Result<Vec<String>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.run(args, super::types::DEFAULT_TIMEOUT_SECS)?;
+        if output.timed_out {
+            return Err(GitError::TimedOut("git command"));
+        }
+        if output.exit_code != Some(0) {
+            return Ok(vec![]);
+        }
+        Ok(std::str::from_utf8(&output.stdout)
+            .unwrap_or("")
+            .lines()
+            .map(|line| line.trim_end_matches('\r').to_string())
+            .collect())
+    }
+}
+/// Mutation callers retain this object across every preflight and command batch.
+pub(crate) fn owned_repo_root(
+    registry: &WorkspaceRegistry,
+    path: &str,
+    workspace: &WorkspaceEnv,
+) -> Result<ResolvedGitDirectory> {
+    let requested = resolve_path(path, workspace).map_err(|e| GitError::command("workspace", e))?;
+    let directory = super::ownership::DirectoryPin::acquire(&requested, workspace)?;
+    if !registry.is_authorized(directory.path()) {
+        return Err(GitError::PathOutsideWorkspace(directory.path().into()));
+    }
+    let pin = super::ownership::RepositoryPin::acquire(directory, workspace, registry)?;
+    if !registry.is_authorized(pin.path()) {
+        return Err(GitError::PathOutsideWorkspace(pin.path().into()));
+    }
+    let repo = ResolvedGitDirectory {
+        workspace: workspace.clone(),
+        git_path: display_path(pin.path()),
+        local_path: pin.path().into(),
+        ownership: Some(std::sync::Arc::new(pin)),
+    };
+    super::commit_guard::preflight(&repo)?;
+    Ok(repo)
 }
 
 pub fn split_upstream(upstream: &str) -> (Option<String>, Option<String>) {
@@ -31,7 +104,8 @@ pub fn canonical_dir(
     path: &str,
     workspace: &WorkspaceEnv,
 ) -> Result<ResolvedGitDirectory> {
-    let candidate = resolve_path(path, workspace);
+    let candidate =
+        resolve_path(path, workspace).map_err(|error| GitError::command("workspace", error))?;
     if !candidate.is_dir() {
         return Err(GitError::NotADirectory(path.to_string()));
     }
@@ -47,6 +121,7 @@ pub fn canonical_dir(
         workspace: workspace.clone(),
         git_path,
         local_path,
+        ownership: None,
     })
 }
 
@@ -59,7 +134,13 @@ pub fn authorized_repo_root(
     if !registry.is_authorized(&canonical.local_path) {
         return Err(GitError::PathOutsideWorkspace(canonical.local_path.clone()));
     }
-    Ok(canonical)
+    super::ownership::authorize_repository_metadata(registry, &canonical.local_path)?;
+    if workspace.is_wsl() {
+        super::commit_guard::preflight(&canonical)?;
+        Ok(canonical)
+    } else {
+        owned_repo_root(registry, path, workspace)
+    }
 }
 
 pub fn resolve_within_repo(repo_root: &Path, rel: &str) -> Result<PathBuf> {
@@ -80,6 +161,43 @@ pub fn resolve_within_repo(repo_root: &Path, rel: &str) -> Result<PathBuf> {
         }
         Err(e) => Err(GitError::Io(e)),
     }
+}
+
+/// Git names directory entries, not the filesystem objects their symlinks target.
+/// Historical entries need only lexical validation; they need not exist today.
+pub fn git_entry_name(rel: &str) -> Result<String> {
+    if !is_safe_pathspec(rel) || rel.starts_with(['/', '\\']) || Path::new(rel).is_absolute() {
+        return Err(GitError::InvalidPath(rel.into()));
+    }
+    #[cfg(windows)]
+    let rel = rel.replace('\\', "/");
+    // Status reports collapsed untracked directories with a trailing slash.
+    let rel = rel.trim_end_matches('/');
+    if rel.split('/').any(str::is_empty) {
+        return Err(GitError::InvalidPath(rel.into()));
+    }
+    Ok(rel.to_string())
+}
+
+/// Keep the leaf itself intact, including dangling/out-of-tree symlinks. Never
+/// traverse a symlink ancestor: Git also refuses pathspecs beyond a symlink.
+pub fn git_worktree_entry(repo_root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = git_entry_name(rel)?;
+    let mut parent = repo_root.to_path_buf();
+    let parts: Vec<_> = rel.split('/').collect();
+    for part in &parts[..parts.len() - 1] {
+        parent.push(part);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(GitError::SymlinkRejected(parent));
+            }
+            Ok(meta) if !meta.is_dir() => return Err(GitError::InvalidPath(rel)),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(repo_root.join(rel))
 }
 
 /// A branch name git accepts (`git check-ref-format --branch`, which also refuses a leading

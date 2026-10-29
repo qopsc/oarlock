@@ -1,5 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const chatMock = vi.hoisted(() => ({
+  activeSessionId: "chat" as string | null,
+  stopSession: vi.fn(async () => {}),
+}));
+vi.mock("../store/chatStore", () => ({
+  useChatStore: { getState: () => chatMock },
+}));
+
 const planMock = vi.hoisted(() => ({
   active: false,
   disable: vi.fn(),
@@ -31,7 +39,9 @@ describe("OARLOCK_CMD_RE", () => {
   });
 
   it("only matches a marker at the start of the message", () => {
-    expect('say <oarlock-command name="init" />'.match(OARLOCK_CMD_RE)).toBeNull();
+    expect(
+      'say <oarlock-command name="init" />'.match(OARLOCK_CMD_RE),
+    ).toBeNull();
   });
 
   it("captures an optional state attribute", () => {
@@ -91,4 +101,15 @@ describe("tryRunSlashCommand", () => {
     expect(planMock.toggle).toHaveBeenCalled();
     expect(planMock.active).toBe(true);
   });
+});
+
+it("stops and resets an idle chat without sending a model prompt", () => {
+  chatMock.activeSessionId = "chat";
+  expect(tryRunSlashCommand("/stop")).toEqual({ kind: "handled" });
+  expect(chatMock.stopSession).toHaveBeenCalledWith("chat");
+});
+it("handles /stop without a selected chat", () => {
+  chatMock.activeSessionId = null;
+  expect(tryRunSlashCommand("/stop")).toEqual({ kind: "handled" });
+  expect(chatMock.stopSession).not.toHaveBeenCalled();
 });

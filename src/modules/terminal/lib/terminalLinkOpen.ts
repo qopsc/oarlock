@@ -1,3 +1,38 @@
+import type { WorkspaceEnv } from "@/modules/workspace/env";
+
+type LinkNavigation = {
+  readonly spaceId: string;
+  readonly tabId: number | null;
+  readonly controller: AbortController;
+};
+let navigation: LinkNavigation | null = null;
+
+/** Shared by delayed terminal navigation and path-drop preparation. */
+export function captureTerminalNavigation(): () => boolean {
+  const current = navigation;
+  return () => current !== null && !current.controller.signal.aborted;
+}
+
+/** Each committed tab/space change permanently invalidates earlier clicks. */
+export function setTerminalLinkNavigation(
+  spaceId: string,
+  tabId: number | null,
+): () => void {
+  navigation?.controller.abort();
+  const current = { spaceId, tabId, controller: new AbortController() };
+  navigation = current;
+  return () => {
+    current.controller.abort();
+    if (navigation === current) navigation = null;
+  };
+}
+
+export type TerminalLinkOperation = {
+  readonly workspace: WorkspaceEnv;
+  readonly spaceId: string;
+  readonly active: () => boolean;
+};
+
 /**
  * Opens a link clicked in a terminal: URLs in the preview when the app takes
  * them (`setTerminalPreviewOpener`), otherwise the browser; files in the
@@ -8,9 +43,17 @@ export function openTerminalLink(
   uri: string,
   cwd: string | null,
   onExternalSettled: () => void,
+  owner: { readonly workspace: WorkspaceEnv; readonly active: () => boolean },
 ): Promise<void> {
+  const current = navigation;
+  if (!current || !owner.active()) return Promise.resolve();
+  const operation: TerminalLinkOperation = {
+    workspace: owner.workspace,
+    spaceId: current.spaceId,
+    active: () => owner.active() && !current.controller.signal.aborted,
+  };
   return import("./terminalLinkTargets").then((links) =>
-    links.openTerminalLinkTarget(uri, cwd, onExternalSettled),
+    links.openTerminalLinkTarget(uri, cwd, onExternalSettled, operation),
   );
 }
 
@@ -35,6 +78,7 @@ type FileOpener = (
   path: string,
   line: number | null,
   column: number | null,
+  spaceId: string,
 ) => void;
 
 let fileOpener: FileOpener | null = null;
@@ -49,8 +93,9 @@ export function openTerminalFile(
   path: string,
   line: number | null,
   column: number | null,
+  spaceId: string,
 ): boolean {
   if (!fileOpener) return false;
-  fileOpener(path, line, column);
+  fileOpener(path, line, column, spaceId);
   return true;
 }

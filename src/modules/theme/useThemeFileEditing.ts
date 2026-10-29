@@ -1,3 +1,4 @@
+import { toast } from "sonner";
 import { type RefObject, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -52,6 +53,9 @@ export function useThemeFileEditing({ tabsRef, openFileTab }: Params) {
               await saveCustomTheme(parsed.theme);
             } catch (e) {
               console.warn("[oarlock] theme ingest failed:", e);
+              toast.error("Theme file saved, but theme could not be applied", {
+                description: String(e),
+              });
             }
           })();
         },
@@ -65,20 +69,26 @@ export function useThemeFileEditing({ tabsRef, openFileTab }: Params) {
     let alive = true;
     let unsub: (() => void) | undefined;
     void onThemeEdit(async (req) => {
-      const theme =
-        req.action === "create"
-          ? starterTheme()
-          : (await listCustomThemes()).find((t) => t.id === req.id);
-      if (!theme) return;
-      if (req.action === "create") await saveCustomTheme(theme);
-      const path = await themeFilePath(theme.id);
-      const open = tabsRef.current.some(
-        (t) => t.kind === "editor" && t.path === path,
-      );
-      if (!open) await writeThemeFile(theme);
-      void persistThemeId(theme.id);
-      openFileTab(path);
-      void getCurrentWebviewWindow().setFocus();
+      try {
+        const theme =
+          req.action === "create"
+            ? starterTheme()
+            : (await listCustomThemes()).find((t) => t.id === req.id);
+        if (!theme) return;
+        if (req.action === "create") await saveCustomTheme(theme);
+        const path = await themeFilePath(theme.id);
+        const open = tabsRef.current.some(
+          (t) => t.kind === "editor" && t.path === path,
+        );
+        if (!open) await writeThemeFile(theme);
+        void persistThemeId(theme.id);
+        openFileTab(path);
+        void getCurrentWebviewWindow().setFocus().catch(console.error);
+      } catch (error) {
+        toast.error("Could not open custom theme", {
+          description: String(error),
+        });
+      }
     }).then((fn) => {
       if (alive) unsub = fn;
       else fn();

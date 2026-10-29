@@ -12,8 +12,9 @@
 //!   browser window: its state goes and it leaves the list. Closing the last
 //!   window quits and keeps it for the next launch.
 //! - Quitting asks each window in turn, the focused one first, to confirm
-//!   (running commands, unsaved files) and save its state, then exits with
-//!   every window kept. Any window can cancel.
+//!   (running commands, unsaved files) and save its state. Edits invalidate
+//!   approval. A final coordinated check briefly seals editors and flushes
+//!   state again before exiting with every window kept. Any window can cancel.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -26,6 +27,9 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 use tauri_plugin_store::StoreExt;
 
 use super::terminal_scrollback;
+mod quit;
+mod restore;
+use quit::{Action as QuitAction, QuitRound};
 
 pub const MAIN: &str = "main";
 const EXTRA_PREFIX: &str = "w-";
@@ -100,18 +104,6 @@ struct RegistryFile {
     windows: Vec<String>,
 }
 
-fn read_registry(path: &Path) -> Vec<String> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<RegistryFile>(&bytes)
-            .map(|file| file.windows)
-            .unwrap_or_else(|error| {
-                log::warn!("ignoring unreadable window list: {error}");
-                Vec::new()
-            }),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Atomic, like the other state files: a reader sees the old list or the new.
 fn write_registry(path: &Path, windows: &[String]) -> std::io::Result<()> {
     let parent = path
@@ -163,39 +155,6 @@ fn remove_path(path: &Path) {
     }
 }
 
-/// `from` replaces `to` (gone afterwards when `from` is missing).
-fn replace_path(from: &Path, to: &Path) {
-    remove_path(to);
-    if fs::symlink_metadata(from).is_err() {
-        return;
-    }
-    if let Some(parent) = to.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Err(error) = fs::rename(from, to) {
-        log::warn!(
-            "could not move {} to {}: {error}",
-            from.display(),
-            to.display()
-        );
-    }
-}
-
-/// Moves `from`'s spaces and scrollback into `main`'s places. Whatever `main`
-/// left there was discarded when it closed.
-fn adopt_files(app_data: &Path, from: &str) {
-    let root = data_root(app_data, from);
-    replace_path(
-        &app_data.join(spaces_store(from)),
-        &app_data.join(spaces_store(MAIN)),
-    );
-    replace_path(
-        &terminal_scrollback::directory(&root),
-        &terminal_scrollback::directory(app_data),
-    );
-    remove_path(&root);
-}
-
 /// Deletes a discarded window's spaces and scrollback.
 fn forget_files(app_data: &Path, label: &str) {
     if label == MAIN {
@@ -206,21 +165,16 @@ fn forget_files(app_data: &Path, label: &str) {
     }
 }
 
-struct QuitRound {
-    id: u64,
-    /// Windows still to ask, in order.
-    queue: VecDeque<String>,
-    /// The window asked now.
-    asking: Option<String>,
-}
-
 #[derive(Default)]
 struct Inner {
+    /// Failed startup must never discard saved windows during teardown.
+    restored: bool,
     /// Open app windows in the order they reopen; persisted.
     open: Vec<String>,
     focused: Option<String>,
     /// Windows whose page answers quit requests (`app_window_ready`).
     ready: HashSet<String>,
+    opening: usize,
     quit: Option<QuitRound>,
     next_round: u64,
     /// Set once every window agreed to quit: closing them keeps their state.
@@ -273,22 +227,19 @@ fn move_active_chat(app: &AppHandle, from: &str, to: Option<&str>) {
 
 /// Reopens the windows listed at the last quit. Runs in `setup`, after Tauri
 /// created `main` but before any page runs, so no store is loaded yet.
-pub fn restore(app: &AppHandle) {
-    let Some(root) = app_data(app) else { return };
-    let plan = restore_plan(read_registry(&root.join(REGISTRY_FILE)));
-    if let Some(from) = &plan.adopt {
-        adopt_files(&root, from);
-        move_active_chat(app, from, Some(MAIN));
+pub fn restore(app: &AppHandle) -> std::io::Result<()> {
+    let root = app.path().app_data_dir().map_err(std::io::Error::other)?;
+    let plan = restore::run(&root)?;
+    for label in plan.open.iter().filter(|label| *label != MAIN) {
+        build(app, label, None, None).map_err(|error| {
+            std::io::Error::other(format!("Could not restore window {label}: {error}. Saved state was retained; relaunch to retry."))
+        })?;
     }
     let state = app.state::<WindowsState>();
-    state.lock().open = plan.open.clone();
-    save_open(app, &plan.open);
-    for label in plan.open.iter().filter(|label| *label != MAIN) {
-        if let Err(error) = build(app, label, None, None) {
-            log::warn!("could not reopen window {label}: {error}");
-            state.lock().open.retain(|open| open != label);
-        }
-    }
+    let mut inner = state.lock();
+    inner.open = plan.open;
+    inner.restored = true;
+    Ok(())
 }
 
 fn percent_encode(text: &str) -> String {
@@ -376,27 +327,40 @@ pub fn open_new(
     from: Option<&str>,
     start: Option<WindowStart>,
 ) -> Result<String, String> {
-    let state = app.state::<WindowsState>();
-    let label = {
-        let inner = state.lock();
-        let taken: HashSet<String> = inner
-            .open
-            .iter()
-            .chain(inner.discarding.iter())
-            .cloned()
-            .chain(app.webview_windows().into_keys())
-            .collect();
-        new_label(&taken).ok_or_else(|| format!("At most {MAX_WINDOWS} windows can be open"))?
-    };
-    let near = from.and_then(|label| app.get_webview_window(label));
-    build(app, &label, start, near.as_ref()).map_err(|e| e.to_string())?;
-    let open = {
+    {
+        let state = app.state::<WindowsState>();
         let mut inner = state.lock();
-        inner.open.push(label.clone());
-        inner.open.clone()
-    };
-    save_open(app, &open);
-    Ok(label)
+        if inner.quitting {
+            return Err("Oarlock is quitting".into());
+        }
+        cancel_quit_locked(app, &mut inner);
+        inner.opening += 1;
+    }
+    let state = app.state::<WindowsState>();
+    let result = (|| {
+        let label = {
+            let inner = state.lock();
+            let taken: HashSet<String> = inner
+                .open
+                .iter()
+                .chain(inner.discarding.iter())
+                .cloned()
+                .chain(app.webview_windows().into_keys())
+                .collect();
+            new_label(&taken).ok_or_else(|| format!("At most {MAX_WINDOWS} windows can be open"))?
+        };
+        let near = from.and_then(|label| app.get_webview_window(label));
+        build(app, &label, start, near.as_ref()).map_err(|e| e.to_string())?;
+        let open = {
+            let mut inner = state.lock();
+            inner.open.push(label.clone());
+            inner.open.clone()
+        };
+        save_open(app, &open);
+        Ok(label)
+    })();
+    state.lock().opening -= 1;
+    result
 }
 
 /// The window app-wide requests go to: the focused app window, else `main`,
@@ -505,26 +469,21 @@ pub fn on_focus(app: &AppHandle, label: &str) {
 }
 
 /// A page (re)started loading: it answers quit requests again only once it
-/// says so, and a quit waiting on it moves on.
+/// says so. Replacing a participant cancels any active quit round.
 pub fn on_page_load(app: &AppHandle, label: &str) {
-    let state = app.state::<WindowsState>();
-    let waiting = {
-        let mut inner = state.lock();
-        inner.ready.remove(label);
-        inner
-            .quit
-            .as_ref()
-            .is_some_and(|round| round.asking.as_deref() == Some(label))
-    };
-    if waiting {
-        advance_quit(app);
+    if !is_app_window(label) {
+        return;
     }
+    let state = app.state::<WindowsState>();
+    let mut inner = state.lock();
+    inner.ready.remove(label);
+    cancel_quit_locked(app, &mut inner);
 }
 
 /// What closing `label` means: discard it when other app windows stay open
 /// and the app is not quitting; keep it otherwise.
-fn discards(quitting: bool, label: &str, remaining: &[String]) -> bool {
-    !quitting && is_app_window(label) && remaining.iter().any(|other| other != label)
+fn discards(restored: bool, quitting: bool, label: &str, remaining: &[String]) -> bool {
+    restored && !quitting && is_app_window(label) && remaining.iter().any(|other| other != label)
 }
 
 pub fn on_destroyed(app: &AppHandle, label: &str) {
@@ -537,25 +496,19 @@ pub fn on_destroyed(app: &AppHandle, label: &str) {
         .filter(|other| is_app_window(other) && other != label)
         .collect();
     let state = app.state::<WindowsState>();
-    let (discard, waiting, settings_parent) = {
+    let (discard, settings_parent) = {
         let mut inner = state.lock();
         inner.ready.remove(label);
         if inner.focused.as_deref() == Some(label) {
             inner.focused = None;
         }
-        let waiting = match inner.quit.as_mut() {
-            Some(round) => {
-                round.queue.retain(|queued| queued != label);
-                round.asking.as_deref() == Some(label)
-            }
-            None => false,
-        };
-        let discard = discards(inner.quitting, label, &remaining);
+        cancel_quit_locked(app, &mut inner);
+        let discard = discards(inner.restored, inner.quitting, label, &remaining);
         if discard {
             inner.open.retain(|open| open != label);
         }
         let settings_parent = inner.settings_parent.as_deref() == Some(label);
-        (discard, waiting, settings_parent)
+        (discard, settings_parent)
     };
     if let Some(control) = app.try_state::<super::control::ControlState>() {
         control.forget_window(label);
@@ -565,9 +518,6 @@ pub fn on_destroyed(app: &AppHandle, label: &str) {
         if let Some(settings) = app.get_webview_window("settings") {
             let _ = settings.destroy();
         }
-    }
-    if waiting {
-        advance_quit(app);
     }
     if remaining.is_empty() {
         // The quick terminal floats on its own (not a child window), so it
@@ -617,118 +567,199 @@ fn discard_state(app: &AppHandle, label: &str) {
 /// window being asked forward.
 pub fn request_quit(app: &AppHandle) {
     let state = app.state::<WindowsState>();
-    let asking = {
-        let mut inner = state.lock();
-        if let Some(round) = &inner.quit {
-            round.asking.clone()
-        } else {
-            let existing: HashSet<String> = app
-                .webview_windows()
-                .into_keys()
-                .filter(|label| is_app_window(label))
-                .collect();
-            let mut queue: VecDeque<String> = VecDeque::new();
-            if let Some(focused) = inner.focused.clone() {
-                queue.push_back(focused);
-            }
-            for label in inner.open.iter().chain(existing.iter()) {
-                if !queue.contains(label) {
-                    queue.push_back(label.clone());
-                }
-            }
-            queue.retain(|label| existing.contains(label));
-            inner.next_round += 1;
-            let id = inner.next_round;
-            inner.quit = Some(QuitRound {
-                id,
-                queue,
-                asking: None,
-            });
-            None
-        }
-    };
-    match asking {
-        Some(label) => {
+    let mut inner = state.lock();
+    if inner.quitting {
+        return;
+    }
+    if inner.opening > 0 {
+        quit_unavailable(
+            app,
+            "A window is opening. Try quitting again when it is ready.",
+        );
+        return;
+    }
+    if let Some(round) = &inner.quit {
+        let asking = round.asking.clone();
+        drop(inner);
+        if let Some((label, _)) = asking {
             if let Some(window) = app.get_webview_window(&label) {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
             }
         }
-        None => advance_quit(app),
+        return;
+    }
+    let existing: HashSet<String> = app
+        .webview_windows()
+        .into_keys()
+        .filter(|label| is_app_window(label))
+        .collect();
+    let mut queue = VecDeque::new();
+    if let Some(focused) = &inner.focused {
+        queue.push_back(focused.clone());
+    }
+    for label in inner.open.iter().chain(existing.iter()) {
+        if !queue.contains(label) {
+            queue.push_back(label.clone());
+        }
+    }
+    // A loading page has not yet installed its guard. Fail closed instead of
+    // treating an unresponsive or reloading window as an empty window.
+    if existing.iter().any(|label| !inner.ready.contains(label)) {
+        quit_unavailable(
+            app,
+            "A window is still loading. Try quitting again when it is ready.",
+        );
+        return;
+    }
+    queue.retain(|label| existing.contains(label));
+    inner.next_round += 1;
+    let mut round = QuitRound::new(inner.next_round, queue);
+    let actions = round.next();
+    inner.quit = Some(round);
+    let exit = dispatch_quit_locked(app, &mut inner, actions);
+    drop(inner);
+    if exit {
+        finish_quit(app);
     }
 }
 
-/// Asks the next window, or exits when none is left. Windows whose page does
-/// not answer requests yet (still loading) have nothing to confirm.
-fn advance_quit(app: &AppHandle) {
-    let state = app.state::<WindowsState>();
-    loop {
-        let next = {
-            let mut inner = state.lock();
-            let ready = inner.ready.clone();
-            let Some(round) = inner.quit.as_mut() else {
-                return;
-            };
-            round.asking = None;
-            match round.queue.pop_front() {
-                Some(label) => {
-                    let id = round.id;
-                    if ready.contains(&label) {
-                        round.asking = Some(label.clone());
-                        Some((label, id))
-                    } else {
-                        continue;
+fn finish_quit(app: &AppHandle) {
+    let open = app.state::<WindowsState>().lock().open.clone();
+    save_open(app, &open);
+    app.exit(0);
+}
+
+#[derive(Clone, Serialize)]
+struct QuitResume {
+    round: u64,
+    ticket: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+fn quit_unavailable(app: &AppHandle, message: &str) {
+    let _ = app.emit(
+        "oarlock:quit-resume",
+        QuitResume {
+            round: 0,
+            ticket: None,
+            message: Some(message.to_owned()),
+        },
+    );
+}
+
+// Emit under the state lock so a newer request cannot overtake an older
+// release. IPC handlers acquire this same lock before accepting any vote.
+fn dispatch_quit_locked(app: &AppHandle, inner: &mut Inner, actions: Vec<QuitAction>) -> bool {
+    for action in actions {
+        match action {
+            QuitAction::Ask(label, request) => {
+                if app
+                    .emit_to(label.as_str(), QUIT_REQUESTED_EVENT, request)
+                    .is_err()
+                {
+                    cancel_quit_locked(app, inner);
+                    return false;
+                }
+            }
+            QuitAction::Verify(labels, request) => {
+                for label in labels {
+                    if app
+                        .emit_to(label.as_str(), QUIT_REQUESTED_EVENT, request)
+                        .is_err()
+                    {
+                        cancel_quit_locked(app, inner);
+                        return false;
                     }
                 }
-                None => {
-                    inner.quit = None;
-                    inner.quitting = true;
-                    None
-                }
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let state = app.state::<WindowsState>();
+                    let mut inner = state.lock();
+                    if inner.quit.as_ref().is_some_and(|round| {
+                        round.id == request.round && round.verifying(request.ticket)
+                    }) {
+                        cancel_quit_locked(&app, &mut inner);
+                        quit_unavailable(&app, "A window did not finish its final check. Your documents remain open; try quitting again.");
+                    }
+                });
             }
-        };
-        match next {
-            Some((label, id)) => {
-                if app
-                    .emit_to(label.as_str(), QUIT_REQUESTED_EVENT, id)
-                    .is_ok()
-                {
-                    return;
-                }
-                // Unreachable page: nothing to confirm there.
+            QuitAction::Resume(round, ticket) => {
+                let _ = app.emit(
+                    "oarlock:quit-resume",
+                    QuitResume {
+                        round,
+                        ticket,
+                        message: None,
+                    },
+                );
             }
-            None => {
-                let open = state.lock().open.clone();
-                save_open(app, &open);
-                app.exit(0);
-                return;
+            QuitAction::Exit => {
+                inner.quit = None;
+                inner.quitting = true;
+                return true;
             }
         }
+    }
+    if inner.quit.as_ref().is_some_and(|round| round.ended) {
+        inner.quit = None;
+    }
+    false
+}
+
+fn cancel_quit_locked(app: &AppHandle, inner: &mut Inner) {
+    let actions = inner
+        .quit
+        .as_mut()
+        .map(QuitRound::cancel)
+        .unwrap_or_default();
+    dispatch_quit_locked(app, inner, actions);
+}
+
+pub fn quit_answer(app: &AppHandle, label: &str, round: u64, ticket: u64, ok: bool) {
+    let state = app.state::<WindowsState>();
+    let mut inner = state.lock();
+    let actions = match inner.quit.as_mut() {
+        Some(active) if active.id == round => active.answer(label, ticket, ok),
+        _ => return,
+    };
+    let exit = dispatch_quit_locked(app, &mut inner, actions);
+    drop(inner);
+    if exit {
+        finish_quit(app);
     }
 }
 
-/// A window's answer to quit request `round`: `ok` once it confirmed and
-/// saved, else the quit is cancelled.
-pub fn quit_answer(app: &AppHandle, label: &str, round: u64, ok: bool) {
+#[tauri::command]
+pub fn app_quit_changed(app: AppHandle, window: tauri::Window, round: u64, ticket: u64) {
     let state = app.state::<WindowsState>();
-    let proceed = {
-        let mut inner = state.lock();
-        let current = inner
-            .quit
-            .as_ref()
-            .is_some_and(|quit| quit.id == round && quit.asking.as_deref() == Some(label));
-        if !current {
-            return;
-        }
-        if !ok {
-            inner.quit = None;
-        }
-        ok
+    let mut inner = state.lock();
+    let actions = match inner.quit.as_mut() {
+        Some(active) if active.id == round => active.changed(window.label(), ticket),
+        _ => return,
     };
-    if proceed {
-        advance_quit(app);
+    dispatch_quit_locked(&app, &mut inner, actions);
+}
+
+/// The watchdog only releases the local seal after native confirms that it
+/// cannot commit this round. Once exit is committed the seal must remain.
+#[tauri::command]
+pub fn app_quit_cancel(app: AppHandle, window: tauri::Window, round: u64) -> bool {
+    if !is_app_window(window.label()) {
+        return false;
     }
+    let state = app.state::<WindowsState>();
+    let mut inner = state.lock();
+    if inner.quitting {
+        return false;
+    }
+    if inner.quit.as_ref().is_some_and(|active| active.id == round) {
+        cancel_quit_locked(&app, &mut inner);
+    }
+    true
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -764,10 +795,12 @@ pub fn app_window_open(
 #[tauri::command]
 pub fn app_window_ready(app: AppHandle, window: tauri::Window) {
     if is_app_window(window.label()) {
-        app.state::<WindowsState>()
-            .lock()
-            .ready
-            .insert(window.label().to_owned());
+        let state = app.state::<WindowsState>();
+        let mut inner = state.lock();
+        inner.ready.insert(window.label().to_owned());
+        // A replaced guard may have missed a request sent while it was being
+        // installed, including when an old page's ready IPC arrived late.
+        cancel_quit_locked(&app, &mut inner);
     }
 }
 
@@ -778,8 +811,8 @@ pub fn app_quit(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn app_quit_ready(app: AppHandle, window: tauri::Window, round: u64, ok: bool) {
-    quit_answer(&app, window.label(), round, ok);
+pub fn app_quit_ready(app: AppHandle, window: tauri::Window, round: u64, ticket: u64, ok: bool) {
+    quit_answer(&app, window.label(), round, ticket, ok);
 }
 
 #[cfg(test)]
@@ -880,25 +913,29 @@ mod tests {
 
     #[test]
     fn closing_discards_a_window_only_while_another_stays_and_no_quit_runs() {
-        assert!(discards(false, "w-a", &labels(&["main"])));
-        assert!(discards(false, "main", &labels(&["w-a"])));
+        assert!(!discards(false, false, "w-a", &labels(&["main"])));
+        assert!(discards(true, false, "w-a", &labels(&["main"])));
+        assert!(discards(true, false, "main", &labels(&["w-a"])));
         // The last window keeps its state for the next launch.
-        assert!(!discards(false, "main", &[]));
-        assert!(!discards(false, "w-a", &labels(&["w-a"])));
+        assert!(!discards(true, false, "main", &[]));
+        assert!(!discards(true, false, "w-a", &labels(&["w-a"])));
         // Quitting keeps every window.
-        assert!(!discards(true, "w-a", &labels(&["main"])));
-        assert!(!discards(false, "settings", &labels(&["main"])));
+        assert!(!discards(true, true, "w-a", &labels(&["main"])));
+        assert!(!discards(true, false, "settings", &labels(&["main"])));
     }
 
     #[test]
-    fn the_window_list_round_trips_and_a_damaged_file_reads_as_empty() {
+    fn the_window_list_round_trips_and_rejects_damaged_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(REGISTRY_FILE);
-        assert!(read_registry(&path).is_empty());
+        assert!(restore::read_registry(&path).unwrap().is_empty());
         write_registry(&path, &labels(&["main", "w-a"])).unwrap();
-        assert_eq!(read_registry(&path), labels(&["main", "w-a"]));
+        assert_eq!(
+            restore::read_registry(&path).unwrap(),
+            labels(&["main", "w-a"])
+        );
         fs::write(&path, b"{not json").unwrap();
-        assert!(read_registry(&path).is_empty());
+        assert!(restore::read_registry(&path).is_err());
     }
 
     fn touch(path: &Path, text: &str) {
@@ -906,6 +943,7 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn main_adopts_a_window_by_taking_its_spaces_and_scrollback() {
         let dir = tempfile::tempdir().unwrap();
@@ -917,7 +955,8 @@ mod tests {
             &root.join("windows/w-a/terminal-scrollback/sb-1.vt"),
             "history",
         );
-        adopt_files(root, "w-a");
+        write_registry(&root.join(REGISTRY_FILE), &labels(&["w-a"])).unwrap();
+        restore::run(root).unwrap();
         assert_eq!(
             fs::read_to_string(root.join("oarlock-spaces.json")).unwrap(),
             "spaces of a"
@@ -927,7 +966,7 @@ mod tests {
             "history"
         );
         assert!(!root.join("terminal-scrollback/old.vt").exists());
-        assert!(!root.join("windows/w-a").exists());
+        assert!(!root.join("windows/w-a/oarlock-spaces.json").exists());
     }
 
     #[test]

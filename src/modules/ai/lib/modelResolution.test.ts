@@ -79,7 +79,8 @@ describe("buildConfiguredLanguageModel", () => {
     });
 
     // Built for the configured model and wrapped, so <think> tags become reasoning.
-    const provider = openaiCompatible.createOpenAICompatible.mock.results[0]?.value;
+    const provider =
+      openaiCompatible.createOpenAICompatible.mock.results[0]?.value;
     expect(model).toMatchObject({ modelId: "qwen3-32b" });
     expect(model).not.toBe(provider?.mock.results[0]?.value);
     expect(openaiCompatible.createOpenAICompatible).toHaveBeenCalledWith(
@@ -90,9 +91,9 @@ describe("buildConfiguredLanguageModel", () => {
   });
 
   it("rejects a compat model whose endpoint is unknown", () => {
-    expect(() =>
-      buildConfiguredLanguageModel("compat-missing", keys),
-    ).toThrow(/Custom endpoint not found: missing/);
+    expect(() => buildConfiguredLanguageModel("compat-missing", keys)).toThrow(
+      /Custom endpoint not found: missing/,
+    );
   });
 
   it("rejects a known endpoint without a model id", () => {
@@ -106,10 +107,73 @@ describe("buildConfiguredLanguageModel", () => {
   it("builds from the endpoint's configured model id and base URL", async () => {
     const model = await buildConfiguredLanguageModel("compat-e1", keys, {
       customEndpoints: compatEndpoint({}),
+      customEndpointKeys: { e1: null },
     });
     expect(model).toMatchObject({ modelId: "relay-model" });
     expect(openaiCompatible.createOpenAICompatible).toHaveBeenLastCalledWith(
       expect.objectContaining({ baseURL: "http://localhost:4000/v1" }),
     );
   });
+});
+
+it("restored legacy references use the migrated endpoint and cannot reuse it after deletion", async () => {
+  const local = {
+    openaiCompatibleBaseURL: "https://retired.example/v1",
+    openaiCompatibleModelId: "retired-model",
+    customEndpoints: [
+      {
+        id: "legacy",
+        name: "Migrated",
+        baseURL: "https://native-legacy.example/v1",
+        modelId: "native-model",
+        contextLimit: 64000,
+      },
+    ],
+    customEndpointKeys: {
+      legacy: { origin: "https://native-legacy.example", key: "native-key" },
+    },
+  };
+  const model = await buildConfiguredLanguageModel(
+    "openai-compatible-custom",
+    keys,
+    local,
+  );
+  expect(model).toMatchObject({ modelId: "native-model" });
+  expect(openaiCompatible.createOpenAICompatible).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      baseURL: "https://native-legacy.example/v1",
+      apiKey: "native-key",
+    }),
+  );
+  expect(() =>
+    buildConfiguredLanguageModel("openai-compatible-custom", keys, {
+      ...local,
+      customEndpoints: [],
+    }),
+  ).toThrow("Custom endpoint not found: legacy");
+});
+
+it("cannot reuse a cached endpoint model after credential readiness is invalidated", async () => {
+  const endpoints = compatEndpoint({});
+  const config = {
+    customEndpoints: endpoints,
+    customEndpointKeys: { e1: null },
+  };
+  await buildConfiguredLanguageModel(
+    "compat-e1",
+    { ...EMPTY_PROVIDER_KEYS },
+    config,
+  );
+  for (const status of ["loading", "failed"] as const) {
+    expect(() =>
+      buildConfiguredLanguageModel(
+        "compat-e1",
+        { ...EMPTY_PROVIDER_KEYS },
+        {
+          ...config,
+          customEndpointKeys: { e1: { status } },
+        },
+      ),
+    ).toThrow(/loading|Could not read/);
+  }
 });

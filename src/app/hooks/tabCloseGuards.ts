@@ -1,7 +1,8 @@
+import { pathKey } from "@/lib/pathKey";
 import type { CloseTabsPlan, Tab } from "@/modules/tabs";
 
 function normalizePath(path: string): string {
-  return path.replace(/\\/g, "/");
+  return pathKey(path);
 }
 
 export function pathAtOrUnder(path: string, root: string): boolean {
@@ -27,7 +28,7 @@ export function renamedPath(
 export function hasOpenPathTab(tabs: readonly Tab[], path: string): boolean {
   return tabs.some(
     (tab) =>
-      (tab.kind === "editor" || tab.kind === "markdown") &&
+      (tab.kind === "markdown" || (tab.kind === "editor" && !tab.detached)) &&
       pathAtOrUnder(tab.path, path),
   );
 }
@@ -63,6 +64,28 @@ export type CloseHazardSnapshot = {
   dirtyIds: number[];
   leafIds: number[];
 };
+
+export function partitionDeletedTabs(
+  tabs: readonly Tab[],
+  ids: readonly number[],
+  isDirty: (id: number) => boolean | undefined = () => undefined,
+): { cleanIds: number[]; dirtyIds: number[] } {
+  const selected = new Set(ids);
+  const cleanIds: number[] = [],
+    dirtyIds: number[] = [];
+  for (const tab of tabs) {
+    if (
+      !selected.has(tab.id) ||
+      (tab.kind !== "editor" && tab.kind !== "markdown")
+    )
+      continue;
+    (tab.kind === "editor" && (isDirty(tab.id) ?? tab.dirty)
+      ? dirtyIds
+      : cleanIds
+    ).push(tab.id);
+  }
+  return { cleanIds, dirtyIds };
+}
 
 export function deletedPathTabs(
   tabs: readonly Tab[],

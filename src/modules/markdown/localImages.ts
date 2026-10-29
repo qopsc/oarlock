@@ -25,6 +25,8 @@ export function dirOf(path: string): string {
  */
 export function joinPath(dir: string, rel: string): string {
   const parts = `${dir}/${rel}`.replace(/\\/g, "/").split("/");
+  // A UNC root includes its server and share, not just the leading slashes.
+  const rootDepth = /^\/\/[^/]+\/[^/]+/.test(dir.replace(/\\/g, "/")) ? 4 : 0;
   const out: string[] = [];
   for (const part of parts) {
     if (part === ".") continue;
@@ -35,7 +37,12 @@ export function joinPath(dir: string, rel: string): string {
     }
     if (part === "..") {
       const last = out[out.length - 1];
-      if (last !== undefined && last !== "" && !/^[A-Za-z]:$/.test(last)) {
+      if (
+        out.length > rootDepth &&
+        last !== undefined &&
+        last !== "" &&
+        !/^[A-Za-z]:$/.test(last)
+      ) {
         out.pop();
       }
       continue;

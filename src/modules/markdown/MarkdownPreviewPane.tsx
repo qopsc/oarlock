@@ -1,15 +1,22 @@
 import { pathKey } from "@/lib/pathKey";
 import { cn } from "@/lib/utils";
+import type { DocumentMutation } from "@/modules/editor/lib/documentMutations";
 import { listenFsChanged } from "@/modules/explorer/lib/watch";
 import { PrivacyRefusalNotice, usePrivacyRefusal } from "@/modules/mac-privacy";
 import { useTheme, variantMode } from "@/modules/theme";
-import { currentWorkspaceEnv } from "@/modules/workspace";
 import { authorizationSettled } from "@/modules/workspace/authorize";
+import {
+  type WorkspaceEnv,
+  workspaceEnvForPath,
+  workspaceScopeKey,
+} from "@/modules/workspace/env";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useState } from "react";
-import { MarkdownViewToggle } from "./MarkdownViewToggle";
 import { dirOf } from "./localImages";
+import { PreviewImagesVisible } from "./MarkdownImage";
+import { MarkdownViewToggle } from "./MarkdownViewToggle";
 import {
   type PreviewReadResult,
   type PreviewStatus,
@@ -27,7 +34,7 @@ type Props = {
 // Re-renders when the file changes on disk: the watcher reports it (the
 // watch set covers Markdown tabs), and writes made through Oarlock (AI edits,
 // editor saves) are announced at once.
-function useFileRevision(path: string): number {
+function useFileRevision(path: string, workspace: WorkspaceEnv): number {
   const [revision, setRevision] = useState(0);
   useEffect(() => {
     const key = pathKey(path);
@@ -46,18 +53,29 @@ function useFileRevision(path: string): number {
         bump([e.payload.path]),
       )
       .then(keep);
+    void getCurrentWebviewWindow()
+      .listen<DocumentMutation>("fs:mutation", (e) => {
+        if (
+          e.payload.kind === "renamed" &&
+          workspaceScopeKey(e.payload.workspace) ===
+            workspaceScopeKey(workspace)
+        )
+          bump([e.payload.to]);
+      })
+      .then(keep);
     return () => {
       alive = false;
       for (const un of unlisteners) un();
     };
-  }, [path]);
+  }, [path, workspace]);
   return revision;
 }
 
 export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
+  const workspace = workspaceEnvForPath(path, useOwnedWorkspace());
   const [status, setStatus] = useState<PreviewStatus>({ kind: "loading" });
   const [shownPath, setShownPath] = useState(path);
-  const revision = useFileRevision(path);
+  const revision = useFileRevision(path, workspace);
   const { activeTheme, resolvedMode } = useTheme();
 
   if (shownPath !== path) {
@@ -73,11 +91,11 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
     // Each reported change of the file reads it again.
     void revision;
     let cancelled = false;
-    authorizationSettled(path)
+    authorizationSettled(path, workspace)
       .then(() =>
         invoke<PreviewReadResult>("fs_read_file", {
           path,
-          workspace: currentWorkspaceEnv(),
+          workspace,
         }),
       )
       .then(
@@ -93,7 +111,7 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [path, revision]);
+  }, [path, revision, workspace]);
 
   return (
     <div
@@ -109,11 +127,13 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
           // sheet never reaches the notices below.
           <article className="markdown-body select-text">
             <RenderBoundary resetKey={status.content} fallback={renderFailed}>
-              <RenderedMarkdown
-                content={status.content}
-                baseDir={dirOf(path)}
-                colorScheme={variantMode(activeTheme, resolvedMode)}
-              />
+              <PreviewImagesVisible value={visible}>
+                <RenderedMarkdown
+                  content={status.content}
+                  baseDir={dirOf(path)}
+                  colorScheme={variantMode(activeTheme, resolvedMode)}
+                />
+              </PreviewImagesVisible>
             </RenderBoundary>
           </article>
         ) : (

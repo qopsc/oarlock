@@ -10,6 +10,9 @@ type Request = {
 };
 
 const mocks = vi.hoisted(() => ({
+  workspace: { kind: "local" } as
+    | { kind: "local" }
+    | { kind: "wsl"; distro: string },
   invoke: vi.fn(),
   signal: null as
     | null
@@ -33,7 +36,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 vi.mock("@/modules/workspace", () => ({
-  currentWorkspaceEnv: () => null,
+  currentWorkspaceEnv: () => mocks.workspace,
 }));
 
 // The bridge owns a process-wide hub, so every test gets a fresh module graph.
@@ -114,6 +117,18 @@ describe("PTY bridge over the multiplexed stream", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("keeps the spawn environment across delayed stream startup", async () => {
+    const { openPty } = await load();
+    nativeInvoke();
+    const owner = { kind: "wsl", distro: "Ubuntu" } as const;
+    mocks.workspace = owner;
+    const pending = openPty(80, 24, { onData: () => {} });
+    mocks.workspace = { kind: "wsl", distro: "Debian" };
+    const session = await pending;
+    expect(openArguments().workspace).toEqual(owner);
+    await session.close();
   });
 
   it("subscribes before spawning and updates agent icons through exit and close", async () => {

@@ -35,6 +35,7 @@ export {
 export { equalizePanes, resizeActivePane } from "./lib/paneLayout";
 export {
   setTerminalFileOpener,
+  setTerminalLinkNavigation,
   setTerminalPreviewOpener,
 } from "./lib/terminalLinkOpen";
 export { startWindowProgress } from "./lib/windowProgress";

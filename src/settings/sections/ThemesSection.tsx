@@ -28,6 +28,7 @@ import {
 } from "@/modules/settings/store";
 import { currentPlatform } from "@/modules/settings/terminalBehavior";
 import { useTheme } from "@/modules/theme";
+import { deleteThemeSelection } from "@/modules/theme/themeDeletion";
 import {
   deleteBgImage,
   importBgImageFromFile,
@@ -43,10 +44,7 @@ import {
 } from "@/modules/theme/themeFiles";
 import { listBuiltinThemes } from "@/modules/theme/themes";
 import { DEFAULT_THEME_ID, type Theme } from "@/modules/theme/types";
-import {
-  type Backdrop,
-  getBackdropKind,
-} from "@/modules/theme/vibrancy";
+import { type Backdrop, getBackdropKind } from "@/modules/theme/vibrancy";
 import { Edit02Icon, PlusSignIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -59,7 +57,15 @@ import { ThemePastePanel } from "../components/ThemePastePanel";
 const loadThemeImporter = () => import("@/modules/theme/schemes/importTheme");
 
 export function ThemesSection() {
-  const { themeId, setThemeId, resolvedMode, customThemes } = useTheme();
+  const {
+    themeId,
+    setThemeId,
+    resolvedMode,
+    customThemes,
+    customThemesError,
+    customThemesReady,
+    retryCustomThemes,
+  } = useTheme();
   const builtinThemes = listBuiltinThemes();
   const themes = useMemo(
     () => [...builtinThemes, ...customThemes],
@@ -69,6 +75,9 @@ export function ThemesSection() {
     () => new Set(customThemes.map((t) => t.id)),
     [customThemes],
   );
+
+  const selectedTheme = useRef(themeId);
+  selectedTheme.current = themeId;
 
   const [importError, setImportError] = useState<string | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
@@ -103,6 +112,10 @@ export function ThemesSection() {
   }, []);
 
   const commitImported = async (imported: Theme[], errors: string[]) => {
+    if (!customThemesReady) {
+      setImportError("Custom themes are not ready. Retry loading them first.");
+      return false;
+    }
     const problems = [...errors];
     if (imported.length > 0) {
       try {
@@ -110,7 +123,7 @@ export function ThemesSection() {
         setThemeId(imported[0].id);
       } catch (e) {
         console.error("[oarlock] saving imported themes failed:", e);
-        problems.push("Could not save the imported theme.");
+        problems.push(`Could not save the imported theme: ${String(e)}`);
       }
     }
     setImportError(problems.length > 0 ? problems.join("\n") : null);
@@ -156,9 +169,17 @@ export function ThemesSection() {
   const onPickThemeFile = () => fileInputRef.current?.click();
 
   const onRemoveCustomTheme = async (id: string) => {
-    if (themeId === id) setThemeId(DEFAULT_THEME_ID);
-    await deleteCustomTheme(id);
-    void deleteThemeFile(id);
+    try {
+      await deleteThemeSelection(
+        id,
+        deleteCustomTheme,
+        () => selectedTheme.current,
+        () => setThemeId(DEFAULT_THEME_ID),
+      );
+      await deleteThemeFile(id);
+    } catch (error) {
+      setImportError(String(error));
+    }
   };
 
   const onPickBgFile = () => bgInputRef.current?.click();
@@ -196,6 +217,31 @@ export function ThemesSection() {
         title="Themes"
         description="Theme, background image, and customization."
       />
+
+      {customThemesError ? (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 p-3 text-sm"
+        >
+          <p>
+            Custom themes could not be loaded. Your files have been preserved.
+          </p>
+          <p className="mt-1 break-words text-xs text-muted-foreground">
+            {customThemesError}
+          </p>
+          <Button
+            className="mt-2"
+            variant="outline"
+            onClick={retryCustomThemes}
+          >
+            Retry
+          </Button>
+        </div>
+      ) : !customThemesReady ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Loading custom themes…
+        </p>
+      ) : null}
 
       {backdrop === "none" ? null : (
         <SettingRow
@@ -256,6 +302,7 @@ export function ThemesSection() {
               variant="outline"
               size="sm"
               className="h-7 gap-1.5 px-2 text-[11px]"
+              disabled={!customThemesReady}
               onClick={onCreateTheme}
             >
               <HugeiconsIcon icon={PlusSignIcon} size={11} strokeWidth={2} />
@@ -266,6 +313,7 @@ export function ThemesSection() {
               size="sm"
               className="h-7 px-2 text-[11px]"
               title="Import a .oarlock-theme, or a Ghostty, iTerm2, Alacritty or Windows Terminal colour scheme"
+              disabled={!customThemesReady}
               onClick={onPickThemeFile}
             >
               Import…
@@ -274,6 +322,7 @@ export function ThemesSection() {
               variant="outline"
               size="sm"
               className="h-7 px-2 text-[11px]"
+              disabled={!customThemesReady}
               aria-expanded={pasteOpen}
               onClick={() => {
                 setImportError(null);
@@ -295,8 +344,8 @@ export function ThemesSection() {
           />
         </div>
         <p className="text-[11px] text-muted-foreground">
-          Import, paste or drop a .oarlock-theme, or a Ghostty, iTerm2, Alacritty
-          or Windows Terminal colour scheme.
+          Import, paste or drop a .oarlock-theme, or a Ghostty, iTerm2,
+          Alacritty or Windows Terminal colour scheme.
         </p>
         {pasteOpen ? (
           <ThemePastePanel
@@ -370,7 +419,7 @@ export function ThemesSection() {
                       className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                       onClick={(e) => {
                         e.stopPropagation();
-                        onEditTheme(t.id);
+                        if (customThemesReady) onEditTheme(t.id);
                       }}
                     >
                       <HugeiconsIcon
@@ -385,7 +434,7 @@ export function ThemesSection() {
                       className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-destructive"
                       onClick={(e) => {
                         e.stopPropagation();
-                        void onRemoveCustomTheme(t.id);
+                        if (customThemesReady) void onRemoveCustomTheme(t.id);
                       }}
                     >
                       ×

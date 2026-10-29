@@ -5,12 +5,16 @@
     "types": ["node"]
   },
   "include": [
+    "../src/vite-env.d.ts",
     "lib",
     "eager-graph.test.ts",
     "symbols-font",
     "nerd-font-constraints",
     "jetbrains-mono",
     "pty-smoke/run.ts",
+    "terminal-search",
+    "editor-search",
+    "vim-review",
     "ipc-profile/run.ts",
     "renderer-profile/lab_report.ts",
     "renderer-profile/lab_report.test.ts",
