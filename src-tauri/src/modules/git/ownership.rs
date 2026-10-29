@@ -183,7 +183,7 @@ fn authorize_metadata(
     ))
 }
 
-fn reciprocal_worktree(root: &Path, git: &Path, common: &Path) -> Result<bool> {
+pub(crate) fn reciprocal_worktree(root: &Path, git: &Path, common: &Path) -> Result<bool> {
     // A gitfile alone grants no access. Only Git's linked-worktree layout with
     // an exact backlink to this worktree's marker can share external metadata.
     if git == common || git.parent() != Some(common.join("worktrees").as_path()) {
@@ -203,7 +203,7 @@ fn context_changed() -> GitError {
 
 /// Resolve gitfiles and linked-worktree commondir without executing Git or
 /// traversing an unbounded file. Explicit execution paths bypass these pointers.
-fn layout(root: &Path, bare: bool) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn layout(root: &Path, bare: bool) -> Result<(PathBuf, PathBuf)> {
     let marker = root.join(".git");
     let git = if bare {
         root.to_path_buf()

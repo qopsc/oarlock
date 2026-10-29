@@ -69,6 +69,7 @@ pub fn privatize(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn inherit_directory(source: &File, target: &File) -> io::Result<()> {
     read(source)?; // Refuse filesystems with a different ACL model.
     const DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";

@@ -1,10 +1,18 @@
 //! A content file is created only after its parent is private. An early handle
 //! to the empty directory cannot retain read access to a not-yet-created file.
-use super::{access_control::AccessControl, file_identity::entry_matches};
-use cap_std::fs::{Dir, DirBuilder, OpenOptions};
-use std::{fs::File, io, path::Path};
+use super::access_control::AccessControl;
+#[cfg(not(target_os = "linux"))]
+use super::file_identity::entry_matches;
+use cap_std::fs::Dir;
+#[cfg(not(target_os = "linux"))]
+use cap_std::fs::{DirBuilder, OpenOptions};
+#[cfg(not(target_os = "linux"))]
+use std::path::Path;
+use std::{fs::File, io};
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) const CONTENT: &str = "content";
+#[cfg(not(target_os = "linux"))]
 pub(crate) struct PrivateDirectory {
     parent: Option<Dir>,
     name: String,
@@ -13,6 +21,7 @@ pub(crate) struct PrivateDirectory {
     directory: Dir,
     identity: File,
 }
+#[cfg(not(target_os = "linux"))]
 impl PrivateDirectory {
     #[cfg(target_os = "macos")]
     pub(crate) fn for_destination(destination: &Dir) -> io::Result<Self> {
@@ -199,6 +208,7 @@ impl PrivateDirectory {
         Err(io::Error::other("Missing staging parent"))
     }
 }
+#[cfg(not(target_os = "linux"))]
 impl Drop for PrivateDirectory {
     fn drop(&mut self) {
         if self.verify().is_err() {
@@ -225,11 +235,28 @@ impl Drop for PrivateDirectory {
 }
 
 pub(crate) struct PrivateCandidate {
+    #[cfg(not(target_os = "linux"))]
     directory: PrivateDirectory,
+    #[cfg(not(target_os = "linux"))]
     file: File,
+    #[cfg(target_os = "linux")]
+    candidate: super::linux_staging::Candidate,
 }
 impl PrivateCandidate {
     pub fn create(destination: &Dir) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                candidate: super::linux_staging::Candidate::create(destination)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::create_named(destination)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn create_named(destination: &Dir) -> io::Result<Self> {
         #[cfg(target_os = "macos")]
         let directory = PrivateDirectory::for_destination(destination)?;
         #[cfg(not(target_os = "macos"))]
@@ -256,22 +283,66 @@ impl PrivateCandidate {
         Ok(candidate)
     }
     pub fn file(&self) -> &File {
-        &self.file
+        #[cfg(target_os = "linux")]
+        {
+            self.candidate.file()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &self.file
+        }
     }
+    #[cfg(not(target_os = "linux"))]
     pub fn directory(&self) -> &Dir {
         &self.directory.directory
     }
     pub fn verify(&self) -> io::Result<()> {
-        self.directory.verify()?;
-        outside_worktrees(&self.directory.identity)?;
-        if !entry_matches(self.directory(), Path::new(CONTENT), &self.file)? {
-            return Err(io::Error::other("Private staging content changed"));
+        #[cfg(target_os = "linux")]
+        {
+            self.candidate.verify()
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.directory.verify()?;
+            outside_worktrees(&self.directory.identity)?;
+            if !entry_matches(self.directory(), Path::new(CONTENT), &self.file)? {
+                return Err(io::Error::other("Private staging content changed"));
+            }
+            Ok(())
+        }
+    }
+    pub fn publish_to(
+        &mut self,
+        destination: &Dir,
+        name: &std::ffi::OsStr,
+        replace: bool,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.candidate.publish(destination, name, replace)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if replace {
+                self.directory().rename(CONTENT, destination, name)
+            } else {
+                self.directory().hard_link(CONTENT, destination, name)
+            }
+        }
     }
     pub fn inheritance_from(&self, destination: &Dir) -> io::Result<AccessControl> {
-        // Reproduce kernel inheritance using an EMPTY probe below the private
-        // directory. Neither probe nor candidate ever enters the worktree.
+        #[cfg(target_os = "linux")]
+        {
+            self.candidate.inheritance_from(destination)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.named_inheritance_from(destination)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn named_inheritance_from(&self, destination: &Dir) -> io::Result<AccessControl> {
+        // Reproduce inheritance with an empty probe in the private directory.
         let probe = PrivateDirectory::create(self.directory())?;
         let source = destination.try_clone()?.into_std_file();
         let mut file = None;
@@ -306,6 +377,7 @@ impl PrivateCandidate {
         result
     }
 }
+#[cfg(not(target_os = "linux"))]
 impl Drop for PrivateCandidate {
     fn drop(&mut self) {
         if entry_matches(self.directory(), Path::new(CONTENT), &self.file).unwrap_or(false) {
@@ -316,7 +388,7 @@ impl Drop for PrivateCandidate {
     }
 }
 
-fn outside_worktrees(directory: &File) -> io::Result<()> {
+pub(super) fn outside_worktrees(directory: &File) -> io::Result<()> {
     let path = super::attachment::handle_path(directory).map_err(io::Error::other)?;
     for ancestor in path.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(".git")) {
@@ -333,6 +405,7 @@ fn outside_worktrees(directory: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn staging_root(destination: &Dir, path: &Path) -> io::Result<Dir> {
     let root = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
     outside_worktrees(&root.try_clone()?.into_std_file())?;

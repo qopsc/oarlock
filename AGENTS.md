@@ -3974,9 +3974,14 @@ on the destination volume, opens and verifies the resulting directory, and refus
 ancestor .git markers (including linked-worktree files). macOS does not permit
 opening its shared TemporaryItems parent, so cleanup rechecks the directory's
 identity through its returned path; a separate same-user process can race that
-final check. Other platforms currently use the OS temporary directory and require
-the destination filesystem. The operation-owned directory is made private before
-any content file is created. No editor placeholder or content file
+final check. Linux opens an `O_TMPFILE` in the target directory and holds a file
+lock until publication. Existing files are linked through a private Git common
+directory on the same filesystem, a hidden sibling outside repositories, or a
+private same-filesystem cache fallback. Before each save, only matching regular
+staging entries older than one minute whose locks are available are removed; no
+journal or startup sweep is used. A file in a repository with no safe staging
+location is refused. Other platforms retain their existing safe-refusal policy.
+The operation-owned directory is private before content is linked into it. No editor placeholder or content file
 is created in the worktree. New-file inheritance is reproduced with an empty
 kernel-created probe below the private directory, using the destination parent's
 ACL inheritance and group rules. Probes are cleared and removed without exposing

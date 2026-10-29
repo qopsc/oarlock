@@ -12,6 +12,8 @@ pub mod grep;
 pub mod index;
 pub mod interactive;
 pub mod launch;
+#[cfg(target_os = "linux")]
+mod linux_staging;
 pub mod mutate;
 pub mod mutation_events;
 pub(crate) mod private_staging;

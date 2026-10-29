@@ -9,7 +9,7 @@ pub mod discard;
 pub mod errors;
 pub mod index_publication;
 pub mod operations;
-mod ownership;
+pub(crate) mod ownership;
 pub mod parser;
 pub(crate) mod process;
 mod remote_guard;

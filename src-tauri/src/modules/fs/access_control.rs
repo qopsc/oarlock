@@ -74,12 +74,14 @@ pub(crate) struct AccessControl {
 }
 
 impl AccessControl {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn privatize_empty_probe(file: &File) -> io::Result<()> {
         if !file.metadata()?.is_file() || file.metadata()?.len() != 0 {
             return Err(io::Error::other("Inheritance probe is not empty"));
         }
         platform::privatize(file)
     }
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn prepare_inheritance(source: &File, private: &File) -> io::Result<()> {
         let before = super::document_save::change_stamp(source)?;
         let meta = source.metadata()?;

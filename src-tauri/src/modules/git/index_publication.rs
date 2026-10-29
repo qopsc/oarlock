@@ -9,11 +9,7 @@ use super::{
     utils::owned_repo_root,
 };
 use crate::modules::{
-    fs::{
-        access_control::AccessControl,
-        document_save,
-        private_staging::{PrivateCandidate, CONTENT},
-    },
+    fs::{access_control::AccessControl, document_save, private_staging::PrivateCandidate},
     workspace::{WorkspaceEnv, WorkspaceRegistry},
 };
 use cap_std::fs::{Dir, OpenOptions};
@@ -214,7 +210,7 @@ impl IndexSnapshot {
         let inherited = AccessControl::prepare_staging(&lock.file)?;
         // The public reservation stays empty. Readers that opened it before
         // ACL restriction never receive candidate contents through that handle.
-        let candidate = PrivateCandidate::create(&self.directory)?;
+        let mut candidate = PrivateCandidate::create(&self.directory)?;
         candidate.file().write_all(planned.bytes())?;
         let access = self.access.as_ref().unwrap_or(&inherited);
         access.apply(candidate.file())?;
@@ -229,9 +225,7 @@ impl IndexSnapshot {
             return Err(rejected("Index lock changed during preparation"));
         }
         let prepared = candidate.file().try_clone()?;
-        candidate
-            .directory()
-            .rename(CONTENT, &self.directory, "index.lock")?;
+        candidate.publish_to(&self.directory, std::ffi::OsStr::new("index.lock"), true)?;
         lock.file = prepared;
         // Persist the prepared lock entry as well as its contents before the
         // commit point, so a power loss cannot erase the recovery evidence.

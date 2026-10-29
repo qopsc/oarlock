@@ -1,6 +1,6 @@
 //! Operation-scoped directory capabilities. After acquisition, no mutation or
 //! temporary-file cleanup resolves an absolute destination path again.
-use super::private_staging::{PrivateCandidate, CONTENT};
+use super::private_staging::PrivateCandidate;
 use cap_std::fs::{Dir, OpenOptions};
 use std::{
     ffi::OsString,
@@ -153,7 +153,7 @@ impl Staged<'_> {
     pub fn file(&self) -> &fs::File {
         self.candidate.file()
     }
-    pub fn persist(self, replace: bool) -> io::Result<fs::File> {
+    pub fn persist(mut self, replace: bool) -> io::Result<fs::File> {
         let dir = &self.destination.dir;
         // Allocate the returned handle before publication, never after commit.
         let file = self.file().try_clone()?;
@@ -163,24 +163,17 @@ impl Staged<'_> {
         self.candidate.verify()?;
         // A cooperating external writer can still change the final destination
         // after its last version check; this is not a filesystem-wide CAS.
-        if replace {
-            self.candidate
-                .directory()
-                .rename(CONTENT, dir, &self.destination.name)
-                .map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "Atomic replacement failed for {}: {error}",
-                            self.destination.opened.display()
-                        ),
-                    )
-                })?;
-        } else {
-            self.candidate
-                .directory()
-                .hard_link(CONTENT, dir, &self.destination.name)?;
-        }
+        self.candidate
+            .publish_to(dir, &self.destination.name, replace)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Atomic replacement failed for {}: {error}",
+                        self.destination.opened.display()
+                    ),
+                )
+            })?;
         Ok(file)
     }
 }
@@ -327,7 +320,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn substituted_symlinks_and_fifos_are_not_followed_or_removed() {
         use std::os::unix::{ffi::OsStrExt, fs::symlink};
@@ -354,6 +347,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn substituted_staging_entry_is_never_published_or_deleted() {
         for publish in [true, false] {
@@ -453,6 +447,7 @@ mod tests {
             assert_eq!(fs::read(moved.join("document")).unwrap(), b"draft");
             assert_eq!(fs::read(outside.join("document")).unwrap(), b"outside");
             assert_eq!(fs::read(outside.join(temporary_name)).unwrap(), b"sentinel");
+            #[cfg(not(target_os = "linux"))]
             assert!(!stage_path.exists());
         }
     }
@@ -468,7 +463,7 @@ mod tests {
         let staged = dest.stage(b"draft").unwrap();
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
-        fs::write(parent.join(CONTENT), b"sentinel").unwrap();
+        fs::write(parent.join("content"), b"sentinel").unwrap();
         drop(staged);
         assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
         assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
