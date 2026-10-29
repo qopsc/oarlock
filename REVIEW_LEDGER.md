@@ -3950,3 +3950,23 @@ Each row below was checked against the current implementation. Except for R020, 
 | R214 | Tier 2 | Git gutter baseline still drops a response received before the CodeMirror view exists. |
 
 Tier assignments are ordering priorities, not new severity determinations or proof of reproduced loss. Tier 1 AI entries remain held for the backend replacement; Windows-only entries remain relevant to the future port. No other production fixes were made during triage.
+
+## Tier 1 fix checkpoint
+
+Three further findings are fixed in addition to R020:
+
+| ID | Commit | Change and verification |
+| --- | --- | --- |
+| R076 | `977dbbf` | The terminal writer stops and reports a persistent visible error on queue overflow or failed write rather than sending later input. Detachment invalidates a late old-PTY failure. Regression tests reproduce the previous behavior and cover overflow and replacement. Full frontend tests passed (5,493, 2 skipped), types and lint passed, macOS Rust Clippy and the native suite passed. An already-dispatched OS write cannot be recalled. |
+| R087 | `506790e` | Replacing the shared shell editor's draft resets its existing CodeMirror history compartment. Undo no longer brings in another leaf's draft; edits within the current leaf remain undoable. Regression uses real CodeMirror state. Undo history is cleared on each leaf switch. Full frontend tests passed (5,494, 2 skipped), types and lint passed. |
+| R009 | `051af2c` | Explorer delete confirmations capture workspace identity and the selected paths; changing either cancels the action. Explorer selection clears on workspace/root change. Regression checks matching, reordered and changed selections and workspace identity. Full frontend tests passed (5,495, 2 skipped), types and lint passed. A live cross-environment menu interaction was not reproduced. |
+
+Updated group counts: **4 closed, 0 duplicates; 52 open: Tier 1 = 9, Tier 2 = 27, Tier 3 = 15, Tier 4 = 1.** The remaining Tier 1 entries are R035, R038, R080, R144, R149, R163, R201, R202 and R212. R144, R149 and R163 concern AI and remain on hold. R035 and R202 concern WSL; their port remains lower priority. Prior tier rows above record the status at the time of the triage and are superseded by this checkpoint.
+
+### AP014 — ordered terminal input during asynchronous paste (proposal, not implemented)
+
+**Reproduction:** a controlled `GhosttyInputController` test delays its clipboard snapshot, dispatches Paste then Enter, and observes the PTY receive Enter before the pasted text. The temporary reproduction was removed after the test; `/private/tmp/oarlock-r080-reproduction.log` records the run. The existing PTY writer orders only bytes after they reach it, so it cannot order events while clipboard capture or paste confirmation is pending.
+
+**Options:** (1) introduce a bounded per-terminal input gate that holds subsequent terminal-bound key/text/composition and paste operations in arrival order until the pending capture and any confirmation resolve, releases them in order, and cancels on terminal disposal/restart. Define clear failure/overflow behavior and cover IME, Kitty keyboard replies, prompt-mode routing, simultaneous pastes and focus changes. (2) cancel a pending paste when later input arrives and tell the user; this is simpler but lets an incomplete command receive Enter and would not preserve the requested input order. (3) suppress later input until the paste finishes and show that input was not sent; this avoids reordering but discards keystrokes.
+
+**Recommendation:** option 1, using the existing terminal lifetime and bounded fail-stop policy while adding the missing input-order gate. The gate is a new mechanism, and needs an explicit decision under the standing triage rule. No R080 production code was changed. No push.
