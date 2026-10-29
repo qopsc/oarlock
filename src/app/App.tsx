@@ -498,6 +498,10 @@ export default function App() {
     (id: number) => editorRefs.current.get(id)?.hasUnsavedChanges(),
     [],
   );
+  const editorCloseRevision = useCallback(
+    (id: number) => editorRefs.current.get(id)?.closeRevision(),
+    [],
+  );
 
   const {
     pendingCloseTab,
@@ -521,15 +525,12 @@ export default function App() {
     tabs,
     activeId,
     editorIsDirty,
+    editorCloseRevision,
     disposeTab,
     disposeDeletedTabs,
     disposeTabs,
   });
 
-  const editorCloseRevision = useCallback(
-    (id: number) => editorRefs.current.get(id)?.closeRevision(),
-    [],
-  );
   const { pendingAppClose, confirmAppClose, cancelAppClose } = useAppCloseGuard(
     tabsRef,
     editorIsDirty,

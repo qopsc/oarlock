@@ -7,6 +7,7 @@ import {
   hasCloseManyHazards,
   hasNewCloseManyHazards,
 } from "@/app/hooks/tabCloseGuards";
+import { hasNewEdits } from "@/app/hooks/quitApproval";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   type CloseTabsPlan,
@@ -26,6 +27,7 @@ type Params = {
   tabs: Tab[];
   activeId: number;
   editorIsDirty?: (id: number) => boolean | undefined;
+  editorCloseRevision?: (id: number) => string | undefined;
   disposeTab: (id: number) => void;
   disposeDeletedTabs: (ids: number[]) => void;
   disposeTabs: (anchorId: number, plan: CloseTabsPlan) => void;
@@ -40,6 +42,7 @@ export function useTabCloseGuards({
   tabs,
   activeId,
   editorIsDirty,
+  editorCloseRevision,
   disposeTab,
   disposeDeletedTabs,
   disposeTabs,
@@ -61,6 +64,7 @@ export function useTabCloseGuards({
     useState<CloseManyPending | null>(null);
   const [closeManyConfirming, setCloseManyConfirming] = useState(false);
   const closeManyRequestRef = useRef(0);
+  const acknowledgedRevisionsRef = useRef(new Map<number, unknown>());
 
   const handleClose = useCallback(
     async (id: number) => {
@@ -100,6 +104,18 @@ export function useTabCloseGuards({
     };
   }, [editorIsDirty]);
 
+  const dirtyRevisions = useCallback((closeIds: number[]) => {
+    const close = new Set(closeIds);
+    const revisions = new Map<number, unknown>();
+    for (const tab of tabsRef.current) {
+      if (close.has(tab.id) && tab.kind === "editor" &&
+          (editorIsDirty?.(tab.id) ?? tab.dirty)) {
+        revisions.set(tab.id, editorCloseRevision?.(tab.id) ?? tab);
+      }
+    }
+    return revisions;
+  }, [editorIsDirty, editorCloseRevision]);
+
   const evaluateCloseMany = useCallback(
     (closeIds: number[]): Promise<CloseManyHazards> =>
       evaluateCloseHazards(
@@ -131,15 +147,18 @@ export function useTabCloseGuards({
       const plan = planCloseMany(kind, anchorId);
       if (plan.closeIds.length === 0) return;
       const requestId = ++closeManyRequestRef.current;
-      const hazards = await evaluateCloseMany(plan.closeIds);
+      const evaluated = await evaluateCloseMany(plan.closeIds);
       if (requestId !== closeManyRequestRef.current) return;
+      const revisions = dirtyRevisions(plan.closeIds);
+      const hazards = { ...evaluated, dirtyIds: [...revisions.keys()] };
       if (hasCloseManyHazards(hazards)) {
+        acknowledgedRevisionsRef.current = revisions;
         setPendingCloseMany({ kind, anchorId, plan, ...hazards });
         return;
       }
       disposeTabs(anchorId, withCurrentActive(plan));
     },
-    [disposeTabs, evaluateCloseMany, planCloseMany, withCurrentActive],
+    [disposeTabs, dirtyRevisions, evaluateCloseMany, planCloseMany, withCurrentActive],
   );
 
   const handleCloseTabsToRight = useCallback(
@@ -160,9 +179,13 @@ export function useTabCloseGuards({
     if (pendingCloseMany === null) return;
     const requestId = ++closeManyRequestRef.current;
     setCloseManyConfirming(true);
-    const hazards = await evaluateCloseMany(pendingCloseMany.plan.closeIds);
+    const evaluated = await evaluateCloseMany(pendingCloseMany.plan.closeIds);
     if (requestId !== closeManyRequestRef.current) return;
-    if (hasNewCloseManyHazards(pendingCloseMany, hazards)) {
+    const revisions = dirtyRevisions(pendingCloseMany.plan.closeIds);
+    const hazards = { ...evaluated, dirtyIds: [...revisions.keys()] };
+    if (hasNewCloseManyHazards(pendingCloseMany, hazards) ||
+        hasNewEdits(revisions, acknowledgedRevisionsRef.current)) {
+      acknowledgedRevisionsRef.current = revisions;
       setPendingCloseMany({ ...pendingCloseMany, ...hazards });
       setCloseManyConfirming(false);
       return;
@@ -172,11 +195,13 @@ export function useTabCloseGuards({
       withCurrentActive(pendingCloseMany.plan),
     );
     setPendingCloseMany(null);
+    acknowledgedRevisionsRef.current.clear();
     setCloseManyConfirming(false);
-  }, [pendingCloseMany, disposeTabs, evaluateCloseMany, withCurrentActive]);
+  }, [pendingCloseMany, disposeTabs, dirtyRevisions, evaluateCloseMany, withCurrentActive]);
 
   const cancelCloseMany = useCallback(() => {
     closeManyRequestRef.current += 1;
+    acknowledgedRevisionsRef.current.clear();
     setPendingCloseMany(null);
     setCloseManyConfirming(false);
   }, []);
