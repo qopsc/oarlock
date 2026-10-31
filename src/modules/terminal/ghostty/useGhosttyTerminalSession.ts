@@ -15,7 +15,7 @@ import {
 } from "@/modules/terminal/ghostty/ghosttyBlockSessions";
 import { loadSessionRenderer } from "@/modules/terminal/ghostty/loadSessionRenderer";
 import { replaceSessionSurface } from "@/modules/terminal/ghostty/replaceSessionSurface";
-import { initializeSessionGeneration as startSessionInitialization } from "@/modules/terminal/ghostty/sessionInitialization";
+import { initializeSessionGeneration as startSessionInitialization, waitForSessionClose } from "@/modules/terminal/ghostty/sessionInitialization";
 import { BoundedPtyWriter } from "@/modules/terminal/lib/BoundedPtyWriter";
 import { captureCompletionOwner } from "@/modules/terminal/lib/completionOwnership";
 import { captureInputOwner } from "@/modules/terminal/lib/inputOwnership";
@@ -821,7 +821,7 @@ async function respawnGhosttySession(
   if (!session || session.disposed) return false;
   reportPendingInputCancellation(session.writer, "restarted");
   toast.dismiss(`terminal-input-${leafId}`);
-  session.generation += 1;
+  const generation = ++session.generation;
   session.requests.dispose();
   session.input?.dispose();
   session.input = null;
@@ -836,7 +836,11 @@ async function respawnGhosttySession(
   session.ptyResize.reset();
   session.writer.detach();
   session.writer.clear();
-  await session.pty?.close();
+  const closingPty = session.pty;
+  if (!(await waitForSessionClose(
+    session, generation, () => closingPty?.close() ?? Promise.resolve(),
+    () => sessions.get(leafId) === session,
+  ))) return false;
   session.pty = null;
   session.shellExited = false;
   session.lastCwd = null;

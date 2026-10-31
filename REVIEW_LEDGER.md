@@ -4116,3 +4116,7 @@ When all 16 existing supersession slots are in use, a new search now receives a 
 ### R037: Discard registration retries
 
 Repeated Retry clicks now coalesce while registration is in flight. This prevents overlapping native registrations from replacing one another's page tokens or an older listener cleanup from removing the current listener. The regression holds the retry registration pending and clicks Retry twice; it verifies only one new registration and listener are created. The existing late-unmount test still verifies registration cleanup. Focused tests (13), the full frontend suite (5,573 passed, 2 skipped), types and lint passed. R037 is closed; Tier 3 remaining = 13, including six AI-on-hold.
+
+### R075: delayed terminal restart
+
+After waiting for the old PTY to close, restart now checks the original session identity, generation and disposal state before clearing fields or starting the replacement. A close failure from an obsolete restart is ignored; a current failure remains visible. Regression tests cover two overlapping restarts, a replaced or closed session and a current close failure. Focused tests (18), the full frontend suite (5,577 passed, 2 skipped), types and lint passed. R075 is closed; Tier 3 remaining = 12, including six AI-on-hold.
