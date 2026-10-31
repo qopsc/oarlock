@@ -5,7 +5,8 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { setThemeId as persistThemeId } from "@/modules/settings/store";
 import type { Tab } from "@/modules/tabs";
 import { workspaceEnvForPath } from "@/modules/workspace";
-import { listCustomThemes, saveCustomTheme } from "./customThemes";
+import { listCustomThemes, readCustomThemes, saveCustomTheme, saveThemeFileSnapshot } from "./customThemes";
+import { createThemeFileIngest } from "./themeFileIngest";
 import {
   isThemeFilePath,
   onThemeEdit,
@@ -28,39 +29,27 @@ type Params = {
 export function useThemeFileEditing({ tabsRef, openFileTab }: Params) {
   useEffect(() => {
     type FileWrittenPayload = { path: string; source?: string };
-    const unlistenPromise =
-      getCurrentWebviewWindow().listen<FileWrittenPayload>(
-        "fs:file-written",
-        (event) => {
-          if (event.payload.source !== "editor") return;
-          if (!isThemeFilePath(event.payload.path)) return;
-          void (async () => {
-            try {
-              // Where the editor saved it: a theme file in the app's config
-              // folder is a host file in a WSL window too.
-              const { path } = event.payload;
-              const res = await invoke<{ kind: string; content?: string }>(
-                "fs_read_file",
-                { path, workspace: workspaceEnvForPath(path) },
-              );
-              if (res.kind !== "text" || typeof res.content !== "string")
-                return;
-              const parsed = parseThemeFile(res.content);
-              if (!parsed.ok) {
-                console.warn("[oarlock] theme not applied:", parsed.error);
-                return;
-              }
-              await saveCustomTheme(parsed.theme);
-            } catch (e) {
-              console.warn("[oarlock] theme ingest failed:", e);
-              toast.error("Theme file saved, but theme could not be applied", {
-                description: String(e),
-              });
-            }
-          })();
-        },
-      );
+    const ingest = createThemeFileIngest({
+      snapshot: readCustomThemes,
+      read: (path) => invoke("fs_read_file", {
+        path, workspace: workspaceEnvForPath(path), versioned: true,
+      }),
+      parse: parseThemeFile,
+      save: saveThemeFileSnapshot,
+      invalid: (error) => console.warn("[oarlock] theme not applied:", error),
+      failed: (error) => {
+        console.warn("[oarlock] theme ingest failed:", error);
+        toast.error("Theme file saved, but theme could not be applied", { description: String(error) });
+      },
+    });
+    const unlistenPromise = getCurrentWebviewWindow().listen<FileWrittenPayload>(
+      "fs:file-written", (event) => {
+        if (event.payload.source === "editor" && isThemeFilePath(event.payload.path))
+          void ingest.ingest(event.payload.path);
+      },
+    );
     return () => {
+      ingest.dispose();
       void unlistenPromise.then((un) => un());
     };
   }, []);

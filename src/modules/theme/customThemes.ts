@@ -28,6 +28,16 @@ export async function listCustomThemes(): Promise<Theme[]> {
 export async function saveCustomTheme(theme: Theme): Promise<void> {
   await saveCustomThemes([theme]);
 }
+/** Publish a file ingestion only while both its catalog and file snapshot are current. */
+export async function saveThemeFileSnapshot(
+  theme: Theme, revision: number, path: string, version: string,
+): Promise<void> {
+  accept(await invoke<ThemeSnapshot>("themes_mutate", {
+    change: { kind: "upsert", themes: [theme] },
+    expectedRevision: revision,
+    expectedFile: { path, version },
+  }));
+}
 /** Native per-ID upsert; independent changes never replace the entire catalog. */
 export async function saveCustomThemes(
   themes: readonly Theme[],

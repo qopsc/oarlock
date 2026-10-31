@@ -27,6 +27,35 @@ pub enum Change {
     Upsert { themes: Vec<Value> },
     Delete { id: String },
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectedThemeFile {
+    path: String,
+    version: String,
+}
+
+fn with_current_theme_file<T>(
+    path: &Path,
+    expected: &str,
+    apply: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    use super::fs::{attachment::handle_path, document_save};
+    document_save::with_lock(path, || {
+        let mut file = super::project_trust::open_regular(path).map_err(|e| e.to_string())?;
+        if handle_path(&file)? != path {
+            return Err("Theme file changed before applying it".into());
+        }
+        let mut bytes = Vec::new();
+        (&mut file).take(MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err("Theme file exceeds 50 MiB".into());
+        }
+        if document_save::version(&file, &bytes).map_err(|e| e.to_string())? != expected {
+            return Err("THEME_FILE_CHANGED".into());
+        }
+        apply()
+    })
+}
 fn valid_id(id: &str) -> bool {
     (2..=64).contains(&id.len())
         && id.as_bytes()[0].is_ascii_alphanumeric()
@@ -338,6 +367,19 @@ impl Store {
         }
         Ok(self.snapshot.clone())
     }
+    fn mutate_at_revision(
+        &mut self,
+        change: Change,
+        expected_revision: Option<u64>,
+    ) -> Result<Snapshot, String> {
+        if let Some(revision) = expected_revision {
+            self.verify_disk()?;
+            if revision != self.snapshot.revision {
+                return Err("THEME_REVISION_CHANGED".into());
+            }
+        }
+        self.mutate(change)
+    }
 }
 fn with_store<T>(
     app: &tauri::AppHandle,
@@ -362,16 +404,29 @@ pub async fn themes_snapshot(app: tauri::AppHandle) -> Result<Snapshot, String> 
     .await
 }
 #[tauri::command]
-pub async fn themes_mutate(app: tauri::AppHandle, change: Change) -> Result<Snapshot, String> {
+pub async fn themes_mutate(app: tauri::AppHandle, change: Change, expected_revision: Option<u64>, expected_file: Option<ExpectedThemeFile>) -> Result<Snapshot, String> {
     super::fs::blocking(move || {
-        with_store(&app, |store| {
+        let update = || with_store(&app, |store| {
             let revision = store.snapshot.revision;
-            let snapshot = store.mutate(change)?;
+            let snapshot = store.mutate_at_revision(change, expected_revision)?;
             if snapshot.revision != revision {
                 let _ = app.emit(EVENT, &snapshot);
             }
             Ok(snapshot)
-        })
+        });
+        if let Some(expected) = expected_file {
+            use super::workspace::{Origin, WorkspaceRegistry};
+            let registry = app.state::<WorkspaceRegistry>();
+            let target = registry.gates(Origin::App).authorized_existing(Path::new(&expected.path))?;
+            let catalog = app.path().app_data_dir().map_err(|e| e.to_string())?.join(FILE);
+            if !Path::new(&expected.path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("oarlock-theme"))
+                || std::fs::canonicalize(catalog).is_ok_and(|catalog| catalog == target) {
+                return Err("Invalid theme source file".into());
+            }
+            with_current_theme_file(&target, &expected.version, update)
+        } else {
+            update()
+        }
     })
     .await
 }
@@ -380,6 +435,25 @@ pub async fn themes_mutate(app: tauri::AppHandle, change: Change) -> Result<Snap
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn stale_ingestions_cannot_publish_after_theme_or_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let revision = store.snapshot.revision;
+        store.mutate(upsert("theme-new")).unwrap();
+        assert!(store.mutate_at_revision(upsert("theme-old"), Some(revision)).unwrap_err().contains("THEME_REVISION_CHANGED"));
+        assert!(store.snapshot.themes.iter().all(|entry| entry["id"] != "theme-old"));
+
+        let path = dir.path().join("draft.oarlock-theme");
+        std::fs::write(&path, b"old").unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let file = std::fs::File::open(&canonical).unwrap();
+        let version = super::super::fs::document_save::version(&file, b"old").unwrap();
+        std::fs::write(&canonical, b"new").unwrap();
+        let result = with_current_theme_file(&canonical, &version, || store.mutate(upsert("theme-stale")));
+        assert!(result.unwrap_err().contains("THEME_FILE_CHANGED"));
+        assert!(store.snapshot.themes.iter().all(|entry| entry["id"] != "theme-stale"));
+    }
     fn theme(id: &str) -> Value {
         json!({"id":id,"name":id,"variants":{"dark":{"colors":{"background":"#000"}}}})
     }
