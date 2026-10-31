@@ -4124,3 +4124,7 @@ After waiting for the old PTY to close, restart now checks the original session 
 ### R021: quick terminal replacement
 
 An exited quick-terminal shell is disposed and its pane is removed while the native window hides. A new pane starts only when the window next receives focus. The regression exercises three exit/hide/show cycles and confirms no replacement pane exists while hidden. The focused test, full frontend suite (5,577 passed, 2 skipped), types and lint passed. R021 is closed; Tier 3 remaining = 11, including six AI-on-hold.
+
+### R065: concurrent remote actions
+
+Each Source Control hook now synchronously reserves an action for its workspace and repository before dispatch. Another action for that repository returns busy until the first completes, while a different workspace remains independent. A regression holds a fetch pending, verifies a second request is refused and then verifies a later request can run. Focused tests (3), the full frontend suite (5,578 passed, 2 skipped), types and lint passed. This covers manual actions in one hook; it does not claim cross-window Git serialization. R065 is closed; Tier 3 remaining = 10, including six AI-on-hold.

@@ -42,7 +42,7 @@ type SourceControlRemoteActionResult = {
   ok: boolean;
   action: SourceControlRemoteAction | null;
   error?: string;
-  blocked?: "diverged" | "missing-upstream" | "no-repo";
+  blocked?: "diverged" | "missing-upstream" | "no-repo" | "busy";
 };
 
 export type SourceControlSummary = {
@@ -277,6 +277,7 @@ export function useSourceControl(
   const stateRef = useRef(state);
   const requestIdRef = useRef(0);
   const inflightRef = useRef<InflightRefresh | null>(null);
+  const remoteActionsRef = useRef(new Set<string>());
   const autoFetchByRepoRef = useRef(new Map<string, number>());
   const enabledRef = useRef(enabled);
   const lastRefreshAtRef = useRef(0);
@@ -515,6 +516,11 @@ export function useSourceControl(
       if (!action) {
         return { ok: false, action: null, blocked: "diverged" };
       }
+      const actionKey = JSON.stringify([workspaceKey, repo.repoRoot]);
+      if (remoteActionsRef.current.has(actionKey)) {
+        return { ok: false, action: null, blocked: "busy" };
+      }
+      remoteActionsRef.current.add(actionKey);
 
       setState((current) => ({ ...current, busyAction: action }));
       const actionContextKey = contextKeyRef.current;
@@ -549,11 +555,12 @@ export function useSourceControl(
         }
         return { ok: false, action, error: message };
       } finally {
+        remoteActionsRef.current.delete(actionKey);
         if (isCurrentContext())
           setState((current) => ({ ...current, busyAction: null }));
       }
     },
-    [refresh, native],
+    [refresh, native, workspaceKey],
   );
 
   useEffect(() => {
