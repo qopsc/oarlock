@@ -137,14 +137,20 @@ function parseKey(text: string, where: string): string[] {
   });
 }
 
-function parseValue(raw: string, where: string): TomlValue | undefined {
+const MAX_INLINE_DEPTH = 64;
+
+function parseValue(
+  raw: string,
+  where: string,
+  depth = 0,
+): TomlValue | undefined {
   if (raw.startsWith('"')) return parseBasicString(raw, where);
   if (raw.startsWith("'")) {
     const end = raw.indexOf("'", 1);
     if (end < 0) throw new SchemeError(`${where}: unterminated string`);
     return raw.slice(1, end);
   }
-  if (raw.startsWith("{")) return parseInlineTable(raw, where);
+  if (raw.startsWith("{")) return parseInlineTable(raw, where, depth + 1);
   return undefined;
 }
 
@@ -183,7 +189,15 @@ function parseBasicString(raw: string, where: string): string {
   throw new SchemeError(`${where}: unterminated string`);
 }
 
-function parseInlineTable(raw: string, where: string): TomlTable {
+function parseInlineTable(
+  raw: string,
+  where: string,
+  depth: number,
+): TomlTable {
+  if (depth > MAX_INLINE_DEPTH)
+    throw new SchemeError(
+      `${where}: inline table nesting exceeds ${MAX_INLINE_DEPTH}`,
+    );
   const body = raw.slice(1, raw.lastIndexOf("}")).trim();
   const table = newTable();
   if (body === "") return table;
@@ -191,7 +205,7 @@ function parseInlineTable(raw: string, where: string): TomlTable {
     const eq = indexOutsideQuotes(entry, "=");
     if (eq < 0)
       throw new SchemeError(`${where}: expected "key = value" in inline table`);
-    const value = parseValue(entry.slice(eq + 1).trim(), where);
+    const value = parseValue(entry.slice(eq + 1).trim(), where, depth);
     if (value !== undefined)
       assign(table, parseKey(entry.slice(0, eq), where), value, where);
   }

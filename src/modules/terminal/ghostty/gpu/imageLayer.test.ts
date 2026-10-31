@@ -354,6 +354,26 @@ describe("texture cache", () => {
     ).toBe(false);
   });
 
+  it("does not read or expand pixels for an image over the texture budget", () => {
+    const gpu = backend();
+    const cache = new ImageTextureCache(gpu, {
+      budgetBytes: 16,
+      maxTextures: 16,
+      graceUpdates: 3,
+    });
+    const pixels = new Proxy(new Uint8Array(25), {
+      get: () => {
+        throw new Error("oversized pixels were read");
+      },
+    });
+    expect(
+      cache.sync([
+        placement({ imageWidth: 5, imageHeight: 5, channels: 1, pixels }),
+      ]).size,
+    ).toBe(0);
+    expect(gpu.create).not.toHaveBeenCalled();
+  });
+
   it("bounds the number of textures", () => {
     const gpu = backend();
     const cache = new ImageTextureCache(gpu, {

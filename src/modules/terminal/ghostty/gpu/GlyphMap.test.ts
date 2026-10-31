@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ATLAS_FULL, GLYPH_DEFERRED } from "./GlyphAtlas";
 import {
   BACKLOG_THRESHOLD,
@@ -84,6 +84,22 @@ describe("TerminalGlyphMap", () => {
     }
     expect(rounds).toBe(5);
     expect(atlas.resolved).toEqual(["0:a", "0:b", "0:c", "0:d", "0:e"]);
+  });
+
+  it("yields even when every attempted glyph waits for its font", () => {
+    const map = new TerminalGlyphMap();
+    const atlas = new FakeAtlas();
+    for (const text of ["a", "b", "c"]) atlas.loading.add(text);
+    const resolve = vi.spyOn(atlas, "resolve");
+    map.ensureCapacity(3);
+    map.resetForEpoch(1);
+    map.add(glyphs("a", "b", "c"));
+    expect(map.process(atlas, oneAtATime)).toEqual({
+      resolved: 0,
+      full: false,
+    });
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(map.pending).toBe(2);
   });
 
   it("uses the larger allowance the caller passes for first frames", () => {

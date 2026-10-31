@@ -5,6 +5,7 @@ import { OarlockGhostty } from "@oarlock/ghostty-core/adapted";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { PackedCellView } from "./core/packedCells";
 import { GhosttyCoreRuntime } from "./GhosttyCoreRuntime";
+import { AdaptedGhosttyTerminalModel } from "./AdaptedGhosttyTerminalModel";
 
 let wasmBytes: ArrayBuffer;
 let wasmModule: WebAssembly.Module;
@@ -75,6 +76,29 @@ describe("GhosttyCoreRuntime", () => {
       }
     },
   );
+
+  it("disposes a constructed model when its initial configuration fails", async () => {
+    const configure = vi
+      .spyOn(AdaptedGhosttyTerminalModel.prototype, "setLigatures")
+      .mockImplementationOnce(() => {
+        throw new Error("configuration failed");
+      });
+    const dispose = vi.spyOn(AdaptedGhosttyTerminalModel.prototype, "dispose");
+    const runtime = new GhosttyCoreRuntime(() =>
+      OarlockGhostty.loadBytes(wasmBytes),
+    );
+    try {
+      await expect(
+        runtime.createModel({ leafId: 987, cols: 80, rows: 24 }),
+      ).rejects.toThrow("configuration failed");
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(runtime.getModel(987)).toBeNull();
+    } finally {
+      configure.mockRestore();
+      dispose.mockRestore();
+      runtime.dispose();
+    }
+  });
 
   it("releases the compiled module of a preload that never becomes a terminal", async () => {
     vi.useFakeTimers();

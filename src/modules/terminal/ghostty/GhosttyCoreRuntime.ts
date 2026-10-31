@@ -120,12 +120,24 @@ export class GhosttyCoreRuntime {
           this.scheduleIdleRelease();
         },
       });
-      model.setLigatures(this.ligatures);
-      model.setAlternateScroll(this.alternateScroll);
-      model.setClipboardPolicy(this.clipboardPolicy);
-      this.models.set(options.leafId, model);
-      this.rebalanceScrollback();
-      return model;
+      try {
+        model.setLigatures(this.ligatures);
+        model.setAlternateScroll(this.alternateScroll);
+        model.setClipboardPolicy(this.clipboardPolicy);
+        this.models.set(options.leafId, model);
+        this.rebalanceScrollback();
+        return model;
+      } catch (error) {
+        try {
+          model.dispose();
+        } catch (cleanupError) {
+          console.error(
+            "Failed to dispose a terminal after setup failed",
+            cleanupError,
+          );
+        }
+        throw error;
+      }
     } finally {
       this.pendingModels.delete(options.leafId);
       this.scheduleIdleRelease();

@@ -122,6 +122,13 @@ describe("parseMinimalToml", () => {
     }
   });
 
+  it("rejects excessive inline-table nesting with a clear error", () => {
+    const nested = `${"{ a = ".repeat(128)}1${" }".repeat(128)}`;
+    expect(() => parseMinimalToml(`colors = ${nested}`)).toThrow(/nesting/i);
+    const allowed = `${"{ a = ".repeat(64)}1${" }".repeat(64)}`;
+    expect(() => parseMinimalToml(`colors = ${allowed}`)).not.toThrow();
+  });
+
   it("treats a __proto__ key as data", () => {
     const doc = parseMinimalToml('[__proto__]\npolluted = "yes"');
     expect(Object.keys(doc)).toEqual(["__proto__"]);

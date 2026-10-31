@@ -272,10 +272,12 @@ export class TerminalGlyphMap {
     allowanceMs?: number,
   ): GlyphProcessResult {
     let resolved = 0;
+    let attempted = 0;
     for (;;) {
       const fromUrgent = this.urgentHead < this.urgent.length;
       if (!fromUrgent && this.normalHead >= this.normal.length) break;
-      if (resolved > 0 && budget.exhausted(allowanceMs)) break;
+      if (attempted > 0 && budget.exhausted(allowanceMs)) break;
+      attempted += 1;
       const id = fromUrgent
         ? this.urgent[this.urgentHead]
         : this.normal[this.normalHead];

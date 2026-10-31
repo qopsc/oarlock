@@ -4,11 +4,13 @@ use std::fmt;
 
 // Cap so a misbehaving server can't make us buffer unbounded data.
 const MAX_CONTENT_LEN: usize = 64 * 1024 * 1024;
+const MAX_HEADER_LEN: usize = 16 * 1024;
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FramingError {
     MissingContentLength,
+    HeaderTooLarge,
     InvalidContentLength(String),
     ContentTooLarge(usize),
     InvalidUtf8,
@@ -18,6 +20,7 @@ impl fmt::Display for FramingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingContentLength => write!(f, "lsp frame missing Content-Length header"),
+            Self::HeaderTooLarge => write!(f, "lsp frame header exceeds {MAX_HEADER_LEN} bytes"),
             Self::InvalidContentLength(v) => write!(f, "lsp frame invalid Content-Length: {v}"),
             Self::ContentTooLarge(n) => {
                 write!(
@@ -51,12 +54,17 @@ impl Default for FrameDecoder {
 
 impl FrameDecoder {
     /// After an error the decoder is poisoned; tear the session down.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, FramingError> {
-        self.buf.extend_from_slice(bytes);
+    pub fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<String>, FramingError> {
         let mut out = Vec::new();
         loop {
             match self.phase {
                 Phase::Headers { scan_from } => {
+                    // Retain only enough to find a terminator at the maximum
+                    // permitted header length, even for a very large input chunk.
+                    let room = MAX_HEADER_LEN + HEADER_TERMINATOR.len() - self.buf.len();
+                    let take = room.min(bytes.len());
+                    self.buf.extend_from_slice(&bytes[..take]);
+                    bytes = &bytes[take..];
                     match find_terminator(&self.buf, scan_from) {
                         Some(header_end) => {
                             let len = parse_content_length(&self.buf[..header_end])?;
@@ -66,8 +74,10 @@ impl FrameDecoder {
                             self.buf.drain(..header_end + HEADER_TERMINATOR.len());
                             self.phase = Phase::Body { len };
                         }
+                        None if self.buf.len() == MAX_HEADER_LEN + HEADER_TERMINATOR.len() => {
+                            return Err(FramingError::HeaderTooLarge);
+                        }
                         None => {
-                            // Terminator may straddle this chunk and the next.
                             self.phase = Phase::Headers {
                                 scan_from: self
                                     .buf
@@ -80,12 +90,20 @@ impl FrameDecoder {
                 }
                 Phase::Body { len } => {
                     if self.buf.len() < len {
+                        let take = (len - self.buf.len()).min(bytes.len());
+                        self.buf.extend_from_slice(&bytes[..take]);
+                        bytes = &bytes[take..];
+                    }
+                    if self.buf.len() < len {
                         return Ok(out);
                     }
                     let rest = self.buf.split_off(len);
                     let payload = std::mem::replace(&mut self.buf, rest);
                     out.push(String::from_utf8(payload).map_err(|_| FramingError::InvalidUtf8)?);
                     self.phase = Phase::Headers { scan_from: 0 };
+                    if bytes.is_empty() && self.buf.is_empty() {
+                        return Ok(out);
+                    }
                 }
             }
         }
@@ -130,6 +148,30 @@ mod tests {
 
     fn frame(payload: &str) -> Vec<u8> {
         encode_frame(payload)
+    }
+
+    #[test]
+    fn unterminated_headers_cannot_grow_without_bound() {
+        let mut decoder = FrameDecoder::default();
+        assert_eq!(
+            decoder.push(&vec![b'x'; 1024 * 1024]),
+            Err(FramingError::HeaderTooLarge)
+        );
+        assert!(decoder.buf.len() <= MAX_HEADER_LEN + HEADER_TERMINATOR.len());
+    }
+
+    #[test]
+    fn maximum_header_and_multiple_messages_share_one_chunk() {
+        let suffix = "\r\nContent-Length: 1";
+        let header = format!(
+            "X:{}{suffix}",
+            "a".repeat(MAX_HEADER_LEN - 2 - suffix.len())
+        );
+        assert_eq!(header.len(), MAX_HEADER_LEN);
+        let mut input = format!("{header}\r\n\r\nx").into_bytes();
+        input.extend(frame("{}"));
+        let mut decoder = FrameDecoder::default();
+        assert_eq!(decoder.push(&input).unwrap(), ["x", "{}"]);
     }
 
     #[test]

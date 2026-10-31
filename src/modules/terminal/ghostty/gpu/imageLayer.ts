@@ -296,7 +296,8 @@ export class ImageTextureCache<Texture> {
       width > 0 &&
       height > 0 &&
       width <= this.backend.maxDimension &&
-      height <= this.backend.maxDimension;
+      height <= this.backend.maxDimension &&
+      width * height * 4 <= this.limits.budgetBytes;
     const rgba = valid
       ? imageRgba(placement.pixels, placement.channels, width, height)
       : null;

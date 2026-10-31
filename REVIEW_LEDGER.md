@@ -4409,7 +4409,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R024 | Windows/WSL port | WSL-only discovery and shell probes are outside this release. |
 | R031 | Open, Tier 3 | `watch.rs::release_window` takes the shared set lock; `resolve_changes` still calls file stamping while holding that lock. |
 | R041 | Open, Tier 3 | `editor/search/regexEvaluation.ts` builds expanded replacement text before enforcing its output budget; Vim substitution needs the same check. |
-| R045 | Open, Tier 3 | `lsp/framing.rs::FrameDecoder::push` appends unterminated headers without a header-byte limit. |
+| R045 | Closed | LSP framing limits headers to 16 KiB before buffering arbitrary input; regressions cover oversized headers, the exact limit, and pipelined messages. |
 | R046 | Open, Tier 3 | `lsp/session.rs` removes a naturally exited server after a bounded reader wait without terminating surviving descendants. |
 | R051 | Closed | Eligible idle sessions are closed before a new root is admitted. Closing sessions remain counted until shutdown finishes; regression tests cover the fifth root, simultaneous admissions and a session reacquired while another shutdown waits. |
 | R052 | Open, Tier 3 | `lsp/transport.ts` retains an unbounded incoming backlog and native channel output has no acknowledgment budget. |
@@ -4418,12 +4418,12 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R070 | Open, Tier 3 | `proc/capture.rs::collect` returns after its grace period while a pipe-reader thread can remain blocked on an inherited pipe. |
 | R071 | Closed | The scrollback reader now uses nonblocking, no-follow admission; the FIFO regression is recorded in the earlier R216 checkpoint. |
 | R079 | Open, Tier 3 | Terminal clipboard snapshot requests have no shared admission cap, and image decoding occurs before the clipboard commit coordinator. |
-| R089 | Open, Tier 3 | `imageLayer.ts::ensure` expands non-RGBA pixels before checking whether the RGBA texture fits its byte budget. |
-| R096 | Open, Tier 3 | `GhosttyCoreRuntime.createModel` configures the newly constructed model before registering it, without disposing it if configuration throws. |
+| R089 | Closed | Images exceeding the texture budget are rejected before pixel expansion; a regression verifies their pixels are never read. |
+| R096 | Closed | Model setup failures dispose the constructed terminal before propagating the error; a real-WASM regression injects a configuration failure. |
 | R098 | Open, Tier 3 | `fontFeatures.ts` retains derived font faces and keyed maps for the page lifetime without eviction. |
-| R099 | Open, Tier 3 | `GlyphMap.process` checks the time budget only after a glyph resolves, so an all-deferred queue is drained in one call. |
+| R099 | Closed | Raster work checks its budget after any attempted queue item, including deferred glyphs. A regression checks yielding with all fonts still loading. |
 | R103 | Open, Tier 3 | Background image import decodes a static image before resizing or checking decoded dimensions; animated files bypass resizing. |
-| R104 | Open, Tier 3 | `minimalToml.ts` recursively parses inline tables without a nesting limit, within the theme import's 1 MiB source limit. |
+| R104 | Closed | Theme TOML inline tables reject nesting deeper than 64 with a clear error; tests cover accepted and rejected boundaries. |
 | R107 | Open, Tier 3 | Shell history initialization uses whole-file reads, including a possible inherited FIFO, before checking file type or size. |
 | R117 | Open, Tier 3 | The build-script capture helper buffers output without a byte cap and waits for inherited pipes after killing only its direct child. |
 | R133 | Closed | Earlier R216 conversation-storage work bounds reads before allocation; large-file stress testing was not performed. |
@@ -4444,6 +4444,8 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Open, Tier 3 | Theme batch upserts clone and repeatedly scan the catalog before the serialized size check. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **3 closed; 21 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **8 closed; 16 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
+
+Resource checkpoint: selected 16 KiB as the LSP header limit and 64 as the theme inline-table depth limit. These are local admission limits; over-limit inputs fail explicitly. Regression tests for R045, R089, R096, R099 and R104 failed before their fixes and passed afterward.
