@@ -4185,3 +4185,7 @@ Counts: 6 open non-held findings (including R034), 2 accepted external races, 1 
 ### R121: secret-storage documentation
 
 The security policy and the security-model introduction now agree with README and the detailed Linux section: macOS and Windows use their system credential stores, while Linux uses a user-only file in the app data directory. The documentation no longer says Linux keys never touch disk. Verified the statements against the existing detailed documentation; no AI backend code was opened or changed. R121 is closed.
+
+### R022: reauthorize explicit opens
+
+Oarlock no longer treats a requested path spelling as a permanent proof of its canonical target. A later explicit open goes back through the existing native authorization, so a retargeted link receives the appropriate grant; simultaneous identical requests still coalesce, and refused requests remain retryable. The regression covers the same spelling resolving differently and concurrent sharing. Focused tests (12), the full frontend suite (5,589 passed, 2 skipped), types and lint passed. R022 is closed. This adds one native authorization request per later explicit open or browse, not per terminal output event.
