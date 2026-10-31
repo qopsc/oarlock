@@ -1,5 +1,24 @@
-import { describe, expect, it } from "vitest";
-import { type HState, historyRowsUpdate, PointerMotion } from "./historyPopover";
+import { describe, expect, it, vi } from "vitest";
+import { EditorState } from "@codemirror/state";
+import { type EditorView, keymap } from "@codemirror/view";
+import { HistorySearch } from "./historySearch";
+import { type HState, historyPopover, historyRowsUpdate, PointerMotion } from "./historyPopover";
+
+it("Escape cancels a pending open instead of reopening history later", async () => {
+  let finish!: (items: string[]) => void;
+  const fetch = () => new Promise<string[]>((resolve) => { finish = resolve; });
+  const search = new HistorySearch(fetch);
+  const state = EditorState.create({ doc: "git", extensions: historyPopover(fetch) });
+  const dispatch = vi.fn();
+  const view = { state, plugin: () => ({ search }), dispatch } as unknown as EditorView;
+  const bindings = state.facet(keymap).flat();
+  expect(bindings.find((binding) => binding.key === "ArrowUp")?.run?.(view)).toBe(true);
+  await Promise.resolve();
+  expect(bindings.find((binding) => binding.key === "Escape")?.run?.(view)).toBe(true);
+  finish(["git status"]);
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  expect(dispatch).not.toHaveBeenCalled();
+});
 
 // crynta/terax-ai#1344: with the pointer resting over the popover, every
 // arrow press snapped back to the row under it.

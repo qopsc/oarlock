@@ -4046,3 +4046,7 @@ R064 is fixed: each successful status read updates the repository's branch, upst
 ## Tier 2: R214 first-load Git gutter
 
 R214 is fixed: Git baseline reads start only after the editor view exists, and an obsolete read cannot dispatch to a retired view. A regression demonstrates that the first baseline marks changed lines when the view appears and that cancelled reads do not update it. The full frontend suite passed (5,538 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 21.
+
+## Tier 2: R085 terminal history lifetimes
+
+R085 is fixed: each command-editor view owns its latest history lookup and debounce, and dismissing, editing or destroying the view invalidates pending results. Failed lookups are handled without leaving the popover pending. Regressions cover Escape during a pending open, out-of-order results, a cancelled timer, view disposal and rejected lookups. The full frontend suite passed (5,541 passed, 2 skipped); focused tests were rerun after the final error-handling adjustment, and types and lint passed. Tier 2 remaining in the ownership group: 20.
