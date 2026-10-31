@@ -4361,10 +4361,10 @@ These are membership lists, not current-status counts. AI/MCP and Windows/WSL en
 | R110 | Closed | `4b875dc` and follow-ups use the shared metadata-preserving writer. |
 | R132, R140, R145, R146, R164, R165, R170, R175 | AI/MCP on hold | Retained from the original register; not re-reviewed while the backend is on hold. |
 | R203 | Closed | `5569b73`: existing theme files are preserved and differences are surfaced. |
-| R204 | Open, Tier 2 | Theme selection updates the live state and fast-path shadow before fire-and-forget persistence; failure is not handled locally. Source revalidated. |
+| R204 | Closed | Mode and theme selections now follow the revisioned preference snapshot after native persistence, rather than changing the live selection and startup shadow optimistically. A failed save keeps the committed selection; the existing preferences error notice reports the failure. Regression checks both selection types. |
 | R209 | Closed | `691b691`: no-op theme mutations verify disk and refuse damaged or missing storage. |
 
-Counts: **11 closed; 1 Tier 2 open; 8 AI/MCP held; 1 Windows-port item**. R235 is a separate later MAJOR for a future non-atomic-save choice, not one of these original 21.
+Counts: **12 closed; no active non-held findings; 8 AI/MCP held; 1 Windows-port item**. R235 is a separate later MAJOR for a future non-atomic-save choice, not one of these original 21.
 
 R059 validation: the real-Git race test failed before the worktree lock and passed afterward, including when branch switching used a directory alias. The full macOS native suite passed 1,533 library tests (four ignored) and all integration suites; the full frontend suite passed 5,608 tests with two skipped. Strict Clippy, type checking and lint passed; lint remained at 80 warnings. A terminal or another program changing HEAD is not serialized by this in-process lock.
 

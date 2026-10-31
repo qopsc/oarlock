@@ -204,16 +204,14 @@ export function ThemeProvider({
   }, [activeTheme, resolvedMode]);
 
   const setMode = useCallback((next: ThemePref) => {
-    setModeState(next);
-    writeFastMode(next);
-    void persistTheme(next);
+    // The revisioned preference snapshot is the authority, including for the
+    // startup shadow. Failed writes leave the currently saved selection intact.
+    void persistTheme(next).catch(() => {});
   }, []);
 
   const setThemeId = useCallback((id: string) => {
     setPreviewId(null);
-    setThemeIdState(id);
-    writeFastThemeId(id);
-    void persistThemeId(id);
+    void persistThemeId(id).catch(() => {});
   }, []);
 
   const previewThemeId = useCallback((id: string | null) => {
