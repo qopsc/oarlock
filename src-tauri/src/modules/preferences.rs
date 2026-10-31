@@ -202,7 +202,7 @@ fn apply(current: &Snapshot, change: Change) -> Result<(Snapshot, Update), Strin
     let (values, force) = match change {
         Change::Set { key, value } => (Map::from_iter([(key, value)]), false),
         Change::Patch { key, values } => {
-            if !matches!(key.as_str(), "terminalBehavior" | "lspActivation") {
+            if !matches!(key.as_str(), "terminalBehavior" | "lspActivation" | "editorFormatterByLang") {
                 return Err("Preference does not accept field patches".into());
             }
             let mut merged = current
@@ -212,7 +212,7 @@ fn apply(current: &Snapshot, change: Change) -> Result<(Snapshot, Update), Strin
                 .cloned()
                 .unwrap_or_default();
             for (field, value) in values {
-                if key == "lspActivation" && value.is_null() {
+                if matches!(key.as_str(), "lspActivation" | "editorFormatterByLang") && value.is_null() {
                     merged.remove(&field);
                 } else {
                     merged.insert(field, value);
@@ -662,6 +662,23 @@ mod tests {
             store.snapshot.values["lspActivation"],
             json!({"b": "dismissed"})
         );
+    }
+
+    #[test]
+    fn formatter_overrides_merge_independent_edits_and_remove_only_requested_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let patch = |values: Value| Change::Patch {
+            key: "editorFormatterByLang".into(),
+            values: values.as_object().unwrap().clone(),
+        };
+        store.mutate(patch(json!({"rust": "lsp"}))).unwrap();
+        store.mutate(patch(json!({"python": "custom"}))).unwrap();
+        assert_eq!(store.snapshot.values["editorFormatterByLang"], json!({"rust": "lsp", "python": "custom"}));
+        store.mutate(patch(json!({"rust": null, "typescript": "lsp"}))).unwrap();
+        assert_eq!(store.snapshot.values["editorFormatterByLang"], json!({"python": "custom", "typescript": "lsp"}));
+        assert!(store.mutate(patch(json!({"python": 3}))).is_err());
+        assert_eq!(store.snapshot.values["editorFormatterByLang"], json!({"python": "custom", "typescript": "lsp"}));
     }
     #[test]
     fn permission_gates_follow_committed_booleans() {

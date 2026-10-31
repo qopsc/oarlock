@@ -32,7 +32,7 @@ import {
   setEditorFontSize,
   setEditorFormatOnSave,
   setEditorFormatter,
-  setEditorFormatterByLang,
+  patchEditorFormatterByLang,
   setEditorWordWrap,
   setEditorWordWrapColumn,
   setVimMode,
@@ -284,8 +284,8 @@ function FormatterOverrides() {
   const entries = Object.entries(byLang);
   const unused = EXPOSED_LANGUAGES.filter((l) => !(l.ext in byLang));
 
-  const update = (next: Record<string, EditorFormatter>) =>
-    void setEditorFormatterByLang(next);
+  const update = (changes: Record<string, EditorFormatter | null>) =>
+    void patchEditorFormatterByLang(changes);
 
   return (
     <>
@@ -299,7 +299,7 @@ function FormatterOverrides() {
           className="h-8 rounded-md border border-border px-3 text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
           onClick={() => {
             const first = unused[0];
-            if (first) update({ ...byLang, [first.ext]: "lsp" });
+            if (first) update({ [first.ext]: "lsp" });
           }}
         >
           Add override
@@ -314,10 +314,7 @@ function FormatterOverrides() {
             value={lang}
             onValueChange={(nextLang) => {
               if (nextLang === lang) return;
-              const next = { ...byLang };
-              delete next[lang];
-              next[nextLang] = formatter;
-              update(next);
+              update({ [lang]: null, [nextLang]: formatter });
             }}
           >
             <SelectTrigger className="h-7 w-44 text-[12px]">
@@ -335,16 +332,14 @@ function FormatterOverrides() {
           </Select>
           <FormatterSelect
             value={formatter}
-            onChange={(v) => update({ ...byLang, [lang]: v })}
+            onChange={(v) => update({ [lang]: v })}
           />
           <button
             type="button"
             className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
             title="Remove override"
             onClick={() => {
-              const next = { ...byLang };
-              delete next[lang];
-              update(next);
+              update({ [lang]: null });
             }}
           >
             <HugeiconsIcon icon={Cancel01Icon} size={12} strokeWidth={2} />

@@ -1346,10 +1346,10 @@ export async function setEditorFormatter(
   await writePref(KEY_EDITOR_FORMATTER, value);
 }
 
-export async function setEditorFormatterByLang(
-  value: Record<string, EditorFormatter>,
+export async function patchEditorFormatterByLang(
+  values: Record<string, EditorFormatter | null>,
 ): Promise<void> {
-  await writePref(KEY_EDITOR_FORMATTER_BY_LANG, value);
+  await mutatePreferences({ kind: "patch", key: KEY_EDITOR_FORMATTER_BY_LANG, values });
 }
 
 export async function setEditorCustomFormatCommand(
