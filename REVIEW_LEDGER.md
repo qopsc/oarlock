@@ -4408,7 +4408,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R011 | Closed | Search retains at most 8 MiB of hit text and paths, then uses the existing truncated-result signal. A real-filesystem regression with three multi-megabyte matching lines failed before the fix and passes after it. |
 | R024 | Windows/WSL port | WSL-only discovery and shell probes are outside this release. |
 | R031 | Open, Tier 3 | `watch.rs::release_window` takes the shared set lock; `resolve_changes` still calls file stamping while holding that lock. |
-| R041 | Open, Tier 3 | `editor/search/regexEvaluation.ts` builds expanded replacement text before enforcing its output budget; Vim substitution needs the same check. |
+| R041 | Closed | Editor and Vim worker substitutions check output size while expanding captures, before joining results. Vim replacement tests compare hundreds of regex, Unicode, named-capture and dollar-token cases against native JavaScript behavior. |
 | R045 | Closed | LSP framing limits headers to 16 KiB before buffering arbitrary input; regressions cover oversized headers, the exact limit, and pipelined messages. |
 | R046 | Open, Tier 3 | `lsp/session.rs` removes a naturally exited server after a bounded reader wait without terminating surviving descendants. |
 | R051 | Closed | Eligible idle sessions are closed before a new root is admitted. Closing sessions remain counted until shutdown finishes; regression tests cover the fifth root, simultaneous admissions and a session reacquired while another shutdown waits. |
@@ -4444,10 +4444,12 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Open, Tier 3 | Theme batch upserts clone and repeatedly scan the catalog before the serialized size check. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **9 closed; 15 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **10 closed; 14 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
 Resource checkpoint: selected 16 KiB as the LSP header limit and 64 as the theme inline-table depth limit. These are local admission limits; over-limit inputs fail explicitly. Regression tests for R045, R089, R096, R099 and R104 failed before their fixes and passed afterward.
 
 R011 policy: search stops collecting when hit text and paths would exceed 8 MiB, using the existing truncated indicator. The bound is on retained UTF-8 data, not the size of its later JSON encoding; serialization is still bounded by a constant multiple of that amount.
+
+R041: replacement output is bounded before joining, including in Vim’s fallback worker path. The Vim implementation preserves native JavaScript replacement semantics for captures, named groups, prefix/suffix tokens, zero-width matches and Unicode, with 420 compatibility combinations plus overflow tests. Pathological regex execution still uses the existing disposable-worker deadline.

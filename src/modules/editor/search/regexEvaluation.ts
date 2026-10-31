@@ -33,21 +33,38 @@ export function evaluateRegex(input: RegexInput): RegexMatch[] {
       to: number;
       match: RegExpExecArray;
     };
-    const insert = replacement.replace(/\$([$&]|\d+)/g, (m, i: string) => {
-      if (i === "&") return result.match[0];
-      if (i === "$") return "$";
-      for (let l = i.length; l > 0; l--) {
-        const n = +i.slice(0, l);
-        if (n > 0 && n < result.match.length)
-          return result.match[n] + i.slice(l);
+    const pieces: string[] = [];
+    let offset = 0;
+    const append = (text: string) => {
+      units += text.length;
+      if (units > MAX_TEXT_UNITS)
+        throw new Error(
+          "Regex replacement output is too large (16 MiB maximum).",
+        );
+      pieces.push(text);
+    };
+    for (const token of replacement.matchAll(/\$([$&]|\d+)/g)) {
+      append(replacement.slice(offset, token.index));
+      const value = token[1];
+      if (value === "&") append(result.match[0]);
+      else if (value === "$") append("$");
+      else {
+        let length = value.length;
+        while (length > 0) {
+          const n = +value.slice(0, length);
+          if (n > 0 && n < result.match.length) {
+            append(String(result.match[n]));
+            append(value.slice(length));
+            break;
+          }
+          length--;
+        }
+        if (length === 0) append(token[0]);
       }
-      return m;
-    });
-    units += insert.length;
-    if (units > MAX_TEXT_UNITS)
-      throw new Error(
-        "Regex replacement output is too large (16 MiB maximum).",
-      );
+      offset = token.index + token[0].length;
+    }
+    append(replacement.slice(offset));
+    const insert = pieces.join("");
     matches.push({ from: result.from, to: result.to, insert });
   }
   return matches;

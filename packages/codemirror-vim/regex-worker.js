@@ -2,6 +2,7 @@
 import { RegExpCursor } from "@codemirror/search";
 import { Text } from "@codemirror/state";
 import { checkResultBudget } from "./result-budget.js";
+import { boundedReplace } from "./bounded-replacement.js";
 const MAX_TEXT = 8_388_608,
   MAX_MATCHES = 10_000;
 let doc = Text.empty;
@@ -35,7 +36,7 @@ export function evaluate(request) {
     return bounded(request.lines.map((line) => line.match(query)));
   }
   if (request.kind === "replace")
-    return bounded(request.value.replace(query, request.replacement));
+    return boundedReplace(request.value, query, request.replacement);
   // Keep the adapter's original range and backward chunk semantics, including
   // overlapping matches when a search starts inside a preceding match.
   const source = query.source.replace(
