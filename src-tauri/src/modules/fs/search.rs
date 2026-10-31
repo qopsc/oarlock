@@ -71,6 +71,9 @@ pub async fn fs_search(
     let ticket = request_key
         .as_deref()
         .map(|key| supersede.begin_window(window.label(), key));
+    if ticket.as_ref().is_some_and(|ticket| !ticket.is_admitted()) {
+        return Err("Too many searches are active. Retry when one finishes.".into());
+    }
     let index = index.inner().clone();
     blocking(move || {
         authorized_root(&app, &root, workspace.as_ref(), Origin::App)?;

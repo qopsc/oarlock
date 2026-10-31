@@ -68,6 +68,10 @@ export type ExplorerSearchHandle = {
   isFocused: () => boolean;
 };
 
+export function SearchFailure({ error }: { error: unknown }) {
+  return <div role="alert" className="px-3 py-2 text-[11px] text-destructive">{String(error)}</div>;
+}
+
 export const ExplorerSearch = forwardRef<ExplorerSearchHandle, Props>(function ExplorerSearch({
   rootPath,
   onOpenFile,
@@ -251,6 +255,8 @@ export const ExplorerSearch = forwardRef<ExplorerSearchHandle, Props>(function E
             ) : results.length === 0 ? (
               refusal ? (
                 <PrivacyRefusalNotice refusal={refusal} className="px-3 py-3" />
+              ) : failure ? (
+                <SearchFailure error={failure} />
               ) : (
                 <div className="px-3 py-2 text-[11px] text-muted-foreground">
                   No matches
