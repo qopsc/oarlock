@@ -39,7 +39,7 @@ impl Store {
     }
 }
 fn read(path: &Path) -> Result<Map<String, Value>, String> {
-    let file = match std::fs::File::open(path) {
+    let file = match crate::modules::fs::open_store_file(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // A dangling symlink still names an existing file to preserve.
@@ -110,6 +110,23 @@ fn read(path: &Path) -> Result<Map<String, Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_store_refuses_symlink_reads_and_writes() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        let store = Store::open(path.clone()).unwrap();
+        store.replace(Map::new()).unwrap();
+        let outside = root.path().join("outside.json");
+        fs::write(&outside, b"outside").unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(Store::open(path).is_err());
+        assert!(store.replace(Map::new()).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
     use serde_json::json;
     #[test]
     fn damaged_or_wrongly_shaped_files_never_become_empty_writable_stores() {

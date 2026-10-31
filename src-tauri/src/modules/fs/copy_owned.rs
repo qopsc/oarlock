@@ -12,8 +12,10 @@ use super::{
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 use cap_std::fs::Dir;
 use std::{ffi::OsString, fs, io, path::Path};
+type CopyGuard<'a> = dyn Fn(&Path) -> Result<(), String> + 'a;
 
-pub(super) fn copy_batch(
+#[cfg(test)]
+fn copy_batch(
     sources: Vec<String>,
     dest_dir: &str,
     root: &str,
@@ -22,19 +24,28 @@ pub(super) fn copy_batch(
     index: &FileIndexState,
     rename_on_conflict: bool,
 ) -> Result<CopyResult, String> {
-    super::require_owned_entry_operation()?;
-    copy_batch_impl(
+    copy_batch_guarded(
         sources,
         dest_dir,
         root,
         workspace,
         registry,
         index,
-        rename_on_conflict,
+        (rename_on_conflict, None),
     )
 }
 
+pub(super) fn copy_batch_guarded(
+    sources: Vec<String>, dest_dir: &str, root: &str, workspace: &WorkspaceEnv,
+    registry: &WorkspaceRegistry, index: &FileIndexState,
+    options: (bool, Option<&CopyGuard<'_>>),
+) -> Result<CopyResult, String> {
+    super::require_owned_entry_operation()?;
+    copy_batch_impl_guarded(sources, dest_dir, root, workspace, registry, index, options)
+}
+
 // Workspace checks reject static escapes; unrelated same-user races are best effort.
+#[cfg(test)]
 fn copy_batch_impl(
     sources: Vec<String>,
     dest_dir: &str,
@@ -44,6 +55,15 @@ fn copy_batch_impl(
     index: &FileIndexState,
     rename_on_conflict: bool,
 ) -> Result<CopyResult, String> {
+    copy_batch_impl_guarded(sources, dest_dir, root, workspace, registry, index, (rename_on_conflict, None))
+}
+
+fn copy_batch_impl_guarded(
+    sources: Vec<String>, dest_dir: &str, root: &str, workspace: &WorkspaceEnv,
+    registry: &WorkspaceRegistry, index: &FileIndexState,
+    options: (bool, Option<&CopyGuard<'_>>),
+) -> Result<CopyResult, String> {
+    let (rename_on_conflict, guard) = options;
     if sources.len() > MAX_COPY_SOURCES {
         return Err(format!("copy at most {MAX_COPY_SOURCES} items at a time"));
     }
@@ -57,6 +77,7 @@ fn copy_batch_impl(
         root: &root,
         registry,
         rename_on_conflict,
+        guard,
     };
     context.validate()?;
     let mut result = CopyResult::default();
@@ -84,6 +105,8 @@ struct CopyContext<'a> {
     root: &'a Path,
     registry: &'a WorkspaceRegistry,
     rename_on_conflict: bool,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    guard: Option<&'a CopyGuard<'a>>,
 }
 impl CopyContext<'_> {
     fn validate(&self) -> Result<(), String> {
@@ -261,6 +284,9 @@ fn copy_file(
                 copy_name(name, n, kind.is_dir())
             };
             context.validate().map_err(io::Error::other)?;
+            if let Some(guard) = context.guard {
+                guard(&context.destination.join(&target)).map_err(io::Error::other)?;
+            }
             staged.0.verify()?;
             match super::mutate::rename_no_replace(&staged_path, &context.destination.join(&target))
             {

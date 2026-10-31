@@ -551,24 +551,8 @@ fn write_snapshot_with(
     snapshot: &serde_json::Map<String, Value>,
     sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    use std::io::Write;
-    let parent = path.parent().ok_or("mcp: missing settings directory")?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut temporary, snapshot).map_err(|e| e.to_string())?;
-    if temporary
-        .as_file()
-        .metadata()
-        .map_err(|e| e.to_string())?
-        .len()
-        > super::storage::MAX_BYTES
-    {
-        return Err("mcp: settings exceed 64 MiB".into());
-    }
-    temporary.flush().map_err(|e| e.to_string())?;
-    sync(temporary.as_file()).map_err(|e| e.to_string())?;
-    temporary.persist(path).map_err(|e| e.error.to_string())?;
-    Ok(())
+    let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
+    crate::modules::fs::native_store::write(path, &bytes, super::storage::MAX_BYTES, sync)
 }
 
 #[cfg(test)]

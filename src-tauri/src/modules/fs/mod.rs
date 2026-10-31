@@ -32,8 +32,19 @@ use tauri::Manager;
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 
 /// Open a store entry relative to a retained parent and verify the opened identity.
+pub(crate) fn store_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("Store has no parent"))?;
+    if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        return Err(std::io::Error::other("Store directory is a symbolic link"));
+    }
+    Ok(std::fs::canonicalize(parent)?.join(path.file_name().ok_or_else(|| std::io::Error::other("Store has no name"))?))
+}
+
 pub(crate) fn open_store_file(path: &Path) -> std::io::Result<std::fs::File> {
-    destination::Destination::pin(path, false, &|_| Ok(()))?.open_current()
+    let expected = store_target(path)?;
+    destination::Destination::pin(path, false, &|actual| {
+        if actual == expected { Ok(()) } else { Err("Store directory changed".into()) }
+    })?.open_current()
 }
 
 #[cfg(all(test, unix))]
@@ -52,6 +63,9 @@ mod native_store_read_tests {
         open_store_file(&store).unwrap().read_to_string(&mut value).unwrap();
         assert_eq!(value, "{\"normal\":true}");
         assert!(open_store_file(&alias).is_err());
+        let linked_parent = root.path().join("linked-parent");
+        symlink(root.path(), &linked_parent).unwrap();
+        assert!(open_store_file(&linked_parent.join("store.json")).is_err());
     }
 }
 

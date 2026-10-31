@@ -214,6 +214,40 @@ pub(crate) fn write_checked_with_limit(
     validate: impl Fn(&Path) -> Result<(), String>,
     limit: u64,
 ) -> Result<String, SaveError> {
+    write_checked_with_hook(target, content, expected, validate, limit, |_| Ok(()))
+}
+
+pub(crate) fn write_checked_with_hook(
+    target: &Path,
+    content: &[u8],
+    expected: Option<&str>,
+    validate: impl Fn(&Path) -> Result<(), String>,
+    limit: u64,
+    after_staging: impl FnOnce(&fs::File) -> std::io::Result<()>,
+) -> Result<String, SaveError> {
+    write_checked_with_policy(target, content, expected, validate, limit, after_staging, false)
+}
+
+pub(crate) fn write_checked_private(
+    target: &Path,
+    content: &[u8],
+    expected: Option<&str>,
+    validate: impl Fn(&Path) -> Result<(), String>,
+    limit: u64,
+    after_staging: impl FnOnce(&fs::File) -> std::io::Result<()>,
+) -> Result<String, SaveError> {
+    write_checked_with_policy(target, content, expected, validate, limit, after_staging, true)
+}
+
+fn write_checked_with_policy(
+    target: &Path,
+    content: &[u8],
+    expected: Option<&str>,
+    validate: impl Fn(&Path) -> Result<(), String>,
+    limit: u64,
+    after_staging: impl FnOnce(&fs::File) -> std::io::Result<()>,
+    private: bool,
+) -> Result<String, SaveError> {
     if content.len() as u64 > limit {
         return Err(SaveError::Failed(
             format!("The document exceeds the {limit}-byte save limit"),
@@ -221,9 +255,22 @@ pub(crate) fn write_checked_with_limit(
     }
     let destination = Destination::pin(target, false, &validate)?;
     let staged = destination.stage(content)?;
+    after_staging(staged.file())?;
     let actual = current(&destination, &validate, limit)?;
     if actual.version.as_deref() != expected {
         return Err(SaveError::Conflict(actual.version));
+    }
+    if private && actual.version.is_some() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = destination.open_current()?.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(SaveError::Failed("Secret file must be owned by the current user and private".into()));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(SaveError::Failed("Private store writes are unsupported on this platform".into()));
     }
     if let Some(access) = &actual.access {
         access.apply(staged.file())?;
@@ -249,7 +296,8 @@ pub(crate) fn write_checked_with_limit(
     if let Some(access) = &actual.access {
         access.verify(staged.file())?;
     }
-    let saved = match staged.persist(expected.is_some()) {
+    let published = if private { staged.persist_private(expected.is_some()) } else { staged.persist(expected.is_some()) };
+    let saved = match published {
         Ok(file) => file,
         Err(error) if expected.is_none() && error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(SaveError::Conflict(

@@ -39,14 +39,14 @@ pub async fn fs_copy(
 ) -> Result<CopyResult, String> {
     super::require_owned_entry_operation()?;
     tauri::async_runtime::spawn_blocking(move || {
-        super::copy_owned::copy_batch(
+        super::copy_owned::copy_batch_guarded(
             sources,
             &dest_dir,
             &root,
             &WorkspaceEnv::from_option(workspace),
             &app.state::<WorkspaceRegistry>(),
             &app.state::<FileIndexState>(),
-            rename_on_conflict.unwrap_or(false),
+            (rename_on_conflict.unwrap_or(false), Some(&|target| super::native_store::refuse_write(&app, target))),
         )
     })
     .await

@@ -152,11 +152,19 @@ impl Staged<'_> {
     pub fn file(&self) -> &fs::File {
         self.candidate.file()
     }
-    pub fn persist(mut self, replace: bool) -> io::Result<fs::File> {
+    pub fn persist(self, replace: bool) -> io::Result<fs::File> {
+        self.publish(replace, true)
+    }
+
+    pub fn persist_private(self, replace: bool) -> io::Result<fs::File> {
+        self.publish(replace, false)
+    }
+
+    fn publish(mut self, replace: bool, inherit: bool) -> io::Result<fs::File> {
         let dir = &self.destination.dir;
         // Allocate the returned handle before publication, never after commit.
         let file = self.file().try_clone()?;
-        if !replace {
+        if !replace && inherit {
             self.candidate.inheritance_from(dir)?.apply(self.file())?;
         }
         self.candidate.verify()?;

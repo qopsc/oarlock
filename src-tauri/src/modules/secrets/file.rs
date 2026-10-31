@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::fs;
 
 pub(crate) fn read_store_at(path: &std::path::Path) -> Result<HashMap<String, String>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::io::Read;
+    let mut file = match crate::modules::fs::open_store_file(path) {
+        Ok(file) => file,
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && fs::symlink_metadata(path)
@@ -14,6 +15,8 @@ pub(crate) fn read_store_at(path: &std::path::Path) -> Result<HashMap<String, St
         }
         Err(error) => return Err(error.to_string()),
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     serde_json::from_slice::<HashMap<String, String>>(&bytes).map_err(|e| e.to_string())
 }
 
@@ -29,21 +32,8 @@ fn write_with(
     map: &HashMap<String, String>,
     sync: impl FnOnce(&fs::File) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
-    // Create exclusively in the same directory; never reopen a predictable name
-    // whose permissions or symlink target could survive an earlier failed write.
-    let parent = path.parent().ok_or("secrets: missing store directory")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    temp.as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut temp, map).map_err(|e| e.to_string())?;
-    temp.flush().map_err(|e| e.to_string())?;
-    sync(temp.as_file()).map_err(|e| e.to_string())?;
-    temp.persist(path).map_err(|e| e.to_string())?;
-    Ok(())
+    let bytes = serde_json::to_vec(map).map_err(|e| e.to_string())?;
+    crate::modules::fs::native_store::write_private(path, &bytes, u64::MAX, sync)
 }
 
 #[cfg(test)]
@@ -86,6 +76,28 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert!(read_store_at(&path).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn a_symlinked_secret_store_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let other = dir.path().join("other.json");
+        fs::write(&other, br#"{"secret":"value"}"#).unwrap();
+        symlink(&other, &path).unwrap();
+        assert!(read_store_at(&path).is_err());
+        assert!(write_store_at(&path, &HashMap::new()).is_err());
+        assert_eq!(fs::read(&other).unwrap(), br#"{"secret":"value"}"#);
+    }
+
+    #[test]
+    fn permissive_secret_file_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        fs::write(&path, br#"{"old":"value"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(write_store_at(&path, &HashMap::new()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), br#"{"old":"value"}"#);
     }
 
     #[test]

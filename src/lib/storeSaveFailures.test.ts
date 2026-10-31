@@ -11,7 +11,7 @@ it("shows a persistent notice when a background store save fails", async () => {
   const callback = mocks.listen.mock.calls[0]?.[1];
   callback({ payload: "spaces.json: permission denied" });
   expect(mocks.error).toHaveBeenCalledWith("Could not save application data", {
-    description: "spaces.json: permission denied", duration: Number.POSITIVE_INFINITY,
+    description: "spaces.json: permission denied", duration: Number.POSITIVE_INFINITY, closeButton: true,
   });
 });
 
@@ -20,6 +20,6 @@ it("shows when the error listener cannot be installed", async () => {
   mocks.listen.mockRejectedValueOnce(new Error("listener unavailable"));
   await installStoreSaveFailureReporting();
   expect(mocks.error).toHaveBeenCalledWith("Could not monitor application data saves", {
-    description: "Error: listener unavailable", duration: Number.POSITIVE_INFINITY,
+    description: "Error: listener unavailable", duration: Number.POSITIVE_INFINITY, closeButton: true,
   });
 });

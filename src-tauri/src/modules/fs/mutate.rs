@@ -325,11 +325,13 @@ pub async fn fs_create_dir(
         let registry = app.state::<WorkspaceRegistry>();
         let gates = registry.gates(origin.unwrap_or_default());
         let p = gates.authorized_new(&requested)?;
+        super::native_store::refuse_write(&app, &p)?;
         // Oarlock's own new folder in a project's trusted item keeps the user's trust in it.
         let change = OwnChange::Folder { target: &p };
         project_trust::keeping_trust(&app, change, || {
             create_checked(&p, true, |opened| {
                 let current = gates.authorized_new(&requested)?;
+                super::native_store::refuse_write(&app, &current)?;
                 if current != p || opened != p {
                     return Err("Creation destination changed during operation".into());
                 }

@@ -3,7 +3,7 @@
 //! The general settings plugin never opens or rewrites the endpoint metadata file.
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
@@ -131,7 +131,7 @@ fn apply(current: &Snapshot, change: Change, new_id: &str) -> Result<Snapshot, S
     Ok(next)
 }
 fn read_json(path: &Path) -> Result<Option<Value>, String> {
-    let file = match std::fs::File::open(path) {
+    let file = match super::fs::open_store_file(path) {
         Ok(file) => file,
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
@@ -244,17 +244,8 @@ impl Store {
     }
 }
 fn persist(path: &Path, value: &Snapshot) -> Result<(), String> {
-    let parent = path.parent().ok_or("endpoint directory missing")?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, value).map_err(|e| e.to_string())?;
-    if file.as_file().metadata().map_err(|e| e.to_string())?.len() > MAX_BYTES {
-        return Err("endpoint store exceeds 64 MiB".into());
-    }
-    file.flush().map_err(|e| e.to_string())?;
-    file.as_file().sync_all().map_err(|e| e.to_string())?;
-    file.persist(path).map_err(|e| e.error.to_string())?;
-    Ok(())
+    let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    super::fs::native_store::write(path, &bytes, MAX_BYTES, |_| Ok(()))
 }
 fn with_store<T>(
     app: &tauri::AppHandle,
@@ -434,6 +425,21 @@ pub async fn ai_endpoint_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_store_refuses_symlink_reads_and_writes() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let outside = root.path().join("outside.json");
+        fs::write(&outside, b"outside").unwrap();
+        fs::remove_file(&store.path).unwrap();
+        symlink(&outside, &store.path).unwrap();
+        assert!(Store::open(root.path()).is_err());
+        assert!(persist(&store.path, &store.snapshot).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
     use serde_json::json;
     fn endpoint(id: &str) -> Endpoint {
         Endpoint {

@@ -39,6 +39,24 @@ fn batch_copies_regular_files_without_replacing_conflicts() {
     assert_eq!(fs::read_to_string(dest.join("a copy.txt")).unwrap(), "new");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn copy_checks_the_actual_chosen_destination_before_publication() {
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("protected.json");
+    fs::write(&source, b"payload").unwrap();
+    let as_string = |path: &Path| path.to_string_lossy().into_owned();
+    let result = copy_batch_impl_guarded(
+        vec![as_string(&source)], &as_string(&dest), &as_string(&dest),
+        &WorkspaceEnv::Local, &registry, &FileIndexState::default(),
+        (false, Some(&|_| Err("Protected native store".into()))),
+    ).unwrap();
+    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed[0].message.contains("Protected native store"));
+    assert!(!dest.join("protected.json").exists());
+    assert_eq!(fs::read(source).unwrap(), b"payload");
+}
+
 #[cfg(unix)]
 #[test]
 fn replacing_source_after_open_never_copies_the_replacement() {
@@ -55,6 +73,7 @@ fn replacing_source_after_open_never_copies_the_replacement() {
         root: &dest,
         registry: &registry,
         rename_on_conflict: false,
+        guard: None,
     };
     let outcome = copy_file(
         &source,
@@ -85,6 +104,7 @@ fn replacing_source_parent_before_open_cannot_read_outside_file() {
         root: &dest,
         registry: &registry,
         rename_on_conflict: false,
+        guard: None,
     };
     fs::rename(&src, tmp.path().join("original")).unwrap();
     symlink(outside.path(), &src).unwrap();
@@ -107,6 +127,7 @@ fn replacing_destination_parent_does_not_write_to_new_target() {
         root: &dest,
         registry: &registry,
         rename_on_conflict: false,
+        guard: None,
     };
     let outcome = copy_file(
         &source,
@@ -138,6 +159,7 @@ fn final_destination_symlink_is_not_overwritten_or_followed() {
         root: &dest,
         registry: &registry,
         rename_on_conflict: false,
+        guard: None,
     };
     let result = copy_file(
         &source,
@@ -229,6 +251,7 @@ fn a_replaced_source_link_is_never_copied_from_its_new_entry() {
         root: &dest,
         registry: &registry,
         rename_on_conflict: false,
+        guard: None,
     };
     let result = copy_file(
         &source,
@@ -290,6 +313,7 @@ fn folder_replaced_after_open_cannot_copy_its_new_target() {
         root: &dest,
         registry: &registry,
         rename_on_conflict: false,
+        guard: None,
     };
     let result = copy_file(
         &folder,

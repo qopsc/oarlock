@@ -281,9 +281,7 @@ fn persist(path: &Path, snapshot: &Snapshot, expected: Option<&Snapshot>) -> Res
     use super::fs::document_save::{self, SaveError};
     let parent = path.parent().ok_or("Themes directory is missing")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let target = std::fs::canonicalize(parent)
-        .map_err(|e| e.to_string())?
-        .join(path.file_name().ok_or("Missing theme filename")?);
+    let target = super::fs::store_target(path).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err("Themes exceed 50 MiB".into());

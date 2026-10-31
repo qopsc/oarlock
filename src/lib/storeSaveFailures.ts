@@ -8,12 +8,14 @@ export async function installStoreSaveFailureReporting(): Promise<void> {
       toast.error("Could not save application data", {
         description: payload,
         duration: Number.POSITIVE_INFINITY,
+        closeButton: true,
       });
     });
   } catch (error) {
     toast.error("Could not monitor application data saves", {
       description: String(error),
       duration: Number.POSITIVE_INFINITY,
+      closeButton: true,
     });
   }
 }

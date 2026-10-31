@@ -1672,6 +1672,11 @@ local `tauri-plugin-store` fork checks every store read and write without
 following symlinks below its data root and refuses hard-linked entries. Its
 autosave failures emit an event displayed in each app window. Workspace file saves
 and Explorer mutations check known native store and agent-settings identities.
+Protected state directories are checked directly; an existing hard-linked
+workspace target also triggers a bounded identity scan of those directories.
+Endpoint, MCP and project-trust stores use checked native publication. Linux
+secret-file writes keep a private candidate and refuse an existing secret file
+that is not owned by the user or grants group/other access.
 The inventory and remaining gaps are recorded in `REVIEW_LEDGER.md`; these
 partial changes do not yet establish the complete native-store boundary.
 

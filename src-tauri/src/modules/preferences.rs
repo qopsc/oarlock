@@ -284,8 +284,7 @@ fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
     use super::fs::document_save::{self, SaveError};
     let parent = path.parent().ok_or("Preferences directory is missing")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let target = std::fs::canonicalize(parent).map_err(|e| e.to_string())?
-        .join(path.file_name().ok_or("Missing preferences filename")?);
+    let target = super::fs::store_target(path).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err("Preferences exceed 64 MiB".into());
@@ -458,6 +457,22 @@ mod tests {
         assert!(store.mutate(set("showHidden", json!(false))).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"{\"keep\":true}");
         assert!(fs::symlink_metadata(&store.path).unwrap().file_type().is_symlink());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn preference_save_refuses_a_replaced_parent_directory() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let outside = root.path().join("outside");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let mut store = Store::open(&data).unwrap();
+        fs::write(outside.join(FILE), b"outside").unwrap();
+        fs::rename(&data, root.path().join("old-data")).unwrap();
+        symlink(&outside, &data).unwrap();
+        assert!(store.mutate(set("showHidden", json!(true))).is_err());
+        assert_eq!(fs::read(outside.join(FILE)).unwrap(), b"outside");
     }
     #[cfg(target_os = "macos")]
     #[test]
