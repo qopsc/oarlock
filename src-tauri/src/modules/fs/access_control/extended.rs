@@ -49,8 +49,27 @@ fn bounded_read(
     bytes.truncate(count as usize);
     Ok(bytes)
 }
+fn parse_names(result: io::Result<Vec<u8>>) -> io::Result<Vec<CString>> {
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return Err(unsupported());
+    }
+    bytes
+        .split_inclusive(|b| *b == 0)
+        .map(|name| {
+            if name.len() < 2 {
+                return Err(unsupported());
+            }
+            CString::from_vec_with_nul(name.to_vec()).map_err(|_| unsupported())
+        })
+        .collect()
+}
 fn names(file: &File) -> io::Result<Vec<CString>> {
-    let bytes = bounded_read(MAX_NAMES, |buffer, size| {
+    parse_names(bounded_read(MAX_NAMES, |buffer, size| {
         #[cfg(target_os = "macos")]
         {
             unsafe {
@@ -66,19 +85,7 @@ fn names(file: &File) -> io::Result<Vec<CString>> {
         {
             unsafe { libc::flistxattr(file.as_raw_fd(), buffer.cast(), size) }
         }
-    })?;
-    if !bytes.is_empty() && bytes.last() != Some(&0) {
-        return Err(unsupported());
-    }
-    bytes
-        .split_inclusive(|b| *b == 0)
-        .map(|name| {
-            if name.len() < 2 {
-                return Err(unsupported());
-            }
-            CString::from_vec_with_nul(name.to_vec()).map_err(|_| unsupported())
-        })
-        .collect()
+    }))
 }
 fn managed_by_acl(name: &CStr) -> bool {
     cfg!(target_os = "linux") && name.to_bytes() == b"system.posix_acl_access"
@@ -213,6 +220,16 @@ impl Extended {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_lists_are_empty_but_read_errors_are_refused() {
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(parse_names(Err(io::Error::from_raw_os_error(code))).unwrap().is_empty());
+        }
+        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EINVAL] {
+            assert_eq!(parse_names(Err(io::Error::from_raw_os_error(code))).unwrap_err().raw_os_error(), Some(code));
+        }
+        assert!(parse_names(Ok(b"unterminated".to_vec())).is_err());
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn refuses_when_a_staging_file_cannot_preserve_an_existing_attribute() {

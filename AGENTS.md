@@ -1681,9 +1681,11 @@ The inventory and remaining gaps are recorded in `REVIEW_LEDGER.md`; these
 partial changes do not yet establish the complete native-store boundary.
 
 On Linux the replacement writer checks each file's POSIX ACL and supported
-extended attributes instead of choosing by filesystem type. It refuses an
-NFSv4 ACL it cannot preserve and any metadata it cannot enumerate or reproduce;
-an unsupported POSIX ACL operation alone is not treated as a saved ACL.
+extended attributes instead of choosing by filesystem type. It treats an
+unsupported attribute-list operation as an empty list, and refuses other
+listing errors or metadata it cannot reproduce. It also refuses an NFSv4 ACL
+it cannot preserve; an unsupported POSIX ACL operation alone is not treated
+as a saved ACL.
 
 Validation for native revisioned preferences: 4,770 frontend tests pass across
 514 files, and 1,298 Rust tests pass with three ignored. Types, Clippy, production
