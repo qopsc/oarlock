@@ -4022,3 +4022,7 @@ R201 is fixed using the existing revisioned theme snapshots and conditional docu
 Regression coverage includes delayed reads, cross-window revision conflicts, unrelated-theme retry, stale file versions and listener disposal; native tests verify stale catalog and file snapshots cannot publish. Full frontend tests passed (5,527 passed, 2 skipped), frontend types and lint passed, and strict all-target Clippy passed. Full native results are recorded at the batch checkpoint. The ownership group now has 8 closed and 48 open: Tier 1 = 5 (all Windows-port or AI-on-hold), Tier 2 = 27, Tier 3 = 15, Tier 4 = 1.
 
 R201 final validation: the full native suite passed (1,487 library tests, 4 ignored, plus all integration suites) after the compatibility adjustment. The full frontend suite passed before that native-only adjustment.
+
+## Tier 2: R017 commit-file diff scope
+
+R017 is fixed: a commit-file diff is reused only when its owning space also matches. The regression covers identical repository, commit and file paths in two spaces, plus same-space reuse. The full frontend suite passed (5,528 passed, 2 skipped); types and lint passed. The full native suite remained green from R201; this change has no native code. Tier 2 remaining in the ownership group: 26.

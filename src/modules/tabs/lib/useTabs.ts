@@ -540,6 +540,21 @@ export function planCommitHistoryOpen(
   };
 }
 
+export function findCommitFileDiffTab(
+  tabs: readonly Tab[],
+  input: { repoRoot: string; sha: string; path: string },
+  spaceId: string,
+): GitCommitFileDiffTab | undefined {
+  return tabs.find(
+    (tab): tab is GitCommitFileDiffTab =>
+      tab.kind === "git-commit-file" &&
+      tab.spaceId === spaceId &&
+      tab.repoRoot === input.repoRoot &&
+      tab.sha === input.sha &&
+      tab.path === input.path,
+  );
+}
+
 function coldTerminalTab(
   tabId: number,
   leafId: number,
@@ -1309,13 +1324,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       originalPath: string | null;
     }) => {
       const curr = tabsRef.current;
-      const existing = curr.find(
-        (t) =>
-          t.kind === "git-commit-file" &&
-          t.repoRoot === input.repoRoot &&
-          t.sha === input.sha &&
-          t.path === input.path,
-      );
+      const existing = findCommitFileDiffTab(curr, input, activeSpaceIdRef.current);
       const title = `${basename(input.path)} @ ${input.shortSha}`;
       if (existing) {
         const nextTabs = curr.map((t) =>
