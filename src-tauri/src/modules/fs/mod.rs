@@ -30,6 +30,30 @@ use tauri::Manager;
 
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 
+/// Open a store entry relative to a retained parent and verify the opened identity.
+pub(crate) fn open_store_file(path: &Path) -> std::io::Result<std::fs::File> {
+    destination::Destination::pin(path, false, &|_| Ok(()))?.open_current()
+}
+
+#[cfg(all(test, unix))]
+mod native_store_read_tests {
+    use super::open_store_file;
+    use std::{fs, io::Read, os::unix::fs::symlink};
+
+    #[test]
+    fn reads_regular_store_and_refuses_symbolic_link() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store.json");
+        let alias = root.path().join("alias.json");
+        fs::write(&store, "{\"normal\":true}").unwrap();
+        symlink(&store, &alias).unwrap();
+        let mut value = String::new();
+        open_store_file(&store).unwrap().read_to_string(&mut value).unwrap();
+        assert_eq!(value, "{\"normal\":true}");
+        assert!(open_store_file(&alias).is_err());
+    }
+}
+
 /// The remaining final-entry race with noncooperating local programs is
 /// best effort on supported platforms; static authorization still applies.
 pub(crate) fn require_owned_entry_operation() -> Result<(), String> {

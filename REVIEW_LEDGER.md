@@ -4219,3 +4219,9 @@ An offline Linux arm64 container compiled the current native source. On tmpfs, a
 The Linux ACL check now accepts overlayfs as a POSIX-ACL filesystem, while still reading and verifying each file's ACL and extended attributes. A new conditional-save test on the container's actual overlay filesystem failed before this change and passes afterward, retaining file mode; the three focused ACL/extended-attribute tests also passed there, including a real nontrivial POSIX ACL round trip. macOS document-save tests and strict Clippy passed. The container reports two existing Linux warnings.
 
 **Still open:** this addresses the reported overlay filesystem, not every filesystem lacking ACL support. Other filesystems remain refused by the existing ACL-model allowlist because absence of a POSIX ACL xattr alone does not establish absence of a different native ACL model. The requested general per-file policy still needs an implementation that can distinguish those cases without losing access rules. No non-atomic fallback was added.
+
+### R216 / R110: native preferences and theme storage, partial
+
+Native preferences and theme catalog reads now open relative to a retained directory, reject symbolic-link entries and check the open file's identity. Preference publication now uses the existing conditional replacement writer, including ACL and extended metadata preservation. Native tests cover ordinary preference changes, a symlink installed before preference read or save, and a macOS ACL round trip; existing theme symlink and normal-save tests also pass. This resolves the originally described preference replacement metadata loss (R110) on the supported native writer paths; unsupported filesystems still refuse safely.
+
+R216 remains open: the store plugin's background persistence and workspace-side hard-link identity protections still need to be completed and verified. No claim is made that the broader native-store boundary is complete.

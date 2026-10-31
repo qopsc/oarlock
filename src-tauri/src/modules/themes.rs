@@ -252,7 +252,7 @@ fn read_json(path: &Path) -> Result<Option<Value>, String> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err("Theme storage must be a regular file, not a symbolic link".into());
     }
-    let file = match super::project_trust::open_regular(path) {
+    let file = match super::fs::open_store_file(path) {
         Ok(file) => file,
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
@@ -291,7 +291,7 @@ fn persist(path: &Path, snapshot: &Snapshot, expected: Option<&Snapshot>) -> Res
     document_save::with_lock(&target, || {
         let version = if let Some(expected) = expected {
             let mut file =
-                super::project_trust::open_regular(&target).map_err(|e| e.to_string())?;
+                super::fs::open_store_file(&target).map_err(|e| e.to_string())?;
             let mut previous = Vec::new();
             (&mut file)
                 .take(MAX_BYTES + 1)

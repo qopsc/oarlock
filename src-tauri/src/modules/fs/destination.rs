@@ -99,7 +99,7 @@ impl Destination {
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NONBLOCK);
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
         }
         let file = self.dir.open_with(&self.name, &options)?.into_std();
         // cap-std confines symlink resolution to the directory, but may follow

@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -255,7 +255,7 @@ fn apply(current: &Snapshot, change: Change) -> Result<(Snapshot, Update), Strin
     Ok((next, update))
 }
 fn read_json(path: &Path) -> Result<Option<Value>, String> {
-    let file = match super::project_trust::open_regular(path) {
+    let file = match super::fs::open_store_file(path) {
         Ok(file) => file,
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
@@ -281,17 +281,34 @@ fn read_json(path: &Path) -> Result<Option<Value>, String> {
         .map_err(|e| e.to_string())
 }
 fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
+    use super::fs::document_save::{self, SaveError};
     let parent = path.parent().ok_or("Preferences directory is missing")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, snapshot).map_err(|e| e.to_string())?;
-    if file.as_file().metadata().map_err(|e| e.to_string())?.len() > MAX_BYTES {
+    let target = std::fs::canonicalize(parent).map_err(|e| e.to_string())?
+        .join(path.file_name().ok_or("Missing preferences filename")?);
+    let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_BYTES {
         return Err("Preferences exceed 64 MiB".into());
     }
-    file.flush().map_err(|e| e.to_string())?;
-    file.as_file().sync_all().map_err(|e| e.to_string())?;
-    file.persist(path).map_err(|e| e.error.to_string())?;
-    Ok(())
+    document_save::with_lock(&target, || {
+        let version = match super::fs::open_store_file(&target) {
+            Ok(mut file) => {
+                let mut old = Vec::new();
+                (&mut file).take(MAX_BYTES + 1).read_to_end(&mut old).map_err(|e| e.to_string())?;
+                if old.len() as u64 > MAX_BYTES { return Err("Preferences exceed 64 MiB".into()); }
+                Some(document_save::version(&file, &old).map_err(|e| e.to_string())?)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&target).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => None,
+            Err(e) => return Err(format!("Cannot safely open preferences: {e}")),
+        };
+        document_save::write_checked(&target, &bytes, version.as_deref(), |actual| {
+            if actual == target { Ok(()) } else { Err("Preferences destination changed".into()) }
+        }).map(|_| ()).map_err(|error| match error {
+            SaveError::Failed(message) => message,
+            SaveError::Conflict(_) => "Preferences changed during commit; files preserved".into(),
+        })
+    })
 }
 struct Store {
     path: PathBuf,
@@ -425,6 +442,33 @@ mod tests {
             key: key.into(),
             value,
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn preferences_refuse_a_symlink_on_open_and_save() {
+        use std::{fs, os::unix::fs::symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.mutate(set("showHidden", json!(true))).unwrap();
+        let target = dir.path().join("external.json");
+        fs::write(&target, b"{\"keep\":true}").unwrap();
+        fs::remove_file(&store.path).unwrap();
+        symlink(&target, &store.path).unwrap();
+        assert!(Store::open(dir.path()).is_err());
+        assert!(store.mutate(set("showHidden", json!(false))).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"{\"keep\":true}");
+        assert!(fs::symlink_metadata(&store.path).unwrap().file_type().is_symlink());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preference_saves_preserve_access_rules() {
+        use crate::modules::fs::access_control::tests::{acl_text, add_acl};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        add_acl(&store.path, "group:everyone deny execute");
+        let expected = acl_text(&store.path);
+        store.mutate(set("showHidden", json!(true))).unwrap();
+        assert_eq!(acl_text(&store.path), expected);
     }
     #[test]
     fn conditional_update_rejects_a_stale_snapshot() {
