@@ -4068,3 +4068,7 @@ R010 is fixed: each folder's latest listing supersedes older reads and delayed s
 ## Tier 2: R004 control caller ownership
 
 R004 is fixed: an explicit pane caller that no longer resolves returns `caller_unavailable` instead of falling back to the active window or space. The frontend also rechecks that caller after asynchronous window focus, so closing or moving it during the wait cannot redirect an open request. External CLI requests without a caller retain their existing active-context behavior. Regressions cover absent native callers, stale frontend callers and closure during focus. Full frontend tests passed (5,552 passed, 2 skipped); the full native suite passed (1,488 library tests, 4 ignored, plus integration suites); strict all-target Clippy, types and lint passed. Tier 2 remaining in the ownership group: 16.
+
+## Tier 2: R101 Linux portal ordering, validation pending
+
+R101 has a local implementation: a relevant `SettingChanged` signal invalidates an older initial `ReadOne` or fallback `Read`, so its late reply cannot restore the previous color scheme. The platform-independent ordering regression passes with `rustc --test`, and the macOS Clippy check passes. This workspace has only the macOS Rust target and no Linux runner, so the GTK/portal integration was not compiled or exercised here. R101 remains open in the Tier 2 count until a Linux build and portal smoke test confirm it; expected result: switch the desktop preference while the initial portal read is delayed, then observe that Oarlock keeps the latest preference.

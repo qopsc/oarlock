@@ -7,7 +7,11 @@
 //! This reads it there at start and on every change and mirrors it into GTK,
 //! which WebKitGTK follows live. Without a portal nothing changes.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, rc::Rc};
+
+#[path = "color_scheme_guard.rs"]
+mod color_scheme_guard;
+use color_scheme_guard::SchemeOrder;
 
 use gtk::gio::{self, prelude::*};
 use gtk::glib::{self, Variant};
@@ -68,7 +72,14 @@ fn apply(settings: &gtk::Settings, scheme: u32, initial: bool) {
     }
 }
 
-fn read(proxy: &gio::DBusProxy, method: &'static str, settings: gtk::Settings, initial: bool) {
+fn read(
+    proxy: &gio::DBusProxy,
+    method: &'static str,
+    settings: gtk::Settings,
+    initial: bool,
+    order: Rc<SchemeOrder>,
+    started: u64,
+) {
     let retry = proxy.clone();
     proxy.call(
         method,
@@ -76,15 +87,22 @@ fn read(proxy: &gio::DBusProxy, method: &'static str, settings: gtk::Settings, i
         gio::DBusCallFlags::NONE,
         READ_TIMEOUT_MS,
         None::<&gio::Cancellable>,
-        move |reply| match reply {
-            Ok(reply) => {
-                if let Some(scheme) = scheme_of(&reply) {
-                    apply(&settings, scheme, initial);
-                }
+        move |reply| {
+            if !order.current(started) {
+                return;
             }
-            // Portals before version 2 only have `Read`.
-            Err(_) if method == "ReadOne" => read(&retry, "Read", settings, initial),
-            Err(_) => {}
+            match reply {
+                Ok(reply) => {
+                    if let Some(scheme) = scheme_of(&reply) {
+                        apply(&settings, scheme, initial);
+                    }
+                }
+                // Portals before version 2 only have `Read`.
+                Err(_) if method == "ReadOne" => {
+                    read(&retry, "Read", settings, initial, order, started)
+                }
+                Err(_) => {}
+            }
         },
     );
 }
@@ -109,17 +127,21 @@ pub fn follow() {
                     return;
                 };
                 let changed = settings.clone();
+                let order = Rc::new(SchemeOrder::default());
+                let changed_order = order.clone();
                 proxy.connect_local("g-signal", false, move |values| {
                     let signal = values.get(2)?.get::<String>().ok()?;
                     let parameters = values.get(3)?.get::<Variant>().ok()?;
                     if signal == "SettingChanged" {
                         if let Some(scheme) = changed_scheme(&parameters) {
+                            changed_order.changed();
                             apply(&changed, scheme, initial);
                         }
                     }
                     None
                 });
-                read(&proxy, "ReadOne", settings, initial);
+                let started = order.snapshot();
+                read(&proxy, "ReadOne", settings, initial, order, started);
                 PROXY.with(|slot| *slot.borrow_mut() = Some(proxy));
             },
         );
