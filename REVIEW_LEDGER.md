@@ -4331,3 +4331,16 @@ The workspace persistence file reached the user's three-re-edit tripwire during 
 ### R203: preserve existing theme files
 
 R203 is fixed. Theme edit requests conditionally create a missing file; an existing file is never overwritten just to open it. Existing JSON is compared without regard to object key order, with a visible notice when it differs from the catalog or cannot be compared. Already-open editors are compared without attempting a write. The existing conditional document-save command accepts an optional write-event source so creating the initial theme file does not masquerade as an editor save and trigger theme ingestion; omitted sources retain the editor default. Tests cover a concurrent existing file, changed and equivalent content, failed comparison, the warning, and an already-open editor. Full macOS native tests passed (1,532 library tests and integration suites, four ignored); frontend tests passed 5,608 with two skipped. Strict Clippy and type checking passed; lint remained at 80 warnings. No packaged-app interaction was run.
+
+## Reconstructed MAJOR group membership
+
+The original register at `858b340` contains 167 rows marked MAJOR; the later grouping summary reported 166 without recording member IDs. The 56 ownership and 15 trust IDs were subsequently recorded explicitly. The remaining groups below are reconstructed from each original finding's primary concern, not a claim that the undocumented original assignment can be recovered. They are disjoint and, together with the recorded 56 and 15, cover all 167 original rows. R044 remains a conditional, supplementary compatibility finding rather than being silently removed to force the old total of 166. Later findings such as R235 and the original MINOR R078 are tracked separately.
+
+| Group | Original member IDs | Count |
+| --- | --- | ---: |
+| Persistence, external change and durability | R014, R028, R030, R033, R059, R077, R100, R102, R106, R110, R132, R140, R145, R146, R164, R165, R170, R175, R203, R204, R209 | 21 |
+| Failure reporting and recovery | R002, R058, R060, R091, R092, R114 | 6 |
+| Resource limits and process lifetime | R011, R024, R031, R041, R045, R046, R051, R052, R068, R069, R070, R071, R079, R089, R096, R098, R099, R103, R104, R107, R117, R133, R137, R138, R142, R143, R154, R159, R160, R162, R173, R174, R179, R186, R190, R192, R207, R210 | 38 |
+| Compatibility, data semantics and UI | R001, R007, R023, R032, R043, R044, R048, R049, R053, R055, R056, R057, R063, R072, R082, R086, R093, R095, R112, R113, R116, R118, R122, R123, R171, R177, R187, R191, R200, R215, R217 | 31 |
+
+These are membership lists, not current-status counts. AI/MCP and Windows/WSL entries remain in the accounting but are held or moved to the port section as applicable. Triage results and evidence are recorded separately below.
