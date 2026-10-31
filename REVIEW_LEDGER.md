@@ -4072,3 +4072,7 @@ R004 is fixed: an explicit pane caller that no longer resolves returns `caller_u
 ## Tier 2: R101 Linux portal ordering, validation pending
 
 R101 has a local implementation: a relevant `SettingChanged` signal invalidates an older initial `ReadOne` or fallback `Read`, so its late reply cannot restore the previous color scheme. The platform-independent ordering regression passes with `rustc --test`, and the macOS Clippy check passes. This workspace has only the macOS Rust target and no Linux runner, so the GTK/portal integration was not compiled or exercised here. R101 remains open in the Tier 2 count until a Linux build and portal smoke test confirm it; expected result: switch the desktop preference while the initial portal read is delayed, then observe that Oarlock keeps the latest preference.
+
+## Tier 2: R108 working-directory dropdown
+
+R108 is fixed: dropdown listings are scoped to the path, visibility setting and workspace environment, and late or closed-menu reads cannot publish. A stale menu selection also checks the current environment before issuing `cd`. Regressions cover the same path in different environments and out-of-order directory responses. Full frontend tests passed (5,554 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 15, including R101 pending Linux validation.
