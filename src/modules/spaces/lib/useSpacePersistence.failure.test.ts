@@ -120,3 +120,12 @@ it("captures each layout's scrollback keys before a later flush changes them", a
   expect(fake.saveState).toHaveBeenNthCalledWith(1, "space", { tabs: [{ key: "first" }], activeTabIndex: 0 });
   expect(fake.saveState).toHaveBeenNthCalledWith(2, "space", { tabs: [{ key: "second" }], activeTabIndex: 0 });
 });
+
+it("flushes the layout even if saving scrollback fails", async () => {
+  fake.persistScrollback.mockRejectedValueOnce(new Error("history failed"));
+  const flush = await mount();
+  await expect(flush()).rejects.toThrow("history failed");
+  expect(fake.saveStore).toHaveBeenCalledOnce();
+  await expect(flush()).resolves.toBeUndefined();
+  expect(fake.saveState).toHaveBeenCalledTimes(1);
+});

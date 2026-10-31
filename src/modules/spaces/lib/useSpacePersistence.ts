@@ -102,9 +102,9 @@ export function useSpacePersistence({
       const failed = results.find((result) => result.status === "rejected");
       const history = await scrollback;
       if (failed?.status === "rejected") throw failed.reason;
-      if (!history.ok) throw history.error;
       await saveSpacesStore();
       for (const [id, value] of pending) last.current.set(id, value);
+      if (!history.ok) throw history.error;
     });
     queue.current = run.catch(() => undefined);
     return run;
