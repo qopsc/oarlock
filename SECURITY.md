@@ -32,7 +32,7 @@ Until `1.0.0`, only the latest minor gets security fixes. See the current versio
 
 ## What we do to keep things safe
 
-- **API keys** live in the OS keychain via `keyring` - not on disk, not in `localStorage`, not in logs.
+- **API keys** use the macOS Keychain or Windows Credential Manager. On Linux they are stored in a user-only file in Oarlock's data folder. They are not stored in `localStorage` or logs.
 - **No telemetry.** Oarlock only talks to the network when you ask it to (AI requests, update checks, web preview).
 - **AI tool approval.** File writes and shell commands from the agent need your OK before they run, unless you turn on Auto-approve for a chat (an always-visible chip shows it). Launching or messaging a coding agent always asks, and no mode skips the path and command deny-lists.
 - **MCP servers ask first.** A tool from an MCP server you added asks before every call, even in Auto-approve, unless you mark that server Trusted; what a server says about its tools never changes that. What servers return is treated as untrusted, and so are the resources you attach and the prompts you run from them: the AI is told they are the server's words. When a server asks to use your AI model (sampling) or asks you for information, nothing happens until you approve it, in any mode and even for a trusted server: you can edit the request, Oarlock sends none of your conversation, and you see the model's reply before it goes back. Remote servers are reached only at the address you configured, through the same network checks as AI requests, and their secret headers and the secret environment variables of local servers stay in your keychain, out of reach of Oarlock's pages.

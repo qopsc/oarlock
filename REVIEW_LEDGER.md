@@ -4181,3 +4181,7 @@ This pass checks current non-AI code and documentation. The six AI/MCP rows rema
 | R216 | Open, Tier 1 pending validation | The plugin wrapper rejects protected names but does not inspect disk aliases. Whether a restricted component can create a useful alias without an independently acting same-user program has not been established; do not downgrade or claim exploitation yet. |
 
 Counts: 6 open non-held findings (including R034), 2 accepted external races, 1 Windows-port item, and 6 AI/MCP-held findings. R034 is a release blocker under the guaranteed untrusted-repository boundary; severity and reproduction for R067 and R216 remain subject to depth validation.
+
+### R121: secret-storage documentation
+
+The security policy and the security-model introduction now agree with README and the detailed Linux section: macOS and Windows use their system credential stores, while Linux uses a user-only file in the app data directory. The documentation no longer says Linux keys never touch disk. Verified the statements against the existing detailed documentation; no AI backend code was opened or changed. R121 is closed.

@@ -11,7 +11,7 @@ The main trust boundaries are:
 1. **IPC boundary** - commands registered in `src-tauri/src/lib.rs`, gated by `src-tauri/capabilities/default.json`.
 2. **File-system boundary** - every file command, PTY and shell spawn, git and the AI tools go through the workspace authorization registry; AI tools also go through `src/modules/ai/lib/security.ts`.
 3. **Network boundary** - AI HTTP proxy in `src-tauri/src/modules/net.rs` with SSRF and DNS-rebinding defenses.
-4. **Secret-storage boundary** - keys live in the OS keychain, never on disk or in `localStorage`.
+4. **Secret-storage boundary** - keys live in the macOS Keychain or Windows Credential Manager, or in a user-only file in the Linux app data directory; they never go in `localStorage`.
 5. **Terminal escape-sequence boundary** - OSC sequences are parsed and acted on, but never blindly trusted to mutate state.
 6. **MCP boundary** - MCP servers are programs and services the user added; their tools ask before every call unless the user trusts the server, and what they return is untrusted input (see below).
 
