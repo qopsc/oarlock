@@ -61,6 +61,11 @@ export async function saveState(id: string, state: SpaceState): Promise<void> {
   await store.set(stateKey(id), state);
 }
 
+/** Flush pending space and layout changes before reporting persistence. */
+export async function saveSpacesStore(): Promise<void> {
+  await store.save();
+}
+
 export async function deleteSpaceData(id: string): Promise<void> {
   await store.delete(stateKey(id));
 }

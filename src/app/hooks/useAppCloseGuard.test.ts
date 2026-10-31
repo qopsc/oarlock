@@ -52,6 +52,18 @@ describe("closeAfterFlush", () => {
 });
 
 describe("boundedSpaceFlush", () => {
+  it("reports a failed workspace save so closing can warn", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(
+        boundedSpaceFlush(async () => {
+          throw new Error("disk failed");
+        }, 1500),
+      ).resolves.toEqual({ ok: false, timedOut: false });
+    } finally {
+      warn.mockRestore();
+    }
+  });
   it("lets close finish when a spaces or scrollback write never settles", async () => {
     vi.useFakeTimers();
     try {
@@ -62,7 +74,7 @@ describe("boundedSpaceFlush", () => {
       expect(done).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       await saving;
-      expect(done).toHaveBeenCalledOnce();
+      expect(done).toHaveBeenCalledWith({ ok: false, timedOut: true });
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();

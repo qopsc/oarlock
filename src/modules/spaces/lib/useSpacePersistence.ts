@@ -9,7 +9,7 @@ import {
   persistedTerminalLeafIds,
   serializeTabs,
 } from "./serialize";
-import { saveState } from "./store";
+import { saveSpacesStore, saveState } from "./store";
 import { useSpaces } from "./useSpaces";
 
 const DEBOUNCE_MS = 3000;
@@ -38,6 +38,7 @@ export function useSpacePersistence({
   enabled,
 }: Params) {
   const last = useRef<Map<string, LastWrite>>(new Map());
+  const queue = useRef<Promise<void>>(Promise.resolve());
   const seeded = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latest = useRef<Snapshot>({ tabs, activeId, activeSpaceId });
@@ -56,38 +57,57 @@ export function useSpacePersistence({
   }
 
   const flush = useCallback((snap: Snapshot): Promise<void> => {
-    const writes: Promise<unknown>[] = [];
     // Assigns new panes their scrollback keys before the tabs are serialized.
-    writes.push(terminalScrollback.persist(persistedTerminalLeafIds(snap.tabs)));
+    const scrollback = terminalScrollback
+      .persist(persistedTerminalLeafIds(snap.tabs))
+      .then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
     const groups = new Map<string, Tab[]>();
     for (const t of snap.tabs) {
       const arr = groups.get(t.spaceId);
       if (arr) arr.push(t);
       else groups.set(t.spaceId, [t]);
     }
-
-    for (const [spaceId, group] of groups) {
-      const serialized = serializeTabs(group, scrollbackKeyForLeaf);
-      const prev = last.current.get(spaceId);
-      let activeTabIndex = prev?.activeTabIndex ?? 0;
-      if (spaceId === snap.activeSpaceId) {
-        const idx = group
-          .filter(isSerializableTab)
-          .findIndex((t) => t.id === snap.activeId);
-        if (idx >= 0) activeTabIndex = idx;
+    const captured = [...groups].map(([spaceId, group]) => ({
+      spaceId,
+      group,
+      serialized: serializeTabs(group, scrollbackKeyForLeaf),
+    }));
+    const run = queue.current.then(async () => {
+      const writes: Promise<unknown>[] = [];
+      const pending = new Map<string, LastWrite>();
+      for (const { spaceId, group, serialized } of captured) {
+        const prev = last.current.get(spaceId);
+        let activeTabIndex = prev?.activeTabIndex ?? 0;
+        if (spaceId === snap.activeSpaceId) {
+          const idx = group
+            .filter(isSerializableTab)
+            .findIndex((t) => t.id === snap.activeId);
+          if (idx >= 0) activeTabIndex = idx;
+        }
+        const json = JSON.stringify(serialized);
+        if (
+          prev &&
+          prev.json === json &&
+          prev.activeTabIndex === activeTabIndex
+        ) {
+          continue;
+        }
+        pending.set(spaceId, { json, activeTabIndex });
+        writes.push(saveState(spaceId, { tabs: serialized, activeTabIndex }));
       }
-      const json = JSON.stringify(serialized);
-      if (
-        prev &&
-        prev.json === json &&
-        prev.activeTabIndex === activeTabIndex
-      ) {
-        continue;
-      }
-      last.current.set(spaceId, { json, activeTabIndex });
-      writes.push(saveState(spaceId, { tabs: serialized, activeTabIndex }));
-    }
-    return Promise.allSettled(writes).then(() => undefined);
+      const results = await Promise.allSettled(writes);
+      const failed = results.find((result) => result.status === "rejected");
+      const history = await scrollback;
+      if (failed?.status === "rejected") throw failed.reason;
+      if (!history.ok) throw history.error;
+      await saveSpacesStore();
+      for (const [id, value] of pending) last.current.set(id, value);
+    });
+    queue.current = run.catch(() => undefined);
+    return run;
   }, []);
 
   useEffect(() => {
@@ -96,7 +116,9 @@ export function useSpacePersistence({
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => {
       timer.current = null;
-      void flush(snap);
+      void flush(snap).catch((error) =>
+        console.warn("Could not save spaces", error),
+      );
     }, DEBOUNCE_MS);
     return () => {
       if (timer.current) clearTimeout(timer.current);
@@ -115,9 +137,16 @@ export function useSpacePersistence({
     const flushNow = () => flush(latest.current);
     flushLatest = flushNow;
     const onHidden = () => {
-      if (document.visibilityState === "hidden") void flushNow();
+      if (document.visibilityState === "hidden")
+        void flushNow().catch((error) =>
+          console.warn("Could not save spaces", error),
+        );
     };
-    const onLeave = () => void flushNow();
+    const onLeave = () => {
+      void flushNow().catch((error) =>
+        console.warn("Could not save spaces", error),
+      );
+    };
     document.addEventListener("visibilitychange", onHidden);
     window.addEventListener("blur", onLeave);
     window.addEventListener("beforeunload", onLeave);
@@ -126,7 +155,9 @@ export function useSpacePersistence({
       window.removeEventListener("blur", onLeave);
       window.removeEventListener("beforeunload", onLeave);
       if (flushLatest === flushNow) flushLatest = null;
-      void flushNow();
+      void flushNow().catch((error) =>
+        console.warn("Could not save spaces", error),
+      );
     };
   }, [enabled, flush]);
 }

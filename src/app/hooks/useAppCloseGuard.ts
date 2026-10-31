@@ -62,17 +62,23 @@ export function closeAfterFlush(
 export async function boundedSpaceFlush(
   flush: () => Promise<void>,
   timeoutMs: number,
-): Promise<void> {
+): Promise<Pick<FlushResult, "ok" | "timedOut">> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
-      Promise.resolve().then(flush),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, timeoutMs);
+    return await Promise.race([
+      Promise.resolve()
+        .then(flush)
+        .then(() => ({ ok: true, timedOut: false })),
+      new Promise<{ ok: boolean; timedOut: boolean }>((resolve) => {
+        timer = setTimeout(
+          () => resolve({ ok: false, timedOut: true }),
+          timeoutMs,
+        );
       }),
     ]);
   } catch (error) {
     console.warn("Could not save spaces before closing", error);
+    return { ok: false, timedOut: false };
   } finally {
     clearTimeout(timer);
   }
@@ -136,10 +142,10 @@ export function useAppCloseGuard(
         const flush = await saveState();
         if (closeAfterFlush(flush, warned.current) === "close") return true;
         warned.current = true;
-        toast.error("Could not save chat history", {
+        toast.error("Could not save application state", {
           id: "close-save-failed",
           duration: Number.POSITIVE_INFINITY,
-          description: "The latest messages may be lost.",
+          description: "Recent workspace or chat changes may be lost.",
           action: { label: "Quit anyway", onClick: () => void quitApp() },
         });
         return false;
@@ -219,14 +225,18 @@ export function useAppCloseGuard(
       ? { dirtyEditors, busyTerminal }
       : null;
   }, [tabsRef, editorIsDirty]);
-  /** Saves chat history, scrollback and spaces; reports the chat flush. */
+  /** Saves chat history, scrollback and spaces; reports either failure. */
   const saveState = useCallback(async () => {
     flushPersist();
-    const [flush] = await Promise.all([
+    const [flush, spaces] = await Promise.all([
       flushSessionWrites({ timeoutMs: CLOSE_FLUSH_TIMEOUT_MS }),
       boundedSpaceFlush(flushSpaces, CLOSE_SCROLLBACK_TIMEOUT_MS),
     ]);
-    return flush;
+    return {
+      ...flush,
+      ok: flush.ok && spaces.ok,
+      timedOut: flush.timedOut || spaces.timedOut,
+    };
   }, []);
   const finish = useCallback(
     async (
@@ -268,12 +278,12 @@ export function useAppCloseGuard(
         if (closeAfterFlush(flush, warned.current) === "warn") {
           warned.current = true;
           if (round !== null) void approval.abort(round);
-          toast.error("Could not save chat history", {
+          toast.error("Could not save application state", {
             id: "close-save-failed",
             duration: Number.POSITIVE_INFINITY,
             description: flush.timedOut
-              ? "Saving is taking too long. The latest messages may be lost."
-              : "The latest messages may be lost.",
+              ? "Saving is taking too long. Recent workspace or chat changes may be lost."
+              : "Recent workspace or chat changes may be lost.",
             action: {
               label: round === null ? "Close anyway" : "Quit anyway",
               // A toast can remain visible while more edits arrive. Re-enter the
