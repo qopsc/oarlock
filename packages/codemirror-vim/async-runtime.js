@@ -150,7 +150,12 @@ function execute(cm, fn, preview = false) {
     deadline: performance.now() + 10_000,
   };
   running = ticket;
+  let finished = false;
+  let timer;
   const finish = (error) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
     ticket.channel?.close();
     if (running === ticket) running = null;
     if (error) cm.vimFailed?.(error, preview);
@@ -158,17 +163,24 @@ function execute(cm, fn, preview = false) {
   };
   try {
     const value = continueVim(cm, ticket, fn);
-    if (isPromise(value))
-      return value.then(
-        (value) => {
-          finish();
-          return value;
-        },
-        (error) => {
+    if (isPromise(value)) {
+      return new Promise((resolve, reject) => {
+        ticket.cancel = (error) => {
+          if (finished) return;
           finish(error);
-          throw error;
-        },
-      );
+          reject(error);
+        };
+        timer = setTimeout(() => ticket.cancel(
+          Error("Vim command timed out. Refine the search and retry."),
+        ), Math.max(0, ticket.deadline - performance.now()));
+        Promise.resolve(value).then(
+          (result) => { if (!finished) { finish(); resolve(result); } },
+          (error) => { if (!finished) { finish(error); reject(error); } },
+        );
+        if (cm.vimDisposed || ticket.generation !== cm.vimGeneration)
+          ticket.cancel(cancelled());
+      });
+    }
     finish();
     return value;
   } catch (error) {
@@ -244,9 +256,11 @@ export function changed(cm, update) {
 export function invalidate(cm) {
   cm.vimGeneration = (cm.vimGeneration || 0) + 1;
   const owner = ticket(cm);
-  owner?.channel?.close();
-  // Keep the global slot until the suspended stack has rejected, so another
-  // editor cannot inherit its macro/mapping state while it unwinds.
   for (let i = queue.length - 1; i >= 0; i--)
     if (queue[i].cm === cm) queue.splice(i, 1)[0].reject(cancelled());
+  // Reset transient shared Vim state before admitting the next editor. Late
+  // resumable continuations still check their retired ticket and cannot reset
+  // the new owner's state a second time.
+  if (owner?.cancel) owner.cancel(cancelled());
+  else owner?.channel?.close();
 }

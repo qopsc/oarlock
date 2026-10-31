@@ -131,6 +131,34 @@ describe("resumable Vim commands", () => {
     expect(Worker.all[0].terminate).toHaveBeenCalledOnce();
     expect(input(cm, () => 8)).toBe(8);
   });
+  it("releases a cancelled stalled callback without resetting a newer command later", async () => {
+    const a = editor(), b = editor(), mutate = vi.fn();
+    let finish;
+    const slow = new Promise((resolve) => { finish = resolve; });
+    const active = input(a, () => resumeVim(a, (function* () { yield slow; mutate(); })()));
+    const failure = expect(active).rejects.toThrow("cancelled");
+    const later = input(b, () => 42);
+    invalidate(a);
+    await failure;
+    expect(await later).toBe(42);
+    expect(a.vimFailed).toHaveBeenCalledTimes(1);
+    finish();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(a.vimFailed).toHaveBeenCalledTimes(1);
+    expect(input(b, () => 7)).toBe(7);
+  });
+  it("times out an unresolved non-worker callback and admits another editor", async () => {
+    vi.useFakeTimers();
+    const a = editor(), b = editor();
+    const active = input(a, () => new Promise(() => {}));
+    const failure = expect(active).rejects.toThrow("timed out");
+    const later = input(b, () => 42);
+    await vi.advanceTimersByTimeAsync(10001);
+    await failure;
+    expect(await later).toBe(42);
+  });
   it("rejects a worker reply after a document changes", async () => {
     vi.stubGlobal("Worker", Worker);
     const cm = editor();
