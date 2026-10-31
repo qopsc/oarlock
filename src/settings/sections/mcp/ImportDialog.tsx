@@ -154,6 +154,14 @@ export function ImportDialog({
         onClose();
       }
     } catch (error) {
+      await Promise.allSettled(
+        configs.map((config) =>
+          invoke("mcp_secret_delete", {
+            serverId: config.id,
+            secrets: secretRefs(config.transport),
+          }),
+        ),
+      );
       setFailures([String(error)]);
     } finally {
       setBusy(false);
@@ -169,8 +177,8 @@ export function ImportDialog({
             Servers configured in other apps on this computer. Imported servers
             start off and untrusted: check each one, then turn it on. Values
             that look like secrets (keys, tokens, passwords, credentials in
-            URLs) go to your system keychain, never into Oarlock's settings file;
-            the others are kept as they are.
+            URLs) go to your system keychain, never into Oarlock's settings
+            file; the others are kept as they are.
           </DialogDescription>
         </DialogHeader>
         <div className="flex max-h-[60vh] flex-col gap-4 overflow-y-auto pr-1">

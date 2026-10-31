@@ -1,3 +1,5 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -8,7 +10,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
-  native,
+  createNative,
   type GitCommitFileChange,
   type GitLogEntry,
 } from "@/modules/ai/lib/native";
@@ -199,6 +201,8 @@ export function GitHistoryPane({
   onOpenCommitFile,
   onSearchHandle,
 }: Props) {
+  const workspace = useOwnedWorkspace();
+  const native = useMemo(() => createNative(() => workspace), [workspace]);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
   const [loadStatus, setLoadStatus] = useState<LoadStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -229,6 +233,14 @@ export function GitHistoryPane({
   const bumpFiles = useCallback(() => setFilesTick((n) => n + 1), []);
 
   const requestIdRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestIdRef.current += 1;
+    };
+  }, []);
   const inflightMoreRef = useRef(false);
   const filesInflightRef = useRef(new Set<string>());
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -321,6 +333,11 @@ export function GitHistoryPane({
   });
 
   const loadInitial = useCallback(async () => {
+    if (!mountedRef.current) return;
+    inflightMoreRef.current = false;
+    filesInflightRef.current.clear();
+    filesCacheRef.current.clear();
+    bumpFiles();
     const requestId = ++requestIdRef.current;
     setLoadStatus("initial");
     setError(null);
@@ -336,9 +353,10 @@ export function GitHistoryPane({
       setError(normalizeError(err));
       setLoadStatus("error");
     }
-  }, [repoRoot]);
+  }, [bumpFiles, native, repoRoot]);
 
   const loadMore = useCallback(async () => {
+    if (!mountedRef.current) return;
     if (inflightMoreRef.current || endReached) return;
     if (loadStatus !== "idle") return;
     const page = nextHistoryPage(commits);
@@ -365,18 +383,15 @@ export function GitHistoryPane({
       setError(normalizeError(err));
       setLoadStatus("error");
     } finally {
-      inflightMoreRef.current = false;
+      if (requestId === requestIdRef.current) inflightMoreRef.current = false;
     }
-  }, [commits, endReached, loadStatus, repoRoot]);
+  }, [commits, endReached, loadStatus, native, repoRoot]);
 
   useEffect(() => {
-    filesInflightRef.current.clear();
-    filesCacheRef.current.clear();
-    bumpFiles();
     setCommits([]);
     setOpenAnchor(null);
     void loadInitial();
-  }, [bumpFiles, loadInitial]);
+  }, [loadInitial]);
 
   useEffect(() => {
     let cancelled = false;
@@ -393,7 +408,7 @@ export function GitHistoryPane({
     return () => {
       cancelled = true;
     };
-  }, [repoRoot]);
+  }, [native, repoRoot]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -425,14 +440,13 @@ export function GitHistoryPane({
   }, [commits.length, activeSearch, endReached, loadMore, loadStatus]);
 
   const handleRefresh = useCallback(() => {
-    filesInflightRef.current.clear();
-    filesCacheRef.current.clear();
-    bumpFiles();
     void loadInitial();
-  }, [bumpFiles, loadInitial]);
+  }, [loadInitial]);
 
   const fetchFiles = useCallback(
     async (sha: string) => {
+      if (!mountedRef.current) return;
+      const requestId = requestIdRef.current;
       if (filesInflightRef.current.has(sha)) return;
       const cache = filesCacheRef.current;
       const existing = cache.get(sha);
@@ -442,6 +456,7 @@ export function GitHistoryPane({
       bumpFiles();
       try {
         const files = await native.gitCommitFiles(repoRoot, sha);
+        if (requestId !== requestIdRef.current) return;
         cache.set(sha, { state: "loaded", files });
         while (cache.size > FILES_CACHE_LIMIT) {
           const oldest = cache.keys().next().value;
@@ -450,13 +465,15 @@ export function GitHistoryPane({
         }
         bumpFiles();
       } catch (err) {
+        if (requestId !== requestIdRef.current) return;
         cache.set(sha, { state: "error", error: normalizeError(err) });
         bumpFiles();
       } finally {
-        filesInflightRef.current.delete(sha);
+        if (requestId === requestIdRef.current)
+          filesInflightRef.current.delete(sha);
       }
     },
-    [repoRoot],
+    [bumpFiles, native, repoRoot],
   );
 
   const handleRowClick = useCallback(
@@ -511,7 +528,7 @@ export function GitHistoryPane({
 
   const copyToClipboard = useCallback(async (value: string) => {
     try {
-      await navigator.clipboard.writeText(value);
+      await writeClipboardText(value);
     } catch {
       /* noop */
     }

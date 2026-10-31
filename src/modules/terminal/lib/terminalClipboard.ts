@@ -1,3 +1,9 @@
+import {
+  invalidateClipboardImage,
+  readTerminalClipboardSnapshot,
+} from "./terminalClipboardSnapshot";
+export { readTerminalClipboardSnapshot } from "./terminalClipboardSnapshot";
+import { ClipboardWrite } from "@/lib/clipboardWrite";
 import { isTauri } from "@tauri-apps/api/core";
 
 /**
@@ -12,118 +18,164 @@ export type TerminalClipboardContent =
       readonly text?: string;
     };
 
-/**
- * How long one clipboard image read answers later ones: a paste event's
- * mode 5522 listing and the program's read that follows it, or a listing
- * and its read, share one read (and one PNG encoding).
- */
-const IMAGE_READ_REUSE_MS = 1000;
+// Match native clipboard_image.rs before allocating a conversion canvas.
+const MAX_IMAGE_SIDE = 16_384;
+const MAX_IMAGE_RGBA_BYTES = 512 * 1024 * 1024;
 
-let imageRead: { at: number; image: Promise<Uint8Array | null> } | null = null;
+class ClipboardImageConversionError extends Error {}
+
+function imageCannotDecode(error: unknown): boolean {
+  return (
+    error instanceof ClipboardImageConversionError ||
+    (typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "image-decode")
+  );
+}
 
 export async function readTerminalClipboard(): Promise<string> {
   try {
-    if (isTauri()) {
-      const { readText } = await import("@tauri-apps/plugin-clipboard-manager");
-      return await readText();
-    }
-    return (await navigator.clipboard?.readText()) ?? "";
+    return (await readTerminalClipboardSnapshot()).text ?? "";
   } catch {
     return "";
   }
 }
 
 export async function writeTerminalClipboard(text: string): Promise<void> {
-  imageRead = null;
-  if (isTauri()) {
-    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
-    await writeText(text);
-    return;
+  invalidateClipboardImage();
+  const write = new ClipboardWrite();
+  write.prepare();
+  try {
+    await write.text(text);
+  } finally {
+    write.dispose();
+    invalidateClipboardImage();
   }
-  if (!navigator.clipboard) throw new Error("Clipboard is unavailable");
-  await navigator.clipboard.writeText(text);
 }
 
-/** Linux primary selection (copy-on-select, middle-click paste); a no-op elsewhere. */
+/** Linux primary selection (copy-on-select, middle-click paste). */
 export async function writePrimarySelection(text: string): Promise<void> {
-  if (!isTauri()) return;
+  if (!isTauri() || !text) return;
+  const write = new ClipboardWrite(true);
+  write.prepare();
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("terminal_primary_selection_write", { text });
+    await write.text(text);
   } catch {
-    /* no primary selection on this platform or session */
+    /* unsupported display/selection */
+  } finally {
+    write.dispose();
   }
 }
 
-/** The Linux primary selection, or null where there is none. */
+/** The Linux primary selection, or null where it is unsupported. */
 export async function readPrimarySelection(): Promise<string | null> {
-  if (!isTauri()) return null;
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<string | null>("terminal_primary_selection_read");
+    return (await readTerminalClipboardSnapshot("never", true)).text;
   } catch {
     return null;
   }
 }
 
-/**
- * The clipboard's image as PNG; null when it holds none (or outside the
- * app). Reads close together share one.
- */
-export function readClipboardImage(): Promise<Uint8Array | null> {
-  const now = Date.now();
-  if (imageRead && now - imageRead.at < IMAGE_READ_REUSE_MS) {
-    return imageRead.image;
-  }
-  const image = fetchClipboardImage();
-  imageRead = { at: now, image };
-  return image;
-}
-
-async function fetchClipboardImage(): Promise<Uint8Array | null> {
-  if (!isTauri()) return null;
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const png = await invoke<ArrayBuffer>("clipboard_image_read");
-    return png.byteLength > 0 ? new Uint8Array(png) : null;
-  } catch {
-    return null;
-  }
+/** Image reuse always verifies the native clipboard version. */
+export async function readClipboardImage(): Promise<Uint8Array | null> {
+  return (await readTerminalClipboardSnapshot("always")).image;
 }
 
 /** Puts an image on the clipboard, converted to PNG when it is another type. */
+async function putImage(
+  data: Uint8Array<ArrayBuffer>,
+  mime: string,
+  write: ClipboardWrite,
+): Promise<void> {
+  if (!isTauri()) throw new Error("Clipboard images need the app");
+  await write.check();
+  const png =
+    mime.toLowerCase() === "image/png" ? data : await toPng(data, mime);
+  await write.image(png);
+}
+
 export async function writeClipboardImage(
   data: Uint8Array<ArrayBuffer>,
   mime: string,
 ): Promise<void> {
-  imageRead = null;
-  if (!isTauri()) throw new Error("Clipboard images need the app");
-  const png = mime.toLowerCase() === "image/png" ? data : await toPng(data, mime);
-  const { invoke } = await import("@tauri-apps/api/core");
+  invalidateClipboardImage();
+  const write = new ClipboardWrite();
+  write.prepare();
   try {
-    await invoke("clipboard_image_write", png);
+    await putImage(data, mime, write);
   } finally {
-    imageRead = null;
+    write.dispose();
+    invalidateClipboardImage();
   }
 }
 
-/** Text or an image from a program, the image's text should it not decode. */
+/** One program write, prepared before it waits behind another conversion. */
+export class ProgramClipboardWrite {
+  private readonly write: ClipboardWrite;
+  constructor(
+    private readonly content: TerminalClipboardContent,
+    owner: AbortSignal,
+    private readonly primary = false,
+  ) {
+    this.write = new ClipboardWrite(primary, owner);
+  }
+  prepare(): void {
+    this.write.prepare();
+  }
+  dispose(): void {
+    this.write.dispose();
+  }
+  async run(): Promise<void> {
+    invalidateClipboardImage();
+    try {
+      if (typeof this.content === "string") {
+        if (!this.primary || this.content) await this.write.text(this.content);
+      } else {
+        try {
+          await putImage(this.content.data, this.content.mime, this.write);
+        } catch (error) {
+          if (this.content.text === undefined || !imageCannotDecode(error))
+            throw error;
+          await this.write.text(this.content.text);
+        }
+      }
+    } finally {
+      this.dispose();
+      invalidateClipboardImage();
+    }
+  }
+}
+
+/** Text or an image from a program, with text fallback only for decoding failures. */
 export async function writeTerminalClipboardContent(
   content: TerminalClipboardContent,
+  owner: AbortSignal,
 ): Promise<void> {
-  if (typeof content === "string") return writeTerminalClipboard(content);
-  try {
-    await writeClipboardImage(content.data, content.mime);
-  } catch (error) {
-    if (content.text === undefined) throw error;
-    await writeTerminalClipboard(content.text);
-  }
+  const write = new ProgramClipboardWrite(content, owner);
+  write.prepare();
+  await write.run();
 }
 
 /** An image the webview decodes, as PNG. */
-async function toPng(data: Uint8Array<ArrayBuffer>, mime: string): Promise<Uint8Array> {
-  const bitmap = await createImageBitmap(new Blob([data], { type: mime }));
+async function toPng(
+  data: Uint8Array<ArrayBuffer>,
+  mime: string,
+): Promise<Uint8Array> {
+  let bitmap: ImageBitmap;
   try {
+    bitmap = await createImageBitmap(new Blob([data], { type: mime }));
+  } catch (error) {
+    throw new ClipboardImageConversionError(String(error));
+  }
+  try {
+    if (
+      bitmap.width > MAX_IMAGE_SIDE ||
+      bitmap.height > MAX_IMAGE_SIDE ||
+      bitmap.width * bitmap.height * 4 > MAX_IMAGE_RGBA_BYTES
+    ) {
+      throw new Error("the clipboard image is too large");
+    }
     const canvas = document.createElement("canvas");
     canvas.width = bitmap.width;
     canvas.height = bitmap.height;
@@ -135,6 +187,8 @@ async function toPng(data: Uint8Array<ArrayBuffer>, mime: string): Promise<Uint8
     );
     if (!blob) throw new Error("The image could not be converted");
     return new Uint8Array(await blob.arrayBuffer());
+  } catch (error) {
+    throw new ClipboardImageConversionError(String(error));
   } finally {
     bitmap.close();
   }

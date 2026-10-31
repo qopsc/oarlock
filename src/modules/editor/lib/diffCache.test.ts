@@ -5,7 +5,10 @@ const nativeMock = vi.hoisted(() => ({
   gitCommitFileDiff: vi.fn(),
 }));
 
-vi.mock("@/modules/ai/lib/native", () => ({ native: nativeMock }));
+vi.mock("@/modules/ai/lib/native", () => ({
+  native: nativeMock,
+  createNative: () => nativeMock,
+}));
 
 const workspaceMock = vi.hoisted(() => ({
   currentWorkspaceScopeKey: vi.fn(() => "scope"),
@@ -42,10 +45,10 @@ describe("git diff content cache", () => {
     const { workingDiffKey, commitDiffKey } = await loadModule();
 
     expect(workingDiffKey("/repo", "src/a.ts", "-")).toBe(
-      "scope|/repo|w|-|src/a.ts",
+      JSON.stringify(["scope", "/repo", "w", "-", "src/a.ts", null]),
     );
     expect(commitDiffKey("/repo", "abc123", "src/a.ts")).toBe(
-      "scope|/repo|c|abc123|src/a.ts",
+      JSON.stringify(["scope", "/repo", "c", "abc123", "src/a.ts", null]),
     );
   });
 
@@ -88,8 +91,12 @@ describe("git diff content cache", () => {
     }
     await mod.fetchWorkingDiff("/repo", "new.ts", "-", null);
 
-    expect(mod.getCachedDiff(mod.workingDiffKey("/repo", "f0.ts", "-"))).toBeUndefined();
-    expect(mod.getCachedDiff(mod.workingDiffKey("/repo", "f1.ts", "-"))).toBeDefined();
+    expect(
+      mod.getCachedDiff(mod.workingDiffKey("/repo", "f0.ts", "-")),
+    ).toBeUndefined();
+    expect(
+      mod.getCachedDiff(mod.workingDiffKey("/repo", "f1.ts", "-")),
+    ).toBeDefined();
   });
 
   it("keeps an entry that was just read when the limit overflows", async () => {
@@ -106,7 +113,9 @@ describe("git diff content cache", () => {
     await fetchWorkingDiff("/repo", "new.ts", "-", null);
 
     expect(getCachedDiff(workingDiffKey("/repo", "f0.ts", "-"))).toBeDefined();
-    expect(getCachedDiff(workingDiffKey("/repo", "f1.ts", "-"))).toBeUndefined();
+    expect(
+      getCachedDiff(workingDiffKey("/repo", "f1.ts", "-")),
+    ).toBeUndefined();
   });
 
   it("does not retry or cache a failed backend call", async () => {
@@ -140,7 +149,9 @@ describe("git diff content cache", () => {
     const { invalidateRepoDiffs } = mod;
     invalidateRepoDiffs("/repo-a");
 
-    expect(getCachedDiff(workingDiffKey("/repo-a", "x.ts", "-"))).toBeUndefined();
+    expect(
+      getCachedDiff(workingDiffKey("/repo-a", "x.ts", "-")),
+    ).toBeUndefined();
 
     workspaceMock.currentWorkspaceScopeKey.mockReturnValue("other");
     expect(getCachedDiff(workingDiffKey("/repo-a", "x.ts", "-"))).toBeDefined();
@@ -162,4 +173,115 @@ describe("git diff content cache", () => {
       null,
     );
   });
+});
+
+it("keeps explicit workspace diff caches separate from the active workspace", async () => {
+  const { fetchWorkingDiff } = await import("./diffCache");
+  const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
+  const debian = { kind: "wsl", distro: "Debian" } as const;
+  nativeMock.gitDiffContent
+    .mockResolvedValueOnce(result("ubuntu"))
+    .mockResolvedValueOnce(result("debian"));
+  const a = await fetchWorkingDiff("/repo", "same.ts", "-", null, ubuntu);
+  const b = await fetchWorkingDiff("/repo", "same.ts", "-", null, debian);
+  expect(a.modifiedContent).toBe("ubuntu");
+  expect(b.modifiedContent).toBe("debian");
+});
+
+it("does not revive invalidated content or reuse its in-flight request", async () => {
+  vi.resetModules();
+  nativeMock.gitDiffContent.mockReset();
+  const mod = await loadModule();
+  let finishOld!: (value: GitDiffContentResult) => void;
+  let finishNew!: (value: GitDiffContentResult) => void;
+  nativeMock.gitDiffContent
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishOld = resolve;
+        }),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishNew = resolve;
+        }),
+    );
+  const first = mod.fetchWorkingDiff("/repo", "a.ts", "-", null);
+  const key = mod.workingDiffKey("/repo", "a.ts", "-");
+  mod.invalidateDiff(key);
+  const second = mod.fetchWorkingDiff("/repo", "a.ts", "-", null);
+  expect(nativeMock.gitDiffContent).toHaveBeenCalledTimes(2);
+  finishOld(result("old"));
+  await first;
+  expect(mod.getCachedDiff(key)).toBeUndefined();
+  const third = mod.fetchWorkingDiff("/repo", "a.ts", "-", null);
+  expect(nativeMock.gitDiffContent).toHaveBeenCalledTimes(2);
+  finishNew(result("new"));
+  expect(await second).toEqual(result("new"));
+  expect(await third).toEqual(result("new"));
+  expect(mod.getCachedDiff(key)).toEqual(result("new"));
+});
+
+it("invalidates a completed command's own workspace after navigation", async () => {
+  vi.resetModules();
+  nativeMock.gitDiffContent.mockReset();
+  const mod = await loadModule();
+  const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
+  const debian = { kind: "wsl", distro: "Debian" } as const;
+  nativeMock.gitDiffContent.mockResolvedValue(result("cached"));
+  await mod.fetchWorkingDiff("/repo", "a.ts", "-", null, ubuntu);
+  await mod.fetchWorkingDiff("/repo", "a.ts", "-", null, debian);
+  workspaceMock.currentWorkspaceScopeKey.mockReturnValue("wsl:Debian");
+  mod.invalidateRepoDiffs("/repo", ubuntu);
+  expect(
+    mod.getCachedDiff(mod.workingDiffKey("/repo", "a.ts", "-", ubuntu)),
+  ).toBeUndefined();
+  expect(
+    mod.getCachedDiff(mod.workingDiffKey("/repo", "a.ts", "-", debian)),
+  ).toBeDefined();
+});
+
+it("does not confuse repository and filename separators", async () => {
+  const { workingDiffKey } = await loadModule();
+  expect(workingDiffKey("/repo", "a|w|-|b", "-")).not.toBe(
+    workingDiffKey("/repo|w|-|a", "b", "-"),
+  );
+});
+
+it("does not reuse a diff with a different rename source", async () => {
+  vi.resetModules();
+  nativeMock.gitDiffContent.mockReset();
+  nativeMock.gitDiffContent
+    .mockResolvedValueOnce(result("from-a"))
+    .mockResolvedValueOnce(result("from-b"));
+  const { fetchWorkingDiff } = await loadModule();
+  await fetchWorkingDiff("/repo", "new.txt", "+", "a.txt");
+  expect(
+    (await fetchWorkingDiff("/repo", "new.txt", "+", "b.txt")).modifiedContent,
+  ).toBe("from-b");
+});
+
+it("invalidates all rename variants while preserving adjacent files and repositories", async () => {
+  vi.resetModules();
+  nativeMock.gitDiffContent.mockReset().mockResolvedValue(result("cached"));
+  const mod = await loadModule();
+  await mod.fetchWorkingDiff("/repo", "new.txt", "+", "a.txt");
+  await mod.fetchWorkingDiff("/repo", "new.txt", "+", "b.txt");
+  await mod.fetchWorkingDiff("/repo", "new.txt-more", "+", null);
+  await mod.fetchWorkingDiff("/repo|w|+|new.txt", "other", "+", null);
+  mod.invalidateWorkingDiff("/repo", "new.txt", "+");
+  for (const original of ["a.txt", "b.txt"]) {
+    expect(
+      mod.getCachedDiff(
+        mod.workingDiffKey("/repo", "new.txt", "+", undefined, original),
+      ),
+    ).toBeUndefined();
+  }
+  expect(
+    mod.getCachedDiff(mod.workingDiffKey("/repo", "new.txt-more", "+")),
+  ).toBeDefined();
+  expect(
+    mod.getCachedDiff(mod.workingDiffKey("/repo|w|+|new.txt", "other", "+")),
+  ).toBeDefined();
 });

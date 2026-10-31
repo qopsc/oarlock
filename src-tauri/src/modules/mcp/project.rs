@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use reqwest::Url;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Webview};
+use tauri::{AppHandle, Emitter, Manager, Webview, WebviewWindow};
 
 use super::import::{self, RawEntry, RawTransport};
 use crate::modules::project_trust::{
@@ -409,6 +409,8 @@ pub struct ProjectServerView {
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectServers {
+    /// Visible in the current space, rather than retained only by an active run.
+    pub active: bool,
     pub project: OpenProject,
     /// The file, spelled as the window spells the project.
     pub path: String,
@@ -454,6 +456,7 @@ fn listing(app: &AppHandle, project: &OpenProject) -> Option<ProjectServers> {
         ),
     };
     Some(ProjectServers {
+        active: true,
         path: project.display_path(FILE),
         project: project.clone(),
         state,
@@ -477,19 +480,124 @@ pub async fn mcp_project_servers(
         return Err("mcp: only Settings lists every project".into());
     }
     crate::modules::fs::blocking(move || {
-        let projects = if all {
-            open_projects(&app)
+        if all {
+            Ok(all_owned_projects(&app)
+                .iter()
+                .filter_map(|project| listing(&app, project))
+                .collect())
         } else {
-            project_trust::window_project(&app, &label)
-                .into_iter()
-                .collect()
-        };
-        Ok(projects
-            .iter()
-            .filter_map(|project| listing(&app, project))
-            .collect())
+            Ok(window_listings(&app, &label))
+        }
     })
     .await
+}
+
+pub(super) fn settings_entry_hash(app: &AppHandle, id: &str) -> Option<String> {
+    all_owned_projects(app)
+        .iter()
+        .filter_map(|p| listing(app, p))
+        .flat_map(|p| p.servers)
+        .find(|server| server.id == id)
+        .map(|server| server.entry_hash)
+}
+
+fn all_owned_projects(app: &AppHandle) -> Vec<OpenProject> {
+    let mut projects = open_projects(app);
+    for retained in app
+        .state::<super::McpState>()
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .all_projects()
+    {
+        if !projects.iter().any(|p| p.key == retained.key) {
+            projects.push(retained);
+        }
+    }
+    projects
+}
+fn retained_projects(app: &AppHandle, window: &str) -> Vec<OpenProject> {
+    app.state::<super::McpState>()
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .projects(window)
+}
+fn window_listings(app: &AppHandle, window: &str) -> Vec<ProjectServers> {
+    let current = project_trust::window_project(app, window);
+    let mut projects = retained_projects(app, window);
+    if let Some(project) = &current {
+        projects.retain(|p| p.key != project.key);
+        projects.push(project.clone());
+    }
+    projects
+        .iter()
+        .filter_map(|project| {
+            let mut listed = listing(app, project)?;
+            listed.active = current.as_ref().is_some_and(|p| p.key == project.key);
+            Some(listed)
+        })
+        .collect()
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunProject {
+    lease: Option<u64>,
+    project_key: Option<String>,
+    projects: Vec<ProjectServers>,
+}
+#[tauri::command]
+pub async fn mcp_run_open(
+    app: AppHandle,
+    window: WebviewWindow,
+    root: Option<String>,
+    workspace: Option<crate::modules::workspace::WorkspaceEnv>,
+) -> Result<RunProject, String> {
+    super::require_app_window(&window)?;
+    let label = window.label().to_owned();
+    let owner = app
+        .state::<super::McpState>()
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .owner(&label);
+    crate::modules::fs::blocking(move || {
+        let project = root
+            .map(|root| project_trust::resolve_project(&root, workspace))
+            .transpose()?;
+        let mut lease = None;
+        let key = project.as_ref().map(|p| p.key.clone());
+        if let Some(project) = project {
+            app.state::<crate::modules::workspace::WorkspaceRegistry>()
+                .authorized_existing(&project.real)
+                .map_err(|e| e.to_string())?;
+            // No server => no retained project or worker. Trust is rechecked on every message.
+            if listing(&app, &project).is_some_and(|p| !p.servers.is_empty()) {
+                lease = Some(
+                    app.state::<super::McpState>()
+                        .leases
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(&label, &owner, project)?,
+                );
+            }
+        }
+        Ok(RunProject {
+            lease,
+            project_key: key,
+            projects: window_listings(&app, &label),
+        })
+    })
+    .await
+}
+#[tauri::command]
+pub fn mcp_run_release(app: AppHandle, window: WebviewWindow, lease: u64) {
+    app.state::<super::McpState>()
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(window.label(), lease);
+    let _ = app.emit_to(window.label(), "mcp:run-leases-changed", ());
 }
 
 // ---- Starting one ----
@@ -497,6 +605,7 @@ pub async fn mcp_project_servers(
 /// What a running project server was started from; checked again on every message.
 #[derive(Clone, Debug)]
 pub struct Binding {
+    project: OpenProject,
     pub window: String,
     pub key: String,
     pub path: PathBuf,
@@ -508,16 +617,21 @@ pub struct Binding {
     hash: Arc<Mutex<String>>,
 }
 
-/// Whether the server may still run: its window still has the project open, the user allows
+/// Whether the server may still run: its window has the project open or an active run retains it, the user allows
 /// the file's current content, and that content declares this server exactly as it started.
 /// An edit to the file that the user allows (Oarlock's own edits keep the trust) and that leaves
 /// this server's entry alone keeps it running; any other change stops it.
 pub fn still_allowed(app: &AppHandle, binding: &Binding) -> bool {
-    let Some(project) =
-        project_trust::window_project(app, &binding.window).filter(|p| p.key == binding.key)
-    else {
+    if owned_project(
+        project_trust::window_project(app, &binding.window),
+        retained_projects(app, &binding.window),
+        Some(&binding.key),
+    )
+    .is_none()
+    {
         return false;
-    };
+    }
+    let project = &binding.project;
     let known = binding
         .hash
         .lock()
@@ -580,6 +694,7 @@ fn allowed_entry(
         return Err(format!("{}: {problem}", entry.raw.name));
     }
     let binding = Binding {
+        project: project.clone(),
         window: String::new(),
         key: project.key.clone(),
         path,
@@ -590,14 +705,30 @@ fn allowed_entry(
     Ok((entry, binding))
 }
 
+/// Native ownership, never the renderer's project key alone, selects a project.
+fn owned_project(
+    current: Option<OpenProject>,
+    retained: Vec<OpenProject>,
+    key: Option<&str>,
+) -> Option<OpenProject> {
+    match key {
+        None => current,
+        Some(key) => current
+            .filter(|p| p.key == key)
+            .or_else(|| retained.into_iter().find(|p| p.key == key)),
+    }
+}
+
 /// A project server of the calling window's project, with what it is bound to.
 pub fn resolve(
     app: &AppHandle,
     window: &str,
     server_id: &str,
+    project_key: Option<&str>,
 ) -> Result<(ProjectEntry, OpenProject, Binding), String> {
-    let project =
-        project_trust::window_project(app, window).ok_or("mcp: this window has no project open")?;
+    let current = project_trust::window_project(app, window);
+    let project = owned_project(current, retained_projects(app, window), project_key)
+        .ok_or("mcp: this project is no longer owned by the window or an active run")?;
     let (entry, mut binding) = allowed_entry(app, &project, server_id)?;
     binding.window = window.to_owned();
     Ok((entry, project, binding))
@@ -675,7 +806,7 @@ pub fn remote_launch(
 pub fn server_url(app: &AppHandle, server_id: &str, shell: Option<String>) -> Result<Url, String> {
     let env = crate::modules::lsp::env::server_env_overlay(shell);
     let vars = lookup(&env);
-    for project in open_projects(app) {
+    for project in all_owned_projects(app) {
         let Ok((entry, _)) = allowed_entry(app, &project, server_id) else {
             continue;
         };
@@ -702,6 +833,31 @@ mod tests {
         let mut missing = Vec::new();
         let out = expand(text, &vars, &mut missing);
         (out, missing)
+    }
+
+    #[test]
+    fn navigation_keeps_only_explicitly_retained_projects_addressable() {
+        let project = |key: &str| OpenProject {
+            real: key.into(),
+            key: key.into(),
+            root: key.into(),
+            workspace: Default::default(),
+        };
+        let current = Some(project("/b"));
+        assert_eq!(
+            owned_project(current.clone(), vec![project("/a")], Some("/a"))
+                .unwrap()
+                .key,
+            "/a"
+        );
+        assert_eq!(
+            owned_project(current.clone(), vec![project("/a")], None)
+                .unwrap()
+                .key,
+            "/b"
+        );
+        assert!(owned_project(current.clone(), vec![], Some("/a")).is_none());
+        assert!(owned_project(current, vec![project("/a")], Some("/foreign")).is_none());
     }
 
     #[test]
@@ -761,6 +917,12 @@ mod tests {
     fn bound(file: &McpJson, name: &str) -> Binding {
         let entry = file.entries.iter().find(|e| e.raw.name == name).unwrap();
         Binding {
+            project: OpenProject {
+                real: "/p".into(),
+                key: "/p".into(),
+                root: "/p".into(),
+                workspace: Default::default(),
+            },
             window: "main".into(),
             key: "/p".into(),
             path: file.path.clone(),

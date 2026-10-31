@@ -1,9 +1,13 @@
 import { openExternalUrl } from "@/lib/external-link";
 import { authorizeFileFolder } from "@/modules/workspace/authorize";
-import { currentWorkspaceEnv } from "@/modules/workspace/env";
+import { getWslHome, workspaceEnvForPath } from "@/modules/workspace/env";
 import { invoke } from "@tauri-apps/api/core";
 import { parseTerminalPathLink } from "../ghostty/core/terminalLinks";
-import { openTerminalFile, openTerminalPreview } from "./terminalLinkOpen";
+import {
+  type TerminalLinkOperation,
+  openTerminalFile,
+  openTerminalPreview,
+} from "./terminalLinkOpen";
 
 /** What clicking a terminal link does. */
 export type TerminalLinkTarget =
@@ -37,7 +41,12 @@ export function resolveTerminalLink(
       return null;
     }
     if (!isLocalFileHost(url.hostname, localHost)) return null;
-    let path = decodeURIComponent(url.pathname);
+    let path: string;
+    try {
+      path = decodeURIComponent(url.pathname);
+    } catch {
+      return null;
+    }
     // file:///C:/dir -> C:/dir
     if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
     const position = /^L?(\d+)(?:[:,]C?(\d+))?$/i.exec(url.hash.slice(1));
@@ -48,7 +57,12 @@ export function resolveTerminalLink(
       column: position?.[2] ? Number(position[2]) : null,
     };
   }
-  if (/^[A-Za-z][A-Za-z0-9+.-]+:/.test(uri) && !/^[A-Za-z]:[\\/]/.test(uri)) {
+  const diagnostic = /^[\w.@+-]+\.[A-Za-z]\w{0,7}:\d+(?::\d+)?$/.test(uri);
+  if (
+    !diagnostic &&
+    /^[A-Za-z][A-Za-z0-9+.-]+:/.test(uri) &&
+    !/^[A-Za-z]:[\\/]/.test(uri)
+  ) {
     return { kind: "external", url: uri };
   }
   const parsed = parseTerminalPathLink(uri);
@@ -86,38 +100,56 @@ export async function openTerminalLinkTarget(
   uri: string,
   cwd: string | null,
   onExternalSettled: () => void,
+  operation: TerminalLinkOperation,
 ): Promise<void> {
-  homeDirectory ??= import("@tauri-apps/api/path")
-    .then(({ homeDir }) => homeDir())
-    .catch(() => null);
-  localHostName ??= import("@tauri-apps/plugin-os")
-    .then(({ hostname }) => hostname())
-    .catch(() => null);
-  const target = resolveTerminalLink(
-    uri,
-    cwd,
-    await homeDirectory,
-    await localHostName,
-  );
-  if (!target) return;
+  if (!operation.active()) return;
+  let home: string | null = null;
+  if (uri === "~" || uri.startsWith("~/")) {
+    if (operation.workspace.kind === "wsl") {
+      home = await getWslHome(operation.workspace.distro).catch(() => null);
+    } else {
+      homeDirectory ??= import("@tauri-apps/api/path")
+        .then(({ homeDir }) => homeDir())
+        .catch(() => null);
+      home = await homeDirectory;
+    }
+  }
+  let host: string | null = null;
+  if (/^file:\/\//i.test(uri)) {
+    localHostName ??= import("@tauri-apps/plugin-os")
+      .then(({ hostname }) => hostname())
+      .catch(() => null);
+    host = await localHostName;
+  }
+  const target = resolveTerminalLink(uri, cwd, home, host);
+  if (!target || !operation.active()) return;
   if (target.kind === "external") {
     if (openTerminalPreview(target.url)) return;
-    void openExternalUrl(target.url, onExternalSettled);
+    void openExternalUrl(target.url, () => {
+      if (operation.active()) onExternalSettled();
+    });
     return;
   }
   // The user clicked it, so its folder may be reached; terminal output alone
   // never authorizes anything. Detected paths are guesses: open only what exists.
-  const workspace = currentWorkspaceEnv();
-  await authorizeFileFolder(target.path, workspace);
+  const workspace = workspaceEnvForPath(target.path, operation.workspace);
+  if (!(await authorizeFileFolder(target.path, workspace))) return;
+  if (!operation.active()) return;
   const stat = await invoke<{ kind: string }>("fs_stat", {
     path: target.path,
     workspace,
   }).catch(() => null);
-  if (!stat) return;
+  if (!stat || !operation.active()) return;
   if (stat.kind !== "dir") {
-    openTerminalFile(target.path, target.line, target.column);
+    openTerminalFile(
+      target.path,
+      target.line,
+      target.column,
+      operation.spaceId,
+    );
   } else if (workspace.kind === "local") {
     const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+    if (!operation.active()) return;
     await revealItemInDir(target.path).catch(() => {});
   }
 }
@@ -133,16 +165,21 @@ function isAbsolutePath(path: string): boolean {
 /** Joins and normalizes `.`/`..` segments, keeping the base's separator. */
 export function joinPath(base: string, relative: string): string {
   const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/";
-  const root = /^[A-Za-z]:[\\/]/.test(base)
-    ? base.slice(0, 3)
-    : base.startsWith("/")
-      ? "/"
-      : "";
+  const uncRoot = /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.exec(base)?.[0];
+  const root =
+    uncRoot ??
+    (/^[A-Za-z]:[\\/]/.test(base)
+      ? base.slice(0, 3)
+      : base.startsWith("/")
+        ? "/"
+        : "");
   const segments: string[] = [];
   for (const part of `${base.slice(root.length)}/${relative}`.split(/[\\/]+/)) {
     if (!part || part === ".") continue;
     if (part === "..") segments.pop();
     else segments.push(part);
   }
-  return root.replace(/[\\/]$/, separator) + segments.join(separator);
+  return (
+    (root ? root.replace(/[\\/]*$/, separator) : "") + segments.join(separator)
+  );
 }

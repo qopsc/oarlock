@@ -81,7 +81,7 @@ pub(super) fn shell_has_children(shell_pid: u32) -> bool {
 
 #[cfg(windows)]
 pub(super) fn shell_has_children(shell_pid: u32) -> bool {
-    any_child(shell_pid, |_| true)
+    any_child(shell_pid, |_| true).unwrap_or(false)
 }
 
 /// Whether the shell has a child that can be reading its console: one built
@@ -90,6 +90,11 @@ pub(super) fn shell_has_children(shell_pid: u32) -> bool {
 /// still at its prompt. A child whose image cannot be read counts.
 #[cfg(windows)]
 pub(super) fn shell_has_console_children(shell_pid: u32) -> bool {
+    verified_console_children(shell_pid).unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub(super) fn verified_console_children(shell_pid: u32) -> Option<bool> {
     any_child(shell_pid, |pid| {
         image_subsystem(pid) != Some(IMAGE_SUBSYSTEM_WINDOWS_GUI)
     })
@@ -97,27 +102,32 @@ pub(super) fn shell_has_console_children(shell_pid: u32) -> bool {
 
 /// Whether any child of `parent` passes `wanted`, from a ToolHelp snapshot.
 #[cfg(windows)]
-fn any_child(parent: u32, mut wanted: impl FnMut(u32) -> bool) -> bool {
+fn any_child(parent: u32, mut wanted: impl FnMut(u32) -> bool) -> Option<bool> {
     use std::mem::{size_of, zeroed};
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return false;
+            return None;
         }
         let mut entry: PROCESSENTRY32 = zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32>() as u32;
-        let mut found = false;
+        let mut found = None;
         if Process32First(snapshot, &mut entry) != 0 {
             loop {
                 if entry.th32ParentProcessID == parent && wanted(entry.th32ProcessID) {
-                    found = true;
+                    found = Some(true);
                     break;
                 }
                 if Process32Next(snapshot, &mut entry) == 0 {
+                    if GetLastError() == ERROR_NO_MORE_FILES {
+                        found = Some(false);
+                    }
                     break;
                 }
             }

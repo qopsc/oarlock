@@ -1,17 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
-use std::{fs, io::Write};
+use std::{fs, io::Read};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
+#[cfg(test)]
 use tempfile::NamedTempFile;
 
-use super::blocking;
 use super::index::FileIndexState;
 use super::launch;
 use super::mutate::note_changed;
 use super::run_prompt;
+use super::{blocking, document_save};
 use crate::modules::project_trust::{self, OwnChange};
 use crate::modules::workspace::{resolve_path, Gates, Origin, WorkspaceEnv, WorkspaceRegistry};
 
@@ -27,6 +28,12 @@ pub enum ReadResult {
         content: String,
         size: u64,
         mtime: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(rename = "aiContextAllowed")]
+        ai_context_allowed: bool,
+        #[serde(skip)]
+        opened_path: Option<PathBuf>,
     },
     Binary {
         size: u64,
@@ -67,21 +74,66 @@ pub async fn fs_read_file(
     path: String,
     workspace: Option<WorkspaceEnv>,
     force: Option<bool>,
+    versioned: Option<bool>,
     origin: Option<Origin>,
 ) -> Result<ReadResult, String> {
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
+        let requested = resolve_path(&path, &workspace)?;
         let real = app
             .state::<WorkspaceRegistry>()
             .gates(origin.unwrap_or_default())
-            .authorized_existing(&resolve_path(&path, &workspace))?;
-        read_file_sync(&real, force.unwrap_or(false))
+            .authorized_existing(&requested)?;
+        let mut result = read_file_checked(
+            &real,
+            force.unwrap_or(false),
+            versioned.unwrap_or(false),
+            |opened| {
+                app.state::<WorkspaceRegistry>()
+                    .gates(origin.unwrap_or_default())
+                    .authorized_existing(opened)
+                    .map(|_| ())
+            },
+        )?;
+        if let ReadResult::Text {
+            ai_context_allowed,
+            opened_path,
+            ..
+        } = &mut result
+        {
+            *ai_context_allowed &= crate::modules::secret_paths::readable(&requested)
+                && opened_path.as_ref().is_some_and(|path| {
+                    app.state::<WorkspaceRegistry>()
+                        .gates(Origin::Ai)
+                        .authorized_existing(path)
+                        .is_ok()
+                });
+        }
+        Ok(result)
     })
     .await
 }
 
+#[cfg(test)]
 fn read_file_sync(p: &Path, force: bool) -> Result<ReadResult, String> {
-    let meta = std::fs::metadata(p).map_err(|e| {
+    read_file_checked(p, force, false, |_| Ok(()))
+}
+
+fn read_file_checked(
+    p: &Path,
+    force: bool,
+    versioned: bool,
+    authorize: impl Fn(&Path) -> Result<(), String>,
+) -> Result<ReadResult, String> {
+    let mut file = crate::modules::project_trust::open_regular(p).map_err(|e| e.to_string())?;
+    let opened_path = super::attachment::handle_path(&file)?;
+    authorize(&opened_path)?;
+    let opened_path = Some(opened_path);
+    let ai_context_allowed = crate::modules::secret_paths::readable(p)
+        && opened_path
+            .as_ref()
+            .is_some_and(|path| crate::modules::secret_paths::readable(path));
+    let meta = file.metadata().map_err(|e| {
         log::debug!("fs_read_file stat({}) failed: {e}", p.display());
         e.to_string()
     })?;
@@ -96,10 +148,18 @@ fn read_file_sync(p: &Path, force: bool) -> Result<ReadResult, String> {
         return Ok(ReadResult::TooLarge { size, limit });
     }
 
-    let bytes = std::fs::read(p).map_err(|e| {
-        log::debug!("fs_read_file read({}) failed: {e}", p.display());
-        e.to_string()
-    })?;
+    let mut bytes = Vec::with_capacity(size.min(limit) as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Ok(ReadResult::TooLarge {
+            size: bytes.len() as u64,
+            limit,
+        });
+    }
+    let size = bytes.len() as u64;
 
     // Null-byte sniff on the first chunk. Not perfect (misses UTF-16 BOM
     // cases) but catches the common "this is a PNG" mistake cheaply.
@@ -108,14 +168,59 @@ fn read_file_sync(p: &Path, force: bool) -> Result<ReadResult, String> {
         return Ok(ReadResult::Binary { size });
     }
 
+    let version = versioned
+        .then(|| document_save::version(&file, &bytes))
+        .transpose()
+        .map_err(|error| error.to_string())?;
     match String::from_utf8(bytes) {
         Ok(content) => Ok(ReadResult::Text {
             content,
             size,
             mtime: mtime_millis(&meta),
+            version,
+            ai_context_allowed,
+            opened_path,
         }),
         Err(_) => Ok(ReadResult::Binary { size }),
     }
+}
+
+pub(crate) fn validate_ai_document(
+    registry: &WorkspaceRegistry,
+    path: &str,
+    workspace: &WorkspaceEnv,
+) -> Result<(), String> {
+    let requested = resolve_path(path, workspace)?;
+    if !crate::modules::secret_paths::readable(&requested) {
+        return Err("Autocomplete is unavailable for protected documents".into());
+    }
+    let real = registry.gates(Origin::Ai).authorized_existing(&requested)?;
+    if !crate::modules::secret_paths::readable(&real) {
+        return Err("Autocomplete is unavailable for protected documents".into());
+    }
+    let file = crate::modules::project_trust::open_regular(&real).map_err(|e| e.to_string())?;
+    let opened = super::attachment::handle_path(&file)?;
+    registry.gates(Origin::Ai).authorized_existing(&opened)?;
+    if !crate::modules::secret_paths::readable(&opened) {
+        return Err("Autocomplete is unavailable for protected documents".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ai_validate_document(
+    app: tauri::AppHandle,
+    path: String,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<(), String> {
+    blocking(move || {
+        validate_ai_document(
+            &app.state::<WorkspaceRegistry>(),
+            &path,
+            &WorkspaceEnv::from_option(workspace),
+        )
+    })
+    .await
 }
 
 #[derive(Serialize, Clone)]
@@ -125,23 +230,11 @@ struct FileWrittenEvent {
     source: Option<String>,
 }
 
-/// Atomic write via O_EXCL tempfile in the target's parent, then rename.
-/// The random suffix is what blocks pre-staged symlink attacks.
-fn write_atomic(target: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = target.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
-    let mut tmp = NamedTempFile::new_in(parent)?;
-    tmp.as_file_mut().write_all(content)?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(target).map_err(|e| e.error)?;
-    Ok(())
-}
-
 /// Resolves `target` to the path the atomic rename must replace. A symlink is
 /// followed to its real file so the link survives the write (dotfile managers
 /// rely on it). A dangling link is an error: writing would either replace the
 /// link or create a file at a location the user never named.
+#[cfg(test)]
 fn resolve_write_target(target: &Path) -> std::io::Result<PathBuf> {
     match fs::symlink_metadata(target) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(target).map_err(|e| {
@@ -160,14 +253,50 @@ fn resolve_write_target(target: &Path) -> std::io::Result<PathBuf> {
 
 /// Atomic write that follows symlinks and keeps the existing file's
 /// permissions. Returns the real path written and whether it already existed.
+fn write_file_checked(
+    target: &Path,
+    content: &[u8],
+    validate: impl Fn(&Path) -> Result<(), String>,
+) -> std::io::Result<(PathBuf, bool)> {
+    let destination = super::destination::Destination::pin(target, false, &validate)?;
+    let original = match destination.open_current() {
+        Ok(file) => {
+            let opened = super::attachment::handle_path(&file).map_err(std::io::Error::other)?;
+            validate(&opened).map_err(std::io::Error::other)?;
+            Some((
+                document_save::version(&file, &[])?,
+                document_save::change_stamp(&file)?,
+                super::access_control::AccessControl::capture(&file)?,
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let staged = destination.stage(content)?;
+    if let Some((_, _, access)) = &original {
+        access.apply(staged.file())?;
+    }
+    destination.validate(&validate)?;
+    if let Some((identity, stamp, access)) = &original {
+        let current = destination.open_current()?;
+        if document_save::version(&current, &[])? != *identity
+            || document_save::change_stamp(&current)? != *stamp
+        {
+            return Err(std::io::Error::other(
+                "File changed before replacement; retry the write",
+            ));
+        }
+        access.verify(&current)?;
+        access.verify(staged.file())?;
+    }
+    staged.persist(original.is_some())?;
+    Ok((target.to_path_buf(), original.is_some()))
+}
+
+#[cfg(test)]
 fn write_file_sync(target: &Path, content: &[u8]) -> std::io::Result<(PathBuf, bool)> {
     let real = resolve_write_target(target)?;
-    let original = fs::metadata(&real).ok();
-    write_atomic(&real, content)?;
-    if let Some(perms) = original.as_ref().map(|m| m.permissions()) {
-        let _ = fs::set_permissions(&real, perms);
-    }
-    Ok((real, original.is_some()))
+    write_file_checked(&real, content, |_| Ok(()))
 }
 
 /// Returns the new mtime so the editor can track disk state for conflict
@@ -186,34 +315,120 @@ pub async fn fs_write_file(
     let watcher = app.clone();
     let (path, mtime) = blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let target = watcher
-            .state::<WorkspaceRegistry>()
-            .gates(origin.unwrap_or_default())
-            .authorized_write_target(&resolve_path(&path, &workspace))?;
-        // Oarlock's own write into a project's trusted item keeps the user's trust in it.
-        let change = OwnChange::File {
-            target: &target,
-            content: content.as_bytes(),
-        };
-        let (real, existed) = project_trust::keeping_trust(&watcher, change, || {
-            write_file_sync(&target, content.as_bytes())
-        })
-        .map_err(|e| {
-            log::warn!("fs_write_file({}) failed: {e}", target.display());
-            e.to_string()
-        })?;
+        let requested = resolve_path(&path, &workspace)?;
+        let registry = watcher.state::<WorkspaceRegistry>();
+        let gates = registry.gates(origin.unwrap_or_default());
+        let target = gates.authorized_write_target(&requested)?;
+        super::native_store::refuse_write(&watcher, &target)?;
+        let mtime = document_save::with_lock(&target, || -> Result<u64, String> {
+            // Oarlock's own write into a project's trusted item keeps the user's trust in it.
+            let change = OwnChange::File {
+                target: &target,
+                content: content.as_bytes(),
+            };
+            let (real, existed) = project_trust::keeping_trust(&watcher, change, || {
+                write_file_checked(&target, content.as_bytes(), |opened| {
+                    let current = gates.authorized_write_target(&requested)?;
+                    super::native_store::refuse_write(&watcher, &current)?;
+                    if current != target || opened != target {
+                        return Err("File destination changed during write".into());
+                    }
+                    Ok(())
+                })
+            })
+            .map_err(|e| {
+                log::warn!("fs_write_file({}) failed: {e}", target.display());
+                format!("Cannot save {}: {e}", target.display())
+            })?;
 
-        if !existed {
-            note_changed(&index, &real);
-        }
-        super::watch::note_written(&watcher, &real);
-        let mtime = fs::metadata(&real).map(|m| mtime_millis(&m)).unwrap_or(0);
+            if !existed {
+                note_changed(&index, &real);
+            }
+            super::watch::note_written(&watcher, &real);
+            let mtime = fs::metadata(&real).map(|m| mtime_millis(&m)).unwrap_or(0);
+            Ok(mtime)
+        })?;
         Ok((path, mtime))
     })
     .await?;
     let _ = app.emit("fs:file-written", FileWrittenEvent { path, source });
 
     Ok(mtime)
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum DocumentSaveResult {
+    Saved { version: String },
+    Conflict { version: Option<String> },
+}
+
+#[tauri::command]
+pub async fn fs_save_document(
+    app: tauri::AppHandle,
+    path: String,
+    content: String,
+    expected_version: Option<String>,
+    workspace: Option<WorkspaceEnv>,
+    source: Option<String>,
+) -> Result<DocumentSaveResult, String> {
+    let emitter = app.clone();
+    let event_path = path.clone();
+    let result = blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let requested = resolve_path(&path, &workspace)?;
+        let registry = app.state::<WorkspaceRegistry>();
+        let gates = registry.gates(Origin::App);
+        let target = gates.authorized_write_target(&requested)?;
+        super::native_store::refuse_write(&app, &target)?;
+        document_save::with_lock(&target, || {
+            let change = OwnChange::File {
+                target: &target,
+                content: content.as_bytes(),
+            };
+            let result = project_trust::keeping_trust(&app, change, || {
+                document_save::write_checked(
+                    &target,
+                    content.as_bytes(),
+                    expected_version.as_deref(),
+                    |opened| {
+                        let current = gates.authorized_write_target(&requested)?;
+                        super::native_store::refuse_write(&app, &current)?;
+                        if current != target || opened != target {
+                            return Err("Document destination changed during save".into());
+                        }
+                        Ok(())
+                    },
+                )
+            });
+            match result {
+                Ok(version) => {
+                    if expected_version.is_none() {
+                        note_changed(&app.state::<FileIndexState>(), &target);
+                    }
+                    super::watch::note_written(&app, &target);
+                    Ok(DocumentSaveResult::Saved { version })
+                }
+                Err(document_save::SaveError::Conflict(version)) => {
+                    Ok(DocumentSaveResult::Conflict { version })
+                }
+                Err(document_save::SaveError::Failed(error)) => {
+                    Err(format!("Cannot save {}: {error}", target.display()))
+                }
+            }
+        })
+    })
+    .await?;
+    if matches!(result, DocumentSaveResult::Saved { .. }) {
+        let _ = emitter.emit(
+            "fs:file-written",
+            FileWrittenEvent {
+                path: event_path,
+                source: Some(source.unwrap_or_else(|| "editor".into())),
+            },
+        );
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -228,7 +443,7 @@ pub async fn fs_canonicalize(
         let real = app
             .state::<WorkspaceRegistry>()
             .gates(origin.unwrap_or_default())
-            .authorized_existing(&resolve_path(&path, &workspace))?;
+            .authorized_existing(&resolve_path(&path, &workspace)?)?;
         Ok(super::to_canon(&real))
     })
     .await
@@ -250,7 +465,7 @@ pub async fn fs_host_path(
     }
     // Mapping a WSL path probes the share, which can stall.
     blocking(move || {
-        let host = host_path(&path, &workspace);
+        let host = host_path(&path, &workspace)?;
         app.state::<WorkspaceRegistry>()
             .gates(Origin::App)
             .authorized_existing(Path::new(&host))?;
@@ -259,8 +474,10 @@ pub async fn fs_host_path(
     .await
 }
 
-fn host_path(path: &str, workspace: &WorkspaceEnv) -> String {
-    resolve_path(path, workspace).to_string_lossy().into_owned()
+fn host_path(path: &str, workspace: &WorkspaceEnv) -> Result<String, String> {
+    Ok(resolve_path(path, workspace)?
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// What "Open in Default App" may hand to the OS: an existing file whose real location is
@@ -375,7 +592,7 @@ pub async fn fs_open_default(
         let workspace = WorkspaceEnv::from_option(workspace);
         open_step(
             gate.state::<WorkspaceRegistry>().gates(Origin::App),
-            &resolve_path(&path, &workspace),
+            &resolve_path(&path, &workspace)?,
             launch::file_runs_as_program,
         )
     })
@@ -416,7 +633,7 @@ pub async fn fs_stat(
 ) -> Result<FileStat, String> {
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = resolve_path(&path, &workspace);
+        let p = resolve_path(&path, &workspace)?;
         let real = app
             .state::<WorkspaceRegistry>()
             .gates(Origin::App)
@@ -449,12 +666,72 @@ fn stat_path(p: &Path, real: &Path) -> Result<FileStat, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn general_file_replacement_preserves_acl() {
+        use super::super::access_control::tests::{acl_text, add_acl};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document");
+        std::fs::write(&path, b"base").unwrap();
+        add_acl(&path, "group:everyone deny execute");
+        let rules = acl_text(&path);
+        super::write_file_sync(&path, b"draft").unwrap();
+        assert_eq!(acl_text(&path), rules);
+        assert_eq!(std::fs::read(&path).unwrap(), b"draft");
+    }
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn versioned_read_binds_to_the_opened_file_and_round_trips_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document");
+        fs::write(&path, b"base").unwrap();
+        let ReadResult::Text {
+            version: Some(expected),
+            ..
+        } = read_file_checked(&path, false, true, |_| Ok(())).unwrap()
+        else {
+            panic!("missing document version")
+        };
+        let saved =
+            document_save::write_checked(&path, b"edit", Some(&expected), |_| Ok(())).unwrap();
+        let ReadResult::Text {
+            version: Some(loaded),
+            ..
+        } = read_file_checked(&path, false, true, |_| Ok(())).unwrap()
+        else {
+            panic!("missing saved version")
+        };
+        assert_eq!(loaded, saved);
+        assert_ne!(loaded, expected);
+
+        let ReadResult::Text {
+            version: Some(old),
+            content,
+            ..
+        } = read_file_checked(&path, false, true, |_| {
+            let mut replacement = NamedTempFile::new_in(dir.path()).unwrap();
+            replacement.write_all(b"edit").unwrap();
+            replacement.persist(&path).unwrap();
+            Ok(())
+        })
+        .unwrap()
+        else {
+            panic!("missing opened-file version")
+        };
+        assert_eq!(content, "edit");
+        assert!(matches!(
+            document_save::write_checked(&path, b"stale", Some(&old), |_| Ok(())),
+            Err(document_save::SaveError::Conflict(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"edit");
+    }
 
     #[test]
     fn host_path_keeps_local_paths() {
         assert_eq!(
-            host_path("/home/me/pic.png", &WorkspaceEnv::Local),
+            host_path("/home/me/pic.png", &WorkspaceEnv::Local).unwrap(),
             "/home/me/pic.png"
         );
     }
@@ -466,7 +743,7 @@ mod tests {
             distro: "Ubuntu".into(),
         };
         assert_eq!(
-            host_path("/mnt/c/Users/me/pic.png", &workspace),
+            host_path("/mnt/c/Users/me/pic.png", &workspace).unwrap(),
             r"C:\Users\me\pic.png"
         );
     }
@@ -783,6 +1060,88 @@ mod tests {
     }
 
     #[test]
+    fn opened_editor_content_requires_authorization_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("safe.txt");
+        std::fs::write(&path, "SYNTHETIC_PRIVATE_CONTENT").unwrap();
+        let result = read_file_checked(&path, false, false, |_| {
+            Err("outside authorized folders".into())
+        });
+        assert!(matches!(result, Err(error) if error == "outside authorized folders"));
+    }
+
+    #[test]
+    fn autocomplete_requires_authorized_nonsecret_document_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        for name in ["safe.txt", ".env", ".ssh/config"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "SYNTHETIC_DOCUMENT").unwrap();
+            let allowed = name == "safe.txt";
+            assert_eq!(
+                validate_ai_document(&registry, path.to_str().unwrap(), &WorkspaceEnv::Local)
+                    .is_ok(),
+                allowed
+            );
+            match read_file_sync(&path, false).unwrap() {
+                ReadResult::Text {
+                    ai_context_allowed, ..
+                } => assert_eq!(ai_context_allowed, allowed),
+                _ => panic!("expected text"),
+            }
+        }
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        assert!(validate_ai_document(
+            &registry,
+            outside.path().to_str().unwrap(),
+            &WorkspaceEnv::Local
+        )
+        .is_err());
+        assert!(validate_ai_document(
+            &registry,
+            root.join("missing").to_str().unwrap(),
+            &WorkspaceEnv::Local
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autocomplete_retains_protected_load_provenance_after_a_symlink_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        std::fs::write(root.join(".env"), "SYNTHETIC_SECRET").unwrap();
+        std::fs::write(root.join("safe.txt"), "safe").unwrap();
+        let link = root.join("alias.txt");
+        std::os::unix::fs::symlink(".env", &link).unwrap();
+        let loaded = read_file_sync(&link, false).unwrap();
+        assert!(
+            validate_ai_document(&registry, link.to_str().unwrap(), &WorkspaceEnv::Local).is_err()
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("safe.txt", &link).unwrap();
+        assert!(
+            validate_ai_document(&registry, link.to_str().unwrap(), &WorkspaceEnv::Local).is_ok()
+        );
+        match loaded {
+            ReadResult::Text {
+                ai_context_allowed,
+                content,
+                ..
+            } => {
+                assert!(!ai_context_allowed);
+                assert_eq!(content, "SYNTHETIC_SECRET");
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
     fn read_file_classifies_utf8_as_text() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("a.txt");
@@ -792,6 +1151,7 @@ mod tests {
                 content,
                 size,
                 mtime,
+                ..
             } => {
                 assert_eq!(content, "hello world");
                 assert_eq!(size, 11);
@@ -844,7 +1204,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("note.txt");
         std::fs::write(&target, b"old").unwrap();
-        write_atomic(&target, b"new").unwrap();
+        write_file_checked(&target, b"new", |_| Ok(())).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
@@ -861,7 +1221,7 @@ mod tests {
         let legacy = dir.path().join(".note.txt.oarlock.tmp");
         symlink(&outside, &legacy).unwrap();
 
-        write_atomic(&target, b"payload").unwrap();
+        write_file_checked(&target, b"payload", |_| Ok(())).unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"payload");
         // The pre-staged symlink target must not have been written through.

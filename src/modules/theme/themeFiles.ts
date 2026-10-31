@@ -28,7 +28,33 @@ export async function themeFilePath(id: string): Promise<string> {
   return join(await themesDir(), `${id}${THEME_FILE_EXT}`);
 }
 
-export async function writeThemeFile(theme: Theme): Promise<string> {
+type ThemeFileComparison = "same" | "different" | "unknown";
+
+function canonicalJson(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, item: unknown) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+    return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)));
+  });
+}
+
+/** Compare without writing: another window may own an unsaved editor buffer. */
+export async function compareThemeFile(path: string, theme: Theme): Promise<ThemeFileComparison> {
+  try {
+    const result = await invoke<{ kind: "text"; content: string } | { kind: "binary" | "toolarge" }>(
+      "fs_read_file", { path, workspace: LOCAL_WORKSPACE },
+    );
+    if (result.kind !== "text") return "unknown";
+    try {
+      return canonicalJson(JSON.parse(result.content)) === canonicalJson(theme) ? "same" : "different";
+    } catch {
+      return "different";
+    }
+  } catch {
+    return "unknown";
+  }
+}
+
+export async function writeThemeFile(theme: Theme): Promise<{ path: string; comparison: ThemeFileComparison }> {
   const dir = await themesDir();
   const workspace = LOCAL_WORKSPACE;
   const dirExists = await invoke("fs_stat", { path: dir, workspace })
@@ -38,20 +64,24 @@ export async function writeThemeFile(theme: Theme): Promise<string> {
     await invoke("fs_create_dir", { path: dir, workspace });
   }
   const path = await join(dir, `${theme.id}${THEME_FILE_EXT}`);
-  await invoke("fs_write_file", {
+  const result = await invoke<{ kind: "saved" | "conflict" }>("fs_save_document", {
     path,
     content: JSON.stringify(theme, null, 2),
+    expectedVersion: null,
     workspace,
     source: "theme",
   });
-  return path;
+  if (result.kind === "saved") return { path, comparison: "same" };
+  if (result.kind === "conflict") return { path, comparison: await compareThemeFile(path, theme) };
+  throw new Error("Could not determine whether the theme file was created");
 }
 
 export async function deleteThemeFile(id: string): Promise<void> {
   try {
     const path = await themeFilePath(id);
     await invoke("fs_delete", { path, workspace: LOCAL_WORKSPACE });
-  } catch {
+  } catch (error) {
+    if (String(error).includes("target cannot be safely verified")) throw error;
     /* file may not exist yet — nothing to clean up */
   }
 }

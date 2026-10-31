@@ -60,11 +60,12 @@ grep-regex = "0.1"
 regex = "1"
 grep-searcher = "0.1"
 globset = "0.4"
+glob = "0.3"
 nucleo-matcher = "0.3"
 shared_child = "1"
 tauri-plugin-log = "2"
 tauri-plugin-os = "2"
-tauri-plugin-store = "2"
+tauri-plugin-store = { path = "vendor/tauri-plugin-store" }
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 # One reqwest for the whole app: tauri-plugin-updater already pulls 0.13 with
@@ -86,6 +87,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Skills: content hashes for project trust, and zip installs (both already in the tree).
 sha2 = "0.10"
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
+# Operation-scoped directory handles for authorized creates, save staging and publication.
+cap-std = { version = "4.0.3", default-features = false }
+sha1 = "0.10.6"
 
 [dev-dependencies]
 proptest = "1"
@@ -108,6 +112,8 @@ keyring-core = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Already used by shared_child; reuse its signal-driven wait without reaping a live job leader.
+sigchld = "0.2.5"
 
 # inotify (Linux) and ReadDirectoryChangesW (Windows). macOS drives FSEvents
 # directly (see fs/watch/macos.rs), which keeps notify out of that build.
@@ -120,18 +126,22 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 objc2 = { version = "0.6", features = ["exception"] }
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSAlert", "NSApplication", "NSButton", "NSColor", "NSControl", "NSEvent", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSView", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSError", "NSFileManager", "NSRunLoop", "NSURL", "NSString", "NSUserDefaults", "NSValue"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSError", "NSFileManager", "NSPathUtilities", "NSRunLoop", "NSURL", "NSString", "NSUserDefaults", "NSValue"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFString"] }
 objc2-core-services = { version = "0.3", default-features = false, features = ["std", "FSEvents", "dispatch2"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 window-vibrancy = "0.8"
 
+# Already bundled by the clipboard plugin; direct reads preserve typed absence/errors.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring-core = "1"
 windows-native-keyring-store = "1"
 window-vibrancy = "0.8"
-# The OS-level proxy setting (registry) is read by reqwest only with this
-# feature, and the previous reqwest honoured it unconditionally on Windows.
+# Preserve OS proxy support for dependencies such as the updater. Guarded
+# AI/MCP/OAuth/image clients explicitly disable all proxies to keep DNS pinning.
 reqwest = { version = "0.13", default-features = false, features = ["system-proxy"] }
 windows-sys = { version = "0.61", features = [
 	"Wdk_System_SystemServices",
@@ -163,7 +173,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
-tauri-plugin-window-state = "2"
+tauri-plugin-window-state = { path = "vendor/tauri-plugin-window-state" }
 
 [profile.dev]
 incremental = true

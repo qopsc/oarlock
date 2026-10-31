@@ -53,6 +53,8 @@ type ServerRun = {
   startedAt: number;
   connection: Connection | null;
   tools: McpListedTool[];
+  toolsVersion: number;
+  toolsDirty: boolean;
   instructions: string | null;
   serverInfo: string | null;
   /** What the server offers, as it announced it (resources, prompts, ...). */
@@ -120,6 +122,8 @@ export class McpManager {
   private runs = new Map<string, ServerRun>();
   private servers: McpServerConfig[] = [];
   private generation = 0;
+  private refreshVersion = 0;
+  private refreshing: Promise<void> | undefined;
   private offered = new Map<string, OfferedTool>();
   private listening: Promise<void> | null = null;
   /** Resources and prompts of the running servers, for the composer. */
@@ -128,16 +132,37 @@ export class McpManager {
   /** Follows Settings: configuration changes and restart requests. */
   listen(): Promise<void> {
     this.listening ??= (async () => {
-      await onMcpChanged((change) => {
+      const off = await onMcpChanged((change) => {
         if (change.kind === "servers") {
-          void loadWindowServers().then((servers) => this.sync(servers));
+          void this.refresh().catch((error) =>
+            console.warn("[mcp] configuration refresh failed", error),
+          );
         }
       });
-      await listen<{ serverId: string }>(MCP_RESTART_EVENT, (event) => {
-        this.restart(event.payload.serverId);
-      });
-    })();
+      try {
+        await listen<{ serverId: string }>(MCP_RESTART_EVENT, (event) => {
+          this.restart(event.payload.serverId);
+        });
+      } catch (error) {
+        off();
+        throw error;
+      }
+    })().catch((error) => {
+      this.listening = null;
+      throw error;
+    });
     return this.listening;
+  }
+
+  /** Ignore superseded config replies, including lease changes while loading. */
+  refresh(): Promise<void> {
+    const version = ++this.refreshVersion;
+    const pending = loadWindowServers(true).then(async (servers) => {
+      if (version === this.refreshVersion) this.sync(servers);
+      else await this.refreshing;
+    });
+    this.refreshing = pending;
+    return pending;
   }
 
   /** Starts, stops, restarts or updates servers to match `servers`. */
@@ -161,9 +186,17 @@ export class McpManager {
         case "update": {
           const run = this.runs.get(plan.server.id);
           if (run) {
+            const wasRetained = run.server.retainedOnly;
             run.server = plan.server;
             changed = true;
-            this.extras.updated(plan.server);
+            if (plan.server.retainedOnly) this.extras.ended(plan.server.id);
+            else if (wasRetained && run.connection)
+              this.extras.connected(
+                plan.server,
+                run.connection.client,
+                run.capabilities,
+              );
+            else this.extras.updated(plan.server);
           }
           break;
         }
@@ -226,9 +259,14 @@ export class McpManager {
   }
 
   /** What running servers ask the model to know, capped. */
-  instructions(): { server: string; text: string }[] {
+  instructions(ids?: ReadonlySet<string>): { server: string; text: string }[] {
     return this.orderedRuns()
-      .filter((r) => r.state === "running" && r.instructions?.trim())
+      .filter(
+        (r) =>
+          r.state === "running" &&
+          r.instructions?.trim() &&
+          (!ids || ids.has(r.server.id)),
+      )
       .map((r) => ({
         server: r.server.name,
         text: capText((r.instructions ?? "").trim(), MAX_INSTRUCTIONS),
@@ -329,6 +367,8 @@ export class McpManager {
       startedAt: Date.now(),
       connection: null,
       tools: [],
+      toolsVersion: 0,
+      toolsDirty: false,
       instructions: null,
       serverInfo: null,
       capabilities: null,
@@ -398,7 +438,12 @@ export class McpManager {
       this.report(run);
       this.publish();
       this.remember(run);
-      this.extras.connected(run.server, opened.client, capabilities);
+      if (!run.server.retainedOnly)
+        this.extras.connected(run.server, opened.client, capabilities);
+      if (run.toolsDirty) {
+        run.toolsDirty = false;
+        this.scheduleRefresh(run, generation);
+      }
     } catch (error) {
       if (connection && run.connection !== connection) {
         await connection.close().catch(() => {});
@@ -476,25 +521,39 @@ export class McpManager {
   }
 
   private scheduleRefresh(run: ServerRun, generation: number): void {
+    if (!this.current(run, generation) || run.state === "crashed") return;
+    if (run.state === "starting") {
+      run.toolsDirty = true;
+      return;
+    }
     if (run.refreshTimer) clearTimeout(run.refreshTimer);
     run.refreshTimer = setTimeout(() => {
       run.refreshTimer = null;
       const client = run.connection?.client;
       if (!client || !this.current(run, generation)) return;
+      const version = ++run.toolsVersion;
       listAllTools(client).then(
         (tools) => {
-          if (!this.current(run, generation) || run.state !== "running") return;
+          if (
+            !this.current(run, generation) ||
+            run.state !== "running" ||
+            version !== run.toolsVersion
+          )
+            return;
           run.tools = tools;
           this.note(run.server.id, `Tools changed: ${tools.length}`);
           this.report(run);
           this.publish();
           this.remember(run);
         },
-        (error) =>
+        (error) => {
+          if (!this.current(run, generation) || version !== run.toolsVersion)
+            return;
           this.note(
             run.server.id,
             `Could not refresh tools: ${message(error)}`,
-          ),
+          );
+        },
       );
     }, REFRESH_DEBOUNCE_MS);
   }
@@ -529,7 +588,7 @@ export class McpManager {
         annotations: cleanAnnotations(tool.annotations),
         trusted: run.server.trusted,
       };
-      catalog[name] = info;
+      if (!run.server.retainedOnly) catalog[name] = info;
       offered.set(name, {
         info,
         description: toolDescription(tool),

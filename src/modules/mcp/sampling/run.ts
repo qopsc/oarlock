@@ -1,3 +1,4 @@
+import { requireCurrentPreferences } from "@/modules/settings/readiness";
 import { modelSupportsTemperature, resolveModel } from "@/modules/ai/config";
 import { buildConfiguredLanguageModel } from "@/modules/ai/lib/agent";
 import { reasoningCallOptions } from "@/modules/ai/lib/reasoningEffort";
@@ -42,6 +43,7 @@ export async function runSampling(opts: {
   /** Whether the conversation's meter counted the usage. */
   counted: boolean;
 }> {
+  requireCurrentPreferences();
   const problem = samplingDraftProblem(opts.draft);
   if (problem) throw new Error(problem);
   const config = liveModelConfig();
@@ -60,6 +62,8 @@ export async function runSampling(opts: {
     opts.temperature !== null &&
     Object.keys(reasoning).length === 0 &&
     modelSupportsTemperature(target.provider, target.modelId);
+  opts.signal.throwIfAborted();
+  requireCurrentPreferences();
   const result = await generateText({
     model,
     instructions: opts.draft.systemPrompt.trim() || undefined,

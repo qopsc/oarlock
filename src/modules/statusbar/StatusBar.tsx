@@ -20,6 +20,7 @@ import { WorkspaceEnvSelector } from "./WorkspaceEnvSelector";
 type Props = {
   cwd: string | null;
   filePath?: string | null;
+  overrideLanguage?: string | null;
   home: string | null;
   /** The workspace folder; breadcrumb paths are copied relative to it. */
   root: string | null;
@@ -38,6 +39,7 @@ type Props = {
 export function StatusBar({
   cwd,
   filePath,
+  overrideLanguage,
   home,
   root,
   onCd,
@@ -62,7 +64,10 @@ export function StatusBar({
           onCd={onCd}
           onOpenTerminal={onOpenTerminal}
         />
-        <LspStatusPill filePath={filePath ?? null} />
+        <LspStatusPill
+          filePath={filePath ?? null}
+          overrideLanguage={overrideLanguage}
+        />
         <DiagnosticsBadge filePath={filePath ?? null} />
         {privateActive ? (
           <Tooltip>

@@ -1,3 +1,4 @@
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { UIMessage } from "@ai-sdk/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -188,3 +189,15 @@ describe("a run still answering after the user opens another conversation", () =
     expect(useChatStore.getState().agentMeta.step).toBe("Writing");
   });
 });
+
+vi.mock("./chatStop", () => ({
+  assertChatCanStart: vi.fn(async () => {}),
+  assertChatNotStopping: vi.fn(),
+  stopChat: vi.fn(async (_id, _options, stop) => {
+    await stop?.();
+  }),
+}));
+
+beforeEach(() =>
+  usePreferencesStore.setState({ hydrated: true, error: null, syncing: false }),
+);

@@ -8,10 +8,9 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use ignore::{WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::AppHandle;
 
-use super::supersede::Supersede;
-use super::{authorized_root, blocking, display_path, privacy_refused_root, to_canon};
+use super::{authorized_root, blocking, display_path, to_canon};
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv};
 
 const FILE_SIZE_CAP: u64 = 5 * 1024 * 1024;
@@ -29,14 +28,6 @@ pub enum GrepChannel {
     Sidebar,
 }
 
-impl GrepChannel {
-    fn supersede_key(self) -> &'static str {
-        match self {
-            GrepChannel::Palette => "grep-interactive",
-            GrepChannel::Sidebar => "grep-sidebar",
-        }
-    }
-}
 /// Walker threads per search. The default is one per core, which for a burst of
 /// keystrokes spawned a dozen threads per query.
 const WALK_THREADS: usize = 4;
@@ -157,6 +148,9 @@ fn search_tree(
                 &matcher,
                 path,
                 UTF8(|line_num, text| {
+                    if cancel() {
+                        return Ok(false);
+                    }
                     let line_text = text.trim_end_matches('\n').to_string();
                     let mut guard = hits.lock().unwrap();
                     if guard.len() >= cap {
@@ -227,7 +221,7 @@ pub fn run_grep(
         return Err("empty pattern".into());
     }
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -254,35 +248,6 @@ pub fn run_grep(
     ))
 }
 
-/// Interactive content search for the command palette and the sidebar's
-/// Search view. Treats the query as a literal (smart-case), and self-cancels
-/// when a newer query from the same channel arrives. The generation is bumped
-/// when the command is dispatched, so the previous walk stops even though it
-/// is still occupying a blocking thread.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn fs_grep_interactive(
-    app: AppHandle,
-    window: tauri::Window,
-    supersede: State<'_, Supersede>,
-    pattern: String,
-    root: String,
-    max_results: Option<usize>,
-    workspace: Option<WorkspaceEnv>,
-    channel: Option<GrepChannel>,
-) -> Result<GrepResponse, String> {
-    let ticket =
-        supersede.begin_window(window.label(), channel.unwrap_or_default().supersede_key());
-    blocking(move || {
-        authorized_root(&app, &root, workspace.as_ref(), Origin::App)?;
-        privacy_refused_root(&root)?;
-        run_grep_interactive(pattern, root, max_results, workspace, &|| {
-            ticket.is_superseded()
-        })
-    })
-    .await
-}
-
 pub fn run_grep_interactive(
     pattern: String,
     root: String,
@@ -294,7 +259,7 @@ pub fn run_grep_interactive(
         return Err("empty pattern".into());
     }
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -351,7 +316,7 @@ pub fn run_glob(
         return Err("empty pattern".into());
     }
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -402,20 +367,6 @@ pub fn run_glob(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn each_channel_supersedes_only_its_own_searches() {
-        let supersede = Supersede::default();
-        let palette = supersede.begin(GrepChannel::Palette.supersede_key());
-        let sidebar = supersede.begin(GrepChannel::Sidebar.supersede_key());
-        let newer_palette = supersede.begin(GrepChannel::Palette.supersede_key());
-        assert!(palette.is_superseded());
-        assert!(newer_palette.is_current());
-        assert!(
-            sidebar.is_current(),
-            "the palette never cancels the sidebar"
-        );
-    }
 
     #[test]
     fn a_missing_or_named_channel_deserializes() {

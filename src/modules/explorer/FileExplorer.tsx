@@ -1,3 +1,4 @@
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -67,6 +68,8 @@ import type { GitStatusCode } from "./lib/gitStatusUtils";
 import { useGlobalShortcuts } from "@/modules/shortcuts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { GitStatusSnapshot } from "@/modules/ai/lib/native";
+import { toast } from "sonner";
+import { confirmedDeletePaths, type DeleteConfirmation } from "./lib/deleteConfirmation";
 
 export type FileExplorerHandle = {
   focus: () => void;
@@ -78,9 +81,7 @@ type Props = {
   rootPath: string | null;
   activeFilePath?: string | null;
   onOpenFile: (path: string, pin?: boolean) => void;
-  onPathRenamed?: (from: string, to: string) => void;
-  onPathsDeleted?: (paths: string[]) => void;
-  canReplacePath?: (path: string) => boolean;
+  canReplacePath?: (path: string, workspace: WorkspaceEnv) => boolean;
   onRevealInTerminal?: (path: string) => void;
   onOpenInSourceControl?: (path: string) => void;
   onOpenGitHistory?: (path: string) => void;
@@ -225,8 +226,6 @@ export const FileExplorer = memo(
       rootPath,
       activeFilePath,
       onOpenFile,
-      onPathRenamed,
-      onPathsDeleted,
       canReplacePath,
       onRevealInTerminal,
       onOpenInSourceControl,
@@ -240,8 +239,6 @@ export const FileExplorer = memo(
     ref,
   ) {
     const tree = useFileTree(rootPath, {
-      onPathRenamed,
-      onPathsDeleted,
       canReplacePath,
       active: visible,
     });
@@ -269,6 +266,8 @@ export const FileExplorer = memo(
     } | null>(null);
     useLayoutEffect(() => {
       pasteScopeRef.current = { rootPath, workspace };
+      setSelectedPaths(new Set());
+      setAnchorPath(null);
       return () => {
         pasteScopeRef.current = { rootPath: null, workspace };
       };
@@ -322,8 +321,30 @@ export const FileExplorer = memo(
       name: string;
       isDir: boolean;
     } | null>(null);
-    const [deleteConfirm, setDeleteConfirm] = useState(false);
+    const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmation | null>(null);
     const [menuIsBatch, setMenuIsBatch] = useState(false);
+    const menuScopeRef = useRef<typeof pasteScopeRef.current | null>(null);
+    const confirmDelete = (
+      event: Event,
+      paths: string[],
+      remove: (paths: string[]) => void,
+    ) => {
+      const scope = pasteScopeRef.current;
+      if (menuScopeRef.current !== scope) {
+        setDeleteConfirm(null);
+        toast.error("Delete cancelled", { description: "The workspace changed. Choose the files again." });
+        return;
+      }
+      if (!deleteConfirm) {
+        event.preventDefault();
+        setDeleteConfirm({ scope, paths });
+        return;
+      }
+      const confirmed = confirmedDeletePaths(deleteConfirm, scope, paths);
+      setDeleteConfirm(null);
+      if (confirmed) remove(confirmed);
+      else toast.error("Delete cancelled", { description: "The selection changed. Choose the files again." });
+    };
     // Bumped on every right-click so the menu content remounts and the popper
     // re-anchors to the new cursor (floating-ui won't reposition on an anchor
     // change alone, only on scroll/resize).
@@ -389,6 +410,7 @@ export const FileExplorer = memo(
       [entryIndexByPath, rows],
     );
     const dnd = useExplorerDnd({
+      workspace,
       rootPath: rootPath ?? "",
       isDir: isDirAt,
       onMove: tree.movePaths,
@@ -789,7 +811,7 @@ export const FileExplorer = memo(
         {!isSearchActive ? (
           <ContextMenu
             onOpenChange={(open) => {
-              if (!open) setDeleteConfirm(false);
+              if (!open) setDeleteConfirm(null);
             }}
           >
             <ContextMenuTrigger asChild>
@@ -804,6 +826,7 @@ export const FileExplorer = memo(
                 onPointerDown={dnd.onPointerDown}
                 onClickCapture={dnd.onClickCapture}
                 onContextMenuCapture={(e) => {
+                  menuScopeRef.current = pasteScopeRef.current;
                   const el = (e.target as HTMLElement).closest<HTMLElement>(
                     "[data-fs-path]",
                   );
@@ -825,7 +848,7 @@ export const FileExplorer = memo(
                     setMenuIsBatch(false);
                     setMenuTarget(null);
                   }
-                  setDeleteConfirm(false);
+                  setDeleteConfirm(null);
                   setMenuNonce((n) => n + 1);
                 }}
               >
@@ -916,14 +939,9 @@ export const FileExplorer = memo(
                   className={COMPACT_ITEM}
                   variant="destructive"
                   onSelect={(e) => {
-                    if (deleteConfirm) {
-                      void tree.deletePaths([...selectedPathsRef.current]);
-                    } else {
-                      // Keep the menu open on the first click so the user
-                      // can confirm; let it close normally on the second.
-                      e.preventDefault();
-                      setDeleteConfirm(true);
-                    }
+                    confirmDelete(e, [...selectedPathsRef.current], (paths) => {
+                      void tree.deletePaths(paths);
+                    });
                   }}
                 >
                   {deleteConfirm
@@ -1054,14 +1072,9 @@ export const FileExplorer = memo(
                     className={COMPACT_ITEM}
                     variant="destructive"
                     onSelect={(e) => {
-                      if (deleteConfirm) {
-                        void tree.deletePath(menuTarget.path);
-                      } else {
-                        // Keep the menu open on the first click so the user
-                        // can confirm; let it close normally on the second.
-                        e.preventDefault();
-                        setDeleteConfirm(true);
-                      }
+                      confirmDelete(e, [menuTarget.path], (paths) => {
+                        void tree.deletePath(paths[0]);
+                      });
                     }}
                   >
                     {deleteConfirm ? "Click again to confirm" : "Delete"}

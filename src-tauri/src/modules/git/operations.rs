@@ -5,21 +5,22 @@ use std::path::{Path, PathBuf};
 use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2};
 use crate::modules::git::process::{
-    decode_text, ensure_git_available, ensure_success, git_show_text, git_stdout_line_opt,
-    git_stdout_lines, read_text_file, run_git, run_git_capped,
+    decode_text, ensure_git_available, ensure_success, git_show_text, read_text_file,
+    run_git_capped, run_git_guarded,
 };
 use crate::modules::git::types::{
-    DiscardEntry, GitBranchEntry, GitBranchListResult, GitCommitFileChange, GitCommitResult,
-    GitDiffContentResult, GitDiffResult, GitLogEntry, GitOutput, GitPanelSnapshot, GitPushResult,
-    GitRepoInfo, GitStatusSnapshot, TextSource, COMMIT_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS,
-    NETWORK_TIMEOUT_SECS,
+    DiscardEntry, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
+    GitLogEntry, GitOutput, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
+    TextSource, COMMIT_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS,
 };
 use crate::modules::git::utils::{
-    authorized_repo_root, canonical_dir, resolve_within_repo, split_upstream, validate_branch_name,
-    ResolvedGitDirectory,
+    authorized_repo_root, canonical_dir, git_entry_name, git_worktree_entry, owned_repo_root,
+    split_upstream, ResolvedGitDirectory,
 };
 use crate::modules::git::{untracked, worktree};
 use crate::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
+
+pub use super::branches::{checkout_branch, commit_on_remote, list_branches, undo_last_commit};
 
 pub fn resolve_repo(
     registry: &WorkspaceRegistry,
@@ -38,37 +39,22 @@ fn resolve_repo_in_authorized(
     registry: &WorkspaceRegistry,
     cwd: &ResolvedGitDirectory,
 ) -> Result<Option<GitRepoInfo>> {
+    super::ownership::authorize_containing_metadata(registry, &cwd.local_path)?;
     let Some(location) = worktree::locate_work_tree(&cwd.workspace, &cwd.git_path)? else {
         return Ok(None);
     };
-    let canonical_root = canonical_dir(registry, &location.toplevel, &cwd.workspace)?;
-    let _ = registry.authorize(&canonical_root.local_path);
+    let canonical_root = discovered_root(registry, cwd, &location.toplevel)?;
 
-    let head = match git_stdout_lines(
-        &canonical_root.workspace,
-        &canonical_root.git_path,
-        ["rev-parse", "--abbrev-ref", "HEAD"],
-    )?
-    .into_iter()
-    .next()
-    {
-        Some(h) => h,
-        None => git_stdout_line_opt(
-            &canonical_root.workspace,
-            &canonical_root.git_path,
-            ["symbolic-ref", "--short", "HEAD"],
-        )?
-        .ok_or(GitError::CommandFailed {
-            context: "failed to resolve HEAD",
-            detail: String::new(),
-        })?,
+    let head = match canonical_root.optional_line(["symbolic-ref", "--quiet", "--short", "HEAD"])? {
+        Some(branch) => branch,
+        None => {
+            let detached =
+                canonical_root.run(["cat-file", "-e", "HEAD^{commit}"], DEFAULT_TIMEOUT_SECS)?;
+            ensure_success(&detached, "git HEAD failed")?;
+            "HEAD".to_string()
+        }
     };
-
-    let upstream = git_stdout_line_opt(
-        &canonical_root.workspace,
-        &canonical_root.git_path,
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )?;
+    let upstream = super::branches::upstream_name(&canonical_root)?;
 
     Ok(Some(GitRepoInfo {
         repo_root: canonical_root.git_path,
@@ -77,6 +63,38 @@ fn resolve_repo_in_authorized(
         is_detached: head == "HEAD",
         linked_worktree: location.linked_worktree,
     }))
+}
+
+fn discovered_root(
+    registry: &WorkspaceRegistry,
+    cwd: &ResolvedGitDirectory,
+    root: &str,
+) -> Result<ResolvedGitDirectory> {
+    let root = canonical_dir(registry, root, &cwd.workspace)?;
+    // Preserve ordinary discovery from a subdirectory, but never let Git
+    // configuration grant access to a different worktree or skip a nearer one.
+    if !cwd.local_path.starts_with(&root.local_path) {
+        return Err(GitError::PathOutsideWorkspace(root.local_path));
+    }
+    for ancestor in cwd.local_path.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) if ancestor == root.local_path => {
+                super::ownership::authorize_repository_metadata(registry, &root.local_path)?;
+                registry.authorize(&root.local_path)?;
+                return authorized_repo_root(registry, &root.git_path, &root.workspace);
+            }
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if ancestor == root.local_path {
+            break;
+        }
+    }
+    Err(GitError::command(
+        "repository discovery",
+        "Git's reported worktree does not own this directory",
+    ))
 }
 
 const MAX_DISCOVERED_REPOS: usize = 24;
@@ -158,14 +176,14 @@ pub fn panel_snapshot(
         return Err(GitError::PathOutsideWorkspace(cwd.local_path));
     }
     ensure_git_available(&cwd.workspace)?;
+    super::ownership::authorize_containing_metadata(registry, &cwd.local_path)?;
     let Some(location) = worktree::locate_work_tree(&cwd.workspace, &cwd.git_path)? else {
         return Ok(GitPanelSnapshot {
             repo: None,
             status: None,
         });
     };
-    let canonical_root = canonical_dir(registry, &location.toplevel, &cwd.workspace)?;
-    let _ = registry.authorize(&canonical_root.local_path);
+    let canonical_root = discovered_root(registry, &cwd, &location.toplevel)?;
 
     let status = status_inner(&canonical_root)?;
     let repo = GitRepoInfo {
@@ -192,9 +210,7 @@ pub fn status(
 }
 
 fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
+    let output = repo_root.run(
         [
             "status",
             "--porcelain=v2",
@@ -208,9 +224,22 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
 
     let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
     let parsed = parse_porcelain_v2(stdout);
+    let mut listing_error = None;
     let files = untracked::expand_untracked_dirs(parsed.files, |dir, budget| {
-        list_untracked_in(repo_root, dir, budget)
+        if listing_error.is_some() {
+            return None;
+        }
+        match list_untracked_in(repo_root, dir, budget) {
+            Ok(files) => files,
+            Err(error) => {
+                listing_error = Some(error);
+                None
+            }
+        }
     });
+    if let Some(error) = listing_error {
+        return Err(error);
+    }
 
     Ok(GitStatusSnapshot {
         repo_root: repo_root.git_path.clone(),
@@ -225,13 +254,13 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
 }
 
 /// Files git reports as untracked (and not ignored) under `dir`, or `None` when
-/// there are more than `budget` or the listing fails. The walk is abandoned as
+/// there are more than `budget`. The walk is abandoned as
 /// soon as the output exceeds what `budget` entries could need.
 fn list_untracked_in(
     repo_root: &ResolvedGitDirectory,
     dir: &str,
     budget: usize,
-) -> Option<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     let output = run_git_capped(
         &repo_root.workspace,
         Some(&repo_root.git_path),
@@ -246,16 +275,13 @@ fn list_untracked_in(
         ],
         DEFAULT_TIMEOUT_SECS,
         untracked::LISTING_CAP_BYTES,
-    )
-    .ok()?;
-    if output.truncated || output.timed_out {
-        return None;
+    )?;
+    // A listing cut short by the output cap reports exit failure.
+    if output.truncated {
+        return Ok(None);
     }
-    // A listing that was cut short by the cap above reports exit failure.
-    if output.exit_code != Some(0) {
-        return None;
-    }
-    untracked::parse_listing(&output.stdout, budget)
+    ensure_success(&output, "git untracked listing failed")?;
+    Ok(untracked::parse_listing(&output.stdout, budget))
 }
 
 pub fn diff(
@@ -275,24 +301,27 @@ fn diff_inner(
     path: Option<&str>,
     staged: bool,
 ) -> Result<GitDiffResult> {
-    let mut args: Vec<OsString> = vec!["diff".into(), "--no-ext-diff".into()];
+    let mut args: Vec<OsString> = vec![
+        "diff".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+    ];
     if staged {
         args.push("--cached".into());
     }
     let pathspec = match path.filter(|p| !p.is_empty()) {
-        Some(p) => Some(pathspec_from_input(&repo_root.local_path, p)?),
+        Some(p) => Some(if staged {
+            git_entry_name(p)?
+        } else {
+            pathspec_from_input(&repo_root.local_path, p)?
+        }),
         None => None,
     };
     if let Some(spec) = pathspec.as_ref() {
         args.push("--".into());
         args.push(spec.clone().into());
     }
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        args,
-        DEFAULT_TIMEOUT_SECS,
-    )?;
+    let output = repo_root.run(args, DEFAULT_TIMEOUT_SECS)?;
     ensure_success(&output, "git diff failed")?;
 
     let diff_text = match String::from_utf8(output.stdout) {
@@ -310,20 +339,41 @@ pub fn diff_content(
     repo_root: &str,
     path: &str,
     staged: bool,
-    original_path: Option<&str>,
+    _original_path: Option<&str>,
     workspace: &WorkspaceEnv,
 ) -> Result<GitDiffContentResult> {
     let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    let worktree_path = resolve_within_repo(&repo_root.local_path, path)?;
-    let rel_path = pathspec(&repo_root.local_path, &worktree_path);
+    let rel_path = git_entry_name(path)?;
+    let worktree_path = if staged {
+        repo_root.local_path.join(&rel_path)
+    } else {
+        git_worktree_entry(&repo_root.local_path, &rel_path)?
+    };
 
-    let original_rel = match original_path {
-        Some(orig) if !orig.is_empty() => {
-            let resolved = resolve_within_repo(&repo_root.local_path, orig)?;
-            Some(pathspec(&repo_root.local_path, &resolved))
+    // An open working diff can outlive a rename change in the index. Its tab's
+    // original-path hint is a snapshot, so obtain the current source from Git.
+    let original_rel = if staged {
+        let output = repo_root.run(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=no"],
+            DEFAULT_TIMEOUT_SECS,
+        )?;
+        ensure_success(&output, "git status failed")?;
+        if output.truncated {
+            return Err(GitError::command(
+                "git diff",
+                "staged path list is truncated",
+            ));
         }
-        _ => None,
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| GitError::command("git diff", "cannot decode staged paths"))?;
+        parse_porcelain_v2(text)
+            .files
+            .into_iter()
+            .find(|file| file.path == rel_path)
+            .and_then(|file| file.original_path)
+    } else {
+        None
     };
 
     let original = if staged {
@@ -347,7 +397,7 @@ pub fn diff_content(
             &format!(":{rel_path}"),
         )?
     } else {
-        read_text_file(&worktree_path)?
+        read_text_file(&repo_root.local_path, &worktree_path)?
     };
     let patch = diff_inner(&repo_root, Some(&rel_path), staged)?;
     let is_binary =
@@ -390,11 +440,17 @@ pub fn file_base(
     }
     ensure_git_available(&cwd.workspace)?;
     let spec = format!("HEAD:./{name}");
-    let output = run_git(
+    super::ownership::authorize_containing_metadata(registry, &cwd.local_path)?;
+    let Some(location) = worktree::locate_work_tree(&cwd.workspace, &cwd.git_path)? else {
+        return Ok(None);
+    };
+    let _guarded = discovered_root(registry, &cwd, &location.toplevel)?;
+    let output = run_git_guarded(
         &cwd.workspace,
         Some(&cwd.git_path),
         [
             OsStr::new("show"),
+            OsStr::new("--no-show-signature"),
             OsStr::new("--no-textconv"),
             OsStr::new(&spec),
         ],
@@ -403,8 +459,14 @@ pub fn file_base(
     if output.timed_out {
         return Err(GitError::TimedOut("git show"));
     }
-    if output.exit_code != Some(0) || output.truncated {
+    if output.truncated {
         return Ok(None);
+    }
+    if output.exit_code != Some(0) {
+        return Ok(match git_show_text(&cwd.workspace, &cwd.git_path, &spec)? {
+            TextSource::Text(text) => Some(text),
+            TextSource::Missing | TextSource::Binary => None,
+        });
     }
     Ok(match decode_text(output.stdout) {
         TextSource::Text(text) => Some(text),
@@ -451,12 +513,7 @@ fn run_git_on_paths(
     context: &'static str,
 ) -> Result<()> {
     for batch in pathspec_batches(paths, PATHSPEC_BATCH_BYTES) {
-        let output = run_git(
-            &repo_root.workspace,
-            Some(&repo_root.git_path),
-            pathspec_args(command, batch),
-            DEFAULT_TIMEOUT_SECS,
-        )?;
+        let output = repo_root.run(pathspec_args(command, batch), DEFAULT_TIMEOUT_SECS)?;
         ensure_success(&output, context)?;
     }
     Ok(())
@@ -475,7 +532,7 @@ pub fn stage(
     paths: &[String],
     workspace: &WorkspaceEnv,
 ) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
     if paths.is_empty() {
         return Ok(());
@@ -490,16 +547,17 @@ pub fn unstage(
     paths: &[String],
     workspace: &WorkspaceEnv,
 ) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
     if paths.is_empty() {
         return Ok(());
     }
-    let resolved = resolve_pathspecs(&repo_root.local_path, paths)?;
+    let resolved = paths
+        .iter()
+        .map(|path| git_entry_name(path))
+        .collect::<Result<Vec<_>>>()?;
     for batch in pathspec_batches(&resolved, PATHSPEC_BATCH_BYTES) {
-        let output = run_git(
-            &repo_root.workspace,
-            Some(&repo_root.git_path),
+        let output = repo_root.run(
             pathspec_args(&["reset", "HEAD"], batch),
             DEFAULT_TIMEOUT_SECS,
         )?;
@@ -509,9 +567,7 @@ pub fn unstage(
         if !looks_like_no_head(&output) {
             return ensure_success(&output, "git reset failed");
         }
-        let output = run_git(
-            &repo_root.workspace,
-            Some(&repo_root.git_path),
+        let output = repo_root.run(
             pathspec_args(&["rm", "--cached", "-r"], batch),
             DEFAULT_TIMEOUT_SECS,
         )?;
@@ -534,7 +590,22 @@ pub fn discard(
     entries: &[DiscardEntry],
     workspace: &WorkspaceEnv,
 ) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
+    discard_owned(registry, &repo_root, entries)
+}
+pub(crate) fn discard_owned(
+    registry: &WorkspaceRegistry,
+    repo_root: &ResolvedGitDirectory,
+    entries: &[DiscardEntry],
+) -> Result<()> {
+    let owner = repo_root
+        .ownership
+        .as_ref()
+        .ok_or_else(|| GitError::command("discard", "Repository ownership is missing"))?;
+    owner.validate()?;
+    if !registry.is_authorized(owner.path()) {
+        return Err(GitError::PathOutsideWorkspace(owner.path().into()));
+    }
     ensure_git_available(&repo_root.workspace)?;
     if entries.is_empty() {
         return Ok(());
@@ -552,13 +623,13 @@ pub fn discard(
     }
 
     run_git_on_paths(
-        &repo_root,
+        repo_root,
         &["restore", "--worktree"],
         &tracked,
         "git restore failed",
     )?;
     run_git_on_paths(
-        &repo_root,
+        repo_root,
         &["clean", "-f", "-d"],
         &untracked,
         "git clean failed",
@@ -571,26 +642,23 @@ pub fn commit(
     message: &str,
     workspace: &WorkspaceEnv,
 ) -> Result<GitCommitResult> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err(GitError::EmptyCommitMessage);
     }
 
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        [OsStr::new("commit"), OsStr::new("-m"), OsStr::new(trimmed)],
-        COMMIT_TIMEOUT_SECS,
-    )?;
+    let output = super::process::run_guarded_commit(&repo_root, trimmed, COMMIT_TIMEOUT_SECS)?;
     ensure_commit_success(&output)?;
 
-    let combined = git_stdout_lines(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        ["show", "-s", "--format=%H%n%s", "HEAD"],
-    )?;
+    let combined = repo_root.lines([
+        "show",
+        "--no-show-signature",
+        "-s",
+        "--format=%H%n%s",
+        "HEAD",
+    ])?;
     let sha = combined.first().cloned().ok_or(GitError::CommandFailed {
         context: "failed to resolve commit sha",
         detail: String::new(),
@@ -603,123 +671,25 @@ pub fn commit(
     })
 }
 
-/// Undoes the newest commit the way `git reset --soft HEAD~1` does: the branch moves back to
-/// the commit's first parent and its changes stay staged, so nothing is lost. `expected_head`
-/// is the commit the user chose: the move is a compare-and-swap on HEAD, so a commit made in
-/// the meantime fails it instead of being undone in its place.
-pub fn undo_last_commit(
-    registry: &WorkspaceRegistry,
-    repo_root: &str,
-    expected_head: &str,
-    workspace: &WorkspaceEnv,
-) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
-    ensure_git_available(&repo_root.workspace)?;
-    if expected_head.len() != 40 || !sha_is_safe(expected_head) {
-        return Err(GitError::command(
-            "undo commit",
-            "expected a full commit sha",
-        ));
-    }
-    // The parent comes from the chosen commit, not from HEAD, so a racing commit cannot
-    // change which commit is undone.
-    let parent = git_stdout_line_opt(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{expected_head}^"),
-        ],
-    )?
-    .ok_or_else(|| GitError::command("undo commit", "the first commit cannot be undone"))?;
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        [
-            "update-ref",
-            "-m",
-            "reset: moving to HEAD~1",
-            "HEAD",
-            &parent,
-            expected_head,
-        ],
-        DEFAULT_TIMEOUT_SECS,
-    )?;
-    if output.timed_out || output.exit_code != Some(0) {
-        return Err(GitError::command(
-            "undo commit",
-            "HEAD moved since the history was loaded; refresh and try again",
-        ));
-    }
-    // As `git reset` does; it is also what tells Source Control's watcher HEAD moved.
-    let _ = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        ["update-ref", "ORIG_HEAD", expected_head],
-        DEFAULT_TIMEOUT_SECS,
-    );
-    Ok(())
-}
-
-/// The first remote-tracking branch that already contains `sha`, if any: undoing such a commit
-/// rewrites history that was shared.
-pub fn commit_on_remote(
-    registry: &WorkspaceRegistry,
-    repo_root: &str,
-    sha: &str,
-    workspace: &WorkspaceEnv,
-) -> Result<Option<String>> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
-    ensure_git_available(&repo_root.workspace)?;
-    if !sha_is_safe(sha) {
-        return Err(GitError::command(
-            "git for-each-ref",
-            "invalid commit identifier",
-        ));
-    }
-    let contains = format!("--contains={sha}");
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        [
-            "for-each-ref",
-            "--count=1",
-            contains.as_str(),
-            "--format=%(refname:short)",
-            "refs/remotes",
-        ],
-        DEFAULT_TIMEOUT_SECS,
-    )?;
-    ensure_success(&output, "git for-each-ref failed")?;
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!name.is_empty()).then_some(name))
-}
-
 pub fn push(
     registry: &WorkspaceRegistry,
     repo_root: &str,
     workspace: &WorkspaceEnv,
 ) -> Result<GitPushResult> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-
-    let upstream = git_stdout_line_opt(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    super::remote_guard::inspect(
+        registry,
+        &repo_root,
+        super::remote_guard::RemoteAction::Push,
     )?;
+
+    let upstream = super::branches::upstream_name(&repo_root)?;
     if upstream.is_none() {
         return Err(GitError::NoUpstream);
     }
 
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        ["push"],
-        NETWORK_TIMEOUT_SECS,
-    )?;
+    let output = repo_root.run(["push"], NETWORK_TIMEOUT_SECS)?;
     ensure_success(&output, "git push failed")?;
 
     let upstream = upstream.unwrap();
@@ -762,6 +732,7 @@ pub fn log(
     };
     let mut args: Vec<&OsStr> = vec![
         OsStr::new("log"),
+        OsStr::new("--no-show-signature"),
         OsStr::new("--no-color"),
         // Full ref names in `%D`, so refs are classified by namespace.
         OsStr::new("--decorate=full"),
@@ -773,22 +744,12 @@ pub fn log(
     if let Some(sha) = anchor {
         args.push(OsStr::new(sha));
     }
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        args,
-        DEFAULT_TIMEOUT_SECS,
-    )?;
+    let output = repo_root.run(args, DEFAULT_TIMEOUT_SECS)?;
     if output.timed_out {
         return Err(GitError::TimedOut("git log"));
     }
     if output.exit_code != Some(0) {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("does not have any commits yet")
-            || stderr.contains("bad default revision")
-            || stderr.contains("unknown revision")
-            || stderr.contains("ambiguous argument 'head'")
-        {
+        if anchor.is_none() && super::branches::is_unborn_head(&repo_root)? {
             return Ok(Vec::new());
         }
         return ensure_success(&output, "git log failed").map(|_| Vec::new());
@@ -862,13 +823,13 @@ pub fn show_commit_diff(
     if !sha_is_safe(sha) {
         return Err(GitError::command("git show", "invalid commit identifier"));
     }
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
+    let output = repo_root.run(
         [
             OsStr::new("show"),
+            OsStr::new("--no-show-signature"),
             OsStr::new("--no-color"),
             OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
             OsStr::new("--patch-with-stat"),
             OsStr::new(sha),
             OsStr::new("--"),
@@ -913,7 +874,7 @@ fn parse_shortstat(tail: &str) -> (u32, u32, u32) {
     (0, 0, 0)
 }
 
-fn sha_is_safe(sha: &str) -> bool {
+pub(super) fn sha_is_safe(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -929,50 +890,36 @@ pub fn commit_files(
         return Err(GitError::command("git diff-tree", "invalid commit sha"));
     }
 
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
+    let output = repo_root.run(
         [
             OsStr::new("diff-tree"),
             OsStr::new("--no-commit-id"),
             OsStr::new("-r"),
             OsStr::new("-z"),
-            OsStr::new("--name-status"),
+            OsStr::new("--raw"),
+            OsStr::new("--no-abbrev"),
+            OsStr::new("--root"),
+            OsStr::new("--first-parent"),
+            OsStr::new("-m"),
+            OsStr::new("-M"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
             OsStr::new("--numstat"),
             OsStr::new(sha),
+            OsStr::new("--"),
         ],
         DEFAULT_TIMEOUT_SECS,
     )?;
     ensure_success(&output, "git diff-tree failed")?;
 
-    let (name_status_bytes, numstat_bytes) = split_name_status_numstat(&output.stdout);
-    let mut files = parse_diff_tree_name_status(name_status_bytes);
-    apply_numstat(&mut files, numstat_bytes);
-    Ok(files)
-}
-
-fn split_name_status_numstat(bytes: &[u8]) -> (&[u8], &[u8]) {
-    let s = std::str::from_utf8(bytes).unwrap_or("");
-    let tokens: Vec<(usize, &str)> = s
-        .split('\0')
-        .scan(0usize, |off, t| {
-            let start = *off;
-            *off += t.len() + 1;
-            Some((start, t))
-        })
-        .collect();
-    let mut split_at = bytes.len();
-    for (idx, tok) in tokens.iter().enumerate() {
-        if tok.1.contains('\t') {
-            split_at = tok.0;
-            // Walk back: numstat for R/C with -z emits "<a>\t<r>" then two
-            // NUL-separated paths. The two trailing path tokens belong to the
-            // numstat block, not name-status.
-            let _ = idx;
-            break;
-        }
+    if output.truncated {
+        return Err(GitError::command(
+            "git diff-tree",
+            "Commit file list exceeds the output limit; view this commit in the terminal",
+        ));
     }
-    (&bytes[..split_at], &bytes[split_at..])
+    super::commit_files::parse(&output.stdout)
+        .map_err(|detail| GitError::command("git diff-tree", detail))
 }
 
 pub fn commit_file_diff(
@@ -988,28 +935,13 @@ pub fn commit_file_diff(
     if !sha_is_safe(sha) {
         return Err(GitError::command("git show", "invalid commit sha"));
     }
-    let resolved = resolve_within_repo(&repo_root.local_path, path)?;
-    let rel = resolved
-        .strip_prefix(&repo_root.local_path)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| path.replace('\\', "/"));
-
+    let rel = git_entry_name(path)?;
     let original_rel = match original_path {
-        Some(orig) if !orig.is_empty() => {
-            let resolved_orig = resolve_within_repo(&repo_root.local_path, orig)?;
-            resolved_orig
-                .strip_prefix(&repo_root.local_path)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| orig.replace('\\', "/"))
-        }
+        Some(orig) if !orig.is_empty() => git_entry_name(orig)?,
         _ => rel.clone(),
     };
 
-    let parent = git_stdout_line_opt(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        ["rev-parse", &format!("{sha}^")],
-    )?;
+    let parent = super::branches::first_parent(&repo_root, sha)?;
     let original = match parent.as_deref() {
         Some(p) => git_show_text(
             &repo_root.workspace,
@@ -1026,8 +958,10 @@ pub fn commit_file_diff(
 
     let mut diff_args: Vec<OsString> = vec![
         "show".into(),
+        "--no-show-signature".into(),
         "--no-color".into(),
         "--no-ext-diff".into(),
+        "--no-textconv".into(),
         "--format=".into(),
         "-m".into(),
         "--first-parent".into(),
@@ -1038,12 +972,7 @@ pub fn commit_file_diff(
     if original_rel != rel {
         diff_args.push(original_rel.clone().into());
     }
-    let patch_output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        diff_args,
-        DEFAULT_TIMEOUT_SECS,
-    )?;
+    let patch_output = repo_root.run(diff_args, DEFAULT_TIMEOUT_SECS)?;
     ensure_success(&patch_output, "git show <commit> -- <path> failed")?;
     let patch_text = match String::from_utf8(patch_output.stdout) {
         Ok(text) => text,
@@ -1073,122 +1002,11 @@ pub fn remote_url(
     if name.is_empty() || name.len() > 64 || !name.chars().all(is_remote_name_char) {
         return Ok(None);
     }
-    git_stdout_line_opt(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        ["config", "--get", &format!("remote.{name}.url")],
-    )
+    repo_root.optional_line(["config", "--get", &format!("remote.{name}.url")])
 }
 
 fn is_remote_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
-}
-
-fn parse_diff_tree_name_status(bytes: &[u8]) -> Vec<GitCommitFileChange> {
-    let s = std::str::from_utf8(bytes).unwrap_or("");
-    let mut tokens = s.split('\0').filter(|t| !t.is_empty());
-    let mut files: Vec<GitCommitFileChange> = Vec::new();
-    while let Some(status_tok) = tokens.next() {
-        let status_char = status_tok.chars().next().unwrap_or(' ');
-        if status_char == 'R' || status_char == 'C' {
-            let original = match tokens.next() {
-                Some(v) => v.to_string(),
-                None => break,
-            };
-            let new_path = match tokens.next() {
-                Some(v) => v.to_string(),
-                None => break,
-            };
-            files.push(GitCommitFileChange {
-                path: new_path,
-                original_path: Some(original),
-                status: status_char.to_string(),
-                status_label: status_label_for(status_char),
-                added: 0,
-                removed: 0,
-                is_binary: false,
-            });
-        } else {
-            let path = match tokens.next() {
-                Some(v) => v.to_string(),
-                None => break,
-            };
-            files.push(GitCommitFileChange {
-                path,
-                original_path: None,
-                status: status_char.to_string(),
-                status_label: status_label_for(status_char),
-                added: 0,
-                removed: 0,
-                is_binary: false,
-            });
-        }
-    }
-    files
-}
-
-fn apply_numstat(files: &mut [GitCommitFileChange], bytes: &[u8]) {
-    let s = std::str::from_utf8(bytes).unwrap_or("");
-    let tokens: Vec<&str> = s.split('\0').filter(|t| !t.is_empty()).collect();
-    let mut idx = 0;
-    while idx < tokens.len() {
-        let header = tokens[idx];
-        idx += 1;
-        let mut cols = header.splitn(3, '\t');
-        let added_raw = cols.next().unwrap_or("0");
-        let removed_raw = cols.next().unwrap_or("0");
-        let inline_path = cols.next().unwrap_or("");
-        let is_binary = added_raw == "-" && removed_raw == "-";
-        let added: u32 = if is_binary {
-            0
-        } else {
-            added_raw.parse().unwrap_or(0)
-        };
-        let removed: u32 = if is_binary {
-            0
-        } else {
-            removed_raw.parse().unwrap_or(0)
-        };
-
-        let (path, original) = if inline_path.is_empty() {
-            let original = tokens.get(idx).map(|s| s.to_string()).unwrap_or_default();
-            idx += 1;
-            let new_path = tokens.get(idx).map(|s| s.to_string()).unwrap_or_default();
-            idx += 1;
-            (new_path, Some(original))
-        } else {
-            (inline_path.to_string(), None)
-        };
-
-        if path.is_empty() {
-            continue;
-        }
-        if let Some(file) = files.iter_mut().find(|f| f.path == path) {
-            file.added = added;
-            file.removed = removed;
-            file.is_binary = is_binary;
-            if file.original_path.is_none() {
-                if let Some(orig) = original {
-                    if !orig.is_empty() && orig != file.path {
-                        file.original_path = Some(orig);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn status_label_for(c: char) -> String {
-    match c {
-        'A' => "Added".into(),
-        'M' => "Modified".into(),
-        'D' => "Deleted".into(),
-        'R' => "Renamed".into(),
-        'C' => "Copied".into(),
-        'T' => "Type changed".into(),
-        'U' => "Unmerged".into(),
-        _ => format!("Status {c}"),
-    }
 }
 
 pub fn fetch(
@@ -1196,14 +1014,14 @@ pub fn fetch(
     repo_root: &str,
     workspace: &WorkspaceEnv,
 ) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        ["fetch", "--prune"],
-        NETWORK_TIMEOUT_SECS,
+    super::remote_guard::inspect(
+        registry,
+        &repo_root,
+        super::remote_guard::RemoteAction::Fetch,
     )?;
+    let output = repo_root.run(["fetch", "--prune"], NETWORK_TIMEOUT_SECS)?;
     ensure_success(&output, "git fetch failed")
 }
 
@@ -1212,14 +1030,14 @@ pub fn pull_ff_only(
     repo_root: &str,
     workspace: &WorkspaceEnv,
 ) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        ["pull", "--ff-only"],
-        NETWORK_TIMEOUT_SECS,
+    super::remote_guard::inspect(
+        registry,
+        &repo_root,
+        super::remote_guard::RemoteAction::Fetch,
     )?;
+    let output = repo_root.run(["pull", "--ff-only"], NETWORK_TIMEOUT_SECS)?;
     ensure_success(&output, "git pull --ff-only failed")
 }
 
@@ -1248,92 +1066,14 @@ fn resolve_pathspecs(repo_root: &Path, paths: &[String]) -> Result<Vec<String>> 
 }
 
 fn pathspec_from_input(repo_root: &Path, rel: &str) -> Result<String> {
-    let resolved = resolve_within_repo(repo_root, rel)?;
-    Ok(pathspec(repo_root, &resolved))
-}
-
-fn pathspec(repo_root: &Path, absolute: &Path) -> String {
-    absolute
-        .strip_prefix(repo_root)
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| absolute.to_string_lossy().replace('\\', "/"))
-}
-
-pub fn list_branches(
-    registry: &WorkspaceRegistry,
-    repo_root: &str,
-    workspace: &WorkspaceEnv,
-) -> Result<GitBranchListResult> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
-    ensure_git_available(&repo_root.workspace)?;
-
-    let current_branch = git_stdout_line_opt(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        ["rev-parse", "--abbrev-ref", "HEAD"],
-    )
-    .ok()
-    .flatten();
-    let is_detached_head = current_branch.as_deref() == Some("HEAD");
-    let worktrees = worktree::list_worktrees(registry, &repo_root).unwrap_or_default();
-
-    let mut branches: Vec<GitBranchEntry> = Vec::new();
-    if let Ok(lines) = git_stdout_lines(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        ["branch", "--format=%(refname:short)%00%(HEAD)"],
-    ) {
-        for line in &lines {
-            let mut parts = line.split('\0');
-            let name = parts.next().unwrap_or("").to_string();
-            let is_head = parts.next().unwrap_or("") == "*";
-            if name.is_empty() {
-                continue;
-            }
-            let worktree_path = worktrees
-                .iter()
-                .find(|wt| !wt.is_current && wt.branch.as_deref() == Some(name.as_str()))
-                .map(|wt| wt.path.clone());
-            branches.push(GitBranchEntry {
-                name,
-                worktree_path,
-                is_head,
-                is_detached: is_head && is_detached_head,
-            });
-        }
-    }
-    branches.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(GitBranchListResult {
-        branches,
-        worktrees,
-    })
-}
-
-pub fn checkout_branch(
-    registry: &WorkspaceRegistry,
-    repo_root: &str,
-    branch_name: &str,
-    workspace: &WorkspaceEnv,
-) -> Result<()> {
-    let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
-    ensure_git_available(&repo_root.workspace)?;
-    validate_branch_name(branch_name)?;
-    // `git checkout <name>` falls back to restoring a file of that name when no such branch
-    // exists (one deleted since the list was loaded), discarding its changes. `switch` only
-    // ever switches branches.
-    let output = run_git(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
-        ["switch", branch_name],
-        DEFAULT_TIMEOUT_SECS,
-    )?;
-    ensure_success(&output, "git switch failed")
+    git_worktree_entry(repo_root, rel)?;
+    git_entry_name(rel)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::git::commit_files::status_label_for;
 
     fn git(dir: &Path, args: &[&str]) -> bool {
         std::process::Command::new("git")
@@ -1382,77 +1122,6 @@ mod tests {
         std::fs::write(outside.path().join("x.ts"), "x").unwrap();
         let path = outside.path().join("x.ts").to_string_lossy().into_owned();
         assert!(file_base(&registry, &path, &local).is_err());
-    }
-
-    #[test]
-    fn branches_list_where_another_worktree_has_them_checked_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("app");
-        std::fs::create_dir(&root).unwrap();
-        if !git(&root, &["init", "-q", "-b", "main"]) {
-            return;
-        }
-        assert!(git(&root, &["commit", "-q", "--allow-empty", "-m", "init"]));
-        assert!(git(&root, &["branch", "free"]));
-        let root_path = crate::modules::git::utils::display_path(&root);
-        let linked_path = crate::modules::git::utils::display_path(&base.join("app-feat"));
-        assert!(git(
-            &root,
-            &["worktree", "add", "-q", "-b", "feat", &linked_path]
-        ));
-        let registry = WorkspaceRegistry::default();
-        registry.authorize(&base).unwrap();
-        let local = WorkspaceEnv::Local;
-
-        let listed = list_branches(&registry, &root_path, &local).unwrap();
-        let summary: Vec<(&str, Option<&str>, bool)> = listed
-            .branches
-            .iter()
-            .map(|b| (b.name.as_str(), b.worktree_path.as_deref(), b.is_head))
-            .collect();
-        assert_eq!(
-            summary,
-            vec![
-                ("feat", Some(linked_path.as_str()), false),
-                ("free", None, false),
-                ("main", None, true),
-            ]
-        );
-        assert_eq!(listed.worktrees.len(), 2);
-        assert!(listed.worktrees[0].is_current && listed.worktrees[0].is_main);
-
-        // From the linked worktree, `main` is the one checked out elsewhere.
-        let listed = list_branches(&registry, &linked_path, &local).unwrap();
-        let main = listed.branches.iter().find(|b| b.name == "main").unwrap();
-        assert_eq!(main.worktree_path.as_deref(), Some(root_path.as_str()));
-        let feat = listed.branches.iter().find(|b| b.name == "feat").unwrap();
-        assert!(feat.is_head && feat.worktree_path.is_none());
-        assert!(listed.worktrees[1].is_current);
-    }
-
-    #[test]
-    fn checkout_refuses_names_git_would_read_otherwise() {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path();
-        if !git(root, &["init", "-q"]) {
-            return;
-        }
-        let registry = WorkspaceRegistry::default();
-        registry.authorize(root).unwrap();
-        for name in ["-f", "--orphan=x", "", "a..b", "HEAD"] {
-            let err = checkout_branch(
-                &registry,
-                &root.to_string_lossy(),
-                name,
-                &WorkspaceEnv::Local,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, GitError::InvalidBranchName(_)),
-                "{name:?}: {err}"
-            );
-        }
     }
 
     #[test]

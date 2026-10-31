@@ -6,15 +6,13 @@ use std::path::{Path, PathBuf};
 
 use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::parser::parse_porcelain_v2;
-use crate::modules::git::process::{
-    ensure_git_available, ensure_success, git_stdout_lines, run_git,
-};
+use crate::modules::git::process::{ensure_git_available, ensure_success, run_git_guarded};
 use crate::modules::git::types::{
     GitLinkedWorktree, GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeEntry,
     GitWorktreeRemoveResult, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
 };
 use crate::modules::git::utils::{
-    authorized_repo_root, display_path, validate_branch_name, ResolvedGitDirectory,
+    display_path, owned_repo_root, validate_branch_name, ResolvedGitDirectory,
 };
 use crate::modules::workspace::{resolve_path, WorkspaceEnv, WorkspaceRegistry};
 
@@ -45,8 +43,25 @@ pub(crate) fn locate_work_tree(
     workspace: &WorkspaceEnv,
     cwd: &str,
 ) -> Result<Option<WorkTreeLocation>> {
-    let lines = git_stdout_lines(workspace, cwd, LOCATE_ARGS)?;
-    let mut lines = lines.iter().map(|line| line.trim());
+    let output = run_git_guarded(workspace, Some(cwd), LOCATE_ARGS, DEFAULT_TIMEOUT_SECS)?;
+    if !output.timed_out && output.exit_code != Some(0) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.starts_with("fatal: not a git repository (or any of the parent directories)")
+            || stderr.starts_with("fatal: this operation must be run in a work tree")
+        {
+            return Ok(None);
+        }
+    }
+    ensure_success(&output, "git repository discovery failed")?;
+    if output.truncated {
+        return Err(GitError::command(
+            "git repository discovery",
+            "output exceeds the limit",
+        ));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| GitError::command("git repository discovery", "cannot decode output"))?;
+    let mut lines = text.lines().map(|line| line.trim());
     let Some(toplevel) = lines.next().filter(|line| !line.is_empty()) else {
         return Ok(None);
     };
@@ -159,12 +174,7 @@ pub(crate) fn list_worktrees(
     registry: &WorkspaceRegistry,
     repo: &ResolvedGitDirectory,
 ) -> Result<Vec<GitWorktreeEntry>> {
-    let output = run_git(
-        &repo.workspace,
-        Some(&repo.git_path),
-        ["worktree", "list", "--porcelain"],
-        DEFAULT_TIMEOUT_SECS,
-    )?;
+    let output = repo.run(["worktree", "list", "--porcelain"], DEFAULT_TIMEOUT_SECS)?;
     ensure_success(&output, "git worktree list failed")?;
     let mut worktrees = parse_worktree_list(&String::from_utf8_lossy(&output.stdout));
     if let Some(current) = worktrees
@@ -178,9 +188,11 @@ pub(crate) fn list_worktrees(
 
 fn is_same_dir(registry: &WorkspaceRegistry, git_path: &str, dir: &ResolvedGitDirectory) -> bool {
     git_path == dir.git_path
-        || registry
-            .canonicalize_cached(resolve_path(git_path, &dir.workspace))
-            .is_ok_and(|canonical| canonical == dir.local_path)
+        || resolve_path(git_path, &dir.workspace).is_ok_and(|path| {
+            registry
+                .canonicalize_cached(path)
+                .is_ok_and(|canonical| canonical == dir.local_path)
+        })
 }
 
 /// `<repository folder>-<branch>` beside the repository: `main_root` is the main worktree
@@ -246,7 +258,8 @@ fn worktree_folder(path: &str, workspace: &WorkspaceEnv) -> Result<WorktreeFolde
             format!("the folder must be a full path: {path}"),
         ));
     }
-    let local_path = resolve_path(&git_path, workspace);
+    let local_path = resolve_path(&git_path, workspace)
+        .map_err(|error| GitError::command("workspace", error))?;
     match std::fs::symlink_metadata(&local_path) {
         Ok(meta) if meta.is_dir() => {
             if std::fs::read_dir(&local_path)?.next().is_some() {
@@ -279,21 +292,16 @@ fn worktree_folder(path: &str, workspace: &WorkspaceEnv) -> Result<WorktreeFolde
 }
 
 fn local_branch_exists(repo: &ResolvedGitDirectory, name: &str) -> Result<bool> {
-    let output = run_git(
-        &repo.workspace,
-        Some(&repo.git_path),
-        [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{name}"),
-        ],
+    let name = format!("refs/heads/{name}");
+    let output = repo.run(
+        ["show-ref", "--verify", "--quiet", &name],
         DEFAULT_TIMEOUT_SECS,
     )?;
-    if output.timed_out {
-        return Err(GitError::TimedOut("git rev-parse"));
+    if !output.timed_out && output.exit_code == Some(1) {
+        return Ok(false);
     }
-    Ok(output.exit_code == Some(0))
+    ensure_success(&output, "git branch lookup failed")?;
+    Ok(true)
 }
 
 /// Fails unless `base` names a commit. Like branch names it can never be read as an option.
@@ -307,9 +315,7 @@ fn ensure_commit(repo: &ResolvedGitDirectory, base: &str) -> Result<()> {
             format!("invalid base: {base}"),
         ));
     }
-    let output = run_git(
-        &repo.workspace,
-        Some(&repo.git_path),
+    let output = repo.run(
         [
             "rev-parse",
             "--verify",
@@ -349,14 +355,15 @@ fn worktree_add_args(branch: &GitWorktreeBranch, path: &str) -> Vec<OsString> {
 
 /// Adds a worktree for a new branch, or for a local branch no worktree has checked out, in
 /// `path` (or `<repository folder>-<branch>` beside the repository), and authorizes its folder.
-pub fn add(
+pub fn add_with_guard(
     registry: &WorkspaceRegistry,
     repo_root: &str,
     branch: &GitWorktreeBranch,
     path: Option<&str>,
     workspace: &WorkspaceEnv,
+    guard: &impl Fn(&Path) -> std::result::Result<(), String>,
 ) -> Result<GitWorktreeAddResult> {
-    let repo = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo.workspace)?;
     let name = branch.name();
     validate_branch_name(name)?;
@@ -402,9 +409,8 @@ pub fn add(
         }
     };
     let folder = worktree_folder(&path, &repo.workspace)?;
-    let output = run_git(
-        &repo.workspace,
-        Some(&repo.git_path),
+    guard(&folder.local_path).map_err(|error| GitError::command("new worktree", error))?;
+    let output = repo.run(
         worktree_add_args(branch, &folder.git_path),
         WORKTREE_TIMEOUT_SECS,
     )?;
@@ -421,6 +427,17 @@ pub fn add(
     })
 }
 
+#[cfg(test)]
+fn add(
+    registry: &WorkspaceRegistry,
+    repo_root: &str,
+    branch: &GitWorktreeBranch,
+    path: Option<&str>,
+    workspace: &WorkspaceEnv,
+) -> Result<GitWorktreeAddResult> {
+    add_with_guard(registry, repo_root, branch, path, workspace, &|_| Ok(()))
+}
+
 fn find_worktree<'a>(
     registry: &WorkspaceRegistry,
     workspace: &WorkspaceEnv,
@@ -431,12 +448,14 @@ fn find_worktree<'a>(
         return Some(found);
     }
     let wanted = registry
-        .canonicalize_cached(resolve_path(path, workspace))
+        .canonicalize_cached(resolve_path(path, workspace).ok()?)
         .ok()?;
     worktrees.iter().find(|wt| {
-        registry
-            .canonicalize_cached(resolve_path(&wt.path, workspace))
-            .is_ok_and(|canonical| canonical == wanted)
+        resolve_path(&wt.path, workspace).is_ok_and(|path| {
+            registry
+                .canonicalize_cached(path)
+                .is_ok_and(|canonical| canonical == wanted)
+        })
     })
 }
 
@@ -469,10 +488,13 @@ fn ensure_removable(worktree: &GitWorktreeEntry) -> Result<()> {
 }
 
 /// Uncommitted and untracked entries in a worktree, as `git worktree remove` counts them.
-fn count_changes(workspace: &WorkspaceEnv, worktree: &str) -> Result<u32> {
-    let output = run_git(
-        workspace,
-        Some(worktree),
+fn count_changes(
+    registry: &WorkspaceRegistry,
+    workspace: &WorkspaceEnv,
+    worktree: &str,
+) -> Result<u32> {
+    let repo = owned_repo_root(registry, worktree, workspace)?;
+    let output = repo.run(
         [
             "status",
             "--porcelain=v2",
@@ -490,14 +512,15 @@ fn count_changes(workspace: &WorkspaceEnv, worktree: &str) -> Result<u32> {
 /// Removes a linked worktree, then prunes the records of worktrees whose folder is gone. One
 /// with uncommitted or untracked changes is only removed when `force` is set; otherwise the
 /// result reports them and nothing changes.
-pub fn remove(
+pub fn remove_with_guard(
     registry: &WorkspaceRegistry,
     repo_root: &str,
     path: &str,
     force: bool,
     workspace: &WorkspaceEnv,
+    guard: &impl Fn(&Path) -> std::result::Result<(), String>,
 ) -> Result<GitWorktreeRemoveResult> {
-    let repo = authorized_repo_root(registry, repo_root, workspace)?;
+    let repo = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo.workspace)?;
     let worktrees = list_worktrees(registry, &repo)?;
     let worktree = find_worktree(registry, &repo.workspace, &worktrees, path).ok_or_else(|| {
@@ -508,13 +531,15 @@ pub fn remove(
     })?;
     ensure_removable(worktree)?;
     // A folder deleted by hand leaves only git's record, which pruning drops.
+    let folder = resolve_path(&worktree.path, &repo.workspace).map_err(|error| GitError::command("workspace", error))?;
     let folder_gone = matches!(
-        std::fs::symlink_metadata(resolve_path(&worktree.path, &repo.workspace)),
+        std::fs::symlink_metadata(&folder),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     );
     if !folder_gone {
+        guard(&folder).map_err(|error| GitError::command("remove worktree", error))?;
         if !force {
-            let changes = count_changes(&repo.workspace, &worktree.path)?;
+            let changes = count_changes(registry, &repo.workspace, &worktree.path)?;
             if changes > 0 {
                 return Ok(GitWorktreeRemoveResult {
                     removed: false,
@@ -527,21 +552,12 @@ pub fn remove(
             args.push("--force".into());
         }
         args.extend(["--".into(), worktree.path.clone().into()]);
-        let output = run_git(
-            &repo.workspace,
-            Some(&repo.git_path),
-            args,
-            WORKTREE_TIMEOUT_SECS,
-        )?;
+        let output = repo.run(args, WORKTREE_TIMEOUT_SECS)?;
         ensure_success(&output, "git worktree remove failed")?;
     }
-    let pruned = run_git(
-        &repo.workspace,
-        Some(&repo.git_path),
-        ["worktree", "prune"],
-        DEFAULT_TIMEOUT_SECS,
-    )
-    .and_then(|output| ensure_success(&output, "git worktree prune failed"));
+    let pruned = repo
+        .run(["worktree", "prune"], DEFAULT_TIMEOUT_SECS)
+        .and_then(|output| ensure_success(&output, "git worktree prune failed"));
     if let Err(e) = pruned {
         log::warn!("worktree removed, but pruning failed: {e}");
     }
@@ -552,7 +568,19 @@ pub fn remove(
 }
 
 #[cfg(test)]
+fn remove(
+    registry: &WorkspaceRegistry,
+    repo_root: &str,
+    path: &str,
+    force: bool,
+    workspace: &WorkspaceEnv,
+) -> Result<GitWorktreeRemoveResult> {
+    remove_with_guard(registry, repo_root, path, force, workspace, &|_| Ok(()))
+}
+
+#[cfg(test)]
 mod tests {
+    use super::super::utils::authorized_repo_root;
     use super::*;
     use std::process::Command;
 
@@ -567,6 +595,37 @@ mod tests {
             locked: None,
             prunable: false,
         }
+    }
+
+    #[test]
+    fn add_refuses_repository_executable_configuration() {
+        let Some(fx) = Fixture::new() else { return };
+        git_ok(&fx.main, &["config", "filter.probe.clean", "sh ./probe.sh"]);
+        let result = add(
+            &fx.registry,
+            fx.main.to_str().unwrap(),
+            &GitWorktreeBranch::New {
+                name: "feature".into(),
+                base: None,
+            },
+            None,
+            &WorkspaceEnv::Local,
+        );
+        assert!(result.err().unwrap().to_string().contains("filter"));
+    }
+
+    #[test]
+    fn remove_refuses_repository_executable_configuration() {
+        let Some(fx) = Fixture::new() else { return };
+        git_ok(&fx.main, &["config", "filter.probe.clean", "sh ./probe.sh"]);
+        let result = remove(
+            &fx.registry,
+            fx.main.to_str().unwrap(),
+            "/missing",
+            false,
+            &WorkspaceEnv::Local,
+        );
+        assert!(result.err().unwrap().to_string().contains("filter"));
     }
 
     #[test]
@@ -1237,6 +1296,59 @@ mod tests {
         assert!(result.removed);
         assert!(!dir.exists());
         assert_eq!(fx.worktree_paths(), vec![fx.root()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_removal_does_not_follow_store_aliases() {
+        use std::os::unix::fs::symlink;
+        let Some(fx) = Fixture::new() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let target = store.path().join("item");
+        std::fs::write(&target, "a\n").unwrap();
+        for (index, kind) in ["hard", "leaf", "parent"].iter().enumerate() {
+            let wt = fx.add(new_branch(&format!("alias-{index}"), None), None).unwrap();
+            let dir = PathBuf::from(&wt.path);
+            match *kind {
+                "hard" => {
+                    std::fs::remove_file(dir.join("a.txt")).unwrap();
+                    std::fs::hard_link(&target, dir.join("a.txt")).unwrap();
+                }
+                "leaf" => {
+                    std::fs::remove_file(dir.join("a.txt")).unwrap();
+                    symlink(&target, dir.join("a.txt")).unwrap();
+                }
+                _ => symlink(store.path(), dir.join("linked-parent")).unwrap(),
+            }
+            assert!(fx.remove(&wt.path, true).unwrap().removed);
+            assert_eq!(std::fs::read(&target).unwrap(), b"a\n", "{kind}");
+        }
+    }
+
+    #[test]
+    fn refuses_worktree_removal_when_it_contains_a_protected_store() {
+        let Some(fx) = Fixture::new() else { return };
+        let wt = fx.add(new_branch("contains-store", None), None).unwrap();
+        let protected = PathBuf::from(&wt.path).join("state/preferences.json");
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, "keep").unwrap();
+        let result = remove_with_guard(&fx.registry, &fx.root(), &wt.path, true, &WorkspaceEnv::Local,
+            &|folder| if protected.starts_with(folder) { Err("contains a protected store".into()) } else { Ok(()) });
+        assert!(result.unwrap_err().to_string().contains("protected store"));
+        assert_eq!(std::fs::read(&protected).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn refuses_worktree_creation_inside_a_protected_store_directory() {
+        let Some(fx) = Fixture::new() else { return };
+        let protected = fx.base.join("state");
+        std::fs::create_dir(&protected).unwrap();
+        let dest = protected.join("new-worktree");
+        let error = add_with_guard(&fx.registry, &fx.root(), &new_branch("protected", None),
+            Some(dest.to_str().unwrap()), &WorkspaceEnv::Local,
+            &|folder| if folder.starts_with(&protected) { Err("protected store directory".into()) } else { Ok(()) }).unwrap_err();
+        assert!(error.to_string().contains("protected store"));
+        assert!(!dest.exists());
     }
 
     #[test]

@@ -6,8 +6,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactDOM from "react-dom/client";
 import { QuickTerminalApp } from "./QuickTerminalApp";
+import { Toaster } from "@/components/ui/sonner";
+import { installStoreSaveFailureReporting } from "@/lib/storeSaveFailures";
 
 installNativeContextMenuGuard();
+await installStoreSaveFailureReporting();
 
 // Reap shells a previous load of this window left behind (this window's only).
 await invoke("pty_close_all").catch(() => {});
@@ -17,6 +20,7 @@ ReactDOM.createRoot(
 ).render(
   <ThemeProvider>
     <QuickTerminalApp />
+    <Toaster position="bottom-right" />
   </ThemeProvider>,
 );
 

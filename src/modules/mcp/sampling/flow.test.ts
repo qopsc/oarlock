@@ -1,3 +1,4 @@
+import { usePreferencesStore } from "@/modules/settings/preferences";
 // A sampling request end to end: the SDK's server asks, the request waits in
 // the window, the user approves it as the dialog does, the model runs on the
 // user's key, the open conversation's meter counts it at the price of the
@@ -103,6 +104,7 @@ async function approveAndSend(modelId: string) {
 let unhost: () => void = () => {};
 
 beforeEach(() => {
+  usePreferencesStore.setState({ hydrated: true, syncing: false, error: null });
   unhost = registerRequestHost();
   useChatStore.setState({
     activeSessionId: "s-a",

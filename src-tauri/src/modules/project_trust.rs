@@ -202,7 +202,7 @@ pub fn join_display(base: &str, relative: &str) -> String {
 /// The project a window names: its real root must be an existing folder.
 pub fn resolve_project(root: &str, workspace: Option<WorkspaceEnv>) -> Result<OpenProject, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
-    let real = std::fs::canonicalize(resolve_path(root, &workspace))
+    let real = std::fs::canonicalize(resolve_path(root, &workspace)?)
         .map_err(|e| format!("project folder not accessible: {e}"))?;
     if !real.is_dir() {
         return Err(format!("not a folder: {root}"));
@@ -279,7 +279,13 @@ fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Reads the store; a damaged or unreadable one reads as empty, so every project asks again.
 fn load(path: &Path) -> TrustFile {
-    match std::fs::read(path) {
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = super::fs::open_store_file(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    match read() {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
             log::warn!("project trust store unreadable, starting over: {error}");
             TrustFile::default()
@@ -289,14 +295,29 @@ fn load(path: &Path) -> TrustFile {
 }
 
 fn save(path: &Path, file: &TrustFile) -> Result<(), String> {
+    use super::fs::document_save::{self, SaveError};
     let parent = path.parent().ok_or("missing app data folder")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(file).map_err(|e| e.to_string())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    std::io::Write::write_all(&mut temporary, &bytes).map_err(|e| e.to_string())?;
-    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
-    temporary.persist(path).map_err(|e| e.error.to_string())?;
-    Ok(())
+    let target = super::fs::store_target(path).map_err(|e| e.to_string())?;
+    document_save::with_lock(&target, || {
+        let version = match super::fs::open_store_file(&target) {
+            Ok(mut file) => {
+                let mut current = Vec::new();
+                file.read_to_end(&mut current).map_err(|e| e.to_string())?;
+                Some(document_save::version(&file, &current).map_err(|e| e.to_string())?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&target).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => None,
+            Err(error) => return Err(format!("Cannot safely open trust storage: {error}")),
+        };
+        document_save::write_checked_with_limit(&target, &bytes, version.as_deref(), |actual| {
+            if actual == target { Ok(()) } else { Err("Trust storage destination changed".into()) }
+        }, u64::MAX).map(|_| ()).map_err(|error| match error {
+            SaveError::Failed(message) => message,
+            SaveError::Conflict(_) => "Trust storage changed during commit; file preserved".into(),
+        })
+    })
 }
 
 fn with_file<T>(app: &AppHandle, f: impl FnOnce(&mut TrustFile) -> T) -> Result<T, String> {
@@ -1328,6 +1349,25 @@ pub async fn project_trust_revoke(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn trust_storage_refuses_symbolic_links_and_keeps_the_target() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("trust.json");
+        let external = root.path().join("other.json");
+        fs::write(&external, b"{\"projects\":{\"other\":{\"display\":\"other\",\"items\":{}}}}").unwrap();
+        let original = fs::read(&external).unwrap();
+        symlink(&external, &path).unwrap();
+        assert!(load(&path).projects.is_empty());
+        assert!(save(&path, &TrustFile::default()).is_err());
+        assert_eq!(fs::read(&external).unwrap(), original);
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        fs::remove_file(&path).unwrap();
+        save(&path, &TrustFile::default()).unwrap();
+        assert!(load(&path).projects.is_empty());
+    }
+
     fn project(key: &str) -> OpenProject {
         OpenProject {
             real: PathBuf::from(key),
@@ -1501,7 +1541,10 @@ mod tests {
         apply_decisions(&mut file, &project("/p"), &current, &both, 1).unwrap();
         assert!(revoke_in(&mut file, "/p", Some(ItemKind::ClaudeSkills)));
         assert_eq!(decided(&file, "/p", ItemKind::ClaudeSkills, "a"), None);
-        assert_eq!(decided(&file, "/p", ItemKind::OarlockSkills, "b"), Some(true));
+        assert_eq!(
+            decided(&file, "/p", ItemKind::OarlockSkills, "b"),
+            Some(true)
+        );
         assert!(revoke_in(&mut file, "/p", Some(ItemKind::OarlockSkills)));
         assert!(file.projects.is_empty(), "an empty record is dropped");
         apply_decisions(&mut file, &project("/p"), &current, &both, 1).unwrap();

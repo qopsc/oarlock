@@ -67,7 +67,10 @@ describe("the OpenCode Go preset", () => {
     expect(models).toEqual(["glm-5.3", "kimi-k3"]);
     expect(fetchImpl).toHaveBeenCalledWith(
       "https://opencode.ai/zen/go/v1/models",
-      { headers: { Authorization: "Bearer sk-go" } },
+      {
+        headers: { Authorization: "Bearer sk-go" },
+        signal: expect.any(AbortSignal),
+      },
     );
   });
 

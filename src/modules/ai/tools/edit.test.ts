@@ -1,3 +1,4 @@
+import { writtenEntry } from "./readCache";
 import type { ToolExecutionOptions } from "ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolContext } from "./context";
@@ -268,4 +269,28 @@ describe("multi_edit atomicity", () => {
     expect(result.error).toContain("not unique");
     expect(nativeMock.writeFile).not.toHaveBeenCalled();
   });
+});
+
+it("editing a partial read does not mark unseen contents as fully read", async () => {
+  setFile("hello world");
+  const ctx = makeContext(
+    new Map([[FILE, { ...writtenEntry("hello world"), fullContent: false }]]),
+  );
+  await runEdit(ctx, {
+    path: FILE,
+    old_string: "hello",
+    new_string: "goodbye",
+  });
+  expect(ctx.readCache.get(FILE)?.fullContent).toBe(false);
+});
+
+it("editing a complete unchanged read preserves complete-read knowledge", async () => {
+  setFile("hello world");
+  const ctx = makeContext(new Map([[FILE, writtenEntry("hello world")]]));
+  await runEdit(ctx, {
+    path: FILE,
+    old_string: "hello",
+    new_string: "goodbye",
+  });
+  expect(ctx.readCache.get(FILE)?.fullContent).toBe(true);
 });

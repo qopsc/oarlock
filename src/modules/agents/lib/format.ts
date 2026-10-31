@@ -12,8 +12,9 @@ const LABELS: Record<string, string> = {
 
 export function displayAgent(agent: string): string {
   if (!agent) return "Agent";
+  const id = agent.toLowerCase();
   return (
-    LABELS[agent.toLowerCase()] ??
+    (Object.prototype.hasOwnProperty.call(LABELS, id) ? LABELS[id] : undefined) ??
     agent.charAt(0).toUpperCase() + agent.slice(1)
   );
 }

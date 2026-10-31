@@ -50,6 +50,7 @@ pub struct HttpSession {
     pub oauth: Option<super::oauth::Policy>,
     /// A project server: what it was opened from, checked on every request.
     pub project: Option<super::project::Binding>,
+    pub revision: Option<u64>,
 }
 
 /// A server URL as configured: http or https, a host, no user info.

@@ -1,3 +1,6 @@
+import { WorkspaceOwner } from "@/modules/workspace/owner";
+import { LOCAL_WORKSPACE } from "@/modules/workspace/env";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
 import { cn, isMarkdownPath } from "@/lib/utils";
 import { MarkdownViewToggle } from "@/modules/markdown";
 import { useWindowInactive } from "@/modules/theme/WindowActivityBridge";
@@ -8,7 +11,9 @@ import { EditorPane, type EditorPaneHandle } from "./EditorPane";
 type Props = {
   tabs: Tab[];
   activeId: number;
+  onOverrideLanguage?: (id: number, language: string | null) => void;
   onDirtyChange: (id: number, dirty: boolean) => void;
+  onBindingChange?: (id: number, path: string, detached: boolean) => void;
   registerHandle: (id: number, handle: EditorPaneHandle | null) => void;
   onCloseTab: (id: number) => void;
   onSetMarkdownView: (id: number, mode: "rendered" | "raw") => void;
@@ -18,10 +23,13 @@ export function EditorStack({
   tabs,
   activeId,
   onDirtyChange,
+  onOverrideLanguage,
+  onBindingChange,
   registerHandle,
   onCloseTab,
   onSetMarkdownView,
 }: Props) {
+  const spaces = useSpaces((s) => s.spaces);
   const editors = tabs.filter(
     (t): t is EditorTab => t.kind === "editor" && !t.cold,
   );
@@ -30,7 +38,28 @@ export function EditorStack({
   // change identity every render, which makes React detach+reattach the ref
   // callback and re-invoke `onDirtyChange`, triggering setState loops in
   // the parent. Memoizing per id keeps each callback's identity stable.
+  const languageRef = useRef(onOverrideLanguage);
+  languageRef.current = onOverrideLanguage;
+  const languageCallbacks = useRef(new Map<number,(value:string|null)=>void>());
+  const getLanguageCallback = (id:number) => {
+    let callback=languageCallbacks.current.get(id);
+    if(!callback){callback=value=>languageRef.current?.(id,value);languageCallbacks.current.set(id,callback);}
+    return callback;
+  };
   const registerRef = useRef(registerHandle);
+  const bindingRef = useRef(onBindingChange);
+  bindingRef.current = onBindingChange;
+  const bindingCallbacks = useRef(
+    new Map<number, (path: string, detached: boolean) => void>(),
+  );
+  const getBindingCallback = (id: number) => {
+    let callback = bindingCallbacks.current.get(id);
+    if (!callback) {
+      callback = (path, detached) => bindingRef.current?.(id, path, detached);
+      bindingCallbacks.current.set(id, callback);
+    }
+    return callback;
+  };
   const dirtyRef = useRef(onDirtyChange);
   const closeRef = useRef(onCloseTab);
 
@@ -78,6 +107,10 @@ export function EditorStack({
   // Drop callback entries for closed tabs to avoid unbounded growth.
   useEffect(() => {
     const live = new Set(editors.map((t) => t.id));
+    for (const id of languageCallbacks.current.keys()) if (!live.has(id)) languageCallbacks.current.delete(id);
+    for (const id of bindingCallbacks.current.keys()) {
+      if (!live.has(id)) bindingCallbacks.current.delete(id);
+    }
     for (const id of refCallbacks.current.keys()) {
       if (!live.has(id)) refCallbacks.current.delete(id);
     }
@@ -114,14 +147,22 @@ export function EditorStack({
                   renderedHint="Save to preview"
                 />
               )}
-              <EditorPane
-                ref={getRefCallback(t.id)}
-                path={t.path}
-                overrideLanguage={t.overrideLanguage}
-                onDirtyChange={getDirtyCallback(t.id)}
-                onClose={getCloseCallback(t.id)}
-                mediaActive={visible && !windowInactive}
-              />
+              <WorkspaceOwner
+                env={
+                  spaces.find((s) => s.id === t.spaceId)?.env ?? LOCAL_WORKSPACE
+                }
+              >
+                <EditorPane
+                  ref={getRefCallback(t.id)}
+                  path={t.path}
+                  overrideLanguage={t.overrideLanguage}
+                  onOverrideLanguage={getLanguageCallback(t.id)}
+                  onDirtyChange={getDirtyCallback(t.id)}
+                  onBindingChange={getBindingCallback(t.id)}
+                  onClose={getCloseCallback(t.id)}
+                  mediaActive={visible && !windowInactive}
+                />
+              </WorkspaceOwner>
             </div>
           </div>
         );

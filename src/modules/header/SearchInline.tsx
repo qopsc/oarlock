@@ -259,7 +259,18 @@ export const SearchInline = forwardRef<SearchInlineHandle, Props>(
               ref={trailingRef}
               className="absolute inset-y-0 right-1.5 flex items-center gap-0.5"
             >
-              {countText ? (
+              {count?.error ? (
+                <button
+                  type="button"
+                  className="mr-0.5 whitespace-nowrap text-[10.5px] text-destructive"
+                  title={`${count.error} Click to retry.`}
+                  aria-label={`${count.error} Retry search`}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => findDirection(true)}
+                >
+                  Search failed · Retry
+                </button>
+              ) : countText ? (
                 <span className="mr-0.5 whitespace-nowrap text-[10.5px] tabular-nums text-muted-foreground">
                   {countText}
                 </span>

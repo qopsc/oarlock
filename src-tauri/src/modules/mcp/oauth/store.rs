@@ -108,6 +108,10 @@ impl Registration {
     }
 }
 
+pub(super) fn account(app: &AppHandle, server: &str, item: OauthItem) -> Result<String, String> {
+    super::super::credentials::account(app, server, oauth_account(server, item)?)
+}
+
 /// Reads a record; None when there is none. A damaged one reads as none (signing in again
 /// writes a fresh one).
 pub async fn read<T: DeserializeOwned>(
@@ -115,7 +119,15 @@ pub async fn read<T: DeserializeOwned>(
     server: &str,
     item: OauthItem,
 ) -> Result<Option<T>, String> {
-    let account = oauth_account(server, item)?;
+    let account = account(app, server, item)?;
+    read_account(app, account, server).await
+}
+
+pub(super) async fn read_account<T: DeserializeOwned>(
+    app: &AppHandle,
+    account: String,
+    server: &str,
+) -> Result<Option<T>, String> {
     let Some(json) = secrets::backend_get(app.clone(), SECRET_SERVICE, vec![account])
         .await?
         .pop()
@@ -138,16 +150,21 @@ pub async fn write<T: Serialize>(
     value: &T,
 ) -> Result<(), String> {
     let json = serde_json::to_string(value).map_err(|e| e.to_string())?;
-    secrets::backend_set(app.clone(), SECRET_SERVICE, oauth_account(server, item)?, json)
-        .await
-        .map_err(|e| format!("mcp: the sign-in could not be kept: {e}"))
+    secrets::backend_set(
+        app.clone(),
+        SECRET_SERVICE,
+        account(app, server, item)?,
+        json,
+    )
+    .await
+    .map_err(|e| format!("mcp: the sign-in could not be kept: {e}"))
 }
 
 pub async fn delete(app: &AppHandle, server: &str, item: OauthItem) -> Result<(), String> {
     secrets::backend_delete(
         app.clone(),
         SECRET_SERVICE,
-        vec![oauth_account(server, item)?],
+        vec![account(app, server, item)?],
     )
     .await
 }

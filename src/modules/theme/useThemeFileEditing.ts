@@ -1,11 +1,14 @@
+import { toast } from "sonner";
 import { type RefObject, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { setThemeId as persistThemeId } from "@/modules/settings/store";
 import type { Tab } from "@/modules/tabs";
 import { workspaceEnvForPath } from "@/modules/workspace";
-import { listCustomThemes, saveCustomTheme } from "./customThemes";
+import { listCustomThemes, readCustomThemes, saveCustomTheme, saveThemeFileSnapshot } from "./customThemes";
+import { createThemeFileIngest } from "./themeFileIngest";
 import {
+  compareThemeFile,
   isThemeFilePath,
   onThemeEdit,
   parseThemeFile,
@@ -27,36 +30,27 @@ type Params = {
 export function useThemeFileEditing({ tabsRef, openFileTab }: Params) {
   useEffect(() => {
     type FileWrittenPayload = { path: string; source?: string };
-    const unlistenPromise =
-      getCurrentWebviewWindow().listen<FileWrittenPayload>(
-        "fs:file-written",
-        (event) => {
-          if (event.payload.source !== "editor") return;
-          if (!isThemeFilePath(event.payload.path)) return;
-          void (async () => {
-            try {
-              // Where the editor saved it: a theme file in the app's config
-              // folder is a host file in a WSL window too.
-              const { path } = event.payload;
-              const res = await invoke<{ kind: string; content?: string }>(
-                "fs_read_file",
-                { path, workspace: workspaceEnvForPath(path) },
-              );
-              if (res.kind !== "text" || typeof res.content !== "string")
-                return;
-              const parsed = parseThemeFile(res.content);
-              if (!parsed.ok) {
-                console.warn("[oarlock] theme not applied:", parsed.error);
-                return;
-              }
-              await saveCustomTheme(parsed.theme);
-            } catch (e) {
-              console.warn("[oarlock] theme ingest failed:", e);
-            }
-          })();
-        },
-      );
+    const ingest = createThemeFileIngest({
+      snapshot: readCustomThemes,
+      read: (path) => invoke("fs_read_file", {
+        path, workspace: workspaceEnvForPath(path), versioned: true,
+      }),
+      parse: parseThemeFile,
+      save: saveThemeFileSnapshot,
+      invalid: (error) => console.warn("[oarlock] theme not applied:", error),
+      failed: (error) => {
+        console.warn("[oarlock] theme ingest failed:", error);
+        toast.error("Theme file saved, but theme could not be applied", { description: String(error) });
+      },
+    });
+    const unlistenPromise = getCurrentWebviewWindow().listen<FileWrittenPayload>(
+      "fs:file-written", (event) => {
+        if (event.payload.source === "editor" && isThemeFilePath(event.payload.path))
+          void ingest.ingest(event.payload.path);
+      },
+    );
     return () => {
+      ingest.dispose();
       void unlistenPromise.then((un) => un());
     };
   }, []);
@@ -65,20 +59,37 @@ export function useThemeFileEditing({ tabsRef, openFileTab }: Params) {
     let alive = true;
     let unsub: (() => void) | undefined;
     void onThemeEdit(async (req) => {
-      const theme =
-        req.action === "create"
-          ? starterTheme()
-          : (await listCustomThemes()).find((t) => t.id === req.id);
-      if (!theme) return;
-      if (req.action === "create") await saveCustomTheme(theme);
-      const path = await themeFilePath(theme.id);
-      const open = tabsRef.current.some(
-        (t) => t.kind === "editor" && t.path === path,
-      );
-      if (!open) await writeThemeFile(theme);
-      void persistThemeId(theme.id);
-      openFileTab(path);
-      void getCurrentWebviewWindow().setFocus();
+      try {
+        const theme =
+          req.action === "create"
+            ? starterTheme()
+            : (await listCustomThemes()).find((t) => t.id === req.id);
+        if (!theme) return;
+        if (req.action === "create") await saveCustomTheme(theme);
+        const path = await themeFilePath(theme.id);
+        const open = tabsRef.current.some(
+          (t) => t.kind === "editor" && t.path === path,
+        );
+        const comparison = open
+          ? await compareThemeFile(path, theme)
+          : (await writeThemeFile(theme)).comparison;
+        if (comparison === "different") {
+          toast.warning("Existing theme file differs from the saved theme", {
+            description: "The existing file was preserved and opened for editing.",
+          });
+        } else if (comparison === "unknown") {
+          toast.warning("Could not compare the existing theme file", {
+            description: "The file was preserved. Check it before saving changes.",
+          });
+        }
+        void persistThemeId(theme.id);
+        openFileTab(path);
+        void getCurrentWebviewWindow().setFocus().catch(console.error);
+      } catch (error) {
+        toast.error("Could not open custom theme", {
+          description: String(error),
+        });
+      }
     }).then((fn) => {
       if (alive) unsub = fn;
       else fn();

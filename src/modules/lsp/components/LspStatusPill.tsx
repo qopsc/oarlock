@@ -1,3 +1,4 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
 import {
   Popover,
   PopoverContent,
@@ -22,13 +23,14 @@ import { useLspHint } from "../lib/useLspHint";
 
 type Props = {
   filePath: string | null;
+  overrideLanguage?: string | null;
 };
 
 const PILL_CLASS =
   "oarlock-pill-in ml-1.5 flex h-6 shrink-0 cursor-pointer [&_button]:cursor-pointer items-center gap-1 rounded-full border border-border/50 bg-accent/50 px-2 text-[10.5px] font-medium text-muted-foreground transition-colors duration-200 hover:bg-accent hover:text-foreground";
 
-export function LspStatusPill({ filePath }: Props) {
-  const hint = useLspHint(filePath);
+export function LspStatusPill({ filePath, overrideLanguage }: Props) {
+  const hint = useLspHint(filePath, overrideLanguage);
   if (!hint) return null;
 
   if (hint.kind === "enable") {
@@ -189,7 +191,7 @@ function InstallPill({ preset }: { preset: LspPreset }) {
 
   const copy = () => {
     if (!install) return;
-    void navigator.clipboard.writeText(install.command).then(() => {
+    void writeClipboardText(install.command).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     });

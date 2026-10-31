@@ -7,6 +7,9 @@ import {
   getAllCustomEndpointKeys,
   getAllKeys,
   hasAnyKey,
+  hasUnavailableProviderKeys,
+  pendingProviderKeys,
+  pendingEndpointKeys,
 } from "../lib/keyring";
 import { useAgentsStore } from "../store/agentsStore";
 import { useChatStore } from "../store/chatStore";
@@ -39,47 +42,88 @@ export function useAiBootstrap(): {
   const mlxBaseURL = usePreferencesStore((s) => s.mlxBaseURL);
   const ollamaModelId = usePreferencesStore((s) => s.ollamaModelId);
   const ollamaBaseURL = usePreferencesStore((s) => s.ollamaBaseURL);
-  const openaiCompatibleModelId = usePreferencesStore(
-    (s) => s.openaiCompatibleModelId,
-  );
-  const openaiCompatibleBaseURL = usePreferencesStore(
-    (s) => s.openaiCompatibleBaseURL,
-  );
   const customEndpoints = usePreferencesStore((s) => s.customEndpoints);
   const hasLocalModel =
     (lmstudioBaseURL.trim().length > 0 && lmstudioModelId.trim().length > 0) ||
     (mlxBaseURL.trim().length > 0 && mlxModelId.trim().length > 0) ||
     (ollamaBaseURL.trim().length > 0 && ollamaModelId.trim().length > 0) ||
-    (openaiCompatibleBaseURL.trim().length > 0 &&
-      openaiCompatibleModelId.trim().length > 0) ||
     customEndpoints.some(
       (e) => e.baseURL.trim().length > 0 && e.modelId.trim().length > 0,
     );
-  const hasComposer = hasAnyKey(apiKeys) || hasLocalModel;
-
   const prefsHydrated = usePreferencesStore((s) => s.hydrated);
   const [keysLoaded, setKeysLoaded] = useState(false);
+  const hasComposer =
+    hasAnyKey(apiKeys) ||
+    hasLocalModel ||
+    (keysLoaded && hasUnavailableProviderKeys(apiKeys));
   useEffect(() => {
     let alive = true;
-    const reload = () => {
-      void getAllKeys().then((keys) => {
-        if (!alive) return;
-        setApiKeys(keys);
-        setKeysLoaded(true);
-      });
+    let generation = 0;
+    let endpointGeneration = 0;
+    let watching = false;
+    let endpoints = usePreferencesStore.getState().customEndpoints;
+    const reloadEndpoints = () => {
+      endpoints = usePreferencesStore.getState().customEndpoints;
+      const request = ++endpointGeneration;
+      setCustomEndpointKeys(pendingEndpointKeys(endpoints));
       if (!prefsHydrated) return;
-      void getAllCustomEndpointKeys(
-        usePreferencesStore.getState().customEndpoints,
-      ).then((epKeys) => {
-        if (!alive) return;
+      void getAllCustomEndpointKeys(endpoints).then((epKeys) => {
+        if (!alive || request !== endpointGeneration) return;
         setCustomEndpointKeys(epKeys);
       });
     };
-    reload();
+    const reload = () => {
+      const request = ++generation;
+      setApiKeys(pendingProviderKeys());
+      void getAllKeys().then((keys) => {
+        if (!alive || request !== generation) return;
+        setApiKeys(keys);
+        setKeysLoaded(true);
+      });
+      reloadEndpoints();
+    };
+    setApiKeys(pendingProviderKeys());
+    setCustomEndpointKeys(pendingEndpointKeys(endpoints));
+    // Recovering endpoint metadata does not change keychain entries and emits
+    // no key event. Watch identities only: renames/URL edits need no key read.
+    const stopPreferences = usePreferencesStore.subscribe(() => {
+      if (!watching) return;
+      const next = usePreferencesStore.getState().customEndpoints;
+      const changed =
+        next.length !== endpoints.length ||
+        next.some((endpoint, i) => endpoint.id !== endpoints[i].id);
+      endpoints = next;
+      if (changed) reloadEndpoints();
+    });
+    // Subscribe before taking the snapshot: a deletion during registration
+    // must be reflected by the first read even if its event was missed.
     const unlistenP = onKeysChanged(reload);
+    void unlistenP.then(
+      () => {
+        if (alive) {
+          watching = true;
+          reload();
+        }
+      },
+      (error) => {
+        if (alive) {
+          const failed = { status: "failed" as const, error: String(error) };
+          setApiKeys(pendingProviderKeys(failed));
+          setCustomEndpointKeys(pendingEndpointKeys(endpoints, failed));
+          setKeysLoaded(true);
+          toast.error("Could not watch API key changes", {
+            description: String(error),
+          });
+        }
+      },
+    );
     return () => {
       alive = false;
-      void unlistenP.then((fn) => fn());
+      stopPreferences();
+      void unlistenP.then(
+        (fn) => fn(),
+        () => {},
+      );
     };
   }, [setApiKeys, setCustomEndpointKeys, prefsHydrated]);
 

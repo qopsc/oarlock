@@ -292,14 +292,14 @@ describe("saving scrollback", () => {
     detach();
   });
 
-  it("logs and carries on when a save fails", async () => {
+  it("reports a failed save while preserving other saves and allowing retry", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { files, backend } = storage();
     backend.save.mockRejectedValueOnce(new Error("disk full"));
     const { instance, panes } = registry(backend);
     panes.set(1, terminal("one\r\n"));
     panes.set(2, terminal("two\r\n"));
-    await instance.persist([1, 2]);
+    await expect(instance.persist([1, 2])).rejects.toThrow("disk full");
     expect(warn).toHaveBeenCalledTimes(1);
     expect([...files.keys()]).toEqual(["sb-new-2"]);
     await instance.persist([1, 2]);
@@ -475,6 +475,20 @@ describe("close-time flush", () => {
     await expect(instance.flush(1_000)).resolves.toEqual({ timedOut: false });
     expect(history(files.get("sb-new-1"))).toContain("at close");
     expect(instance.keyForLeaf(2)).toBeUndefined();
+  });
+
+  it("reports a completed but failed close-time save", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { backend } = storage();
+    const { instance, panes } = registry(backend);
+    const model = terminal("before\r\n");
+    panes.set(1, model);
+    await instance.persist([1]);
+    instance.attachLeafSource(() => [1]);
+    write(model, "new history\r\n");
+    backend.save.mockRejectedValueOnce(new Error("disk full"));
+    await expect(instance.flush(1_000)).resolves.toEqual({ timedOut: false, failed: true });
+    expect(warn).toHaveBeenCalled();
   });
 
   it("never waits past its timeout", async () => {

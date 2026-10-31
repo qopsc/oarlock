@@ -7,6 +7,8 @@ export type MatchCount = {
   readonly capped: boolean;
   /** Still counting: `total` may grow. */
   readonly pending: boolean;
+  /** A failed search is not a successful search with zero matches. */
+  readonly error?: string;
 };
 
 export function sameMatchCount(
@@ -19,13 +21,15 @@ export function sameMatchCount(
     a.current === b.current &&
     a.total === b.total &&
     a.capped === b.capped &&
-    a.pending === b.pending
+    a.pending === b.pending &&
+    a.error === b.error
   );
 }
 
 /** "3 of 12", "12 matches" when none is selected, "No results"; "" without a count. */
 export function formatMatchCount(count: MatchCount | null): string {
   if (!count) return "";
+  if (count.error) return "Search failed";
   const more = count.capped || count.pending ? "+" : "";
   if (count.total === 0) return count.pending ? "" : "No results";
   if (count.current > 0) return `${count.current} of ${count.total}${more}`;

@@ -16,7 +16,7 @@ const storeMock = vi.hoisted(() => ({
   get: vi.fn(),
 }));
 
-const terminalMock = vi.hoisted(() => ({ writeToSession: vi.fn(() => true) }));
+const terminalMock = vi.hoisted(() => ({ writeToSession: vi.fn((_leaf: number, _text: string) => true), capture: vi.fn() }));
 
 vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
   useManagedAgentsStore: {
@@ -30,7 +30,7 @@ vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
 }));
 
 vi.mock("@/modules/terminal", () => ({
-  writeToSession: terminalMock.writeToSession,
+  captureGhosttyInputOwner: terminalMock.capture,
 }));
 
 import { buildManagedAgentTools } from "./agent";
@@ -87,6 +87,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   storeMock.getBySessionId.mockReturnValue(undefined);
   terminalMock.writeToSession.mockReturnValue(true);
+  terminalMock.capture.mockImplementation((leafId: number) => ({
+    write: (text: string) => terminalMock.writeToSession(leafId, text),
+  }));
 });
 
 describe("spawn_coding_agent", () => {
@@ -158,6 +161,9 @@ describe("send_to_agent", () => {
       "line one line two",
     );
     expect(storeMock.bumpRound).toHaveBeenCalledWith(3);
+    vi.runOnlyPendingTimers();
+    expect(terminalMock.capture).toHaveBeenCalledTimes(1);
+    expect(terminalMock.writeToSession).toHaveBeenCalledWith(3, "\r");
   });
 
   it("rejects an instruction with control characters", async () => {

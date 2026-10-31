@@ -21,16 +21,20 @@
 //! closes; all end at app exit. Servers run with the user's rights, outside
 //! the workspace authorization registry: they are programs the user chose.
 
+mod credentials;
 mod framing;
 mod http;
 pub mod import;
 mod jsonc;
+mod leases;
 mod logs;
 mod names;
 pub mod oauth;
 pub mod project;
+pub mod settings;
 mod status;
 mod stdio;
+mod storage;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,7 +43,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::future::Abortable;
 use serde::Deserialize;
 use tauri::ipc::{Channel, JavaScriptChannelId, Request, Response};
-use tauri::{AppHandle, Emitter, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::modules::net::{self, AiStreamState};
 use crate::modules::windows::is_app_window;
@@ -62,6 +66,10 @@ const MAX_HTTP_REQUESTS: usize = 128;
 type StdioMap = Arc<RwLock<HashMap<u32, Arc<StdioSession>>>>;
 
 pub struct McpState {
+    settings: tokio::sync::Mutex<()>,
+    saved: Mutex<Option<Arc<storage::Store>>>,
+    credentials: RwLock<Option<HashMap<String, credentials::Version>>>,
+    leases: Mutex<leases::Leases>,
     stdio: StdioMap,
     http: Mutex<HashMap<u32, Arc<http::HttpSession>>>,
     /// The local sessions of project servers, and what each was started from.
@@ -75,6 +83,10 @@ pub struct McpState {
 impl Default for McpState {
     fn default() -> Self {
         Self {
+            settings: tokio::sync::Mutex::default(),
+            saved: Mutex::default(),
+            credentials: RwLock::default(),
+            leases: Mutex::default(),
             stdio: Arc::default(),
             http: Mutex::default(),
             projects: Mutex::default(),
@@ -139,6 +151,10 @@ impl McpState {
 
     /// A window reloaded or closed: its servers stop and its reports go.
     pub fn release_window(&self, app: &AppHandle, window: &str) {
+        self.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_window(window);
         let stopped: Vec<Arc<StdioSession>> = {
             let mut map = self.stdio.write().unwrap_or_else(|e| e.into_inner());
             let ids: Vec<u32> = map
@@ -171,6 +187,10 @@ impl McpState {
 
     /// App exit: every server ends within a bounded time.
     pub fn shut_down(&self) {
+        self.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close();
         let sessions: Vec<Arc<StdioSession>> = self
             .stdio
             .write()
@@ -219,7 +239,7 @@ async fn resolve_secrets(
     }
     let accounts = names
         .iter()
-        .map(|name| secret_account(server_id, kind, name))
+        .map(|name| credentials::account(app, server_id, secret_account(server_id, kind, name)?))
         .collect::<Result<Vec<_>, _>>()?;
     let values =
         crate::modules::secrets::backend_get(app.clone(), SECRET_SERVICE, accounts).await?;
@@ -276,23 +296,40 @@ pub async fn mcp_spawn(
     window: WebviewWindow,
     state: State<'_, McpState>,
     server_id: String,
-    command: String,
-    args: Vec<String>,
-    env: HashMap<String, String>,
-    secret_env: Vec<String>,
-    cwd: Option<String>,
+    revision: u64,
     shell: Option<String>,
     on_message: Channel<Response>,
     on_exit: Channel<StdioExit>,
 ) -> Result<u32, String> {
     require_app_window(&window)?;
     require_server_id(&server_id)?;
+    let settings_guard = state.settings.lock().await;
+    let saved = credentials::launch(&app, &server_id, revision)?;
+    let transport = &saved["transport"];
+    if transport["type"] != "stdio" {
+        return Err("mcp: transport changed".into());
+    }
+    let command = transport["command"]
+        .as_str()
+        .ok_or("mcp: missing command")?
+        .to_owned();
+    let args: Vec<String> =
+        serde_json::from_value(transport["args"].clone()).map_err(|e| e.to_string())?;
+    let cwd: Option<String> =
+        serde_json::from_value(transport["cwd"].clone()).map_err(|e| e.to_string())?;
+    let (env, secret_env) = credentials::entries(&transport["env"])?;
     check_spawn_input(&command, &args, &env, &secret_env)?;
     let owner = window.label().to_owned();
+    let page = state
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .owner(&owner);
     if state.sessions_of(&owner) >= MAX_SESSIONS_PER_WINDOW {
         return Err("mcp: too many servers in this window".into());
     }
     let secrets = resolve_secrets(&app, &server_id, SecretKind::Env, &secret_env).await?;
+    drop(settings_guard);
     let cwd = stdio::resolve_cwd(cwd.as_deref())?;
     let mut configured: Vec<(String, String)> = env.into_iter().collect();
     configured.sort();
@@ -300,6 +337,8 @@ pub async fn mcp_spawn(
     start_stdio(
         &state,
         StdioStart {
+            page,
+            project: None,
             owner,
             server_id,
             command,
@@ -317,6 +356,8 @@ pub async fn mcp_spawn(
 /// A local server to start: the command as given, its configured environment
 /// (values resolved) and folder.
 struct StdioStart {
+    page: Arc<()>,
+    project: Option<project::Binding>,
     owner: String,
     server_id: String,
     command: String,
@@ -333,6 +374,8 @@ async fn start_stdio(
     on_exit: Channel<StdioExit>,
 ) -> Result<u32, String> {
     let StdioStart {
+        page,
+        project,
         owner,
         server_id,
         command,
@@ -345,6 +388,7 @@ async fn start_stdio(
     let sessions = state.stdio.clone();
     let logs = state.logs.clone();
     let spawn_id = server_id.clone();
+    let publish_owner = owner.clone();
     let session = tauri::async_runtime::spawn_blocking(move || {
         let shell_env = crate::modules::lsp::env::server_env_overlay(shell);
         let binary = match stdio::resolve_program(&command, &shell_env, &cwd) {
@@ -389,11 +433,26 @@ async fn start_stdio(
     .await
     .map_err(|e| e.to_string())??;
 
-    state
-        .stdio
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, session.clone());
+    {
+        let leases = state.leases.lock().unwrap_or_else(|e| e.into_inner());
+        if !leases.is_live(&publish_owner, &page) {
+            drop(leases);
+            session.stop();
+            return Err("mcp: the owning page closed or reloaded".into());
+        }
+        state
+            .stdio
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, session.clone());
+        if let Some(binding) = project {
+            state
+                .projects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, binding);
+        }
+    }
     // It may have exited before the insert, when its exit could not remove it.
     if session.has_exited() {
         state
@@ -554,29 +613,6 @@ pub struct SecretRef {
 }
 
 #[tauri::command]
-pub async fn mcp_secret_set(
-    app: AppHandle,
-    window: WebviewWindow,
-    server_id: String,
-    kind: SecretKind,
-    name: String,
-    value: String,
-) -> Result<(), String> {
-    require_settings(&window)?;
-    let account = secret_account(&server_id, kind, &name)?;
-    if value.len() > crate::modules::secrets::MAX_VALUE_BYTES {
-        return Err(format!(
-            "mcp: the value of {name} is longer than {} KiB",
-            crate::modules::secrets::MAX_VALUE_BYTES / 1024
-        ));
-    }
-    if value.is_empty() || !names::valid_value(&value, kind) {
-        return Err(format!("mcp: invalid value for {name}"));
-    }
-    crate::modules::secrets::backend_set(app, SECRET_SERVICE, account, value).await
-}
-
-#[tauri::command]
 pub async fn mcp_secret_delete(
     app: AppHandle,
     window: WebviewWindow,
@@ -584,11 +620,14 @@ pub async fn mcp_secret_delete(
     secrets: Vec<SecretRef>,
 ) -> Result<(), String> {
     require_settings(&window)?;
+    let state = app.state::<McpState>();
+    let _held = state.settings.lock().await;
+    credentials::require_unconfigured(&app, &server_id)?;
     let accounts = secrets
         .iter()
         .map(|s| secret_account(&server_id, s.kind, &s.name))
         .collect::<Result<Vec<_>, _>>()?;
-    crate::modules::secrets::backend_delete(app, SECRET_SERVICE, accounts).await
+    crate::modules::secrets::backend_delete(app.clone(), SECRET_SERVICE, accounts).await
 }
 
 /// Which of the named secrets are set; the values never leave the backend.
@@ -602,7 +641,13 @@ pub async fn mcp_secret_status(
     require_settings(&window)?;
     let accounts = secrets
         .iter()
-        .map(|s| secret_account(&server_id, s.kind, &s.name))
+        .map(|s| {
+            credentials::account(
+                &app,
+                &server_id,
+                secret_account(&server_id, s.kind, &s.name)?,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let values = crate::modules::secrets::backend_get(app, SECRET_SERVICE, accounts).await?;
     Ok(values
@@ -619,12 +664,21 @@ pub async fn mcp_http_open(
     window: WebviewWindow,
     state: State<'_, McpState>,
     server_id: String,
-    url: String,
-    headers: HashMap<String, String>,
-    secret_headers: Vec<String>,
+    revision: u64,
 ) -> Result<u32, String> {
     require_app_window(&window)?;
     require_server_id(&server_id)?;
+    let settings_guard = state.settings.lock().await;
+    let saved = credentials::launch(&app, &server_id, revision)?;
+    let transport = &saved["transport"];
+    if !matches!(transport["type"].as_str(), Some("http" | "sse")) {
+        return Err("mcp: transport changed".into());
+    }
+    let url = transport["url"]
+        .as_str()
+        .ok_or("mcp: missing URL")?
+        .to_owned();
+    let (headers, secret_headers) = credentials::entries(&transport["headers"])?;
     if headers.len() + secret_headers.len() > MAX_ENTRIES {
         return Err("mcp: too many headers".into());
     }
@@ -632,26 +686,43 @@ pub async fn mcp_http_open(
         return Err(format!("mcp: invalid header name {name:?}"));
     }
     let owner = window.label().to_owned();
+    let page = state
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .owner(&owner);
     if state.sessions_of(&owner) >= MAX_SESSIONS_PER_WINDOW {
         return Err("mcp: too many servers in this window".into());
     }
     let secrets = resolve_secrets(&app, &server_id, SecretKind::Header, &secret_headers).await?;
+    drop(settings_guard);
     let mut entries: Vec<(String, String)> = headers.into_iter().collect();
     entries.sort();
     entries.extend(secrets);
-    open_http(&state, owner, server_id, &url, entries, None).await
+    open_http(
+        &state,
+        (owner, page),
+        server_id,
+        &url,
+        entries,
+        None,
+        Some(revision),
+    )
+    .await
 }
 
 /// Opens a session: the one origin its requests may reach, private
 /// addresses only when that host is local or private, and sign-in unless the
 /// configuration sets `Authorization` itself.
+#[allow(clippy::too_many_arguments)]
 async fn open_http(
     state: &McpState,
-    owner: String,
+    owner: (String, Arc<()>),
     server_id: String,
     url: &str,
     entries: Vec<(String, String)>,
     project: Option<project::Binding>,
+    revision: Option<u64>,
 ) -> Result<u32, String> {
     let url = http::parse_server_url(url)?;
     let host = url.host_str().ok_or("mcp: the URL has no host")?.to_owned();
@@ -662,6 +733,11 @@ async fn open_http(
     let oauth = (!http::sets_authorization(&headers))
         .then(|| oauth::Policy::for_server(&url, allow_private));
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let (owner, page) = owner;
+    let leases = state.leases.lock().unwrap_or_else(|e| e.into_inner());
+    if !leases.is_live(&owner, &page) {
+        return Err("mcp: the owning page closed or reloaded".into());
+    }
     state.http.lock().unwrap_or_else(|e| e.into_inner()).insert(
         id,
         Arc::new(http::HttpSession {
@@ -672,6 +748,7 @@ async fn open_http(
             headers,
             oauth,
             project,
+            revision,
         }),
     );
     Ok(id)
@@ -681,11 +758,13 @@ async fn open_http(
 /// `.mcp.json` declares it: variables expanded here from the shell
 /// environment, in the project's folder, with `CLAUDE_PROJECT_DIR` set.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn mcp_project_spawn(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, McpState>,
     server_id: String,
+    project_key: Option<String>,
     shell: Option<String>,
     on_message: Channel<Response>,
     on_exit: Channel<StdioExit>,
@@ -693,6 +772,11 @@ pub async fn mcp_project_spawn(
     require_app_window(&window)?;
     require_server_id(&server_id)?;
     let owner = window.label().to_owned();
+    let page = state
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .owner(&owner);
     if state.sessions_of(&owner) >= MAX_SESSIONS_PER_WINDOW {
         return Err("mcp: too many servers in this window".into());
     }
@@ -701,8 +785,12 @@ pub async fn mcp_project_spawn(
     let resolve_id = server_id.clone();
     let resolve_shell = shell.clone();
     let (launch, project, binding) = crate::modules::fs::blocking(move || {
-        let (entry, project, binding) =
-            project::resolve(&resolve_app, &resolve_owner, &resolve_id)?;
+        let (entry, project, binding) = project::resolve(
+            &resolve_app,
+            &resolve_owner,
+            &resolve_id,
+            project_key.as_deref(),
+        )?;
         if project.workspace.is_wsl() {
             return Err(
                 "mcp: a WSL project's local servers are not started; add the server in Settings"
@@ -731,6 +819,8 @@ pub async fn mcp_project_spawn(
     let id = start_stdio(
         &state,
         StdioStart {
+            page,
+            project: Some(binding),
             owner,
             server_id,
             command: launch.command,
@@ -743,11 +833,6 @@ pub async fn mcp_project_spawn(
         on_exit,
     )
     .await?;
-    state
-        .projects
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, binding);
     Ok(id)
 }
 
@@ -766,18 +851,25 @@ pub async fn mcp_project_http_open(
     window: WebviewWindow,
     state: State<'_, McpState>,
     server_id: String,
+    project_key: Option<String>,
     shell: Option<String>,
 ) -> Result<ProjectSession, String> {
     require_app_window(&window)?;
     require_server_id(&server_id)?;
     let owner = window.label().to_owned();
+    let page = state
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .owner(&owner);
     if state.sessions_of(&owner) >= MAX_SESSIONS_PER_WINDOW {
         return Err("mcp: too many servers in this window".into());
     }
     let resolve_owner = owner.clone();
     let resolve_id = server_id.clone();
     let (launch, binding) = crate::modules::fs::blocking(move || {
-        let (entry, _, binding) = project::resolve(&app, &resolve_owner, &resolve_id)?;
+        let (entry, _, binding) =
+            project::resolve(&app, &resolve_owner, &resolve_id, project_key.as_deref())?;
         let env = crate::modules::lsp::env::server_env_overlay(shell);
         let launch = project::remote_launch(&entry, &project::lookup(&env))?;
         Ok((launch, binding))
@@ -796,11 +888,12 @@ pub async fn mcp_project_http_open(
     let url = http::parse_server_url(&launch.url)?.to_string();
     let id = open_http(
         &state,
-        owner,
+        (owner, page),
         server_id,
         &url,
         launch.headers,
         Some(binding),
+        None,
     )
     .await?;
     Ok(ProjectSession { id, url })
@@ -818,6 +911,7 @@ pub fn mcp_http_close(window: WebviewWindow, state: State<'_, McpState>, id: u32
 #[serde(rename_all = "camelCase")]
 struct StreamRequest {
     request_id: String,
+    page_generation: String,
     session: u32,
     url: String,
     method: String,
@@ -832,6 +926,7 @@ pub async fn mcp_http_stream(
     app: AppHandle,
     window: WebviewWindow,
     streams: State<'_, McpHttpStreams>,
+    pages: State<'_, net::page::NetworkPages>,
     state: State<'_, McpState>,
     request: Request<'_>,
 ) -> Result<(), String> {
@@ -844,6 +939,7 @@ pub async fn mcp_http_stream(
         .ok_or("missing or oversized MCP request metadata")?;
     let StreamRequest {
         request_id,
+        page_generation,
         session,
         url,
         method,
@@ -852,11 +948,13 @@ pub async fn mcp_http_stream(
     } = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
     let session = state.http_session(window.label(), session)?;
     let on_event = on_event.channel_on::<_, Response>(window.as_ref().clone());
-    let body = net::request_body(request.body())?;
-    let (lease, registration) =
-        streams
-            .0
-            .start_bounded(window.label(), &request_id, MAX_HTTP_REQUESTS)?;
+    let ((lease, registration), body) = net::admit_request_body(request.body(), || {
+        pages.with_page(window.label(), &page_generation, || {
+            streams
+                .0
+                .start_bounded(window.label(), &request_id, MAX_HTTP_REQUESTS)
+        })
+    })?;
     tauri::async_runtime::spawn(async move {
         let run = async {
             let url = reqwest::Url::parse(&url).map_err(|e| format!("invalid url: {e}"))?;
@@ -871,6 +969,9 @@ pub async fn mcp_http_stream(
                 if !project::still_allowed(&app, binding) {
                     return Err(NOT_ALLOWED.to_owned());
                 }
+            }
+            if let Some(revision) = session.revision {
+                credentials::check_revision(&app, &session.server_id, revision)?;
             }
             let host = url.host_str().ok_or("missing host")?.to_string();
             let ips = net::classify_and_collect_safe_ips(&host, session.allow_private).await?;
@@ -888,7 +989,16 @@ pub async fn mcp_http_stream(
                 Ok::<_, String>(request.send())
             };
             let token = match &session.oauth {
-                Some(policy) => oauth::bearer(&app, &session.server_id, &session.url, policy).await,
+                Some(policy) => {
+                    oauth::bearer(
+                        &app,
+                        &session.server_id,
+                        &session.url,
+                        policy,
+                        session.revision,
+                    )
+                    .await
+                }
                 None => None,
             };
             let mut response = send(token.clone())?
@@ -906,6 +1016,7 @@ pub async fn mcp_http_stream(
                             policy,
                             token.as_deref(),
                             challenge,
+                            session.revision,
                         )
                         .await;
                         match outcome {
@@ -950,12 +1061,14 @@ pub async fn mcp_http_stream(
             }
             let cap =
                 (!http::is_event_stream(response.headers())).then_some(http::MAX_RESPONSE_BYTES);
-            let mut headers = net::header_map_to_strings(response.headers());
+            let mut headers = net::header_pairs(response.headers());
             if sign_in {
-                headers.insert(oauth::SIGN_IN_HEADER.to_owned(), "required".to_owned());
+                headers.retain(|(name, _)| name != oauth::SIGN_IN_HEADER);
+                headers.push((oauth::SIGN_IN_HEADER.to_owned(), "required".to_owned()));
             }
             let metadata = serde_json::to_vec(&serde_json::json!({
                 "status": response.status().as_u16(),
+                "statusText": response.status().canonical_reason().unwrap_or(""),
                 "headers": headers,
             }))
             .map_err(|e| e.to_string())?;
@@ -989,25 +1102,57 @@ pub async fn mcp_http_stream(
 pub async fn mcp_http_cancel(
     window: WebviewWindow,
     streams: State<'_, McpHttpStreams>,
+    pages: State<'_, net::page::NetworkPages>,
+    page_generation: String,
     request_id: String,
 ) -> Result<(), String> {
-    streams.0.cancel(window.label(), &request_id);
-    Ok(())
+    pages.with_page(window.label(), &page_generation, || {
+        streams.0.cancel(window.label(), &request_id);
+        Ok(())
+    })
 }
 
 #[tauri::command]
 pub async fn mcp_http_ack(
     window: WebviewWindow,
     streams: State<'_, McpHttpStreams>,
+    pages: State<'_, net::page::NetworkPages>,
+    page_generation: String,
     request_id: String,
     bytes: u64,
 ) -> Result<(), String> {
-    streams.0.acknowledge(window.label(), &request_id, bytes)
+    pages.with_page(window.label(), &page_generation, || {
+        streams.0.acknowledge(window.label(), &request_id, bytes)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_http_open_cannot_publish_into_a_replacement_page() {
+        let state = McpState::default();
+        let old = state.leases.lock().unwrap().owner("main");
+        state.leases.lock().unwrap().release_window("main");
+        let new = state.leases.lock().unwrap().owner("main");
+        let open = |page| {
+            open_http(
+                &state,
+                ("main".into(), page),
+                "server".into(),
+                "http://127.0.0.1:3456/mcp",
+                vec![],
+                None,
+                None,
+            )
+        };
+        assert!(open(old).await.unwrap_err().contains("closed or reloaded"));
+        assert!(state.http.lock().unwrap().is_empty());
+        let id = open(new).await.unwrap();
+        assert!(state.http_session("main", id).is_ok());
+        assert!(state.http_session("another-window", id).is_err());
+    }
 
     #[test]
     fn spawn_input_is_bounded_and_validated() {

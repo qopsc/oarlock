@@ -1,161 +1,181 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const pluginStore = vi.hoisted(() => {
-  const instances: {
-    data: Map<string, unknown>;
-    get: ReturnType<typeof vi.fn>;
-    set: ReturnType<typeof vi.fn>;
-    save: ReturnType<typeof vi.fn>;
-    onChange: ReturnType<typeof vi.fn>;
-  }[] = [];
-  class LazyStore {
-    data = new Map<string, unknown>();
-    get = vi.fn(async (key: string) => this.data.get(key));
-    set = vi.fn(async (key: string, value: unknown) => {
-      this.data.set(key, value);
-    });
-    save = vi.fn(async () => undefined);
-    onChange = vi.fn(async () => () => undefined);
-    constructor() {
-      instances.push(this);
-    }
-  }
-  return { instances, LazyStore };
+import { beforeEach, expect, it, vi } from "vitest";
+import type { Theme } from "./types";
+const native = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  receive: undefined as undefined | ((event: { payload: unknown }) => void),
+  stop: vi.fn(),
+  listen: vi.fn(),
+}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: native.listen }));
+const theme = (id: string): Theme => ({
+  id,
+  name: id,
+  variants: { dark: { colors: { background: "#000" } } },
+});
+const flush = async () => {
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+};
+beforeEach(() => {
+  vi.resetModules();
+  vi.clearAllMocks();
+  native.listen.mockImplementation(
+    async (_name: string, receive: typeof native.receive) => {
+      native.receive = receive;
+      return native.stop;
+    },
+  );
+});
+it("submits only the selected theme batch or deletion to native", async () => {
+  const mod = await import("./customThemes");
+  native.invoke.mockResolvedValue({ revision: 1, themes: [theme("theme-a")] });
+  await mod.saveCustomTheme(theme("theme-a"));
+  expect(native.invoke).toHaveBeenCalledWith("themes_mutate", {
+    change: { kind: "upsert", themes: [theme("theme-a")] },
+  });
+  await mod.deleteCustomTheme("theme-b");
+  expect(native.invoke).toHaveBeenLastCalledWith("themes_mutate", {
+    change: { kind: "delete", id: "theme-b" },
+  });
+  expect(native.invoke.mock.calls.every((c) => c[0] === "themes_mutate")).toBe(
+    true,
+  );
+});
+it("does not invoke for an empty import", async () => {
+  const mod = await import("./customThemes");
+  await mod.saveCustomThemes([]);
+  expect(native.invoke).not.toHaveBeenCalled();
+});
+it("creates imports without using the overwrite operation", async () => {
+  const mod = await import("./customThemes");
+  native.invoke.mockResolvedValue({ revision: 1, themes: [theme("new-theme")] });
+  await mod.createImportedThemes([theme("new-theme")]);
+  expect(native.invoke).toHaveBeenCalledWith("themes_mutate", {
+    change: { kind: "create", themes: [theme("new-theme")] },
+  });
+});
+it("subscribes before its initial read and rejects a stale startup snapshot", async () => {
+  const mod = await import("./customThemes");
+  let done: (value: unknown) => void = () => {};
+  native.invoke.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        done = resolve;
+      }),
+  );
+  const changed = vi.fn(),
+    failed = vi.fn();
+  const stop = await mod.watchCustomThemes(changed, failed);
+  expect(native.listen.mock.invocationCallOrder[0]).toBeLessThan(
+    native.invoke.mock.invocationCallOrder[0],
+  );
+  native.receive?.({ payload: { revision: 2, themes: [theme("new-theme")] } });
+  done({ revision: 1, themes: [theme("old-theme")] });
+  await flush();
+  expect(changed).toHaveBeenCalledTimes(1);
+  expect(changed).toHaveBeenLastCalledWith({
+    revision: 2,
+    themes: [theme("new-theme")],
+  });
+  stop();
+  expect(native.stop).toHaveBeenCalledOnce();
+});
+it("events and command replies cannot regress or duplicate an observer", async () => {
+  const mod = await import("./customThemes");
+  native.invoke.mockResolvedValueOnce({ revision: 0, themes: [] });
+  const changed = vi.fn();
+  const stop = await mod.watchCustomThemes(changed, vi.fn());
+  await flush();
+  changed.mockClear();
+  native.invoke.mockResolvedValueOnce({
+    revision: 1,
+    themes: [theme("old-theme")],
+  });
+  native.receive?.({ payload: { revision: 2, themes: [theme("new-theme")] } });
+  await mod.saveCustomTheme(theme("old-theme"));
+  native.receive?.({ payload: { revision: 2, themes: [theme("new-theme")] } });
+  expect(changed).toHaveBeenCalledOnce();
+  expect(changed.mock.calls[0][0].revision).toBe(2);
+  stop();
+});
+it("load failure is reported without writing defaults; retry can recover", async () => {
+  const mod = await import("./customThemes");
+  native.invoke.mockRejectedValueOnce(Error("damaged file preserved"));
+  const changed = vi.fn(),
+    failed = vi.fn();
+  let stop = await mod.watchCustomThemes(changed, failed);
+  await flush();
+  expect(failed).toHaveBeenCalledOnce();
+  expect(changed).not.toHaveBeenCalled();
+  stop();
+  native.invoke.mockResolvedValueOnce({ revision: 0, themes: [] });
+  stop = await mod.watchCustomThemes(changed, failed);
+  await flush();
+  expect(changed).toHaveBeenCalledWith({ revision: 0, themes: [] });
+  expect(
+    native.invoke.mock.calls.every((c) => c[0] === "themes_snapshot"),
+  ).toBe(true);
+  stop();
+});
+it("retired watchers ignore late reads and already queued events", async () => {
+  const mod = await import("./customThemes");
+  let done: (value: unknown) => void = () => {};
+  native.invoke.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        done = resolve;
+      }),
+  );
+  const changed = vi.fn();
+  const stop = await mod.watchCustomThemes(changed, vi.fn());
+  stop();
+  native.receive?.({ payload: { revision: 2, themes: [theme("new-theme")] } });
+  done({ revision: 1, themes: [] });
+  await flush();
+  expect(changed).not.toHaveBeenCalled();
+});
+it("registration failure removes its observer", async () => {
+  const mod = await import("./customThemes");
+  native.listen.mockRejectedValueOnce(Error("no events"));
+  const changed = vi.fn();
+  await expect(mod.watchCustomThemes(changed, vi.fn())).rejects.toThrow(
+    "no events",
+  );
+  native.invoke.mockResolvedValueOnce({ revision: 1, themes: [] });
+  await mod.saveCustomTheme(theme("theme-a"));
+  expect(changed).not.toHaveBeenCalled();
+});
+it("failed writes do not announce uncommitted themes", async () => {
+  const mod = await import("./customThemes");
+  native.invoke.mockResolvedValueOnce({ revision: 1, themes: [] });
+  const changed = vi.fn();
+  const stop = await mod.watchCustomThemes(changed, vi.fn());
+  await flush();
+  changed.mockClear();
+  native.invoke.mockRejectedValueOnce(Error("disk failure"));
+  await expect(mod.saveCustomTheme(theme("theme-a"))).rejects.toThrow(
+    "disk failure",
+  );
+  expect(changed).not.toHaveBeenCalled();
+  stop();
 });
 
-vi.mock("@tauri-apps/plugin-store", () => ({
-  LazyStore: pluginStore.LazyStore,
-}));
-
-const events = vi.hoisted(() => ({
-  listen: vi.fn(async () => () => undefined),
-  emit: vi.fn(async () => undefined),
-}));
-
-vi.mock("@tauri-apps/api/event", () => events);
-
-import type { Theme } from "./types";
-
-function theme(id: string): Theme {
-  return {
-    id,
-    name: id,
-    author: "",
-    description: "",
-    variants: {},
-  };
-}
-
-async function loadModule() {
-  vi.resetModules();
-  return await import("./customThemes");
-}
-
-describe("custom theme store", () => {
-  beforeEach(() => {
-    pluginStore.instances.length = 0;
-    events.emit.mockClear();
-    events.listen.mockClear();
-  });
-
-  it("treats a missing or malformed store value as an empty list", async () => {
-    const mod = await loadModule();
-
-    await expect(mod.listCustomThemes()).resolves.toEqual([]);
-
-    const store = pluginStore.instances[0];
-    store.data.set("themes", "not-an-array");
-    await expect(mod.listCustomThemes()).resolves.toEqual([]);
-  });
-
-  it("upserts by id: appends unknown ids and replaces known ones", async () => {
-    const mod = await loadModule();
-
-    await mod.saveCustomTheme(theme("a"));
-    await mod.saveCustomTheme(theme("b"));
-    await mod.saveCustomTheme(theme("a"));
-
-    const store = pluginStore.instances[0];
-    const stored = store.data.get("themes") as Theme[];
-    expect(stored.map((t) => t.id)).toEqual(["b", "a"]);
-    expect(store.save).toHaveBeenCalledTimes(3);
-    expect(events.emit).toHaveBeenCalledWith("oarlock://custom-themes-changed");
-  });
-
-  it("saves a batch in one write, the last duplicate id winning", async () => {
-    const mod = await loadModule();
-    await mod.saveCustomTheme(theme("a"));
-    await mod.saveCustomTheme(theme("b"));
-    const store = pluginStore.instances[0];
-    store.save.mockClear();
-    events.emit.mockClear();
-
-    await mod.saveCustomThemes([
-      { ...theme("b"), name: "first" },
-      theme("c"),
-      { ...theme("b"), name: "second" },
-    ]);
-
-    const stored = store.data.get("themes") as Theme[];
-    expect(stored.map((t) => [t.id, t.name])).toEqual([
-      ["a", "a"],
-      ["b", "second"],
-      ["c", "c"],
-    ]);
-    expect(store.save).toHaveBeenCalledTimes(1);
-    expect(events.emit).toHaveBeenCalledTimes(1);
-  });
-
-  it("an empty batch touches nothing", async () => {
-    const mod = await loadModule();
-    await mod.saveCustomThemes([]);
-    const store = pluginStore.instances[0];
-    expect(store.set).not.toHaveBeenCalled();
-    expect(events.emit).not.toHaveBeenCalled();
-  });
-
-  it("delete is a no-op when the id does not exist", async () => {
-    const mod = await loadModule();
-    await mod.saveCustomTheme(theme("a"));
-    events.emit.mockClear();
-    const store = pluginStore.instances[0];
-    store.set.mockClear();
-    store.save.mockClear();
-
-    await mod.deleteCustomTheme("missing");
-
-    expect(store.set).not.toHaveBeenCalled();
-    expect(store.save).not.toHaveBeenCalled();
-    expect(events.emit).not.toHaveBeenCalled();
-  });
-
-  it("delete removes only the target theme and persists", async () => {
-    const mod = await loadModule();
-    await mod.saveCustomTheme(theme("a"));
-    await mod.saveCustomTheme(theme("b"));
-
-    await mod.deleteCustomTheme("a");
-
-    const store = pluginStore.instances[0];
-    const stored = store.data.get("themes") as Theme[];
-    expect(stored.map((t) => t.id)).toEqual(["b"]);
-    expect(events.emit).toHaveBeenCalledWith("oarlock://custom-themes-changed");
-  });
-
-  it("subscribes to store-key changes and cross-window events once", async () => {
-    const mod = await loadModule();
-    const cb = vi.fn();
-
-    const unlisten = await mod.onCustomThemesChange(cb);
-
-    const store = pluginStore.instances[0];
-    const keyHandler = store.onChange.mock.calls[0][0] as (k: string) => void;
-    keyHandler("themes");
-    expect(cb).toHaveBeenCalledTimes(1);
-
-    keyHandler("other");
-    expect(cb).toHaveBeenCalledTimes(1);
-
-    unlisten();
-  });
+it("a stale initial read failure cannot undo recovery from a newer event", async () => {
+  const mod = await import("./customThemes");
+  let reject: (error: unknown) => void = () => {};
+  native.invoke.mockImplementationOnce(
+    () =>
+      new Promise((_resolve, fail) => {
+        reject = fail;
+      }),
+  );
+  const changed = vi.fn(),
+    failed = vi.fn();
+  const stop = await mod.watchCustomThemes(changed, failed);
+  native.receive?.({ payload: { revision: 3, themes: [theme("new-theme")] } });
+  reject(Error("old read failed"));
+  await flush();
+  expect(failed).not.toHaveBeenCalled();
+  expect(changed).toHaveBeenCalledOnce();
+  stop();
 });

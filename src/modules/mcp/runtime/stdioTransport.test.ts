@@ -26,11 +26,7 @@ import { describeExit, TauriStdioTransport } from "./stdioTransport";
 const encoder = new TextEncoder();
 const launch = {
   serverId: "s1",
-  command: "npx",
-  args: ["-y", "server"],
-  env: { MODE: "x" },
-  secretEnv: ["TOKEN"],
-  cwd: null,
+  revision: 7,
   shell: "/bin/zsh",
 };
 
@@ -57,16 +53,12 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("TauriStdioTransport", () => {
-  it("spawns through the native host, secrets named rather than passed", async () => {
+  it("spawns the saved native configuration at the requested revision", async () => {
     const t = new TauriStdioTransport(launch);
     await t.start();
     expect(bridge.invoke).toHaveBeenCalledWith("mcp_spawn", {
       serverId: "s1",
-      command: "npx",
-      args: ["-y", "server"],
-      env: { MODE: "x" },
-      secretEnv: ["TOKEN"],
-      cwd: null,
+      revision: 7,
       shell: "/bin/zsh",
       onMessage: expect.anything(),
       onExit: expect.anything(),

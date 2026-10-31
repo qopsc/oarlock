@@ -291,17 +291,20 @@ pub fn run() {
     let control_state = control::ControlState::default();
     let control_for_setup = control_state.clone();
 
-    let builder = tauri::Builder::default();
-    // First, so a later launch hands over before anything else starts. Debug
-    // builds skip it: a dev build would otherwise hand off to an installed
-    // Oarlock (same identifier) and exit.
-    let builder = if cfg!(debug_assertions) {
-        builder
-    } else {
-        builder.plugin(tauri_plugin_single_instance::init(
-            modules::second_launch::on_second_launch,
-        ))
-    };
+    // Resolve the profile before paths, plugin stores and single-instance ownership
+    // are initialized. Debug builds must never open the installed app's data.
+    let mut context = tauri::generate_context!();
+    context.config_mut().identifier =
+        modules::profile::identifier(&context.config().identifier, cfg!(debug_assertions))
+            .to_owned();
+    let autostart_name = modules::profile::autostart_name(
+        &context.config().identifier,
+        &context.package_info().name,
+    )
+    .into_owned();
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
+        modules::second_launch::on_second_launch,
+    ));
     let builder = builder.plugin(tauri_plugin_clipboard_manager::init());
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -321,7 +324,11 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name(autostart_name)
+                .build(),
+        )
         // Stores open only by plain names in the app data folder.
         .plugin(modules::store_scope::plugin())
         .plugin(tauri_plugin_os::init())
@@ -342,13 +349,13 @@ pub fn run() {
             modules::asset_all_folders::protocol,
         )
         .on_page_load(|webview, payload| {
+            net::page::on_load(webview, payload.event());
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
-                if let Some(state) = webview.try_state::<net::AiStreamState>() {
-                    state.cancel_window(webview.window().label());
+                if let Some(state) = webview.try_state::<shell::ShellState>() {
+                    state.release_window(webview.app_handle(), webview.label());
                 }
-                if let Some(state) = webview.try_state::<modules::mcp::McpHttpStreams>() {
-                    state.cancel_window(webview.label());
-                }
+                modules::ai_subagents::release_window(webview.app_handle(), webview.label());
+                modules::ai_chat_control::release_window(webview.app_handle(), webview.label());
                 if let Some(state) = webview.try_state::<modules::mcp::McpState>() {
                     state.release_window(webview.app_handle(), webview.label());
                 }
@@ -358,6 +365,8 @@ pub fn run() {
                 if let Some(state) = webview.try_state::<fs::watch::FsWatchState>() {
                     state.release_window(webview.app_handle(), webview.label());
                 }
+                git::discard::page_loading(webview.app_handle(), webview.label());
+                fs::mutation_events::release_window(webview.label());
                 modules::project_trust::release_window(webview.app_handle(), webview.label());
                 windows::on_page_load(webview.app_handle(), webview.label());
             }
@@ -365,27 +374,44 @@ pub fn run() {
         .setup(move |_app| {
             #[cfg(feature = "bench")]
             modules::bench::guard(_app.handle())?;
+            if let Err(error) = modules::preferences::initialize(_app.handle()) {
+                log::warn!("{error}");
+            }
             modules::asset_scope::install(_app.handle());
             #[cfg(target_os = "macos")]
             modules::window_presentation::macos::install(_app.handle());
             #[cfg(target_os = "linux")]
             modules::color_scheme::follow();
+            // Restore before starting IPC or allowing pages to load shared stores.
+            windows::restore(_app.handle()).map_err(|error| {
+                log::error!("{error}");
+                error
+            })?;
             if let Err(error) = control::start(_app.handle().clone(), control_for_setup.clone()) {
                 log::warn!("could not start Oarlock control server: {error}");
             }
-            // After `main` exists, before any page runs.
-            windows::restore(_app.handle());
             Ok(())
         })
+        .manage(modules::preferences::PreferencesState::default())
+        .manage(modules::themes::ThemeState::default())
+        .manage(modules::ai_endpoints::EndpointState::default())
         .manage(pty::PtyState::default())
         .manage(net::AiStreamState::default())
+        .manage(net::image::ImageRequests::default())
+        .manage(net::probe::ProbeRequests::default())
+        .manage(net::page::NetworkPages::default())
+        .manage(fs::interactive::SearchRequests::default())
         .manage(modules::ai_sessions::SessionFilesState::default())
+        .manage(modules::ai_metadata::MetadataState::default())
+        .manage(modules::ai_subagents::SubagentState::default())
+        .manage(modules::ai_chat_control::ChatControl::default())
         .manage(modules::terminal_scrollback::ScrollbackState::default())
         .manage(modules::window_presentation::WindowPresentationState::default())
         .manage(control_state)
         .manage(shell::ShellState::default())
         .manage(secrets::SecretsState::default())
         .manage(primary_selection::PrimarySelection::default())
+        .manage(modules::clipboard_write::ClipboardWrites::default())
         .manage(modules::quick_terminal::QuickTerminalState::default())
         .manage(windows::WindowsState::default())
         .manage(modules::system_fonts::SystemFontsState::default())
@@ -407,6 +433,13 @@ pub fn run() {
         .manage(LaunchDir::new(launch.folder))
         .manage(LaunchFiles::new(windows::MAIN, launch.files))
         .invoke_handler(tauri::generate_handler![
+            modules::themes::themes_snapshot,
+            modules::themes::themes_mutate,
+            modules::preferences::preferences_snapshot,
+            modules::preferences::preferences_mutate,
+            modules::ai_endpoints::ai_endpoints_snapshot,
+            modules::ai_endpoints::ai_endpoints_mutate,
+            modules::ai_endpoints::ai_endpoint_credential,
             pty::pty_open,
             pty::pty_write,
             pty::pty_stream_open,
@@ -417,13 +450,23 @@ pub fn run() {
             pty::pty_close_all,
             pty::pty_has_foreground_process,
             pty::pty_has_foreground_job,
+            pty::pty_prepare_path_drop,
             pty::pty_authorize_cwd,
             pty::pty_shell_name,
             pty::pty_list_shells,
             fs::tree::list_subdirs,
             fs::tree::fs_read_dir,
             fs::file::fs_read_file,
+            fs::reconcile::fs_reconcile_documents,
+            fs::file::ai_validate_document,
+            fs::attachment::ai_import_attachment,
+            fs::attachment::ai_pick_attachment_files,
             fs::file::fs_write_file,
+            fs::file::fs_save_document,
+            fs::mutation_events::fs_recovery_begin,
+            fs::mutation_events::fs_recovery_changed,
+            fs::mutation_events::fs_recovery_end,
+            fs::formatter::fs_format_document,
             fs::file::fs_stat,
             fs::file::fs_host_path,
             fs::file::fs_canonicalize,
@@ -436,22 +479,26 @@ pub fn run() {
             fs::mutate::fs_delete_batch,
             fs::copy::fs_copy,
             fs::clipboard::fs_clipboard_paths,
-            modules::clipboard_image::clipboard_image_read,
+            modules::clipboard_read::terminal_clipboard_snapshot,
+            modules::clipboard_snapshot::ai_clipboard_snapshot,
             modules::clipboard_image::clipboard_image_write,
-            primary_selection::terminal_primary_selection_write,
-            primary_selection::terminal_primary_selection_read,
+            modules::clipboard_write::clipboard_write_begin,
+            modules::clipboard_write::clipboard_write_cancel,
+            modules::clipboard_write::clipboard_text_write,
             modules::quick_terminal::quick_terminal_toggle,
             modules::quick_terminal::quick_terminal_set_hotkey,
             fs::watch::fs_watch_add,
-            fs::watch::fs_watch_remove,
+            fs::watch::watch_release,
+            fs::watch::watch_health,
+            fs::watch::watch_retry,
             fs::watch::git_watch_add,
-            fs::watch::git_watch_remove,
             lsp::lsp_detect,
             lsp::lsp_host_pid,
             lsp::lsp_resolve_root,
             lsp::lsp_spawn,
             lsp::lsp_send,
             lsp::lsp_kill,
+            lsp::lsp_retire_generation,
             modules::mcp::mcp_spawn,
             modules::mcp::mcp_send,
             modules::mcp::mcp_kill,
@@ -460,7 +507,6 @@ pub fn run() {
             modules::mcp::mcp_log_note,
             modules::mcp::mcp_status_report,
             modules::mcp::mcp_status_list,
-            modules::mcp::mcp_secret_set,
             modules::mcp::mcp_secret_delete,
             modules::mcp::mcp_secret_status,
             modules::mcp::mcp_http_open,
@@ -471,27 +517,42 @@ pub fn run() {
             modules::mcp::mcp_project_spawn,
             modules::mcp::mcp_project_http_open,
             modules::mcp::project::mcp_project_servers,
+            modules::mcp::project::mcp_run_open,
+            modules::mcp::project::mcp_run_release,
+            modules::mcp::settings::mcp_settings_mutate,
+            modules::mcp::settings::mcp_settings_snapshot,
             modules::mcp::import::mcp_import_scan,
             modules::mcp::import::mcp_import_secrets,
             modules::mcp::oauth::mcp_oauth_status,
             modules::mcp::oauth::mcp_oauth_probe,
+            modules::mcp::oauth::mcp_oauth_probe_cancel,
             modules::mcp::oauth::mcp_oauth_sign_in,
             modules::mcp::oauth::mcp_oauth_cancel,
             modules::mcp::oauth::mcp_oauth_sign_out,
             fs::search::fs_search,
             fs::search::fs_list_files,
             fs::grep::fs_grep,
-            fs::grep::fs_grep_interactive,
+            fs::interactive::fs_grep_interactive,
+            fs::interactive::fs_grep_cancel,
             fs::grep::fs_glob,
             git::commands::git_resolve_repo,
             git::commands::git_panel_snapshot,
             git::commands::git_status,
+            git::commands::git_ai_staged_diff,
             git::commands::git_diff,
             git::commands::git_diff_content,
             git::commands::git_file_base,
             git::commands::git_stage,
             git::commands::git_unstage,
             git::commands::git_discard,
+            git::discard::git_discard_register,
+            git::discard::git_discard_unregister,
+            git::discard::git_discard_begin,
+            git::discard::git_discard_prepared,
+            git::discard::git_discard_match_documents,
+            git::discard::git_discard_status,
+            git::discard::git_discard_settled,
+            git::discard::git_discard_cancel,
             git::commands::git_commit,
             git::commands::git_undo_commit,
             git::commands::git_commit_on_remote,
@@ -508,6 +569,7 @@ pub fn run() {
             git::commands::git_checkout_branch,
             git::commands::git_worktree_add,
             git::commands::git_worktree_remove,
+            git::worker::git_execution_capability,
             modules::skills::skills_list,
             modules::skills::skills_load,
             modules::skills::skills_read_file,
@@ -525,18 +587,23 @@ pub fn run() {
             modules::project_trust::project_trust_revoke,
             modules::project_memory::project_memory_read,
             shell::shell_run_command,
+            modules::ai_subagents::ai_subagent_task,
+            modules::ai_chat_control::ai_chat_register,
+            modules::ai_chat_control::ai_chat_stop,
+            modules::ai_chat_control::ai_chat_stop_ack,
             shell::shell_session_open,
             shell::shell_session_run,
             shell::shell_session_close,
             shell::shell_bg_spawn,
+            shell::shell_detached_spawn,
             shell::shell_bg_logs,
             shell::shell_bg_kill,
+            shell::shell_bg_kill_chat,
             shell::shell_bg_list,
             workspace::wsl_list_distros,
             workspace::wsl_default_distro,
             workspace::ipc::wsl_home,
             workspace::workspace_authorize,
-            workspace::workspace_set_all_folders,
             workspace::workspace_current_dir,
             control::control_frontend_ready,
             control::control_respond,
@@ -549,11 +616,15 @@ pub fn run() {
             secrets::secrets_set,
             secrets::secrets_delete,
             secrets::secrets_get_all,
-            net::lm_ping,
+            net::probe::lm_ping,
+            net::probe::lm_ping_cancel,
             net::image::markdown_remote_image,
+            net::image::markdown_remote_image_cancel,
             net::ai_http_stream,
             net::ai_http_cancel,
             net::ai_http_ack,
+            modules::ai_metadata::ai_sessions_snapshot,
+            modules::ai_metadata::ai_sessions_mutate,
             modules::ai_sessions::ai_session_load,
             modules::ai_sessions::ai_session_save,
             modules::ai_sessions::ai_session_delete,
@@ -575,6 +646,8 @@ pub fn run() {
             windows::app_window_ready,
             windows::app_quit,
             windows::app_quit_ready,
+            windows::app_quit_changed,
+            windows::app_quit_cancel,
             #[cfg(target_os = "macos")]
             app_menu::app_menu_set_shortcuts,
             #[cfg(target_os = "macos")]
@@ -588,7 +661,7 @@ pub fn run() {
             #[cfg(feature = "bench")]
             modules::bench::bench_exit,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app, event| {
             match event {
@@ -602,12 +675,14 @@ pub fn run() {
                     event: tauri::WindowEvent::Destroyed,
                     ..
                 } => {
-                    if let Some(state) = app.try_state::<net::AiStreamState>() {
-                        state.cancel_window(&label);
+                    app.state::<net::page::NetworkPages>().close(&label, || {
+                        net::page::cancel_requests(app, &label);
+                    });
+                    if let Some(state) = app.try_state::<shell::ShellState>() {
+                        state.release_window(app, &label);
                     }
-                    if let Some(state) = app.try_state::<modules::mcp::McpHttpStreams>() {
-                        state.cancel_window(&label);
-                    }
+                    modules::ai_subagents::release_window(app, &label);
+                    modules::ai_chat_control::release_window(app, &label);
                     if let Some(state) = app.try_state::<modules::mcp::McpState>() {
                         state.release_window(app, &label);
                     }
@@ -620,6 +695,8 @@ pub fn run() {
                     if let Some(state) = app.try_state::<LaunchFiles>() {
                         state.take(&label);
                     }
+                    git::discard::release_window(app, &label);
+                    fs::mutation_events::release_window(&label);
                     modules::project_trust::release_window(app, &label);
                     windows::on_destroyed(app, &label);
                 }

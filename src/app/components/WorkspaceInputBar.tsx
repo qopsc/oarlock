@@ -85,8 +85,22 @@ export function WorkspaceInputBar({
   const renderAi = hasComposer && aiLoaded;
   const aiComposerShown = open && renderAi && effectiveMode === "ai";
   const dropOver = useComposerDropStore((s) => s.over);
+  const cancelImports = c.cancelImports;
+  useEffect(() => {
+    if (!aiComposerShown) cancelImports();
+  }, [aiComposerShown, cancelImports]);
+  useEffect(() => () => cancelImports(), [cancelImports]);
+  const setVoiceVisible = c.voice.setVisible;
+  useEffect(() => {
+    setVoiceVisible(aiComposerShown);
+    return () => setVoiceVisible(false);
+  }, [aiComposerShown, setVoiceVisible]);
 
   const switchMode = (next: "shell" | "ai") => {
+    if (next === "shell") {
+      c.voice.setVisible(false);
+      c.cancelImports();
+    }
     setMode(next);
     requestAnimationFrame(() => {
       if (next === "ai") c.textareaRef.current?.focus();

@@ -230,7 +230,7 @@ export function elicitationFields(
 
 /** Each field's starting value: the schema's default, else empty. */
 export function initialValues(fields: readonly ElicitField[]): ElicitValues {
-  const values: ElicitValues = {};
+  const values: ElicitValues = Object.create(null);
   for (const field of fields) {
     switch (field.kind) {
       case "string":
@@ -336,8 +336,8 @@ export function validateElicitation(
   fields: readonly ElicitField[],
   values: ElicitValues,
 ): { errors: Record<string, string>; content: ElicitContent | null } {
-  const errors: Record<string, string> = {};
-  const content: ElicitContent = {};
+  const errors: Record<string, string> = Object.create(null);
+  const content: ElicitContent = Object.create(null);
   for (const field of fields) {
     const value = values[field.name];
     switch (field.kind) {

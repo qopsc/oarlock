@@ -7,12 +7,12 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
 use oarlock_control_protocol::{
     CallerContext, ControlDescriptor, ControlRequest, ControlResponse, OpenParams,
     MAX_MESSAGE_BYTES, METHOD_CAPABILITIES, METHOD_IDENTIFY, METHOD_OPEN, METHOD_PING,
     PROTOCOL_VERSION, SERVER_RESPONSE_ID,
 };
+use serde_json::{json, Value};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(7);
@@ -683,8 +683,7 @@ mod tests {
 
     #[test]
     fn loopback_parsing_rejects_hostnames_and_remote_hosts() {
-        let error =
-            parse_loopback_address("localhost:4312").expect_err("reject hostname");
+        let error = parse_loopback_address("localhost:4312").expect_err("reject hostname");
         assert_eq!(error.code, "invalid_endpoint");
         let error = parse_loopback_address("127.0.0.1").expect_err("reject missing port");
         assert_eq!(error.code, "invalid_endpoint");

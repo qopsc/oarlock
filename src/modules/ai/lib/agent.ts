@@ -1,3 +1,5 @@
+import { credentialProblem, readyKey } from "./credentialState";
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   convertToModelMessages,
   extractReasoningMiddleware,
@@ -124,16 +126,33 @@ export async function buildLanguageModel(
   options: BuildModelOptions = {},
   customEndpointKey?: string | null,
 ): Promise<LanguageModel> {
-  if (providerNeedsKey(provider) && !keys[provider]) {
+  if (providerNeedsKey(provider)) {
+    const problem = credentialProblem(keys[provider]);
+    if (problem) throw new Error(problem);
+  }
+  if (providerNeedsKey(provider) && !readyKey(keys[provider])) {
     throw new Error(missingKeyMessage(provider));
   }
-  const key = keys[provider] ?? "";
+  const key = readyKey(keys[provider]) ?? "";
   const lmstudioURL = options.lmstudioBaseURL ?? LMSTUDIO_DEFAULT_BASE_URL;
   const mlxURL = options.mlxBaseURL ?? MLX_DEFAULT_BASE_URL;
   const ollamaURL = options.ollamaBaseURL ?? OLLAMA_DEFAULT_BASE_URL;
   const compatURL = options.openaiCompatibleBaseURL ?? "";
+  // Custom credentials must be explicitly selected after origin validation.
+  // The retired provider-wide key is never an execution fallback.
   const epKey = customEndpointKey ?? "";
-  const cacheKey = `${provider} ${key} ${epKey} ${resolvedModelId} ${lmstudioURL} ${mlxURL} ${ollamaURL} ${compatURL}`;
+  // User-controlled keys, model IDs and URLs can contain spaces. Preserve
+  // field boundaries so a cache hit cannot select another endpoint or key.
+  const cacheKey = JSON.stringify([
+    provider,
+    key,
+    epKey,
+    resolvedModelId,
+    lmstudioURL,
+    mlxURL,
+    ollamaURL,
+    compatURL,
+  ]);
   const hit = modelCache.get(cacheKey);
   if (hit) return hit;
 
@@ -170,8 +189,9 @@ export async function buildLanguageModel(
       break;
     }
     case "deepseek": {
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = createOpenAICompatible({
         name: "deepseek",
         baseURL: "https://api.deepseek.com",
@@ -180,8 +200,9 @@ export async function buildLanguageModel(
       break;
     }
     case "mistral": {
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = createOpenAICompatible({
         name: "mistral",
         baseURL: "https://api.mistral.ai/v1",
@@ -195,8 +216,9 @@ export async function buildLanguageModel(
       break;
     }
     case "openrouter": {
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = createOpenAICompatible({
         name: "openrouter",
         baseURL: "https://openrouter.ai/api/v1",
@@ -214,13 +236,14 @@ export async function buildLanguageModel(
           "OpenAI-compatible provider has no base URL. Set it in Settings → Models.",
         );
       }
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = separateThinkTags(
         createOpenAICompatible({
           name: "openai-compatible",
           baseURL: compatURL,
-          apiKey: epKey || key || undefined,
+          apiKey: epKey || undefined,
           // OpenCode Go/Zen refuses requests without a session header.
           headers: opencodeSessionHeaders(compatURL),
           fetch: localProxyFetch,
@@ -229,8 +252,9 @@ export async function buildLanguageModel(
       break;
     }
     case "lmstudio": {
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = separateThinkTags(
         createOpenAICompatible({
           name: "lmstudio",
@@ -241,8 +265,9 @@ export async function buildLanguageModel(
       break;
     }
     case "mlx": {
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = separateThinkTags(
         createOpenAICompatible({
           name: "mlx",
@@ -253,8 +278,9 @@ export async function buildLanguageModel(
       break;
     }
     case "ollama": {
-      const { createOpenAICompatible } =
-        await import("@ai-sdk/openai-compatible");
+      const { createOpenAICompatible } = await import(
+        "@ai-sdk/openai-compatible"
+      );
       built = separateThinkTags(
         createOpenAICompatible({
           name: "ollama",
@@ -324,9 +350,19 @@ const SKILL_TOOLS: ReadonlySet<string> = new Set<ToolName>([
 export function activeToolNames<T extends string>(
   tools: readonly T[],
   skills: AgentSkills | undefined,
+  allowUnmanaged = false,
 ): T[] | undefined {
-  if (skills && skills.skills.length > 0) return undefined;
-  return tools.filter((name) => !SKILL_TOOLS.has(name));
+  const hasSkills = !!skills?.skills.length;
+  if (
+    hasSkills &&
+    (allowUnmanaged || !tools.some((name) => name === "bash_detach"))
+  )
+    return undefined;
+  return tools.filter(
+    (name) =>
+      (hasSkills || !SKILL_TOOLS.has(name)) &&
+      (allowUnmanaged || name !== "bash_detach"),
+  );
 }
 
 function buildStableSystem(
@@ -362,6 +398,8 @@ export type AgentUsageDelta = TokenUsage & {
 };
 
 export type RunAgentOptions = {
+  /** Recheck admission after asynchronous model loading, before sending data. */
+  assertReady?: () => void;
   keys: ProviderKeys;
   modelId?: string;
   customInstructions?: string;
@@ -377,9 +415,6 @@ export type RunAgentOptions = {
   mlxModelId?: string;
   ollamaBaseURL?: string;
   ollamaModelId?: string;
-  openaiCompatibleBaseURL?: string;
-  openaiCompatibleModelId?: string;
-  openaiCompatibleContextLimit?: number;
   openrouterModelId?: string;
   customEndpoints?: readonly CustomEndpoint[];
   customEndpointKeys?: CustomEndpointKeys;
@@ -403,6 +438,7 @@ export type RunAgentOptions = {
 const ASK_STATE: ApprovalState = { mode: "ask", planMode: false };
 
 export async function runAgentStream(opts: RunAgentOptions) {
+  opts.assertReady?.();
   const modelId = opts.modelId ?? DEFAULT_MODEL_ID;
   const model = await buildConfiguredLanguageModel(modelId, opts.keys, {
     lmstudioBaseURL: opts.lmstudioBaseURL,
@@ -411,8 +447,6 @@ export async function runAgentStream(opts: RunAgentOptions) {
     mlxModelId: opts.mlxModelId,
     ollamaBaseURL: opts.ollamaBaseURL,
     ollamaModelId: opts.ollamaModelId,
-    openaiCompatibleBaseURL: opts.openaiCompatibleBaseURL,
-    openaiCompatibleModelId: opts.openaiCompatibleModelId,
     openrouterModelId: opts.openrouterModelId,
     customEndpoints: opts.customEndpoints,
     customEndpointKeys: opts.customEndpointKeys,
@@ -435,11 +469,7 @@ export async function runAgentStream(opts: RunAgentOptions) {
   // The system prompt goes with every step whole, so it counts against the
   // context before the history, and a run it cannot fit fails here, naming
   // AGENTS.md when that is what does not fit, instead of at the provider.
-  const contextLimit = resolveContextLimit(
-    modelId,
-    endpoints,
-    opts.openaiCompatibleContextLimit,
-  );
+  const contextLimit = resolveContextLimit(modelId, endpoints);
   const systemTokens =
     approxTextTokens(stableSystem) +
     (opts.planMode ? approxTextTokens(PLAN_MODE_PROMPT) : 0);
@@ -471,6 +501,8 @@ export async function runAgentStream(opts: RunAgentOptions) {
   );
   const compactedHistory = compact.messages;
   if (compact.compacted) {
+    // Elided file contents cannot justify an unchanged response or a later edit.
+    opts.toolContext.readCache.clear();
     opts.onCompact?.({ droppedCount: compact.droppedCount });
   }
 
@@ -482,6 +514,8 @@ export async function runAgentStream(opts: RunAgentOptions) {
   );
 
   let stepsSeen = 0;
+  opts.abortSignal?.throwIfAborted();
+  opts.assertReady?.();
   const result = streamText({
     model,
     instructions: prompt.system,
@@ -494,6 +528,7 @@ export async function runAgentStream(opts: RunAgentOptions) {
     activeTools: activeToolNames(
       Object.keys(tools) as (keyof typeof tools)[],
       opts.skills,
+      usePreferencesStore.getState().aiAllowUnmanagedJobs,
     ),
     toolApproval: buildToolApproval(
       opts.approvalState ?? (() => ASK_STATE),

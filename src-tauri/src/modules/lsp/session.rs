@@ -11,6 +11,9 @@ use tauri::Manager;
 
 use super::framing::{encode_frame, FrameDecoder};
 
+pub(super) const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 const READ_BUF: usize = 32 * 1024;
 const STDERR_LINE_CAP: usize = 512;
 const STDERR_TAIL_LINES: usize = 8;
@@ -62,29 +65,117 @@ pub struct LspSession {
     _job: Option<crate::modules::proc::job::ProcessJob>,
     child: Arc<SharedChild>,
     stdin: Mutex<Option<ChildStdin>>,
+    stopping: AtomicBool,
+    writing: AtomicBool,
+    kill_reason: Arc<Mutex<Option<String>>>,
     pub(super) exited: Arc<AtomicBool>,
 }
 
+struct WritePermit(Arc<LspSession>);
+impl Drop for WritePermit {
+    fn drop(&mut self) {
+        self.0.writing.store(false, Ordering::Release);
+    }
+}
+
 impl LspSession {
+    fn stop_for_write(&self, reason: String) -> String {
+        let mut saved = self.kill_reason.lock().unwrap();
+        if saved.is_none() {
+            *saved = Some(reason.clone());
+        }
+        drop(saved);
+        self.kill();
+        reason
+    }
+
+    pub async fn send(self: &Arc<Self>, message: String) -> Result<(), String> {
+        self.send_with_timeout(message, WRITE_TIMEOUT).await
+    }
+
+    async fn send_with_timeout(
+        self: &Arc<Self>,
+        message: String,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if message.len() > MAX_WRITE_BYTES {
+            return Err(self.stop_for_write(
+                "Language server write exceeds 16 MiB. Restart the language server.".into(),
+            ));
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("lsp session is stopping".into());
+        }
+        if self
+            .writing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(self.stop_for_write(
+                "Concurrent language server writes refused. Restart the language server.".into(),
+            ));
+        }
+        let permit = WritePermit(self.clone());
+        let writing = tauri::async_runtime::spawn_blocking(move || {
+            let result = permit.0.write_message(&message);
+            drop(permit);
+            result
+        });
+        match tokio::time::timeout(timeout, writing).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(self.stop_for_write(error)),
+            Ok(Err(error)) => {
+                Err(self.stop_for_write(format!("Language server writer failed: {error}")))
+            }
+            Err(_) => Err(self.stop_for_write(
+                "Language server write stalled for 30 seconds. Restart the language server.".into(),
+            )),
+        }
+    }
+
     pub fn write_message(&self, payload: &str) -> Result<(), String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("lsp session is stopping".into());
+        }
         let mut guard = self.stdin.lock().unwrap();
+        if self.stopping.load(Ordering::Acquire) {
+            *guard = None;
+            return Err("lsp session is stopping".into());
+        }
         let stdin = guard.as_mut().ok_or("lsp session stdin closed")?;
-        stdin
+        let result = stdin
             .write_all(&encode_frame(payload))
             .and_then(|_| stdin.flush())
-            .map_err(|e| format!("lsp write failed: {e}"))
+            .map_err(|e| format!("lsp write failed: {e}"));
+        if self.stopping.load(Ordering::Acquire) {
+            *guard = None;
+        }
+        result
     }
 
     // Servers fork helpers (cargo check, rustc, proc-macro hosts); killing
     // only the leader leaves them burning CPU. Unix: signal the process
     // group. Windows: the Job Object covers the tree.
     pub fn kill(&self) {
-        *self.stdin.lock().unwrap() = None;
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
+        }
         #[cfg(unix)]
         unsafe {
             libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
         }
+        #[cfg(windows)]
+        if let Some(job) = &self._job {
+            if let Err(error) = job.terminate() {
+                log::warn!("lsp process-tree termination failed: {error}");
+            }
+        }
         let _ = self.child.kill();
+        // A full pipe holds this mutex. Stop must not wait on server input;
+        // the active writer closes its handle when termination releases it.
+        if let Ok(mut stdin) = self.stdin.try_lock() {
+            *stdin = None;
+        }
     }
 }
 
@@ -154,12 +245,16 @@ pub fn spawn(
         }
     };
 
+    let kill_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let exited = Arc::new(AtomicBool::new(false));
     let session = Arc::new(LspSession {
         #[cfg(windows)]
         _job: job,
         child: child.clone(),
         stdin: Mutex::new(Some(stdin)),
+        stopping: AtomicBool::new(false),
+        writing: AtomicBool::new(false),
+        kill_reason: kill_reason.clone(),
         exited: exited.clone(),
     });
 
@@ -228,7 +323,6 @@ pub fn spawn(
         push_line(&mut line);
     })?;
 
-    let kill_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cap_mb = max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
     let pid = child.id();
     let session_w = session.clone();
@@ -295,6 +389,9 @@ mod tests {
         LspSession {
             child,
             stdin: Mutex::new(stdin),
+            stopping: AtomicBool::new(false),
+            writing: AtomicBool::new(false),
+            kill_reason: Arc::new(Mutex::new(None)),
             exited: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -391,6 +488,121 @@ mod tests {
     }
 
     #[test]
+    fn releasing_one_window_terminates_only_its_language_server() {
+        let state = super::super::LspState::default();
+        let make = || {
+            let mut cmd = Command::new("/bin/sleep");
+            cmd.arg("30").stdin(Stdio::piped());
+            let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+            let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+            (child, session)
+        };
+        let (a, session_a) = make();
+        let (b, session_b) = make();
+        {
+            let mut registry = state.sessions.write().unwrap();
+            registry.reserve(1, "a", "page-a", "rust", 0).unwrap();
+            registry.publish(1, session_a).unwrap();
+            registry.reserve(2, "b", "page-b", "rust", 0).unwrap();
+            registry.publish(2, session_b).unwrap();
+        }
+        state.release_window("a");
+        let stopped = a
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some();
+        let other_running = b.try_wait().unwrap().is_none();
+        // Always clean up both processes before reporting assertions.
+        state.kill_all();
+        let _ = a.kill();
+        let _ = a.wait();
+        let _ = b.wait();
+        assert!(stopped, "closing the owner left its language server alive");
+        assert!(
+            other_running,
+            "closing one window killed another window's server"
+        );
+    }
+
+    fn sleeping_writer() -> (Arc<SharedChild>, Arc<LspSession>) {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::piped());
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+        (child, session)
+    }
+
+    #[tokio::test]
+    async fn a_stalled_write_terminates_the_process_and_releases_its_permit() {
+        let (child, session) = sleeping_writer();
+        let result = session
+            .send_with_timeout("x".repeat(1024 * 1024), Duration::from_millis(50))
+            .await;
+        assert!(result.unwrap_err().contains("stalled"));
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.writing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "writer kept its permit after termination"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(session
+            .kill_reason
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains("stalled"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_writer_is_rejected_before_waiting_for_the_pipe_lock() {
+        let (child, session) = sleeping_writer();
+        let first = tokio::spawn({
+            let session = session.clone();
+            async move { session.send("x".repeat(1024 * 1024)).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session.writing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "first writer never reserved ownership"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(session
+            .send("second".into())
+            .await
+            .unwrap_err()
+            .contains("Concurrent"));
+        assert!(first.await.unwrap().is_err());
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_native_messages_are_refused_before_writing() {
+        let (child, session) = sleeping_writer();
+        assert!(session
+            .send("x".repeat(MAX_WRITE_BYTES + 1))
+            .await
+            .unwrap_err()
+            .contains("16 MiB"));
+        assert!(!session.writing.load(Ordering::Acquire));
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn write_after_kill_errors() {
         let mut cmd = Command::new("/bin/cat");
         cmd.stdin(Stdio::piped()).stdout(Stdio::null());
@@ -400,5 +612,43 @@ mod tests {
 
         session.kill();
         assert!(session.write_message("{}").is_err());
+    }
+
+    #[test]
+    fn stopping_a_server_does_not_wait_for_its_blocked_stdin_writer() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::piped());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+        let writer = session.clone();
+        let write = thread::spawn(move || writer.write_message(&"x".repeat(1024 * 1024)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.stdin.try_lock().is_ok() {
+            assert!(Instant::now() < deadline, "writer never acquired stdin");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let stopper = session.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let stop = thread::spawn(move || {
+            stopper.kill();
+            done.send(()).unwrap();
+        });
+        let prompt = result.recv_timeout(Duration::from_millis(500)).is_ok();
+        // Always rescue and join the reproduction before reporting a failure.
+        let _ = child.kill();
+        let _ = child.wait();
+        stop.join().unwrap();
+        assert!(write.join().unwrap().is_err());
+        assert!(prompt, "Stop waited on a full language-server stdin pipe");
     }
 }

@@ -54,6 +54,8 @@ pub struct Session {
     pub shell_pid: u32,
     /// Label of the webview that opened this PTY and receives its output.
     pub owner: Arc<str>,
+    pub(super) drop_shell: super::path_drop::Shell,
+    pub(super) drop_pending: AtomicBool,
     pub killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Feeds the per-session writer thread, which keeps input ordered and off
     /// every async worker.
@@ -80,6 +82,9 @@ impl Drop for Session {
 }
 
 impl Session {
+    pub(super) fn accepts_path_drop(&self) -> bool {
+        !self.output.is_closed() && !self.finished.load(Ordering::Acquire)
+    }
     pub(super) fn diagnostics(&self) -> OutputDiagnostics {
         OutputDiagnostics {
             shell_pid: self.shell_pid,
@@ -264,6 +269,7 @@ pub(super) fn spawn_with(
     let pair = pty_system.openpty(size).map_err(|e| e.to_string())?;
 
     let cmd = build_command()?;
+    let drop_shell = super::path_drop::Shell::from_command(&cmd);
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -318,6 +324,8 @@ pub(super) fn spawn_with(
         _job: job,
         shell_pid,
         owner,
+        drop_shell,
+        drop_pending: AtomicBool::new(false),
         killer: Mutex::new(killer),
         input: input.clone(),
         master: Arc::new(Mutex::new(Some(pair.master))),

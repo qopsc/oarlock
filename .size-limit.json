@@ -15,7 +15,7 @@
     "path": [
       "dist/assets/*.js"
     ],
-    "limit": "2797.1 KB",
+    "limit": "2882.08 KB",
     "gzip": true
   },
   {
@@ -25,7 +25,7 @@
       "dist/assets/TerminalFitQueue-*.js",
       "dist/assets/ghostty-vt-*.js"
     ],
-    "limit": "92.83 KB",
+    "limit": "95.79 KB",
     "gzip": true
   },
   {

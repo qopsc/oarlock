@@ -5,6 +5,7 @@ mod foreground;
 mod gate;
 mod hub;
 mod output;
+mod path_drop;
 mod presentation;
 mod protocol;
 mod queue;
@@ -25,6 +26,7 @@ use portable_pty::PtySize;
 use tauri::Manager;
 
 use crate::modules::control::ControlState;
+use crate::modules::net::page::NetworkPages;
 use crate::modules::workspace::{
     resolve_path, user_spawn_cwd_or_home, WorkspaceEnv, WorkspaceRegistry,
 };
@@ -68,6 +70,26 @@ impl Default for PtyState {
 }
 
 impl PtyState {
+    fn owned(&self, id: u32, label: &str) -> Result<Arc<Session>, String> {
+        unpoisoned(self.sessions.read())
+            .get(&id)
+            .filter(|session| &*session.owner == label)
+            .cloned()
+            .ok_or_else(|| "no session".to_string())
+    }
+
+    fn take_owned(&self, id: u32, label: &str) -> Result<Option<Arc<Session>>, String> {
+        let session = {
+            let mut sessions = unpoisoned(self.sessions.write());
+            if sessions.get(&id).is_some_and(|session| &*session.owner != label) {
+                return Err("no session".into());
+            }
+            sessions.remove(&id)
+        };
+        if session.is_some() { self.hub.submit(Command::Unregister { id }); }
+        Ok(session)
+    }
+
     /// Removes a session from the registry and from the hub's delivery set.
     pub(super) fn take(&self, id: u32) -> Option<Arc<Session>> {
         let session = unpoisoned(self.sessions.write()).remove(&id);
@@ -173,13 +195,36 @@ fn reap(id: u32, session: Arc<Session>, reason: &str) {
         .expect("spawn pty drop thread");
 }
 
+/// Publication shares the page lock with reload/close, so retirement either
+/// sees the registered session or prevents it from being registered at all.
+fn publish_for_page(
+    state: &PtyState,
+    pages: &NetworkPages,
+    label: &str,
+    generation: &str,
+    id: u32,
+    session: Arc<Session>,
+) -> Result<(), String> {
+    let result = pages.with_page(label, generation, || {
+        unpoisoned(state.sessions.write()).insert(id, session.clone());
+        Ok(())
+    }).map_err(|_| "Terminal startup was cancelled because its window closed or reloaded".to_string());
+    if result.is_err() {
+        state.hub.submit(Command::Unregister { id });
+        reap(id, session, "expired page during startup");
+    }
+    result
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn pty_open(
     app: tauri::AppHandle,
     webview: tauri::Webview,
     state: tauri::State<'_, PtyState>,
+    pages: tauri::State<'_, NetworkPages>,
     control: tauri::State<'_, ControlState>,
+    page_generation: String,
     cols: u16,
     rows: u16,
     cwd: Option<String>,
@@ -189,6 +234,10 @@ pub async fn pty_open(
     pane_id: Option<u32>,
     presentation: Option<PresentationClass>,
 ) -> Result<u32, String> {
+    let label = webview.label().to_owned();
+    pages.with_page(&label, &page_generation, || Ok(())).map_err(|_| {
+        "Terminal startup was cancelled because its window closed or reloaded".to_string()
+    })?;
     let workspace = WorkspaceEnv::from_option(workspace);
     let blocks = blocks.unwrap_or(false);
     // A Windows helper cannot execute inside WSL without explicit path and
@@ -234,7 +283,7 @@ pub async fn pty_open(
         log::error!("pty_open failed: {e}");
         e
     })?;
-    unpoisoned(state.sessions.write()).insert(id, session);
+    publish_for_page(&state, &pages, &label, &page_generation, id, session)?;
     // The shell can exit before this insert (instant failure, `exit` in an rc
     // file); the waiter's reap then ran with the id absent. Re-check and reap
     // so the pseudoconsole isn't stranded.
@@ -258,6 +307,7 @@ pub async fn pty_open(
 // serialization of every keystroke on both sides of the IPC boundary.
 #[tauri::command]
 pub async fn pty_write(
+    webview: tauri::Webview,
     state: tauri::State<'_, PtyState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<(), String> {
@@ -270,13 +320,7 @@ pub async fn pty_write(
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("pty_write: expected raw body".to_string());
     };
-    let session = unpoisoned(state.sessions.read())
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| {
-            log::warn!("pty_write: unknown id={id}");
-            "no session".to_string()
-        })?;
+    let session = state.owned(id, webview.label())?;
     // One ordered queue per session feeds a dedicated writer thread: no task
     // spawn or lock per keystroke, and the result is the real pipe write's.
     session.write(bytes.clone()).await.map_err(|e| {
@@ -287,18 +331,13 @@ pub async fn pty_write(
 
 #[tauri::command]
 pub fn pty_resize(
+    webview: tauri::Webview,
     state: tauri::State<PtyState>,
     id: u32,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let session = unpoisoned(state.sessions.read())
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| {
-            log::warn!("pty_resize: unknown id={id}");
-            "no session".to_string()
-        })?;
+    let session = state.owned(id, webview.label())?;
     let result = session
         .resize(PtySize {
             rows,
@@ -314,10 +353,10 @@ pub fn pty_resize(
 }
 
 #[tauri::command]
-pub fn pty_close(state: tauri::State<PtyState>, id: u32) -> Result<(), String> {
+pub fn pty_close(webview: tauri::Webview, state: tauri::State<PtyState>, id: u32) -> Result<(), String> {
     // Detached drop: on Windows `ClosePseudoConsole` can block until conhost
     // drains, which would freeze this Tauri worker thread and stall IPC.
-    match state.take(id) {
+    match state.take_owned(id, webview.label())? {
         Some(session) => {
             log::info!("pty closed id={id}");
             reap(id, session, "close");
@@ -328,12 +367,8 @@ pub fn pty_close(state: tauri::State<PtyState>, id: u32) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn pty_has_foreground_process(state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
-    let sessions = unpoisoned(state.sessions.read());
-    let session = sessions.get(&id).ok_or_else(|| {
-        log::warn!("pty_has_foreground_process: unknown session id={id}");
-        "no session".to_string()
-    })?;
+pub fn pty_has_foreground_process(webview: tauri::Webview, state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
+    let session = state.owned(id, webview.label())?;
     let shell_pid = session.shell_pid;
     if shell_pid == 0 {
         return Ok(false);
@@ -346,12 +381,8 @@ pub fn pty_has_foreground_process(state: tauri::State<PtyState>, id: u32) -> Res
 // pty_has_foreground_process, which counts background children too. Windows
 // has no foreground group: there, a child built for the console subsystem.
 #[tauri::command]
-pub fn pty_has_foreground_job(state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
-    let sessions = unpoisoned(state.sessions.read());
-    let session = sessions.get(&id).ok_or_else(|| {
-        log::warn!("pty_has_foreground_job: unknown session id={id}");
-        "no session".to_string()
-    })?;
+pub fn pty_has_foreground_job(webview: tauri::Webview, state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
+    let session = state.owned(id, webview.label())?;
     let shell_pid = session.shell_pid;
     if shell_pid == 0 {
         return Ok(false);
@@ -367,6 +398,35 @@ pub fn pty_has_foreground_job(state: tauri::State<PtyState>, id: u32) -> Result<
     {
         Ok(foreground::shell_has_console_children(shell_pid))
     }
+}
+
+#[tauri::command]
+pub async fn pty_prepare_path_drop(
+    webview: tauri::Webview,
+    state: tauri::State<'_, PtyState>,
+    id: u32,
+    paths: Vec<String>,
+    source: WorkspaceEnv,
+) -> Result<path_drop::Prepared, String> {
+    let session = unpoisoned(state.sessions.read())
+        .get(&id)
+        .filter(|session| *session.owner == *webview.label())
+        .cloned()
+        .ok_or("Terminal no longer exists")?;
+    if session.drop_pending.swap(true, Ordering::AcqRel) {
+        return Err("A path drop is already being prepared for this terminal".into());
+    }
+    crate::modules::fs::blocking(move || {
+        struct Pending(Arc<Session>);
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.0.drop_pending.store(false, Ordering::Release);
+            }
+        }
+        let pending = Pending(session);
+        path_drop::prepare(&pending.0, paths, source)
+    })
+    .await
 }
 
 /// A terminal reported its working directory (OSC 7): authorizes that folder as a workspace root
@@ -400,7 +460,7 @@ pub async fn pty_authorize_cwd(
     drop(session);
     // Canonicalizing the folder touches the disk (a network volume, wsl.exe for WSL).
     crate::modules::fs::blocking(move || {
-        let reported = resolve_path(&path, &WorkspaceEnv::from_option(workspace));
+        let reported = resolve_path(&path, &WorkspaceEnv::from_option(workspace))?;
         let registry = app.state::<WorkspaceRegistry>();
         #[cfg(unix)]
         let taken = cwd::authorize_reported(&registry, &reported, &processes);
@@ -579,6 +639,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn path_drops_require_the_original_live_foreground_shell() {
+        let state = Arc::new(PtyState::default());
+        struct Cleanup<'a>(&'a PtyState);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                for id in [51, 52, 53, 54] {
+                    if let Some(session) = self.0.take(id) {
+                        reap(id, session, "test cleanup");
+                    }
+                }
+            }
+        }
+        let _cleanup = Cleanup(&state);
+        let original = open_running(&state, 51, "main", "read line");
+        let prepare = |session: &Session| {
+            path_drop::prepare(
+                session,
+                vec!["/tmp/a$(echo nope)".into()],
+                WorkspaceEnv::Local,
+            )
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Err(error) = prepare(&original) {
+            assert!(Instant::now() < deadline, "original shell drop: {error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let replaced = open_running(&state, 52, "main", "exec /bin/sleep 30");
+        wait_for("exec replacement", || {
+            path_drop::process_executable(replaced.shell_pid)
+                .is_some_and(|p| p.file_name() == Some(std::ffi::OsStr::new("sleep")))
+        });
+        assert!(prepare(&replaced).is_err());
+        let nested = open_running(&state, 53, "main", "set -m; /bin/sleep 30");
+        wait_for("foreground child", || {
+            unpoisoned(nested.master.lock())
+                .as_ref()
+                .and_then(|master| master.process_group_leader())
+                .is_some_and(|pid| pid > 0 && pid as u32 != nested.shell_pid)
+        });
+        assert!(prepare(&nested).is_err());
+        let shared = open_running(&state, 54, "main", "(read line); :");
+        wait_for("child sharing foreground group", || {
+            foreground::shell_has_children(shared.shell_pid)
+        });
+        assert!(prepare(&shared).is_err());
+        original.close_output();
+        assert!(prepare(&original).is_err());
+    }
+
     /// What `pty_authorize_cwd` decides for terminal `session` and a reported folder.
     fn authorize_reported(session: &Session, registry: &WorkspaceRegistry, folder: &Path) -> bool {
         let leader = unpoisoned(session.master.lock())
@@ -708,5 +818,62 @@ mod tests {
         if let Some(session) = state.take(2) {
             reap(2, session, "test cleanup");
         }
+    }
+
+    #[test]
+    fn terminal_operations_require_the_owning_window() {
+        let state = Arc::new(PtyState::default());
+        let main = open_running(&state, 11, "main", "sleep 30");
+        let quick = open_running(&state, 12, "quick", "sleep 30");
+        // Write, resize and both foreground queries use owned(); close uses
+        // take_owned() under the same registry lock as removal.
+        assert!(state.owned(11, "quick").is_err());
+        assert!(state.owned(12, "main").is_err());
+        assert!(state.take_owned(11, "quick").is_err());
+        assert!(state.take_owned(12, "main").is_err());
+        assert!(Arc::ptr_eq(&state.owned(11, "main").unwrap(), &main));
+        assert!(Arc::ptr_eq(&state.owned(12, "quick").unwrap(), &quick));
+        for (id, owner) in [(11, "main"), (12, "quick")] {
+            let session = state.take_owned(id, owner).unwrap().unwrap();
+            reap(id, session, "test cleanup");
+            assert!(state.take_owned(id, owner).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn a_startup_finishing_after_page_reload_or_close_is_reaped() {
+        for reload in [false, true] {
+            let state = Arc::new(PtyState::default());
+            let pages = NetworkPages::default();
+            pages.begin("main", || {}).unwrap();
+            let generation = pages.finish("main").unwrap();
+            // Hold a real spawned shell outside the registry, like a slow pty_open.
+            let session = open_running(&state, 42, "main", "sleep 30");
+            let pid = session.shell_pid as i32;
+            drop(state.take(42));
+            if reload {
+                pages.begin("main", || {}).unwrap();
+                pages.finish("main").unwrap();
+            } else {
+                pages.close("main", || {});
+            }
+            assert!(publish_for_page(&state, &pages, "main", &generation, 42, session).is_err());
+            assert!(!unpoisoned(state.sessions.read()).contains_key(&42));
+            wait_for("the late-starting shell to be killed", || unsafe { libc::kill(pid, 0) != 0 });
+        }
+    }
+
+    #[test]
+    fn a_current_page_can_publish_and_close_its_terminal() {
+        let state = Arc::new(PtyState::default());
+        let pages = NetworkPages::default();
+        pages.begin("main", || {}).unwrap();
+        let generation = pages.finish("main").unwrap();
+        let session = open(&state, 43, "main");
+        drop(state.take(43));
+        publish_for_page(&state, &pages, "main", &generation, 43, session).unwrap();
+        assert!(unpoisoned(state.sessions.read()).contains_key(&43));
+        pages.close("main", || state.destroy_webview("main"));
+        assert!(!unpoisoned(state.sessions.read()).contains_key(&43));
     }
 }

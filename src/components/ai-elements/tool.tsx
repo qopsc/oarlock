@@ -119,6 +119,7 @@ export type ToolProps = ComponentProps<typeof Collapsible> & {
   input?: unknown;
   output?: unknown;
   errorText?: string;
+  denialReason?: string;
 };
 
 // Tools whose `input` carries large/streaming content (file bodies, sub-
@@ -141,6 +142,7 @@ const ToolImpl = ({
   input,
   output,
   errorText,
+  denialReason,
   defaultOpen,
   ...props
 }: ToolProps) => {
@@ -197,6 +199,8 @@ const ToolImpl = ({
           </span>
         )}
       </CollapsibleTrigger>
+
+      {denialReason ? <p className="px-2 pb-1 text-[11px] text-muted-foreground">{denialReason}</p> : null}
 
       {hasDetails && (
         <CollapsibleContent

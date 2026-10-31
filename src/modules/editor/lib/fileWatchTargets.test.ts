@@ -36,3 +36,23 @@ describe("fileWatchTargets", () => {
     });
   });
 });
+
+it("releases a detached draft's coverage without dropping a replacement editor's watch", () => {
+  const draft: Tab = {
+    id: 1,
+    kind: "editor",
+    spaceId: "s",
+    title: "draft",
+    path: "/repo/a.ts",
+    dirty: true,
+    preview: false,
+    detached: true,
+  };
+  expect(fileWatchTargets([draft])).toEqual({
+    dirs: new Set(),
+    files: new Set(),
+  });
+  expect(
+    fileWatchTargets([draft, { ...draft, id: 2, detached: false }]),
+  ).toEqual({ dirs: new Set(["/repo"]), files: new Set(["/repo/a.ts"]) });
+});

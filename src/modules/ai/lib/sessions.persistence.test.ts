@@ -20,6 +20,35 @@ const storage = vi.hoisted(() => {
     arg?: unknown,
     options?: { headers: Record<string, string> },
   ): Promise<unknown> => {
+    if (command === "ai_sessions_snapshot")
+      return {
+        revision: Number(data.get("revision") ?? 0),
+        sessions: data.get("sessions") ?? [],
+      };
+    if (command === "ai_sessions_mutate") {
+      const { delta } = arg as {
+        delta: {
+          creates: Record<string, unknown>[];
+          updates: { id: string; patch: object }[];
+          deletes: string[];
+        };
+      };
+      let list = (data.get("sessions") ?? []) as Record<string, unknown>[];
+      list = list
+        .filter((s) => !delta.deletes.includes(s.id as string))
+        .map((s) => ({
+          ...s,
+          ...delta.updates.find((u) => u.id === s.id)?.patch,
+        }));
+      list = [
+        ...delta.creates.filter((s) => !list.some((v) => v.id === s.id)),
+        ...list,
+      ];
+      data.set("sessions", list);
+      const revision = Number(data.get("revision") ?? 0) + 1;
+      data.set("revision", revision);
+      return { revision, sessions: list };
+    }
     if (command === "ai_session_save") {
       const meta = JSON.parse(
         options?.headers["x-oarlock-session"] ?? "{}",
@@ -466,4 +495,25 @@ it("preserves the losing window's messages as a new conversation on request", as
   expect(storage.files.get("shared")).toEqual(message("from A"));
   expect([...storage.files.values()]).toContainEqual(message("from B"));
   expect((await b.flushSessionWrites()).ok).toBe(true);
+});
+
+it("merges independent windows' metadata transactions instead of replacing snapshots", async () => {
+  const meta = (id: string) => ({ id, title: id, createdAt: 1, updatedAt: 1 });
+  storage.data.set("sessions", [meta("existing")]);
+  const a = await reload();
+  const b = await reload();
+  const [left, right] = await Promise.all([a.loadAll(), b.loadAll()]);
+  await Promise.all([
+    a.saveSessionsList([meta("a"), ...left.sessions], left.sessions),
+    b.saveSessionsList([meta("b"), ...right.sessions], right.sessions),
+  ]);
+  expect((await a.loadAll()).sessions.map((s) => s.id).sort()).toEqual([
+    "a",
+    "b",
+    "existing",
+  ]);
+  expect(calls("ai_sessions_mutate").map((c) => c[1])).toEqual([
+    { delta: { creates: [meta("a")], updates: [], deletes: [] } },
+    { delta: { creates: [meta("b")], updates: [], deletes: [] } },
+  ]);
 });

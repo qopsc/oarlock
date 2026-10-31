@@ -21,6 +21,7 @@ export type AuthStatus = {
   expiresAtMs: number | null;
   canRefresh: boolean;
   signingIn: boolean;
+  saving?: boolean;
 };
 
 const REASON: Record<AuthReason, string> = {
@@ -39,6 +40,7 @@ function minutes(ms: number): string {
 
 /** One line for the server's card. */
 export function authStatusText(status: AuthStatus, now: number): string {
+  if (status.saving) return "Saving sign-in…";
   if (status.signingIn) return "Waiting for you to sign in in your browser…";
   switch (status.state) {
     case "required": {

@@ -11,7 +11,7 @@
 //! request it; a request carrying a foreign `Origin` (a page in the preview reading it with
 //! `fetch`) is refused, and responses only name the app's own origin.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -56,10 +56,34 @@ pub fn protocol<R: Runtime>(
             return;
         };
         let scope = app.asset_protocol_scope();
-        let all_folders = app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref());
-        let served = |real: &Path| serves(real, scope.is_allowed(real), all_folders);
+        let served = |real: &Path| {
+            serves(
+                real,
+                scope_allows_opened(&scope, real),
+                app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref()),
+            )
+        };
         responder.respond(respond(&request, &origin, served));
     });
+}
+
+// Tauri's is_allowed canonicalizes the supplied path again, which would allow
+// a changed entry to authorize a different open handle. Match the already
+// verified handle path directly, using the asset scope's configured options.
+fn scope_allows_opened(scope: &tauri::scope::fs::Scope, path: &Path) -> bool {
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        require_literal_leading_dot: true,
+        ..Default::default()
+    };
+    !scope
+        .forbidden_patterns()
+        .iter()
+        .any(|pattern| pattern.matches_path_with(path, options))
+        && scope
+            .allowed_patterns()
+            .iter()
+            .any(|pattern| pattern.matches_path_with(path, options))
 }
 
 /// The app's setting, read for each request: the AI tools' setting never widens previews.
@@ -180,22 +204,43 @@ fn respond(
     let Some(path) = requested_path(request.uri().path()) else {
         return status_only(StatusCode::BAD_REQUEST, Some(origin));
     };
-    // A missing file outside reads as refused, so the answer never says whether it exists.
-    let real = match std::fs::canonicalize(&path) {
-        Ok(real) if served(&real) => real,
-        _ => return status_only(StatusCode::FORBIDDEN, Some(origin)),
+    // Authorize the opened object, not a pathname that could be changed before open.
+    // Missing, unverifiable and unauthorized files all receive the same response.
+    let Ok(file) = open_preview(&path) else {
+        return status_only(StatusCode::FORBIDDEN, Some(origin));
     };
+    let Ok(real) = super::fs::attachment::handle_path(&file) else {
+        return status_only(StatusCode::FORBIDDEN, Some(origin));
+    };
+    if !served(&real) {
+        return status_only(StatusCode::FORBIDDEN, Some(origin));
+    }
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return status_only(StatusCode::NOT_FOUND, Some(origin));
+    }
     let range = request
         .headers()
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match read(&real, range, head) {
+    match read(file, &real, range, head) {
         Ok(file) => file.response(origin),
         Err(error) => {
             log::debug!("{SCHEME}: cannot read {}: {error}", real.display());
             status_only(StatusCode::NOT_FOUND, Some(origin))
         }
     }
+}
+
+fn open_preview(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Do not wait for a writer if a requested pathname names a FIFO.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    options.open(path)
 }
 
 /// A file, or the part of it a range asks for, ready to answer with.
@@ -208,8 +253,7 @@ struct Served {
     body: Vec<u8>,
 }
 
-fn read(real: &Path, range: Option<&str>, head: bool) -> std::io::Result<Served> {
-    let mut file = File::open(real)?;
+fn read(mut file: File, real: &Path, range: Option<&str>, head: bool) -> std::io::Result<Served> {
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::other("not a file"));
@@ -254,6 +298,10 @@ fn read(real: &Path, range: Option<&str>, head: bool) -> std::io::Result<Served>
         body,
     })
 }
+
+#[cfg(test)]
+#[path = "asset_all_folders_handle_tests.rs"]
+mod handle_tests;
 
 impl Served {
     fn response(self, origin: &str) -> http::Response<Vec<u8>> {

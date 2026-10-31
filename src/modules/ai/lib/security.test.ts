@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   checkReadable,
@@ -9,6 +12,20 @@ import {
 } from "./security";
 
 describe("checkReadable — secret basenames", () => {
+  it("blocks internal staging contents and placeholders for reads and writes", () => {
+    for (const path of [
+      "/work/.oarlock-stage-0123/content",
+      "/work/.oarlock-save-0123",
+      "C:\\work\\.OARLOCK-STAGE-0123.\\content",
+      "/work/.oarlock-stage-0123",
+    ]) {
+      expect(checkReadable(path)).toMatchObject({ ok: false });
+      expect(checkWritable(path)).toMatchObject({ ok: false });
+    }
+    expect(checkReadable("/work/notes.oarlock-stage-0123")).toEqual({
+      ok: true,
+    });
+  });
   it("blocks plain .env", () => {
     expect(checkReadable("/home/me/.env")).toMatchObject({ ok: false });
   });
@@ -44,9 +61,11 @@ describe("checkReadable — secret basenames", () => {
     expect(checkReadable("/home/me/Documents/id_rsa_old")).toMatchObject({
       ok: false,
     });
-    expect(checkReadable("/home/me/Documents/id_ed25519-backup")).toMatchObject({
-      ok: false,
-    });
+    expect(checkReadable("/home/me/Documents/id_ed25519-backup")).toMatchObject(
+      {
+        ok: false,
+      },
+    );
     expect(checkReadable("/home/me/Documents/id_rsa.pub")).toMatchObject({
       ok: false,
     });
@@ -358,7 +377,7 @@ describe("checkReadableCanonical — parent-directory fallback", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("passes through when neither target nor parent resolves", async () => {
+  it("refuses when no existing ancestor can be resolved", async () => {
     const failing = async () => {
       throw "No such file or directory (os error 2)";
     };
@@ -366,7 +385,7 @@ describe("checkReadableCanonical — parent-directory fallback", () => {
       "/home/me/project/newfile.txt",
       failing,
     );
-    expect(r.ok).toBe(true);
+    expect(r.ok).toBe(false);
   });
 });
 
@@ -473,16 +492,69 @@ describe("checkShellCommand — home directory rm guard", () => {
 
   it("blocks rm -rf on home subdirectories", () => {
     expect(checkShellCommand("rm -rf ~/subdir")).toMatchObject({ ok: false });
-    expect(checkShellCommand("rm -rf ~/subdir && ls")).toMatchObject({ ok: false });
+    expect(checkShellCommand("rm -rf ~/subdir && ls")).toMatchObject({
+      ok: false,
+    });
   });
 
   it("blocks rm -rf when the home target is immediately followed by a pipe", () => {
     expect(checkShellCommand("rm -rf ~|cat")).toMatchObject({ ok: false });
     expect(checkShellCommand("rm -rf $HOME|cat")).toMatchObject({ ok: false });
-    expect(checkShellCommand("rm -rf ${HOME}|cat")).toMatchObject({ ok: false });
+    expect(checkShellCommand("rm -rf ${HOME}|cat")).toMatchObject({
+      ok: false,
+    });
   });
 
   it("does not block rm -rf on explicit absolute paths", () => {
-    expect(checkShellCommand("rm -rf /home/me/safe")).toMatchObject({ ok: true });
+    expect(checkShellCommand("rm -rf /home/me/safe")).toMatchObject({
+      ok: true,
+    });
   });
 });
+
+it("checks the existing ancestor of recursively created directories", async () => {
+  const result = await checkWritableCanonical(
+    "/home/me/link/new/deep",
+    async (path) => {
+      if (path === "/home/me/link/new/deep" || path === "/home/me/link/new")
+        throw "No such file or directory (os error 2)";
+      return path === "/home/me/link" ? "/home/me/.ssh" : path;
+    },
+  );
+  expect(result.ok).toBe(false);
+});
+
+it("refuses a real symlink into a protected directory with multiple missing parents", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oarlock-path-guard-"));
+  try {
+    await mkdir(join(root, ".ssh"));
+    await symlink(join(root, ".ssh"), join(root, "innocent"));
+    const result = await checkWritableCanonical(
+      join(root, "innocent/new/deep"),
+      async (path) => {
+        try {
+          return await realpath(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT")
+            throw "No such file or directory (os error 2)";
+          throw error;
+        }
+      },
+    );
+    expect(result.ok).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it.each(["/new/deep", "C:/new/deep", "C:\\new\\deep"])(
+  "keeps an allowed recursive destination rooted: %s",
+  async (path) => {
+    const root = path.startsWith("C:") ? path.slice(0, 3) : "/";
+    const result = await checkWritableCanonical(path, async (candidate) => {
+      if (candidate === root) return candidate;
+      throw "No such file or directory (os error 2)";
+    });
+    expect(result).toEqual({ ok: true, canonical: path });
+  },
+);

@@ -1,6 +1,7 @@
 const DB_NAME = "oarlock-bg-images";
 const STORE = "images";
 const VERSION = 1;
+const STAGED_IMAGE = /^oarlock-stage-v1-(\d{13})-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -65,6 +66,24 @@ export async function deleteBgImage(id: string): Promise<void> {
     tx.objectStore(STORE).delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error("Image deletion was aborted"));
+  });
+}
+
+/** Only our dated import keys are candidates; legacy and unrelated data remain untouched. */
+export function isStaleBgImage(key: IDBValidKey, now: number): key is string {
+  if (typeof key !== "string") return false;
+  const match = STAGED_IMAGE.exec(key);
+  return !!match && Number(match[1]) <= now - 60_000;
+}
+export async function staleBgImages(now: number): Promise<string[]> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const request = tx.objectStore(STORE).getAllKeys();
+    request.onsuccess = () => resolve(request.result.filter((key) => isStaleBgImage(key, now)) as string[]);
+    request.onerror = () => reject(request.error);
+    tx.onabort = () => reject(tx.error);
   });
 }
 
@@ -104,7 +123,7 @@ export async function importBgImageFromFile(file: File): Promise<{ id: string; b
   if (!file.type.startsWith("image/")) {
     throw new Error("This file isn't an image.");
   }
-  const id = crypto.randomUUID();
+  const id = `oarlock-stage-v1-${Date.now()}-${crypto.randomUUID()}`;
   const animated = await isAnimated(file);
   const limit = animated ? MAX_ANIMATED_BYTES : MAX_STATIC_BYTES;
   if (file.size > limit) {

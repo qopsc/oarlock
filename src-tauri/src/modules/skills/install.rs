@@ -10,10 +10,10 @@ use serde::Serialize;
 
 use super::discover::{read_skill_text, SKILL_FILE};
 use super::frontmatter::{parse_skill, validate_name, yaml_scalar, MAX_DESCRIPTION_CHARS};
-use crate::modules::git::process::{ensure_git_available, ensure_success, run_git};
+use crate::modules::git::process::{ensure_git_available, ensure_success, run_git_guarded};
 use crate::modules::git::types::NETWORK_TIMEOUT_SECS;
-use crate::modules::git::utils::validate_branch_name;
-use crate::modules::workspace::{is_plain_name, WorkspaceEnv};
+use crate::modules::git::utils::{owned_repo_root, validate_branch_name};
+use crate::modules::workspace::{is_plain_name, WorkspaceEnv, WorkspaceRegistry};
 
 pub const STAGING_PREFIX: &str = ".install-";
 const MAX_URL_LEN: usize = 2048;
@@ -158,6 +158,7 @@ pub fn clone(staging: &Path, source: &GitSource) -> Result<PathBuf, String> {
         "clone",
         "--depth",
         "1",
+        "--no-checkout",
         "--no-tags",
         "--single-branch",
     ]
@@ -170,10 +171,11 @@ pub fn clone(staging: &Path, source: &GitSource) -> Result<PathBuf, String> {
     }
     args.extend(["--".to_owned(), source.url.clone(), "repo".to_owned()]);
     let staging_str = staging.to_string_lossy().into_owned();
-    let output = run_git(&local, Some(&staging_str), &args, NETWORK_TIMEOUT_SECS)
+    let output = run_git_guarded(&local, Some(&staging_str), &args, NETWORK_TIMEOUT_SECS)
         .map_err(|e| e.to_string())?;
     ensure_success(&output, "git clone").map_err(|e| e.to_string())?;
     let repo = std::fs::canonicalize(staging.join("repo")).map_err(|e| e.to_string())?;
+    checkout_guarded(&repo)?;
     match &source.subpath {
         None => Ok(repo),
         Some(subpath) => {
@@ -185,6 +187,18 @@ pub fn clone(staging: &Path, source: &GitSource) -> Result<PathBuf, String> {
             Ok(folder)
         }
     }
+}
+
+/// Inspect the just-cloned repository before any checkout can run a filter.
+fn checkout_guarded(repo: &Path) -> Result<(), String> {
+    let registry = WorkspaceRegistry::default();
+    let root = registry.authorize(repo).map_err(|e| e.to_string())?;
+    let owned = owned_repo_root(&registry, &root.to_string_lossy(), &WorkspaceEnv::Local)
+        .map_err(|e| e.to_string())?;
+    let output = owned
+        .run(["checkout", "--force"], NETWORK_TIMEOUT_SECS)
+        .map_err(|e| e.to_string())?;
+    ensure_success(&output, "git checkout").map_err(|e| e.to_string())
 }
 
 /// Extracts a zip into `dest` (an empty folder): plain relative names only, no links, no
@@ -517,6 +531,127 @@ pub fn template(name: &str, description: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn clone_without_checkout() -> Option<tempfile::TempDir> {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.name", "Test"]);
+        git(&source, &["config", "user.email", "test@example.invalid"]);
+        git(&source, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(source.join(".gitattributes"), "SKILL.md filter=probe\n").unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: test\n---\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "initial"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                "--no-checkout",
+                source.to_str().unwrap(),
+                "repo",
+            ],
+        );
+        Some(dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_clone_runs_without_checkout_then_populates_the_inspected_repo() {
+        use std::{os::unix::fs::PermissionsExt, process::Command};
+        const SOURCE: &str = "OARLOCK_TEST_SKILL_CLONE_SOURCE";
+        const STAGING: &str = "OARLOCK_TEST_SKILL_CLONE_STAGING";
+        if std::env::var_os(SOURCE).is_some() {
+            let staging = PathBuf::from(std::env::var_os(STAGING).unwrap());
+            let result = clone(&staging, &source("https://example.invalid/repo")).unwrap();
+            assert!(result.join("SKILL.md").is_file());
+            return;
+        }
+        let Some(dir) = clone_without_checkout() else {
+            return;
+        };
+        let staging = dir.path().join("stage");
+        let binaries = dir.path().join("bin");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::create_dir(&binaries).unwrap();
+        let real_git = if cfg!(target_os = "macos") {
+            "/Library/Developer/CommandLineTools/usr/bin/git"
+        } else {
+            "/usr/bin/git"
+        };
+        let wrapper = binaries.join("git");
+        let script = format!("#!/bin/sh\ncase \" $* \" in\n  *\" clone \"*) case \" $* \" in *\" --no-checkout \"*) ;; *) exit 77 ;; esac; exec {real_git} -c protocol.file.allow=always clone --no-checkout \"$OARLOCK_TEST_SKILL_CLONE_SOURCE\" repo ;;\n  *) exec {real_git} \"$@\" ;;\nesac\n");
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let search_path = format!(
+            "{}:{}",
+            binaries.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "modules::skills::install::tests::skill_clone_runs_without_checkout_then_populates_the_inspected_repo", "--nocapture"])
+            .env("PATH", search_path).env(SOURCE, dir.path().join("source")).env(STAGING, staging)
+            .output().unwrap();
+        assert!(
+            result.status.success(),
+            "child failed: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn skill_checkout_refuses_configured_smudge_filter() {
+        let Some(dir) = clone_without_checkout() else {
+            return;
+        };
+        let repo = dir.path().join("repo");
+        std::fs::write(
+            repo.join(".git/probe.sh"),
+            "#!/bin/sh\nprintf ran > .git/filter-ran\ncat\n",
+        )
+        .unwrap();
+        let result = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["config", "filter.probe.smudge", "sh .git/probe.sh"])
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert!(checkout_guarded(&repo).unwrap_err().contains("filter"));
+        assert!(!repo.join(".git/filter-ran").exists());
+        assert!(!repo.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn skill_checkout_populates_a_clean_clone() {
+        let Some(dir) = clone_without_checkout() else {
+            return;
+        };
+        let repo = dir.path().join("repo");
+        checkout_guarded(&repo).unwrap();
+        assert!(repo.join("SKILL.md").is_file());
+    }
 
     fn source(url: &str) -> GitSource {
         GitSource {

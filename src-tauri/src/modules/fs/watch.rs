@@ -45,7 +45,57 @@ trait Backend: Send {
     /// the set; implementations must be a no-op when nothing relevant moved.
     fn sync(&mut self, set: &WatchSet);
     fn needs_retry(&self) -> bool {
+        self.health_error().is_some()
+    }
+    fn health_error(&self) -> Option<String> {
+        None
+    }
+    fn publishes_health(&self) -> bool {
         false
+    }
+}
+
+/// Conservative shared coverage: any backend failure degrades live consumers
+/// until recovery. Revisions prevent an older IPC snapshot undoing an event.
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize)]
+pub struct WatchHealth {
+    revision: u64,
+    error: Option<String>,
+}
+#[derive(Default)]
+struct HealthState {
+    snapshot: WatchHealth,
+    backend: Option<String>,
+    poller: Option<String>,
+}
+impl HealthState {
+    fn update(&mut self, error: Option<String>, poller: bool) -> Option<WatchHealth> {
+        if poller {
+            self.poller = error;
+        } else {
+            self.backend = error;
+        }
+        let error = self.backend.clone().or_else(|| self.poller.clone());
+        if error == self.snapshot.error {
+            return None;
+        }
+        self.snapshot.revision += 1;
+        self.snapshot.error = error;
+        Some(self.snapshot.clone())
+    }
+}
+fn publish_health(
+    health: &Mutex<HealthState>,
+    app: Option<&AppHandle>,
+    error: Option<String>,
+    poller: bool,
+) {
+    let changed = health
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .update(error, poller);
+    if let (Some(snapshot), Some(app)) = (changed, app) {
+        let _ = app.emit("watch:health", snapshot);
     }
 }
 
@@ -53,6 +103,8 @@ trait Backend: Send {
 /// filter against, a way to report a batch, and the file-list cache.
 #[derive(Clone)]
 struct Sink {
+    health: Arc<Mutex<HealthState>>,
+    app: Option<AppHandle>,
     tx: mpsc::Sender<Batch>,
     dirs: Arc<RwLock<Arc<DirSet>>>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -60,6 +112,14 @@ struct Sink {
 }
 
 impl Sink {
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    fn failed(&self, error: String) {
+        self.coverage(Some(error));
+    }
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    fn coverage(&self, error: Option<String>) {
+        publish_health(&self.health, self.app.as_ref(), error, false);
+    }
     fn send(&self, batch: Batch) {
         if !batch.is_empty() {
             let _ = self.tx.send(batch);
@@ -97,6 +157,8 @@ impl Shared {
 }
 
 struct Running {
+    health: Arc<Mutex<HealthState>>,
+    app: Option<AppHandle>,
     shared: Arc<Shared>,
     backend: Box<dyn Backend>,
     /// The batch channel for the share poller, taken when the first directory on the share is
@@ -106,69 +168,112 @@ struct Running {
 
 #[derive(Default)]
 pub struct FsWatchState {
+    health: Arc<Mutex<HealthState>>,
     inner: Mutex<Option<Running>>,
     owners: Mutex<WatchOwners>,
 }
 
-/// The watches each window holds, so a window that closes or reloads gives
-/// back what it never removed.
+/// Registrations belong to one window incarnation. A preparation that outlives
+/// release_window cannot install into a reloaded window with the same label.
 #[derive(Default)]
-struct WatchOwners(HashMap<String, Held>);
-
-/// Directories and repositories as (key, spelling), files as (directory key, key, spelling).
+struct WatchOwners {
+    windows: HashMap<String, WindowWatches>,
+    next_id: u64,
+}
+#[derive(Default)]
+struct WindowWatches {
+    incarnation: Arc<()>,
+    handles: HashMap<String, Held>,
+}
 type HeldDir = (String, String);
 type HeldFile = (String, String, String);
+type HeldRepo = (String, String, String); // canonical root, spelling, acquired git directory
 
-#[derive(Default, Debug, PartialEq)]
-struct Held {
-    dirs: HashMap<HeldDir, usize>,
-    files: HashMap<HeldFile, usize>,
-    repos: HashMap<HeldDir, usize>,
+#[derive(Debug, PartialEq)]
+enum Held {
+    Directory(HeldDir),
+    File(HeldFile),
+    Repository(HeldRepo),
 }
-
-impl WatchOwners {
-    fn add(&mut self, owner: &str, dirs: &[HeldDir], files: &[HeldFile], repos: &[HeldDir]) {
-        let held = self.0.entry(owner.to_owned()).or_default();
-        for dir in dirs {
-            *held.dirs.entry(dir.clone()).or_default() += 1;
+impl Held {
+    fn release_all(held: Vec<Self>, set: &mut WatchSet) -> bool {
+        let mut moved = false;
+        for registration in held {
+            moved |= registration.release(set);
         }
-        for file in files {
-            *held.files.entry(file.clone()).or_default() += 1;
-        }
-        for repo in repos {
-            *held.repos.entry(repo.clone()).or_default() += 1;
-        }
+        moved
     }
-
-    fn remove(&mut self, owner: &str, dirs: &[HeldDir], files: &[HeldFile], repos: &[HeldDir]) {
-        let Some(held) = self.0.get_mut(owner) else {
-            return;
-        };
-        fn release<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, usize>, key: &K) {
-            if let Some(count) = counts.get_mut(key) {
-                *count -= 1;
-                if *count == 0 {
-                    counts.remove(key);
-                }
+    fn release(self, set: &mut WatchSet) -> bool {
+        match self {
+            Self::Directory((dir, spelling)) => set.remove_dir(&dir, &spelling),
+            Self::File((dir, key, spelling)) => set.remove_file(&dir, &key, &spelling),
+            Self::Repository((root, spelling, git_dir)) => {
+                release_repo(set, &root, &spelling, &git_dir)
             }
         }
-        for dir in dirs {
-            release(&mut held.dirs, dir);
-        }
-        for file in files {
-            release(&mut held.files, file);
-        }
-        for repo in repos {
-            release(&mut held.repos, repo);
-        }
-        if held.dirs.is_empty() && held.files.is_empty() && held.repos.is_empty() {
-            self.0.remove(owner);
+    }
+}
+impl WatchOwners {
+    fn begin(&mut self, owner: &str) -> Arc<()> {
+        self.windows
+            .entry(owner.to_owned())
+            .or_default()
+            .incarnation
+            .clone()
+    }
+    fn current(&self, owner: &str, incarnation: &Arc<()>) -> Result<(), String> {
+        if self
+            .windows
+            .get(owner)
+            .is_some_and(|w| Arc::ptr_eq(&w.incarnation, incarnation))
+        {
+            Ok(())
+        } else {
+            Err("Watch owner closed or reloaded".into())
         }
     }
+    fn reserve(&mut self, count: usize) -> Result<Vec<String>, String> {
+        let end = self
+            .next_id
+            .checked_add(count as u64)
+            .ok_or("Watch handle space exhausted")?;
+        let ids = (self.next_id..end).map(|id| id.to_string()).collect();
+        self.next_id = end;
+        Ok(ids)
+    }
+    fn keep(&mut self, owner: &str, handles: impl IntoIterator<Item = (String, Held)>) {
+        self.windows
+            .get_mut(owner)
+            .expect("validated owner while locked")
+            .handles
+            .extend(handles);
+    }
+    fn release(&mut self, owner: &str, handles: &[String]) -> Vec<Held> {
+        let Some(window) = self.windows.get_mut(owner) else {
+            return vec![];
+        };
+        handles
+            .iter()
+            .filter_map(|id| window.handles.remove(id))
+            .collect()
+    }
+    fn take(&mut self, owner: &str) -> Vec<Held> {
+        self.windows
+            .remove(owner)
+            .map(|w| w.handles.into_values().collect())
+            .unwrap_or_default()
+    }
+}
 
-    fn take(&mut self, owner: &str) -> Held {
-        self.0.remove(owner).unwrap_or_default()
-    }
+#[derive(serde::Serialize)]
+struct WatchPath {
+    path: String,
+    handle: String,
+}
+#[derive(Default, serde::Serialize)]
+pub struct FsWatchHandles {
+    directories: Vec<WatchPath>,
+    files: Vec<WatchPath>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -184,12 +289,14 @@ struct GitChangedPayload {
     repo_roots: Vec<String>,
 }
 
-fn start(app: &AppHandle) -> Result<Running, String> {
+fn start(app: &AppHandle, health: Arc<Mutex<HealthState>>) -> Result<Running, String> {
     let (tx, rx) = mpsc::channel::<Batch>();
     let poll_tx = Some(tx.clone());
     let shared = Arc::new(Shared::new());
     let index = app.state::<FileIndexState>().inner().clone();
     let sink = Sink {
+        health: health.clone(),
+        app: Some(app.clone()),
         tx,
         dirs: shared.dirs.clone(),
         index: index.clone(),
@@ -197,6 +304,7 @@ fn start(app: &AppHandle) -> Result<Running, String> {
     let backend: Box<dyn Backend> = Box::new(PlatformBackend::new(sink)?);
 
     let drain_shared = shared.clone();
+    let emitter = app.clone();
     let app = app.clone();
     std::thread::Builder::new()
         .name("oarlock-fs-watch".into())
@@ -204,6 +312,8 @@ fn start(app: &AppHandle) -> Result<Running, String> {
         .spawn(move || drain_loop(rx, drain_shared, app, index))
         .map_err(|e| e.to_string())?;
     Ok(Running {
+        health,
+        app: Some(emitter),
         shared,
         backend,
         poll_tx,
@@ -244,7 +354,7 @@ fn poll_once(tx: &mpsc::Sender<Batch>, shared: &Shared) -> bool {
     }
     let signatures: Vec<Option<u64>> = polled
         .iter()
-        .map(|(_, path)| plan::listing_signature(path))
+        .map(|(_, path)| path.as_deref().and_then(plan::listing_signature))
         .collect();
     // The files open in editors are registered under the same directory. An edit in place
     // leaves the listing untouched, so their own stamps are what move.
@@ -353,7 +463,8 @@ fn resolve_changes(pending: Pending, shared: &Shared) -> Changes {
     let (touched, locations) = {
         let set = shared.set.lock().unwrap_or_else(|e| e.into_inner());
         let touched = pending.resolve(set.dir_keys());
-        let locations: Vec<Option<PathBuf>> = touched.iter().map(|dir| set.dir_path(dir)).collect();
+        let locations: Vec<Option<PathBuf>> =
+            touched.iter().map(|dir| set.listing_path(dir)).collect();
         (touched, locations)
     };
     // Reading the directories happens outside the lock: add/remove never wait for the disk.
@@ -384,38 +495,29 @@ fn prepare_dirs(
     gates: Gates<'_>,
     workspace: &WorkspaceEnv,
     paths: Vec<String>,
-) -> Vec<(String, PathBuf)> {
-    paths
-        .into_iter()
-        .filter_map(|raw| {
-            let resolved = resolve_path(&raw, workspace);
-            let canonical = std::fs::canonicalize(&resolved).ok()?;
-            if !canonical.is_dir() || plan::is_skipped(&canonical) || !gates.reaches(&canonical) {
-                return None;
-            }
-            Some((raw, canonical))
-        })
-        .collect()
-}
-
-/// The key a directory being released was registered under. A removed or renamed directory no
-/// longer canonicalizes, but its parent usually still does.
-fn removal_dir_key(workspace: &WorkspaceEnv, raw: &str) -> String {
-    let resolved = resolve_path(raw, workspace);
-    if let Ok(canonical) = std::fs::canonicalize(&resolved) {
-        return to_canon(canonical);
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut dirs = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let resolved = resolve_path(&raw, workspace)?;
+        let canonical =
+            std::fs::canonicalize(&resolved).map_err(|e| format!("Cannot watch {raw}: {e}"))?;
+        if !canonical.is_dir() || !gates.reaches(&canonical) {
+            return Err(format!(
+                "Cannot watch {raw}: directory unavailable or not authorized"
+            ));
+        }
+        if !plan::is_skipped(&canonical) {
+            dirs.push((raw, canonical));
+        }
     }
-    match canonical_file(workspace, raw) {
-        Some((_, key, _)) => key,
-        None => to_canon(resolved),
-    }
+    Ok(dirs)
 }
 
 /// A file is identified by its canonical directory plus its own name, so the
 /// path we report matches what editor tabs store even when the file itself no
 /// longer exists.
 fn canonical_file(workspace: &WorkspaceEnv, raw: &str) -> Option<(String, String, PathBuf)> {
-    let resolved = resolve_path(raw, workspace);
+    let resolved = resolve_path(raw, workspace).ok()?;
     let name = resolved.file_name()?.to_owned();
     let parent = std::fs::canonicalize(resolved.parent()?).ok()?;
     let file = parent.join(name);
@@ -429,30 +531,10 @@ impl FsWatchState {
 
     /// Gives back every watch `owner` (a window) still holds.
     pub fn release_window(&self, app: &AppHandle, owner: &str) {
-        let held = self.owners().take(owner);
-        if held.dirs.is_empty() && held.files.is_empty() && held.repos.is_empty() {
-            return;
-        }
+        let mut owners = self.owners();
+        let held = owners.take(owner);
         let _ = self.with_running(app, false, |running| {
-            running.apply(|set| {
-                let mut moved = false;
-                for ((dir, spelling), count) in &held.dirs {
-                    for _ in 0..*count {
-                        moved |= set.remove_dir(dir, spelling);
-                    }
-                }
-                for ((dir, key, spelling), count) in &held.files {
-                    for _ in 0..*count {
-                        set.remove_file(dir, key, spelling);
-                    }
-                }
-                for ((root, spelling), count) in &held.repos {
-                    for _ in 0..*count {
-                        moved |= release_repo(set, root, spelling);
-                    }
-                }
-                moved
-            });
+            running.apply(|set| Held::release_all(held, set));
         });
     }
 
@@ -467,7 +549,13 @@ impl FsWatchState {
             if !create {
                 return Ok(None);
             }
-            *guard = Some(start(app)?);
+            match start(app, self.health.clone()) {
+                Ok(running) => *guard = Some(running),
+                Err(error) => {
+                    publish_health(&self.health, Some(app), Some(error.clone()), false);
+                    return Err(error);
+                }
+            }
         }
         Ok(guard.as_mut().map(f))
     }
@@ -483,12 +571,53 @@ impl Running {
             return;
         }
         *self.shared.dirs.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set.snapshot());
+        let previous = self
+            .health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot
+            .error
+            .is_some();
         self.backend.sync(&set);
+        if !self.backend.publishes_health() {
+            publish_health(
+                &self.health,
+                self.app.as_ref(),
+                self.backend.health_error(),
+                false,
+            );
+        }
         let poll = set.has_polled_dirs();
         drop(set);
         if poll {
             self.start_polling();
             self.shared.polling.notify_one();
+        } else {
+            publish_health(&self.health, self.app.as_ref(), None, true);
+        }
+        let recovered = previous
+            && self
+                .health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot
+                .error
+                .is_none();
+        if recovered {
+            if let Some(app) = &self.app {
+                let (paths, repo_roots) = self
+                    .shared
+                    .set
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .refresh_targets();
+                if !paths.is_empty() {
+                    let _ = app.emit("fs:changed", ChangedPayload { paths });
+                }
+                if !repo_roots.is_empty() {
+                    let _ = app.emit("git:changed", GitChangedPayload { repo_roots });
+                }
+            }
         }
     }
 
@@ -497,14 +626,49 @@ impl Running {
             return;
         };
         let shared = self.shared.clone();
+        let retry_tx = tx.clone();
         let spawned = std::thread::Builder::new()
             .name("oarlock-fs-poll".into())
             .stack_size(256 * 1024)
             .spawn(move || poll_loop(tx, shared));
         if let Err(e) = spawned {
-            log::warn!("fs watch poller failed to start: {e}");
+            self.poll_tx = Some(retry_tx);
+            publish_health(
+                &self.health,
+                self.app.as_ref(),
+                Some(format!("File watcher polling could not start: {e}")),
+                true,
+            );
+        } else {
+            publish_health(&self.health, self.app.as_ref(), None, true);
         }
     }
+}
+
+#[tauri::command]
+pub fn watch_health(state: tauri::State<FsWatchState>) -> WatchHealth {
+    state
+        .health
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .snapshot
+        .clone()
+}
+
+#[tauri::command]
+pub async fn watch_retry(app: AppHandle) -> Result<WatchHealth, String> {
+    blocking(move || {
+        let state = app.state::<FsWatchState>();
+        state.with_running(&app, true, |running| running.apply(|_| true))?;
+        let snapshot = state
+            .health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot
+            .clone();
+        Ok(snapshot)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -514,107 +678,96 @@ pub async fn fs_watch_add(
     paths: Vec<String>,
     files: Option<Vec<String>>,
     workspace: Option<WorkspaceEnv>,
-) -> Result<(), String> {
+) -> Result<FsWatchHandles, String> {
     let owner = webview.label().to_owned();
+    let incarnation = app.state::<FsWatchState>().owners().begin(&owner);
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
         let gates = app.state::<WorkspaceRegistry>().inner().gates(Origin::App);
-        let dirs = prepare_dirs(gates, &workspace, paths);
+        let dirs = prepare_dirs(gates, &workspace, paths)?;
         let files: Vec<_> = files
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|raw| {
-                let (dir, key, path) = canonical_file(&workspace, &raw)?;
-                // Its folder, as the watch sees it: the file's own changes are reported from there.
-                if !gates.reaches(path.parent()?) {
-                    return None;
+            .map(|raw| {
+                let (dir, key, path) = canonical_file(&workspace, &raw)
+                    .ok_or_else(|| format!("Cannot watch {raw}: parent directory unavailable"))?;
+                if !path.parent().is_some_and(|parent| gates.reaches(parent)) {
+                    return Err(format!("Cannot watch {raw}: directory not authorized"));
                 }
-                Some((dir, key, raw, FileStamp::of(&path)))
+                Ok((dir, key, raw, FileStamp::of(&path)))
             })
-            .collect();
-        if dirs.is_empty() && files.is_empty() {
-            return Ok(());
-        }
-        let held_dirs: Vec<HeldDir> = dirs
-            .iter()
-            .map(|(spelling, dir)| (to_canon(dir), spelling.clone()))
-            .collect();
-        let held_files: Vec<HeldFile> = files
-            .iter()
-            .map(|(dir, key, spelling, _)| (dir.clone(), key.clone(), spelling.clone()))
-            .collect();
-        // Taken before the OS watch starts (inside `apply`), so a change after it differs.
-        let baselines: Vec<Option<u64>> = dirs
+            .collect::<Result<_, String>>()?;
+        let baselines: Vec<_> = dirs
             .iter()
             .map(|(_, dir)| plan::listing_signature(dir))
             .collect();
-        app.state::<FsWatchState>()
-            .with_running(&app, true, |running| {
-                running.apply(|set| {
-                    let mut moved = false;
-                    for ((spelling, dir), signature) in dirs.into_iter().zip(baselines) {
-                        let key = to_canon(&dir);
-                        // A `/mnt/<drive>` workspace path already became a native drive path in
-                        // `prepare_dirs`; what is left on the share can never notify.
-                        let poll = plan::is_wsl_share(&key);
-                        if set.add_dir(key.clone(), spelling, dir, poll) {
-                            set.record_listing(&key, signature);
-                            moved = true;
-                        }
+        let state = app.state::<FsWatchState>();
+        // Same lock order for acquire, explicit release and window cleanup.
+        let mut owners = state.owners();
+        owners.current(&owner, &incarnation)?;
+        let mut ids = owners.reserve(dirs.len() + files.len())?.into_iter();
+        let mut handles = FsWatchHandles::default();
+        let mut held = Vec::new();
+        if dirs.is_empty() && files.is_empty() {
+            return Ok(handles);
+        }
+        state.with_running(&app, true, |running| {
+            running.apply(|set| {
+                let mut moved = false;
+                for ((spelling, dir), signature) in dirs.into_iter().zip(baselines) {
+                    let key = to_canon(&dir);
+                    let handle = ids.next().expect("reserved handle");
+                    held.push((
+                        handle.clone(),
+                        Held::Directory((key.clone(), spelling.clone())),
+                    ));
+                    handles.directories.push(WatchPath {
+                        path: spelling.clone(),
+                        handle,
+                    });
+                    let poll = plan::is_wsl_share(&key);
+                    if set.add_dir(key.clone(), spelling, dir, poll) {
+                        set.record_listing(&key, signature);
+                        moved = true;
                     }
-                    for (dir, key, spelling, stamp) in files {
-                        set.add_file(dir, key, spelling, stamp);
-                    }
-                    moved
-                });
-            })?;
-        app.state::<FsWatchState>()
-            .owners()
-            .add(&owner, &held_dirs, &held_files, &[]);
-        Ok(())
+                }
+                for (dir, key, spelling, stamp) in files {
+                    let handle = ids.next().expect("reserved handle");
+                    held.push((
+                        handle.clone(),
+                        Held::File((dir.clone(), key.clone(), spelling.clone())),
+                    ));
+                    handles.files.push(WatchPath {
+                        path: spelling.clone(),
+                        handle,
+                    });
+                    moved |= set.add_file(dir, key, spelling, stamp);
+                }
+                moved
+            })
+        })?;
+        owners.keep(&owner, held);
+        Ok(handles)
     })
     .await
 }
 
+/// Release exactly the acquisitions named by this window. No path or workspace
+/// lookup is needed, so this works after deletion or loss of a WSL environment.
 #[tauri::command]
-pub async fn fs_watch_remove(
+pub async fn watch_release(
     app: AppHandle,
     webview: tauri::Webview,
-    paths: Vec<String>,
-    files: Option<Vec<String>>,
-    workspace: Option<WorkspaceEnv>,
+    handles: Vec<String>,
 ) -> Result<(), String> {
     let owner = webview.label().to_owned();
     blocking(move || {
-        let workspace = WorkspaceEnv::from_option(workspace);
-        let dirs: Vec<HeldDir> = paths
-            .into_iter()
-            .map(|raw| (removal_dir_key(&workspace, &raw), raw))
-            .collect();
-        let files: Vec<HeldFile> = files
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|raw| {
-                let (dir, key, _) = canonical_file(&workspace, &raw)?;
-                Some((dir, key, raw))
-            })
-            .collect();
-        app.state::<FsWatchState>()
-            .with_running(&app, false, |running| {
-                running.apply(|set| {
-                    let mut moved = false;
-                    for (dir, spelling) in &dirs {
-                        moved |= set.remove_dir(dir, spelling);
-                    }
-                    for (dir, key, spelling) in &files {
-                        set.remove_file(dir, key, spelling);
-                    }
-                    moved
-                });
-            })?;
-        app.state::<FsWatchState>()
-            .owners()
-            .remove(&owner, &dirs, &files, &[]);
+        let state = app.state::<FsWatchState>();
+        let mut owners = state.owners();
+        let held = owners.release(&owner, &handles);
+        state.with_running(&app, false, |running| {
+            running.apply(|set| Held::release_all(held, set))
+        })?;
         Ok(())
     })
     .await
@@ -633,7 +786,7 @@ fn git_dir_of(root: &Path, workspace: &WorkspaceEnv) -> Option<PathBuf> {
         return std::fs::canonicalize(dot_git).ok();
     }
     let mut text = String::new();
-    std::fs::File::open(&dot_git)
+    crate::modules::project_trust::open_regular(&dot_git)
         .ok()?
         .take(4096)
         .read_to_string(&mut text)
@@ -641,7 +794,7 @@ fn git_dir_of(root: &Path, workspace: &WorkspaceEnv) -> Option<PathBuf> {
     let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
     // A WSL repository names its git dir as a Linux path.
     let path = if target.starts_with('/') || Path::new(target).is_absolute() {
-        resolve_path(target, workspace)
+        resolve_path(target, workspace).ok()?
     } else {
         root.join(target)
     };
@@ -665,10 +818,13 @@ fn plan_repo_watch(
     workspace: &WorkspaceEnv,
     repo_root: String,
 ) -> Option<RepoWatchPlan> {
-    let root = std::fs::canonicalize(resolve_path(&repo_root, workspace)).ok()?;
+    let root = std::fs::canonicalize(resolve_path(&repo_root, workspace).ok()?).ok()?;
     if !root.is_dir() || !registry.is_authorized(&root) {
         return None;
     }
+    // A gitfile can name another repository. Use the same authorization and
+    // reciprocal-linked-worktree rules as Git before listing its metadata.
+    crate::modules::git::ownership::authorize_repository_metadata(registry, &root).ok()?;
     let git_dir = git_dir_of(&root, workspace)?;
     let git_dir_key = to_canon(&git_dir);
     let files = GIT_STATE_FILES
@@ -715,16 +871,15 @@ fn register_repo(set: &mut WatchSet, plan: RepoWatchPlan) -> bool {
 
 /// Undoes one `register_repo` of `root` under `spelling`. True when the set of watched
 /// directories moved.
-fn release_repo(set: &mut WatchSet, root: &str, spelling: &str) -> bool {
-    let Some(git_dir) = set.repo_git_dir(root, spelling) else {
+fn release_repo(set: &mut WatchSet, root: &str, spelling: &str, git_dir: &str) -> bool {
+    if !set.remove_repo(root, spelling, git_dir) {
         return false;
-    };
-    set.remove_repo(root, spelling);
+    }
     for name in GIT_STATE_FILES {
         let key = format!("{}/{name}", git_dir.trim_end_matches('/'));
-        set.remove_file(&git_dir, &key, &key);
+        set.remove_file(git_dir, &key, &key);
     }
-    set.remove_dir(&git_dir, &git_dir)
+    set.remove_dir(git_dir, git_dir)
 }
 
 /// Watches a repository while a Source Control view of it is on screen: activity in its git
@@ -736,46 +891,27 @@ pub async fn git_watch_add(
     webview: tauri::Webview,
     repo_root: String,
     workspace: Option<WorkspaceEnv>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let owner = webview.label().to_owned();
+    let incarnation = app.state::<FsWatchState>().owners().begin(&owner);
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let Some(plan) = plan_repo_watch(&app.state::<WorkspaceRegistry>(), &workspace, repo_root)
-        else {
-            return Ok(());
-        };
-        let held = (plan.root.clone(), plan.spelling.clone());
-        app.state::<FsWatchState>()
-            .with_running(&app, true, |running| {
-                running.apply(|set| register_repo(set, plan));
-            })?;
-        app.state::<FsWatchState>()
-            .owners()
-            .add(&owner, &[], &[], &[held]);
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn git_watch_remove(
-    app: AppHandle,
-    webview: tauri::Webview,
-    repo_root: String,
-    workspace: Option<WorkspaceEnv>,
-) -> Result<(), String> {
-    let owner = webview.label().to_owned();
-    blocking(move || {
-        let workspace = WorkspaceEnv::from_option(workspace);
-        let held = (removal_dir_key(&workspace, &repo_root), repo_root);
-        app.state::<FsWatchState>()
-            .with_running(&app, false, |running| {
-                running.apply(|set| release_repo(set, &held.0, &held.1));
-            })?;
-        app.state::<FsWatchState>()
-            .owners()
-            .remove(&owner, &[], &[], &[held]);
-        Ok(())
+        let plan = plan_repo_watch(&app.state::<WorkspaceRegistry>(), &workspace, repo_root)
+            .ok_or("Cannot watch this repository in its owning environment")?;
+        let held = Held::Repository((
+            plan.root.clone(),
+            plan.spelling.clone(),
+            plan.git_dir_key.clone(),
+        ));
+        let state = app.state::<FsWatchState>();
+        let mut owners = state.owners();
+        owners.current(&owner, &incarnation)?;
+        let handle = owners.reserve(1)?.pop().expect("reserved handle");
+        state.with_running(&app, true, |running| {
+            running.apply(|set| register_repo(set, plan))
+        })?;
+        owners.keep(&owner, [(handle.clone(), held)]);
+        Ok(handle)
     })
     .await
 }
@@ -808,32 +944,30 @@ pub fn note_written(app: &AppHandle, path: &Path) {
 mod tests {
 
     #[test]
-    fn a_window_gives_back_the_watches_it_still_holds() {
+    fn handles_are_owned_idempotent_and_cannot_cross_window_incarnations() {
         let mut owners = WatchOwners::default();
-        let dir = |d: &str| (d.to_owned(), d.to_owned());
-        let file = |d: &str, f: &str| (d.to_owned(), f.to_owned(), f.to_owned());
-        owners.add(
+        let old = owners.begin("main");
+        owners.begin("other");
+        let id = owners.reserve(1).unwrap().pop().unwrap();
+        owners.keep(
             "main",
-            &[dir("/a"), dir("/a")],
-            &[file("/a", "/a/x")],
-            &[dir("/r")],
+            [(id.clone(), Held::Directory(("/a".into(), "/a".into())))],
         );
-        owners.add("w-1", &[dir("/a")], &[], &[]);
-        owners.remove("main", &[dir("/a")], &[], &[]);
-        // Removing what the window never added changes nothing.
-        owners.remove("main", &[dir("/b")], &[file("/b", "/b/y")], &[dir("/s")]);
-        let held = owners.take("main");
-        assert_eq!(held.dirs, HashMap::from([(dir("/a"), 1)]));
-        assert_eq!(held.files, HashMap::from([(file("/a", "/a/x"), 1)]));
-        assert_eq!(held.repos, HashMap::from([(dir("/r"), 1)]));
-        assert_eq!(owners.take("main"), Held::default());
-        // Another window's watches stay its own.
-        assert_eq!(owners.take("w-1").dirs, HashMap::from([(dir("/a"), 1)]));
-        owners.add("w-2", &[dir("/c")], &[], &[dir("/r")]);
-        owners.remove("w-2", &[dir("/c")], &[], &[]);
-        assert!(!owners.0.is_empty(), "the repository is still held");
-        owners.remove("w-2", &[], &[], &[dir("/r")]);
-        assert!(owners.0.is_empty());
+        assert!(owners
+            .release("other", std::slice::from_ref(&id))
+            .is_empty());
+        assert_eq!(owners.release("main", &[id.clone(), id]).len(), 1);
+        let id = owners.reserve(1).unwrap().pop().unwrap();
+        owners.keep(
+            "main",
+            [(id.clone(), Held::Directory(("/a".into(), "/a".into())))],
+        );
+        assert_eq!(owners.take("main").len(), 1);
+        let new = owners.begin("main");
+        assert!(owners.current("main", &old).is_err());
+        assert!(owners.current("main", &new).is_ok());
+        assert!(owners.release("main", &[id]).is_empty());
+        assert!(owners.take("main").is_empty());
     }
 
     use super::*;
@@ -856,6 +990,8 @@ mod tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let mut running = Running {
+            health: Arc::default(),
+            app: None,
             shared: Arc::new(Shared::new()),
             backend: Box::new(Retrying {
                 calls: calls.clone(),
@@ -1066,6 +1202,21 @@ mod tests {
         assert_eq!(changes.report, vec![to_canon(&file)]);
     }
 
+    #[test]
+    fn failed_watch_preparation_does_not_silently_omit_requested_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let registry = WorkspaceRegistry::default();
+        let prepare =
+            |paths| prepare_dirs(registry.gates(Origin::App), &WorkspaceEnv::Local, paths);
+        assert!(prepare(vec![to_canon(&root)]).is_err());
+        registry.authorize(&root).unwrap();
+        assert!(prepare(vec![to_canon(&root), to_canon(root.join("missing"))]).is_err());
+        std::fs::write(root.join("file"), "text").unwrap();
+        assert!(prepare(vec![to_canon(root.join("file"))]).is_err());
+        assert_eq!(prepare(vec![to_canon(&root)]).unwrap().len(), 1);
+    }
+
     /// A project opened through a link (`/tmp` on macOS, `/home` on Fedora Atomic) is watched
     /// at its canonical path but keyed by the frontend under the path it was given.
     #[cfg(unix)]
@@ -1087,7 +1238,8 @@ mod tests {
             registry.gates(Origin::App),
             &WorkspaceEnv::Local,
             vec![link_src.clone()],
-        );
+        )
+        .unwrap();
         assert_eq!(dirs, vec![(link_src.clone(), real.join("src"))]);
         let (dir_key, file_key, file_path) =
             canonical_file(&WorkspaceEnv::Local, &link_file).unwrap();
@@ -1101,7 +1253,7 @@ mod tests {
             set.record_listing(&dir_key, plan::listing_signature(&dir));
             set.add_file(
                 dir_key.clone(),
-                file_key,
+                file_key.clone(),
                 link_file.clone(),
                 FileStamp::of(&file_path),
             );
@@ -1111,12 +1263,17 @@ mod tests {
         std::fs::write(real.join("src/open.ts"), "two, a different length").unwrap();
         let changes = resolve_changes(burst(&real.join("src")), &shared);
         assert_eq!(changes.touched, vec![dir_key.clone()]);
-        assert_eq!(changes.report, vec![link_src.clone(), link_file]);
+        assert_eq!(changes.report, vec![link_src.clone(), link_file.clone()]);
 
         // Released under the same spelling, also once the directory itself is gone.
         std::fs::remove_dir_all(real.join("src")).unwrap();
-        assert_eq!(removal_dir_key(&WorkspaceEnv::Local, &link_src), dir_key);
-        assert!(shared.set.lock().unwrap().remove_dir(&dir_key, &link_src));
+        let mut set = shared.set.lock().unwrap();
+        assert!(
+            !set.remove_dir(&dir_key, &link_src),
+            "the file still owns parent coverage"
+        );
+        assert!(set.remove_file(&dir_key, &file_key, &link_file));
+        assert!(set.is_empty());
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
@@ -1194,6 +1351,47 @@ mod tests {
     }
 
     #[test]
+    fn a_gitfile_cannot_watch_unauthorized_external_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("HEAD"), "outside state").unwrap();
+        std::fs::write(root.join(".git"), format!("gitdir: {}\n", outside.display())).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let spelling = root.to_string_lossy().into_owned();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, spelling.clone()).is_none());
+        registry.authorize(&outside).unwrap();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, spelling).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_symlink_cannot_watch_external_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".git")).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, root.to_string_lossy().into_owned()).is_none());
+    }
+
+    #[test]
+    fn a_valid_linked_worktree_can_watch_its_verified_metadata() {
+        let (tmp, root, _) = repo_fixture();
+        let linked = tmp.path().join("linked");
+        git(&root, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "linked-watch"]);
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&linked).unwrap();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, linked.to_string_lossy().into_owned()).is_some());
+    }
+
+    #[test]
     fn git_operations_and_work_tree_edits_reach_the_repository_view() {
         let (_tmp, root, registry) = repo_fixture();
         let spelling = root.to_string_lossy().into_owned();
@@ -1244,12 +1442,22 @@ mod tests {
         let mut set = shared.set.lock().unwrap();
         set.remove_dir(&other_key, &other_key);
         set.remove_dir(&src, &src);
-        assert!(release_repo(&mut set, &to_canon(&root), &spelling));
+        assert!(release_repo(
+            &mut set,
+            &to_canon(&root),
+            &spelling,
+            &git_dir_key
+        ));
         assert!(
             set.is_empty(),
             "releasing the repository gives everything back"
         );
-        assert!(!release_repo(&mut set, &to_canon(&root), &spelling));
+        assert!(!release_repo(
+            &mut set,
+            &to_canon(&root),
+            &spelling,
+            &git_dir_key
+        ));
     }
 
     /// The WSL share cannot notify, and staging rewrites `index` in place, which moves no
@@ -1279,5 +1487,228 @@ mod tests {
         let mut pending = Pending::default();
         pending.merge(batch);
         assert_eq!(resolve_changes(pending, &shared).repos, vec![spelling]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_alias_handle_releases_original_watch() {
+        let (tmp, root, registry) = repo_fixture();
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let spelling = alias.to_string_lossy().into_owned();
+        let plan = plan_repo_watch(&registry, &WorkspaceEnv::Local, spelling.clone()).unwrap();
+        let held = Held::Repository((
+            plan.root.clone(),
+            plan.spelling.clone(),
+            plan.git_dir_key.clone(),
+        ));
+        let mut owners = WatchOwners::default();
+        owners.begin("main");
+        let id = owners.reserve(1).unwrap().pop().unwrap();
+        owners.keep("main", [(id.clone(), held)]);
+        let mut set = WatchSet::default();
+        register_repo(&mut set, plan);
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        for held in owners.release("main", &[id]) {
+            held.release(&mut set);
+        }
+        assert!(
+            set.is_empty(),
+            "closing the diff must release the original watch"
+        );
+    }
+
+    #[test]
+    fn file_handles_release_deleted_directories_without_path_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("file");
+        std::fs::write(&path, "x").unwrap();
+        let spelling = path.to_string_lossy().into_owned();
+        let (dir_key, file_key, file_path) =
+            canonical_file(&WorkspaceEnv::Local, &spelling).unwrap();
+        let mut set = WatchSet::default();
+        set.add_dir(dir_key.clone(), dir_key.clone(), dir.clone(), false);
+        set.add_file(
+            dir_key.clone(),
+            file_key.clone(),
+            spelling.clone(),
+            FileStamp::of(&file_path),
+        );
+        let mut owners = WatchOwners::default();
+        owners.begin("main");
+        let ids = owners.reserve(2).unwrap();
+        owners.keep(
+            "main",
+            [
+                (
+                    ids[0].clone(),
+                    Held::Directory((dir_key.clone(), dir_key.clone())),
+                ),
+                (ids[1].clone(), Held::File((dir_key, file_key, spelling))),
+            ],
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        for held in owners.release("main", &ids) {
+            held.release(&mut set);
+        }
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn repository_handles_retain_their_acquired_git_directories() {
+        let mut set = WatchSet::default();
+        for git_dir in ["/old", "/new"] {
+            set.add_repo("/repo".into(), "/repo".into(), git_dir.into());
+            set.add_dir(
+                git_dir.into(),
+                git_dir.into(),
+                PathBuf::from(git_dir),
+                false,
+            );
+            for name in GIT_STATE_FILES {
+                let key = format!("{git_dir}/{name}");
+                set.add_file(git_dir.into(), key.clone(), key, None);
+            }
+        }
+        assert!(release_repo(&mut set, "/repo", "/repo", "/old"));
+        assert!(set.repos_touched(["/old"]).is_empty());
+        assert_eq!(set.repos_touched(["/new"]), vec!["/repo"]);
+        assert!(!release_repo(&mut set, "/repo", "/repo", "/old"));
+        assert!(release_repo(&mut set, "/repo", "/repo", "/new"));
+        assert!(set.is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_git_metadata_fifo_cannot_block_watch_preparation() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join(".git");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let root = tmp.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(git_dir_of(&root, &WorkspaceEnv::Local));
+        });
+        assert!(rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("watch preparation blocked on a FIFO")
+            .is_none());
+        worker.join().unwrap();
+    }
+    #[test]
+    fn coverage_failure_is_revisioned_and_retry_recovers_existing_registrations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Failing {
+            fail: Arc<AtomicBool>,
+            error: Option<String>,
+        }
+        impl Backend for Failing {
+            fn sync(&mut self, _: &WatchSet) {
+                self.error = self
+                    .fail
+                    .load(Ordering::SeqCst)
+                    .then(|| "backend unavailable".into());
+            }
+            fn health_error(&self) -> Option<String> {
+                self.error.clone()
+            }
+        }
+        let fail = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared::new());
+        let health = Arc::new(Mutex::new(HealthState::default()));
+        let mut running = Running {
+            shared: shared.clone(),
+            health: health.clone(),
+            app: None,
+            backend: Box::new(Failing {
+                fail: fail.clone(),
+                error: None,
+            }),
+            poll_tx: None,
+        };
+        running.apply(|set| set.add_dir("/a".into(), "/alias".into(), PathBuf::from("/a"), false));
+        assert_eq!(health.lock().unwrap().snapshot, WatchHealth::default());
+        fail.store(true, Ordering::SeqCst);
+        running.apply(|set| set.add_dir("/b".into(), "/b".into(), PathBuf::from("/b"), false));
+        assert_eq!(
+            health.lock().unwrap().snapshot,
+            WatchHealth {
+                revision: 1,
+                error: Some("backend unavailable".into())
+            }
+        );
+        running.apply(|_| true);
+        assert_eq!(
+            health.lock().unwrap().snapshot.revision,
+            1,
+            "unchanged errors do not emit repeatedly"
+        );
+        fail.store(false, Ordering::SeqCst);
+        running.apply(|_| true);
+        assert_eq!(
+            health.lock().unwrap().snapshot,
+            WatchHealth {
+                revision: 2,
+                error: None
+            }
+        );
+        assert_eq!(
+            shared.set.lock().unwrap().refresh_targets().0,
+            vec!["/alias", "/b"]
+        );
+    }
+
+    #[test]
+    fn a_healthy_notification_backend_cannot_hide_a_failed_poller() {
+        let mut health = HealthState::default();
+        health.update(Some("poller unavailable".into()), true);
+        assert!(health.update(None, false).is_none());
+        assert_eq!(health.snapshot.error.as_deref(), Some("poller unavailable"));
+        assert!(health.update(None, true).unwrap().error.is_none());
+    }
+    #[test]
+    fn explicit_file_in_excluded_directory_receives_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join("build");
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("output.txt");
+        std::fs::write(&file, "initial").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let dirs = prepare_dirs(
+            registry.gates(Origin::App),
+            &WorkspaceEnv::Local,
+            vec![to_canon(&dir)],
+        )
+        .unwrap();
+        assert!(dirs.is_empty(), "existing directory exclusion");
+        let shared = Shared::new();
+        shared.set.lock().unwrap().add_file(
+            to_canon(&dir),
+            to_canon(&file),
+            to_canon(&file),
+            FileStamp::of(&file),
+        );
+        std::fs::write(&file, "external change").unwrap();
+        // FSEvents filters callback paths through the native directory subscription set.
+        let key = to_canon(&dir);
+        let batch = plan::reduce_directory_events(
+            [(key.as_bytes(), 0)].into_iter(),
+            &shared.set.lock().unwrap().snapshot(),
+            &mut |_| {},
+        );
+        let mut pending = Pending::default();
+        pending.merge(batch);
+        let changes = resolve_changes(pending, &shared);
+        assert!(
+            changes.report.contains(&to_canon(&file)),
+            "explicitly opened file received no update"
+        );
     }
 }

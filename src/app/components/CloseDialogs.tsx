@@ -40,11 +40,14 @@ type Props = {
   onConfirmCloseMany: () => void;
   pendingAppClose: PendingAppClose | null;
   onCancelAppClose: () => void;
-  onConfirmAppClose: () => void;
+  onConfirmAppClose: (request: PendingAppClose) => void;
 };
 
 /** The warning; `quits` when Oarlock quits rather than one window closing. */
-export function appCloseMessage(blocker: AppCloseBlocker, quits = true): string {
+export function appCloseMessage(
+  blocker: AppCloseBlocker,
+  quits = true,
+): string {
   const doing = quits ? "Quitting" : "Closing this window";
   const dirty =
     blocker.dirtyEditors === 1
@@ -181,7 +184,7 @@ export function CloseDialogs({
     const optOut = appCloseCanOptOut && optOutAppClose;
     setOptOutAppClose(false);
     if (optOut) await persistOptOut();
-    onConfirmAppClose();
+    if (pendingAppClose) onConfirmAppClose(pendingAppClose);
   };
 
   const cancelAppClose = () => {
@@ -359,7 +362,12 @@ export function CloseDialogs({
             <AlertDialogCancel onClick={cancelAppClose}>
               Cancel
             </AlertDialogCancel>
-            <AlertDialogAction onClick={() => void confirmAppClose()}>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                void confirmAppClose();
+              }}
+            >
               {pendingAppClose?.quits === false
                 ? "Close Anyway"
                 : "Quit Anyway"}

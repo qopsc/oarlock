@@ -173,6 +173,18 @@ export function checkReadable(path: string): SafetyResult {
   }
 
   const cmp = comparisonForm(path);
+  if (
+    cmp
+      .split("/")
+      .some((part) =>
+        secretPaths.componentPrefixes.some((prefix) => part.startsWith(prefix)),
+      )
+  ) {
+    return {
+      ok: false,
+      reason: "Refused: internal save staging is not accessible to AI tools.",
+    };
+  }
   for (const dir of PROTECTED_DIRS) {
     if (isUnderProtected(cmp, dir)) {
       return {
@@ -294,32 +306,34 @@ export async function checkWritableCanonical(
 ): Promise<{ ok: true; canonical: string } | { ok: false; reason: string }> {
   const initial = checkWritable(path);
   if (!initial.ok) return initial;
-  // Try canonicalizing the target itself first.
-  try {
-    const canonical = await canonicalize(path);
-    // Always recheck the canonical form — same rationale as checkReadableCanonical.
-    const recheck = checkWritable(canonical);
-    if (!recheck.ok) return recheck;
-    return { ok: true, canonical };
-  } catch (error) {
-    if (!isNotFoundError(error)) return unresolved(path, error);
-    // Target doesn't exist — canonicalize the parent so we still catch a
-    // symlinked parent directory (`./project -> /Users/me/.ssh`).
-    const lastSep = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    if (lastSep > 0) {
-      const parent = path.slice(0, lastSep);
-      const tail = path.slice(lastSep);
-      try {
-        const canonParent = await canonicalize(parent);
-        const recheckParent = checkWritable(canonParent + tail);
-        if (!recheckParent.ok) return recheckParent;
-        return { ok: true, canonical: canonParent + tail };
-      } catch (error) {
-        if (!isNotFoundError(error)) return unresolved(parent, error);
-        // Parent doesn't exist either — let the caller surface the actual error.
-      }
+  // Recursive creates can have several missing parents. Resolve the nearest
+  // existing ancestor before checking the whole destination, including links.
+  let ancestor = path;
+  let suffix = "";
+  for (;;) {
+    try {
+      const resolved = await canonicalize(ancestor);
+      const canonical =
+        suffix && /[\\/]$/.test(resolved)
+          ? resolved.slice(0, -1) + suffix
+          : resolved + suffix;
+      const recheck = checkWritable(canonical);
+      if (!recheck.ok) return recheck;
+      return { ok: true, canonical };
+    } catch (error) {
+      if (!isNotFoundError(error)) return unresolved(ancestor, error);
+      const lastSep = Math.max(
+        ancestor.lastIndexOf("/"),
+        ancestor.lastIndexOf("\\"),
+      );
+      const rootLength = /^[a-zA-Z]:[\\/]/.test(ancestor) ? 3 : 1;
+      if (lastSep < 0 || ancestor.length <= rootLength)
+        return unresolved(ancestor, error);
+      const parentEnd = Math.max(rootLength, lastSep);
+      suffix = ancestor.slice(parentEnd) + suffix;
+      if (parentEnd > lastSep) suffix = ancestor[lastSep] + suffix;
+      ancestor = ancestor.slice(0, parentEnd);
     }
-    return { ok: true, canonical: path };
   }
 }
 

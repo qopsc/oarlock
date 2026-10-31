@@ -47,16 +47,16 @@ describe("authorizing what the user opened", () => {
     ]);
   });
 
-  it("asks once per path and environment, and again after a refusal", async () => {
-    invoke.mockResolvedValueOnce("/a").mockRejectedValueOnce("gone");
+  it("rechecks a later open of the same spelling and retries refusals", async () => {
+    invoke.mockResolvedValueOnce("/a").mockResolvedValueOnce("/other").mockRejectedValueOnce("gone");
     expect(await authorize.authorizeFileFolder("/a/x.txt", local)).toBe(true);
     expect(await authorize.authorizeFileFolder("/a/x.txt", local)).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledTimes(2);
 
     expect(await authorize.authorizeFileFolder("/a/x.txt", ubuntu)).toBe(false);
     invoke.mockResolvedValueOnce("/a");
     expect(await authorize.authorizeFileFolder("/a/x.txt", ubuntu)).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(invoke).toHaveBeenCalledTimes(4);
   });
 
   it("shares one request between callers while it is in flight", async () => {

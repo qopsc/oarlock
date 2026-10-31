@@ -21,6 +21,36 @@ unsafe impl Send for ProcessJob {}
 unsafe impl Sync for ProcessJob {}
 
 impl ProcessJob {
+    pub fn terminate(&self) -> io::Result<()> {
+        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub fn active_processes(&self) -> io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(info.ActiveProcesses)
+        }
+    }
+
     pub fn create_for(pid: u32) -> io::Result<Self> {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -62,6 +92,70 @@ impl ProcessJob {
     }
 }
 
+/// Install the job before any user code can fork. Attaching after a normal
+/// spawn lets a fast command's descendants escape the job.
+pub fn spawn_tree(
+    cmd: &mut std::process::Command,
+) -> io::Result<(shared_child::SharedChild, ProcessJob)> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    let child = shared_child::SharedChild::spawn(cmd)?;
+    let setup = ProcessJob::create_for(child.id()).and_then(|job| {
+        resume_suspended(child.id())?;
+        Ok(job)
+    });
+    match setup {
+        Ok(job) => Ok((child, job)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+fn resume_suspended(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: the process was created suspended, so it has exactly one primary
+    // thread and cannot create another before we resume it. Every handle closes.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entry: THREADENTRY32 = zeroed();
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        let mut found = Thread32First(snapshot, &mut entry);
+        let mut result = Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "suspended process thread missing",
+        ));
+        while found != 0 {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+                if thread.is_null() {
+                    result = Err(io::Error::last_os_error());
+                } else {
+                    result = if ResumeThread(thread) == u32::MAX {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    };
+                    CloseHandle(thread);
+                }
+                break;
+            }
+            found = Thread32Next(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+        result
+    }
+}
+
 impl Drop for ProcessJob {
     fn drop(&mut self) {
         if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
@@ -85,13 +179,46 @@ mod tests {
     }
 
     #[test]
-    fn drop_kills_assigned_process_tree() {
-        let mut child = Command::new("cmd.exe")
-            .args(["/C", "ping -n 30 127.0.0.1 > nul"])
-            .spawn()
-            .expect("spawn cmd.exe");
+    fn suspended_spawn_resumes_after_job_assignment() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "exit 7"]);
+        let (child, _job) = spawn_tree(&mut cmd).expect("spawn in job");
+        assert_eq!(
+            child
+                .wait_timeout(Duration::from_secs(3))
+                .unwrap()
+                .expect("resumed")
+                .code(),
+            Some(7)
+        );
+    }
 
-        let job = ProcessJob::create_for(child.id()).expect("create job");
+    #[test]
+    fn explicit_termination_kills_the_tree_while_the_job_handle_is_retained() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > nul"]);
+        let (child, job) = spawn_tree(&mut cmd).expect("spawn in job");
+        job.terminate().expect("terminate job");
+        assert!(child
+            .wait_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_some());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while job.active_processes().unwrap() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "job descendants survived termination"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(job);
+    }
+
+    #[test]
+    fn drop_kills_assigned_process_tree() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > nul"]);
+        let (child, job) = spawn_tree(&mut cmd).expect("spawn in job");
         drop(job);
 
         let deadline = Instant::now() + Duration::from_secs(3);

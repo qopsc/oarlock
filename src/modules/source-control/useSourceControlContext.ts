@@ -1,4 +1,5 @@
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import { openResolvedGraph } from "./resolveGraph";
 import { native } from "@/modules/ai/lib/native";
 import type { SidebarViewId } from "@/modules/sidebar";
 import type { Tab } from "@/modules/tabs";
@@ -13,6 +14,10 @@ import { isStatusLive, statusConsumers } from "./statusConsumers";
 import { useSourceControl } from "./useSourceControl";
 
 type Params = {
+  enabled?: boolean;
+  spaceId: string;
+  workspaceKey: string;
+  isContextCurrent: (spaceId: string, workspaceKey: string) => boolean;
   activeTab: Tab | undefined;
   tabs: Tab[];
   activeTerminalLeafCwd: string | null;
@@ -39,6 +44,10 @@ type Params = {
  * per-session path so tab switches / cd don't re-fire git IPC.
  */
 export function useSourceControlContext({
+  enabled = true,
+  spaceId,
+  workspaceKey,
+  isContextCurrent,
   activeTab,
   tabs,
   activeTerminalLeafCwd,
@@ -104,7 +113,7 @@ export function useSourceControlContext({
     (leafId: number) => terminalLeafCwd(tabsRef.current, leafId),
     [],
   );
-  const sourceControl = useSourceControl(sourceControlPath, true, {
+  const sourceControl = useSourceControl(sourceControlPath, enabled, {
     live,
     leafCwd,
   });
@@ -113,7 +122,19 @@ export function useSourceControlContext({
     cycleSidebarView("source-control");
   }, [cycleSidebarView]);
 
+  const graphScope = JSON.stringify([spaceId, workspaceKey, activeTab?.id, graphContextPath, sidebarView, repositoryTarget]);
+  const graphOwner = useRef({ scope: graphScope, request: 0, alive: true });
+  if (graphOwner.current.scope !== graphScope) {
+    graphOwner.current.scope = graphScope;
+    graphOwner.current.request += 1;
+  }
+  useEffect(() => {
+    graphOwner.current.alive = true;
+    return () => { graphOwner.current.alive = false; graphOwner.current.request += 1; };
+  }, []);
+
   const openGitGraphFromContext = useCallback(async () => {
+    const request = ++graphOwner.current.request;
     // A snapshot nobody is refreshing may predate a branch switch or a cd, so
     // only a live one is trusted; otherwise resolve the repo afresh below.
     const known = live && sourceControl.hasRepo ? sourceControl.repo : null;
@@ -129,15 +150,17 @@ export function useSourceControlContext({
       return;
     }
     if (!graphContextPath) return;
-    try {
-      const repo = await native.gitResolveRepo(graphContextPath);
-      if (!repo) return;
-      openCommitHistoryTab({ repoRoot: repo.repoRoot, branch: repo.branch });
-    } catch {
-      /* noop */
-    }
+    await openResolvedGraph(
+      () => native.gitResolveRepo(graphContextPath),
+      () => graphOwner.current.alive && graphOwner.current.request === request &&
+        isContextCurrent(spaceId, workspaceKey),
+      (repo) => openCommitHistoryTab({ repoRoot: repo.repoRoot, branch: repo.branch }),
+    );
   }, [
     openCommitHistoryTab,
+    isContextCurrent,
+    spaceId,
+    workspaceKey,
     sourceControl.hasRepo,
     sourceControl.repo,
     sourceControl.status?.branch,

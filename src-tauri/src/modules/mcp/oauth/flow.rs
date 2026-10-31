@@ -77,6 +77,12 @@ pub fn clean(text: &str) -> String {
 /// GETs a metadata document: its body on 200, None when it is not there.
 async fn metadata(policy: &Policy, url: Url) -> Result<Option<bytes::Bytes>, String> {
     let fetched = fetch::request(policy, Method::GET, url, Body::None, None).await?;
+    if fetched.status.is_server_error() || fetched.status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(format!(
+            "Sign-in metadata request failed: HTTP {}",
+            fetched.status
+        ));
+    }
     Ok((fetched.status == StatusCode::OK).then_some(fetched.body))
 }
 
@@ -463,6 +469,40 @@ pub async fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_metadata_is_not_reported_as_absent() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        for code in [503, 429, 404] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let policy = Policy::for_server(&url, true);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                socket.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let result = resource_metadata(&policy, &url, None).await;
+            server.await.unwrap();
+            if code == 404 {
+                assert!(matches!(result, Ok(None)));
+            } else {
+                assert!(
+                    matches!(result, Err(error) if error.contains(&code.to_string())),
+                    "temporary failure was accepted as absent metadata"
+                );
+            }
+        }
+    }
 
     fn auth() -> AuthServer {
         AuthServer {

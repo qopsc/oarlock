@@ -12,6 +12,8 @@ import { SUBAGENTS, type SubagentType } from "./registry";
 const SUBAGENT_MAX_STEPS = 12;
 
 type Args = {
+  assertReady?: () => void;
+  abortSignal?: AbortSignal;
   type: SubagentType;
   prompt: string;
   keys: ProviderKeys;
@@ -33,6 +35,8 @@ type RunResult = {
 };
 
 export async function runSubagent({
+  assertReady,
+  abortSignal,
   type,
   prompt,
   keys,
@@ -42,12 +46,17 @@ export async function runSubagent({
   onStep,
   onUsage,
 }: Args): Promise<RunResult> {
+  abortSignal?.throwIfAborted();
+  assertReady?.();
   const def = SUBAGENTS[type];
   if (!def) throw new Error(`unknown subagent type: ${type}`);
 
+  // Fresh messages require fresh read history. Neither the parent nor another
+  // subagent has shown its file contents to this model call.
+  const context = { ...toolContext, readCache: new Map() };
   const readOnly: Record<string, unknown> = {
-    ...buildFsTools(toolContext),
-    ...buildSearchTools(toolContext),
+    ...buildFsTools(context),
+    ...buildSearchTools(context),
   };
   const tools: Record<string, unknown> = {};
   for (const t of def.tools) {
@@ -57,7 +66,10 @@ export async function runSubagent({
   const model = await buildConfiguredLanguageModel(modelId, keys, config);
 
   const start = Date.now();
+  abortSignal?.throwIfAborted();
+  assertReady?.();
   const result = await generateText({
+    abortSignal,
     model,
     instructions: def.systemPrompt,
     prompt,
@@ -66,6 +78,7 @@ export async function runSubagent({
     // applies: a mutating tool whitelisted by mistake stops for approval
     // (which a subagent cannot get) instead of running.
     toolApproval: TOOL_APPROVAL,
+    maxOutputTokens: 8192,
     stopWhen: isStepCount(SUBAGENT_MAX_STEPS),
     onStepEnd: (step) => {
       if (onUsage && step.usage) onUsage(modelId, tokenUsage(step.usage));

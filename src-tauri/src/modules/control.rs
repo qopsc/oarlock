@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use serde_json::{json, Value};
-use tauri::{Emitter, Manager};
 use oarlock_control_protocol::{
     ControlDescriptor, ControlRequest, ControlResponse, FrontendRequest, FrontendResponse,
     OpenParams, MAX_MESSAGE_BYTES, METHODS, METHOD_CAPABILITIES, METHOD_IDENTIFY, METHOD_OPEN,
     METHOD_PING, PROTOCOL_VERSION, SERVER_RESPONSE_ID,
 };
+use serde_json::{json, Value};
+use tauri::{Emitter, Manager};
 
 use crate::modules::{fs, windows, workspace};
 
@@ -75,8 +75,65 @@ impl PaneIds {
             .map(|(window, pane)| (window.as_str(), *pane))
     }
 
+    fn resolve_caller(&self, id: Option<u32>) -> Result<Option<(String, u32)>, &'static str> {
+        match id {
+            None => Ok(None),
+            Some(id) => self.resolve(id).map(|(window, pane)| Some((window.to_owned(), pane)))
+                .ok_or("The calling terminal pane is no longer available"),
+        }
+    }
+
     fn forget_window(&mut self, window: &str) {
         self.panes.retain(|_, (owner, _)| owner != window);
+    }
+}
+
+#[derive(Default)]
+struct PendingRequests {
+    last_id: u64,
+    requests: HashMap<String, PendingResponse>,
+}
+struct PendingResponse {
+    window: String,
+    sender: SyncSender<FrontendResponse>,
+}
+impl PendingRequests {
+    fn insert(
+        &mut self,
+        window: &str,
+        sender: SyncSender<FrontendResponse>,
+    ) -> Result<String, &'static str> {
+        if self.requests.len() >= MAX_PENDING_REQUESTS {
+            return Err("too many pending frontend requests");
+        }
+        self.last_id = self
+            .last_id
+            .checked_add(1)
+            .ok_or("control request identifiers exhausted")?;
+        let id = format!("ui-{:016x}", self.last_id);
+        self.requests.insert(
+            id.clone(),
+            PendingResponse {
+                window: window.to_owned(),
+                sender,
+            },
+        );
+        Ok(id)
+    }
+    fn remove(&mut self, id: &str) {
+        self.requests.remove(id);
+    }
+    fn respond(&mut self, id: &str, window: &str, response: FrontendResponse) -> bool {
+        if !self
+            .requests
+            .get(id)
+            .is_some_and(|pending| pending.window == window)
+        {
+            return false;
+        }
+        self.requests
+            .remove(id)
+            .is_some_and(|pending| pending.sender.send(response).is_ok())
     }
 }
 
@@ -87,7 +144,7 @@ struct ControlCore {
     panes: Mutex<PaneIds>,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
-    pending: Mutex<HashMap<String, SyncSender<FrontendResponse>>>,
+    pending: Mutex<PendingRequests>,
 }
 
 #[derive(Clone)]
@@ -101,7 +158,7 @@ impl Default for ControlState {
             panes: Mutex::new(PaneIds::default()),
             shutting_down: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingRequests::default()),
         }))
     }
 }
@@ -182,7 +239,7 @@ pub fn start(app: tauri::AppHandle, state: ControlState) -> Result<(), String> {
         .map_err(|error| format!("read local control address: {error}"))?
         .to_string();
     let token = generate_token()?;
-    let descriptor_path = descriptor_path()?;
+    let descriptor_path = descriptor_path(&app.config().identifier)?;
     sweep_stale_launcher_dirs(&descriptor_path);
     let cli_path = find_bundled_cli();
     let launcher_dir = cli_path.as_deref().and_then(|cli_path| {
@@ -508,15 +565,15 @@ fn forward_to_frontend(
     // A shell's request goes to its own window, with its pane as that window
     // knows it; anything else to the window in front.
     let mut caller = request.caller;
-    let resolved = caller.pane_id.and_then(|id| {
-        state
+    let resolved = match state
             .0
             .panes
             .lock()
             .expect("control panes poisoned")
-            .resolve(id)
-            .map(|(window, pane)| (window.to_owned(), pane))
-    });
+            .resolve_caller(caller.pane_id) {
+        Ok(resolved) => resolved,
+        Err(message) => return ControlResponse::failure(request.id, "caller_unavailable", message),
+    };
     let target = match resolved {
         Some((window, pane)) => {
             caller.pane_id = Some(pane);
@@ -545,23 +602,19 @@ fn forward_to_frontend(
 
     let id = request.id.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
+    let frontend_id = match state
+        .0
+        .pending
+        .lock()
+        .expect("control pending poisoned")
+        .insert(&target, sender)
     {
-        let mut pending = state.0.pending.lock().expect("control pending poisoned");
-        if pending.len() >= MAX_PENDING_REQUESTS {
-            return ControlResponse::failure(
-                id,
-                "server_busy",
-                "too many pending frontend requests",
-            );
-        }
-        if pending.contains_key(&id) {
-            return ControlResponse::failure(id, "duplicate_id", "request id is already pending");
-        }
-        pending.insert(id.clone(), sender);
-    }
+        Ok(id) => id,
+        Err(message) => return ControlResponse::failure(id, "server_busy", message),
+    };
 
     let frontend_request = FrontendRequest {
-        id: id.clone(),
+        id: frontend_id.clone(),
         method: request.method,
         params: request.params,
         caller,
@@ -572,7 +625,7 @@ fn forward_to_frontend(
             .pending
             .lock()
             .expect("control pending poisoned")
-            .remove(&id);
+            .remove(&frontend_id);
         return ControlResponse::failure(
             id,
             "frontend_unavailable",
@@ -599,7 +652,7 @@ fn forward_to_frontend(
                 .pending
                 .lock()
                 .expect("control pending poisoned")
-                .remove(&id);
+                .remove(&frontend_id);
             ControlResponse::failure(id, "frontend_timeout", "Oarlock UI did not respond in time")
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => ControlResponse::failure(
@@ -626,17 +679,21 @@ pub fn control_frontend_ready(
 
 #[tauri::command]
 pub fn control_respond(
+    window: tauri::Window,
     state: tauri::State<'_, ControlState>,
     request_id: String,
     response: FrontendResponse,
 ) -> bool {
-    let sender = state
+    let delivered = state
         .0
         .pending
         .lock()
         .expect("control pending poisoned")
-        .remove(&request_id);
-    sender.is_some_and(|sender| sender.send(response).is_ok())
+        .respond(&request_id, window.label(), response);
+    if !delivered {
+        log::warn!("Dropped expired, duplicate, unknown or wrong-window control response");
+    }
+    delivered
 }
 
 fn write_response(stream: &mut TcpStream, response: &ControlResponse) -> std::io::Result<()> {
@@ -674,10 +731,10 @@ fn generate_token() -> Result<String, String> {
     Ok(token)
 }
 
-fn descriptor_path() -> Result<PathBuf, String> {
+fn descriptor_path(identifier: &str) -> Result<PathBuf, String> {
     let cache =
         dirs::cache_dir().ok_or_else(|| "could not resolve user cache directory".to_string())?;
-    let dir = cache.join("oarlock");
+    let dir = cache.join(super::profile::control_directory(identifier));
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("create control directory {}: {error}", dir.display()))?;
     #[cfg(unix)]
@@ -846,7 +903,11 @@ fn prepare_cli_launcher(descriptor: &Path, cli_path: &Path) -> Result<PathBuf, S
             .map_err(|error| format!("secure CLI bin directory: {error}"))?;
     }
 
-    let launcher = bin_dir.join(if cfg!(windows) { "oarlock.exe" } else { "oarlock" });
+    let launcher = bin_dir.join(if cfg!(windows) {
+        "oarlock.exe"
+    } else {
+        "oarlock"
+    });
     if std::fs::symlink_metadata(&launcher).is_ok() {
         std::fs::remove_file(&launcher)
             .map_err(|error| format!("replace stale CLI launcher: {error}"))?;
@@ -865,7 +926,11 @@ fn prepare_cli_launcher(descriptor: &Path, cli_path: &Path) -> Result<PathBuf, S
 }
 
 fn remove_launcher_dir(bin_dir: &Path) {
-    let launcher = bin_dir.join(if cfg!(windows) { "oarlock.exe" } else { "oarlock" });
+    let launcher = bin_dir.join(if cfg!(windows) {
+        "oarlock.exe"
+    } else {
+        "oarlock"
+    });
     let _ = std::fs::remove_file(launcher);
     let _ = std::fs::remove_dir(bin_dir);
     if let Some(run_dir) = bin_dir.parent() {
@@ -1001,10 +1066,13 @@ mod tests {
         assert_ne!(main, other);
         assert_eq!(ids.resolve(main), Some(("main", 1)));
         assert_eq!(ids.resolve(other), Some(("w-a", 1)));
+        assert_eq!(ids.resolve_caller(None), Ok(None));
+        assert_eq!(ids.resolve_caller(Some(main)), Ok(Some(("main".to_string(), 1))));
         // A restarted shell keeps its pane's id.
         assert_eq!(ids.assign("w-a", 1), other);
         ids.forget_window("w-a");
         assert_eq!(ids.resolve(other), None);
+        assert!(ids.resolve_caller(Some(other)).is_err());
         assert_eq!(ids.resolve(main), Some(("main", 1)));
         assert_eq!(ids.resolve(0), None);
     }
@@ -1064,7 +1132,11 @@ mod tests {
         let descriptor = temp.path().join("control.json");
 
         let bin_dir = prepare_cli_launcher(&descriptor, &cli).expect("prepare launcher");
-        let launcher = bin_dir.join(if cfg!(windows) { "oarlock.exe" } else { "oarlock" });
+        let launcher = bin_dir.join(if cfg!(windows) {
+            "oarlock.exe"
+        } else {
+            "oarlock"
+        });
         assert_eq!(std::fs::read(&launcher).expect("read launcher"), b"cli");
 
         remove_launcher_dir(&bin_dir);
@@ -1113,5 +1185,64 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+    fn frontend_response(value: &str) -> FrontendResponse {
+        FrontendResponse {
+            ok: true,
+            result: Some(json!(value)),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn late_response_after_timeout_is_dropped() {
+        let mut pending = PendingRequests::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = pending.insert("main", sender).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        pending.remove(&id);
+        assert!(!pending.respond(&id, "main", frontend_response("late")));
+    }
+
+    #[test]
+    fn reused_caller_id_cannot_reuse_a_frontend_reply_slot() {
+        let mut pending = PendingRequests::default();
+        let (first, _) = mpsc::sync_channel(1);
+        let first_id = pending.insert("main", first).unwrap();
+        pending.remove(&first_id);
+        let (second, receiver) = mpsc::sync_channel(1);
+        let second_id = pending.insert("main", second).unwrap();
+        assert_ne!(first_id, second_id);
+        assert!(!pending.respond(&first_id, "main", frontend_response("stale")));
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.respond(&second_id, "main", frontend_response("current")));
+        assert_eq!(receiver.recv().unwrap().result, Some(json!("current")));
+    }
+
+    #[test]
+    fn duplicate_and_wrong_window_replies_are_dropped() {
+        let mut pending = PendingRequests::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = pending.insert("main", sender).unwrap();
+        assert!(!pending.respond(&id, "other", frontend_response("wrong")));
+        assert!(pending.respond(&id, "main", frontend_response("first")));
+        assert!(!pending.respond(&id, "main", frontend_response("duplicate")));
+        assert_eq!(receiver.recv().unwrap().result, Some(json!("first")));
+    }
+
+    #[test]
+    fn request_id_exhaustion_never_wraps() {
+        let mut pending = PendingRequests {
+            last_id: u64::MAX,
+            ..Default::default()
+        };
+        let (sender, _) = mpsc::sync_channel(1);
+        assert_eq!(
+            pending.insert("main", sender).unwrap_err(),
+            "control request identifiers exhausted"
+        );
     }
 }

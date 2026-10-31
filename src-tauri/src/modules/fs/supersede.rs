@@ -23,9 +23,13 @@ pub struct Supersede {
 pub struct Ticket {
     counter: Arc<AtomicU64>,
     mine: u64,
+    admitted: bool,
 }
 
 impl Ticket {
+    pub fn is_admitted(&self) -> bool {
+        self.admitted
+    }
     pub fn is_current(&self) -> bool {
         self.counter.load(Ordering::SeqCst) == self.mine
     }
@@ -46,10 +50,10 @@ impl Supersede {
             .find(|&i| key.is_char_boundary(i))
             .unwrap_or(0);
         let key = &key[..end];
-        let counter = {
+        let (counter, admitted) = {
             let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(counter) = counters.get(key) {
-                counter.clone()
+                (counter.clone(), true)
             } else {
                 if counters.len() >= MAX_KEYS {
                     // A counter only the table holds has no ticket, and none
@@ -57,16 +61,17 @@ impl Supersede {
                     counters.retain(|_, counter| Arc::strong_count(counter) > 1);
                 }
                 let counter = Arc::new(AtomicU64::new(0));
-                // Sixteen keys all with searches in flight: this one goes
-                // untracked rather than displacing any of them.
                 if counters.len() < MAX_KEYS {
                     counters.insert(key.to_owned(), counter.clone());
+                    (counter, true)
+                } else {
+                    // Reject overflow rather than allow unsupersedable work.
+                    (counter, false)
                 }
-                counter
             }
         };
         let mine = counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ticket { counter, mine }
+        Ticket { counter, mine, admitted }
     }
 }
 
@@ -162,13 +167,14 @@ mod tests {
     }
 
     #[test]
-    fn with_every_key_busy_a_new_key_is_untracked_and_nobody_else_is_disturbed() {
+    fn with_every_key_busy_overflow_is_refused_and_nobody_else_is_disturbed() {
         let state = Supersede::default();
         let held: Vec<Ticket> = (0..MAX_KEYS)
             .map(|i| state.begin(&format!("held{i}")))
             .collect();
         let overflow = state.begin("overflow");
-        assert!(overflow.is_current());
+        assert!(!overflow.is_admitted());
+        assert!(!state.begin("overflow").is_admitted());
         assert_eq!(state.counters.lock().unwrap().len(), MAX_KEYS);
         assert!(held.iter().all(Ticket::is_current));
         // The tracked searches are unaffected and still supersede correctly.
@@ -183,6 +189,7 @@ mod tests {
         drop(held);
         drop(newer);
         let late = state.begin("late");
+        assert!(late.is_admitted());
         assert!(state.begin("late").is_current());
         assert!(late.is_superseded());
     }

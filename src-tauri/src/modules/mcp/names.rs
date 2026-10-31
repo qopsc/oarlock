@@ -1,8 +1,8 @@
 //! Validation of what the page names: server ids, environment variable and
 //! header names, and the keychain accounts secret values live under. Pure.
 
-/// Keychain service of MCP secrets. The page writes them through
-/// `mcp_secret_set` and can never read them back: the generic `secrets_*`
+/// Keychain service of MCP secrets. Settings stages them in a configuration
+/// transaction and can never read them back: the generic `secrets_*`
 /// commands refuse this service (`secrets::page_may_use_service`).
 pub const SECRET_SERVICE: &str = "oarlock-mcp";
 

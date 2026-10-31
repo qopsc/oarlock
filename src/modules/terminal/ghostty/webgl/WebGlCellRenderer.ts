@@ -220,7 +220,10 @@ export class WebGlCellRenderer {
    * The drawing buffer has an alpha channel, for translucent terminals: cells on the default
    * background stay transparent. Fixed for the context's life; the pool matches it to the theme.
    */
-  constructor(readonly translucent = false) {
+  constructor(
+    readonly translucent = false,
+    private readonly loadImageLayer = () => import("./WebGlImageLayer"),
+  ) {
     this.canvas.className = "block";
     this.canvas.setAttribute("aria-hidden", "true");
     const context = this.canvas.getContext(
@@ -517,22 +520,31 @@ export class WebGlCellRenderer {
 
   private readonly handleContextRestored = (): void => {
     if (this.disposed) return;
+    try {
+      this.atlas = null;
+      this.glyphGpuCapacity = 0;
+      this.backgroundGpuBytes = 0;
+      this.resources = this.createResources();
+      this.uploadedCursorCount = -1;
+      this.renderedLink = null;
+      this.linkVertices.count = 0;
+      if (this.profile) {
+        this.atlas = new WebGlGlyphAtlas(
+          this.gl,
+          this.profile.metrics,
+          this.profile.scale,
+        );
+      }
+    } catch (error) {
+      this.clearContextRestoreTimer();
+      this.contextLost = true;
+      this.onContextFailure?.(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      return;
+    }
     this.clearContextRestoreTimer();
     this.contextLost = false;
-    this.atlas = null;
-    this.glyphGpuCapacity = 0;
-    this.backgroundGpuBytes = 0;
-    this.resources = this.createResources();
-    this.uploadedCursorCount = -1;
-    this.renderedLink = null;
-    this.linkVertices.count = 0;
-    if (this.profile) {
-      this.atlas = new WebGlGlyphAtlas(
-        this.gl,
-        this.profile.metrics,
-        this.profile.scale,
-      );
-    }
     this.contextRecoveryCount += 1;
     this.viewportDirty = true;
     this.forceFullRedraw = true;
@@ -577,19 +589,27 @@ export class WebGlCellRenderer {
       });
     if (this.imagesLoading) return null;
     this.imagesLoading = true;
-    imageLayerModule ??= import("./WebGlImageLayer").then((module) => {
+    imageLayerModule ??= this.loadImageLayer().then((module) => {
       loadedImageLayerModule = module;
       return module;
     });
-    imageLayerModule.then(
+    const pending = imageLayerModule;
+    pending.then(
       () => {
         if (this.disposed) return;
         this.imagesStale = true;
         this.forcePresent = true;
         this.requestFrame?.();
       },
-      // Without its code the pane draws no images; it does not retry every frame.
-      () => {},
+      (error: unknown) => {
+        if (imageLayerModule === pending) imageLayerModule = null;
+        if (this.disposed) return;
+        this.imagesLoading = false;
+        if (!this.imagesShownValue || this.contextLost) return;
+        this.onContextFailure?.(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      },
     );
     return null;
   }

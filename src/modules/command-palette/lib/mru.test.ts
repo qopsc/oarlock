@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mruRank, mruSnapshot, recordUse } from "./mru";
 
 describe("mruRank", () => {
@@ -25,4 +25,26 @@ describe("mru persistence without localStorage", () => {
   it("does not throw when recording a use", () => {
     expect(() => recordUse("some.command")).not.toThrow();
   });
+});
+
+afterEach(() => vi.unstubAllGlobals());
+
+it.each(["null", "7", '"broken"', "[]", '{"settings.open":"bad"}'])(
+  "keeps the palette usable with invalid stored ranking: %s",
+  (stored) => {
+    const setItem = vi.fn();
+    vi.stubGlobal("localStorage", { getItem: () => stored, setItem });
+    expect(mruRank(mruSnapshot(), "settings.open")).toBe(0);
+    expect(() => recordUse("settings.open")).not.toThrow();
+    expect(JSON.parse(setItem.mock.calls[0][1])["settings.open"]).toBeTypeOf(
+      "number",
+    );
+  },
+);
+
+it("retains valid usage timestamps", () => {
+  vi.stubGlobal("localStorage", {
+    getItem: () => '{"settings.open":123}',
+  });
+  expect(mruRank(mruSnapshot(), "settings.open")).toBe(123);
 });

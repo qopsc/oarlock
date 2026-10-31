@@ -5,7 +5,8 @@ import {
   StateField,
 } from "@codemirror/state";
 import {
-  EditorView,
+  type EditorView,
+  ViewPlugin,
   keymap,
   showTooltip,
   type Tooltip,
@@ -13,6 +14,7 @@ import {
 } from "@codemirror/view";
 import { Clock01Icon } from "@hugeicons/core-free-icons";
 import { hugeIcon } from "./completionIcons";
+import { HistorySearch } from "./historySearch";
 
 type Fetcher = (query: string, limit: number) => Promise<string[]>;
 
@@ -170,26 +172,35 @@ function historyTooltipView(view: EditorView): TooltipView {
 }
 
 export function historyPopover(fetch: Fetcher) {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
   const open = (view: EditorView) => {
     const query = view.state.doc.toString();
-    void fetch(query, LIMIT).then((items) => {
-      if (items.length) dispatch(view, { open: true, items, index: 0 });
+    view.plugin(runtime)?.search.start(query, LIMIT, 0, (items) => {
+      if (view.state.doc.toString() === query && items.length)
+        dispatch(view, { open: true, items, index: 0 });
     });
   };
 
   const refilter = (view: EditorView) => {
-    if (timer) clearTimeout(timer);
     const query = view.state.doc.toString();
-    timer = setTimeout(() => {
-      void fetch(query, LIMIT).then((items) => {
-        if (view.state.field(historyField, false)?.open) {
-          dispatch(view, { open: true, items, index: 0 });
-        }
-      });
-    }, REFILTER_MS);
+    view.plugin(runtime)?.search.start(query, LIMIT, REFILTER_MS, (items) => {
+      if (view.state.doc.toString() === query && view.state.field(historyField, false)?.open)
+        dispatch(view, { open: true, items, index: 0 });
+    });
   };
+
+  const runtime = ViewPlugin.fromClass(class {
+    search = new HistorySearch(fetch);
+    update(update: import("@codemirror/view").ViewUpdate) {
+      const wasOpen = update.startState.field(historyField, false)?.open;
+      const isOpen = update.state.field(historyField, false)?.open;
+      if (wasOpen && !isOpen) this.search.cancel();
+      if (update.docChanged) {
+        if (isOpen) refilter(update.view);
+        else this.search.cancel();
+      }
+    }
+    destroy() { this.search.dispose(); }
+  });
 
   const upOrOpen = (view: EditorView): boolean => {
     const h = view.state.field(historyField, false);
@@ -219,13 +230,17 @@ export function historyPopover(fetch: Fetcher) {
   };
 
   const dismiss = (view: EditorView): boolean => {
-    if (!view.state.field(historyField, false)?.open) return false;
+    const search = view.plugin(runtime)?.search;
+    const pending = search?.pending() ?? false;
+    search?.cancel();
+    if (!view.state.field(historyField, false)?.open) return pending;
     close(view);
     return true;
   };
 
   return [
     historyField,
+    runtime,
     Prec.highest(
       keymap.of([
         { key: "ArrowUp", run: upOrOpen },
@@ -234,9 +249,6 @@ export function historyPopover(fetch: Fetcher) {
         { key: "Escape", run: dismiss },
       ]),
     ),
-    EditorView.updateListener.of((u) => {
-      if (!u.docChanged) return;
-      if (u.state.field(historyField, false)?.open) refilter(u.view);
-    }),
+
   ];
 }

@@ -41,6 +41,17 @@ describe("fileUriToPath", () => {
     expect(fileUriToPath("https://example.com/x")).toBeNull();
   });
 
+  it("rejects malformed percent encodings instead of breaking server message handling", () => {
+    for (const uri of [
+      "file:///repo/100%.ts",
+      "file:///repo/%E0%A4.ts",
+      "file:///repo/%ZZ.ts",
+    ]) {
+      expect(fileUriToPath(uri)).toBeNull();
+      expect(sameFileUri(uri, "file:///repo/a.ts")).toBe(false);
+    }
+  });
+
   it("decodes an encoded, lower-case drive (crynta/terax-ai#1305)", () => {
     expect(fileUriToPath("file:///d%3A/repo/app.py")).toBe("D:/repo/app.py");
   });

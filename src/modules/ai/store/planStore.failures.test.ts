@@ -5,12 +5,13 @@ const native = vi.hoisted(() => ({
   writeFile: vi.fn(async (_path: string, _content: string) => {}),
   createDir: vi.fn(async (_path: string) => {}),
 }));
-vi.mock("../lib/native", () => ({ native }));
+vi.mock("../lib/native", () => ({ native, createNative: () => native }));
 
 import { type QueuedEdit, usePlanStore } from "./planStore";
 
 const edit = (id: string, path: string): QueuedEdit => ({
   id,
+  workspace: { kind: "local" },
   kind: "write_file",
   path,
   originalContent: "",
@@ -54,6 +55,24 @@ describe("plan Apply failures", () => {
     expect(usePlanStore.getState().queue[0].error).toBe("disk full");
 
     await applyAll();
+    expect(usePlanStore.getState().queue).toEqual([]);
+  });
+
+  it("does not write an edit rejected while its path validation is pending", async () => {
+    let resolve!: (path: string) => void;
+    native.canonicalize.mockImplementationOnce(
+      () =>
+        new Promise<string>((done) => {
+          resolve = done;
+        }),
+    );
+    const { enqueue, applyAll, removeOne } = usePlanStore.getState();
+    enqueue(edit("pending", "/repo/a.ts"));
+    const applying = applyAll();
+    removeOne("pending");
+    resolve("/repo/a.ts");
+    await applying;
+    expect(native.writeFile).not.toHaveBeenCalled();
     expect(usePlanStore.getState().queue).toEqual([]);
   });
 });

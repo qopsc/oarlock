@@ -29,6 +29,7 @@ export type ProjectServerView = {
 };
 
 export type ProjectServers = {
+  active?: boolean;
   project: OpenProject;
   /** The file, spelled as the window spells the project. */
   path: string;
@@ -114,6 +115,7 @@ export function projectServerConfig(
   const choices = effectiveRecord(record, view.entryHash);
   return {
     id: view.id,
+    projectKey: project.key,
     name: view.name.trim().slice(0, 64) || view.id,
     source: `project:${project.root}`,
     enabled: choices.enabled,
@@ -145,7 +147,7 @@ export function projectConfigs(
   return projects.flatMap((p) =>
     p.servers.flatMap((view) => {
       const config = projectServerConfig(view, p.project, records[view.id]);
-      return config ? [config] : [];
+      return config ? [{ ...config, retainedOnly: p.active === false }] : [];
     }),
   );
 }

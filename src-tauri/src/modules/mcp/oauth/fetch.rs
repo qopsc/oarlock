@@ -95,6 +95,32 @@ pub async fn request(
     body: Body,
     basic: Option<String>,
 ) -> Result<Fetched, String> {
+    request_with_timeout(policy, method, url, body, basic, TIMEOUT).await
+}
+
+async fn request_with_timeout(
+    policy: &Policy,
+    method: Method,
+    url: Url,
+    body: Body,
+    basic: Option<String>,
+    timeout: Duration,
+) -> Result<Fetched, String> {
+    net::deadline::within(
+        timeout,
+        "Sign-in HTTP request",
+        request_inner(policy, method, url, body, basic),
+    )
+    .await
+}
+
+async fn request_inner(
+    policy: &Policy,
+    method: Method,
+    url: Url,
+    body: Body,
+    basic: Option<String>,
+) -> Result<Fetched, String> {
     let mut url = url;
     for _ in 0..=MAX_REDIRECTS {
         let host = url.host_str().ok_or("missing host")?.to_owned();
@@ -165,6 +191,101 @@ pub async fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn redirect_hops_share_one_request_deadline() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/0", listener.local_addr().unwrap())).unwrap();
+        let policy = Policy::for_server(&url, true);
+        let server = tokio::spawn(async move {
+            for hop in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let read = socket.read(&mut bytes).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&bytes[..read]);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let response = if hop == 3 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned()
+                } else {
+                    format!("HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", hop + 1)
+                };
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        // Scaled deadline exercises the real request/redirect path without a
+        // 30-second wall-clock test. Each hop fits, the whole chain does not.
+        let result = request_with_timeout(
+            &policy,
+            Method::GET,
+            url,
+            Body::None,
+            None,
+            Duration::from_millis(300),
+        )
+        .await;
+        server.abort();
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.contains("timed out")),
+            "four delayed hops exceeded the request deadline but succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_closes_a_response_that_stalls_after_headers() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let policy = Policy::for_server(&url, true);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            let closed = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                .await
+                .expect("deadline retained the response socket");
+            assert!(closed.is_err() || closed.unwrap() == 0);
+        });
+        let result = request_with_timeout(
+            &policy,
+            Method::GET,
+            url,
+            Body::None,
+            None,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(result.err().unwrap().contains("timed out"));
+        tokio::time::timeout(Duration::from_secs(4), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     fn public() -> Policy {
         Policy::for_server(&Url::parse("https://mcp.example.com/mcp").unwrap(), false)

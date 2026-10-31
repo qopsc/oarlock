@@ -20,3 +20,17 @@ describe("prompt and template arguments", () => {
     });
   });
 });
+
+it("preserves prototype-named arguments and required errors", () => {
+  const fields = [{ name: "__proto__", label: "Value", required: true }];
+  expect(
+    Object.keys(
+      missingArguments(fields, Object.fromEntries([["__proto__", ""]])),
+    ),
+  ).toEqual(["__proto__"]);
+  expect(
+    JSON.stringify(
+      filledArguments(fields, Object.fromEntries([["__proto__", "answer"]])),
+    ),
+  ).toBe('{"__proto__":"answer"}');
+});

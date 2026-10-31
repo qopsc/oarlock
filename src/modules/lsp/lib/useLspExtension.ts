@@ -1,4 +1,6 @@
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { workspaceEnvForPath } from "@/modules/workspace/env";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
 import type { Extension } from "@codemirror/state";
 import { useEffect, useState } from "react";
 import { serverForLanguage } from "./presets";
@@ -9,8 +11,13 @@ export function useLspExtension(
   path: string,
   langId: string | null,
   ready: boolean,
+  owner?: { current: { active: boolean; generation: number } },
 ): Extension | null {
-  const [ext, setExt] = useState<Extension | null>(null);
+  const workspace = workspaceEnvForPath(path, useOwnedWorkspace());
+  const [attached, setAttached] = useState<{
+    key: string;
+    ext: Extension;
+  } | null>(null);
   const customServers = usePreferencesStore((s) => s.lspCustomServers);
   const lspActivation = usePreferencesStore((s) => s.lspActivation);
   const preset = serverForLanguage(langId, customServers, lspActivation);
@@ -20,16 +27,25 @@ export function useLspExtension(
   );
 
   const presetId = preset?.id;
+  const key = JSON.stringify([
+    path,
+    langId,
+    ready,
+    workspace,
+    presetId,
+    activation,
+    generation,
+  ]);
   // biome-ignore lint/correctness/useExhaustiveDependencies(generation): re-acquire after a server crash tears the session down
   // biome-ignore lint/correctness/useExhaustiveDependencies(presetId): swapping the enabled server for a language must rebind the doc
   useEffect(() => {
     if (!ready || !langId || activation !== "enabled") {
-      setExt(null);
+      setAttached(null);
       return;
     }
     let cancelled = false;
     let handle: LspDocHandle | null = null;
-    acquireDocExtension(path, langId)
+    acquireDocExtension(path, langId, workspace, owner)
       .then((h) => {
         if (!h) return;
         if (cancelled) {
@@ -37,15 +53,15 @@ export function useLspExtension(
           return;
         }
         handle = h;
-        setExt(h.extension);
+        setAttached({ key, ext: h.extension });
       })
       .catch((e) => console.error("[lsp] acquire failed", e));
     return () => {
       cancelled = true;
       handle?.release();
-      setExt(null);
+      setAttached(null);
     };
-  }, [path, langId, ready, activation, generation, presetId]);
+  }, [path, langId, ready, activation, generation, presetId, workspace, key, owner]);
 
-  return ext;
+  return attached?.key === key ? attached.ext : null;
 }

@@ -1,3 +1,5 @@
+import { evaluateRegex } from "../search/regexEvaluation";
+import { wholeWordMatches } from "../search/regexView";
 import {
   getSearchQuery,
   SearchQuery,
@@ -36,6 +38,19 @@ function chunkedScan(
   chunk: number,
   cap = 10_000,
 ) {
+  if (query.regexp) {
+    const raw = evaluateRegex({
+      text: state.doc.toString(),
+      spec: { ...query, regexp: true },
+    });
+    const matches = query.wholeWord ? wholeWordMatches(state, raw) : raw;
+    return {
+      from: matches.map((m) => m.from),
+      to: matches.map((m) => m.to),
+      capped: false,
+      done: true,
+    };
+  }
   const scan = new MatchScan(state, query, cap, chunk);
   // One chunk per slice, to cross every boundary.
   while (!scan.step(() => true));
@@ -144,7 +159,7 @@ describe("MatchScan", () => {
     expect(scan.from).toEqual(fullScan(state, query).from);
   });
 
-  it("does not count a multi-line regular expression in a huge document", () => {
+  it("refuses every regex in the UI counter, including small single-line queries", () => {
     const state = EditorState.create({ doc: "a\n".repeat(2_200_000) });
     const multiline = new MatchScan(
       state,
@@ -158,9 +173,9 @@ describe("MatchScan", () => {
       new SearchQuery({ search: "^a$", regexp: true }),
       5,
     );
-    expect(single.unsupported).toBe(false);
+    expect(single.unsupported).toBe(true);
     single.step(() => false);
-    expect(single.capped).toBe(true);
+    expect(single.from).toEqual([]);
   });
 });
 

@@ -65,7 +65,7 @@ describe("startPromptCall", () => {
     const showForm = vi.fn();
     const out = await startPromptCall("docs:greet", showForm);
     expect(showForm).not.toHaveBeenCalled();
-    expect(api.getMcpPrompt).toHaveBeenCalledWith("s1", "greet", {});
+    expect(api.getMcpPrompt).toHaveBeenCalledWith("s1", "greet", {}, undefined);
     expect(out).toMatchObject({
       kind: "message",
       block: expect.stringContaining('<mcp-prompt server="Docs" name="greet">'),
@@ -99,11 +99,15 @@ describe("startPromptCall", () => {
       { type: "ref/prompt", name: "review" },
       { name: "language", value: "r" },
       {},
+      undefined,
     );
     await shown.submit({ language: "rust", style: "" });
-    expect(api.getMcpPrompt).toHaveBeenCalledWith("s1", "review", {
-      language: "rust",
-    });
+    expect(api.getMcpPrompt).toHaveBeenCalledWith(
+      "s1",
+      "review",
+      { language: "rust" },
+      undefined,
+    );
     await expect(pending).resolves.toMatchObject({ kind: "message" });
   });
 
@@ -295,6 +299,7 @@ describe("templateForm", () => {
       "s1",
       template.uriTemplate,
       { team: "core", name: "ann" },
+      undefined,
     );
     expect(attach.mock.calls[0][0].files[0]).toMatchObject({
       name: "ann",
@@ -307,6 +312,7 @@ describe("templateForm", () => {
       { type: "ref/resource", uri: template.uriTemplate },
       { name: "name", value: "a" },
       { team: "core" },
+      undefined,
     );
   });
 
@@ -330,4 +336,115 @@ describe("templateForm", () => {
     );
     expect(attach).not.toHaveBeenCalled();
   });
+});
+
+it("cancels a pending argument form and makes a stale Submit inert", async () => {
+  useMcpExtras.getState().setServers([docs()]);
+  const controller = new AbortController();
+  let shown!: ArgumentsFormRequest;
+  const pending = startPromptCall(
+    "docs:review",
+    (form) => {
+      shown = form;
+    },
+    controller.signal,
+  );
+  await vi.waitFor(() => expect(shown).toBeDefined());
+  controller.abort();
+  await expect(pending).resolves.toEqual({ kind: "cancelled" });
+  await shown.submit({ language: "rust" });
+  expect(api.getMcpPrompt).not.toHaveBeenCalled();
+});
+it("forwards cancellation to prompt retrieval and suppresses its late result", async () => {
+  useMcpExtras.getState().setServers([docs()]);
+  const controller = new AbortController();
+  let finish!: (value: unknown) => void;
+  api.getMcpPrompt.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const send = vi.fn(),
+    sendAsWritten = vi.fn();
+  const pending = runPromptCall({
+    command: "docs:greet",
+    picked: false,
+    showForm: vi.fn(),
+    send,
+    sendAsWritten,
+    signal: controller.signal,
+  });
+  await vi.waitFor(() =>
+    expect(api.getMcpPrompt).toHaveBeenCalledWith(
+      "s1",
+      "greet",
+      {},
+      controller.signal,
+    ),
+  );
+  controller.abort();
+  finish(text("late answer"));
+  await pending;
+  expect(send).not.toHaveBeenCalled();
+  expect(sendAsWritten).not.toHaveBeenCalled();
+  expect(toast.error).not.toHaveBeenCalled();
+});
+
+it("cancelling a resource read passes its signal and discards a late response", async () => {
+  const controller = new AbortController();
+  let finish!: (value: object) => void;
+  api.readMcpResource.mockReturnValueOnce(
+    new Promise((r) => {
+      finish = r;
+    }),
+  );
+  const pending = resourceFiles(
+    "s1",
+    "Docs",
+    { uri: "doc://a", name: "a" },
+    controller.signal,
+  );
+  const rejected = expect(pending).rejects.toMatchObject({
+    name: "AbortError",
+  });
+  expect(api.readMcpResource).toHaveBeenLastCalledWith(
+    "s1",
+    "doc://a",
+    controller.signal,
+  );
+  controller.abort();
+  finish({ contents: [{ uri: "doc://a", text: "late" }] });
+  await rejected;
+});
+it("a cancelled template form cannot attach after its read finishes", async () => {
+  let finish!: (value: object) => void;
+  api.readMcpTemplate.mockReturnValueOnce(
+    new Promise((r) => {
+      finish = r;
+    }),
+  );
+  const attach = vi.fn();
+  const form = templateForm(
+    {
+      serverId: "s1",
+      serverName: "Docs",
+      template: {
+        name: "doc",
+        uriTemplate: "doc://{id}",
+        variables: ["id"],
+        optional: [],
+      },
+    },
+    attach,
+    vi.fn(),
+  );
+  const pending = form.submit({ id: "a" });
+  form.cancel();
+  finish({
+    uri: "doc://a",
+    result: { contents: [{ uri: "doc://a", text: "late" }] },
+  });
+  await pending;
+  expect(attach).not.toHaveBeenCalled();
 });

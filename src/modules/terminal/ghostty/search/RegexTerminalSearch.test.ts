@@ -1,14 +1,36 @@
 import { readFile } from "node:fs/promises";
 import { OarlockGhostty } from "@oarlock/ghostty-core/adapted";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { AdaptedGhosttyTerminalModel } from "../AdaptedGhosttyTerminalModel";
-import {
-  compileTerminalPattern,
-  matchLine,
-  RegexTerminalSearch,
-} from "./RegexTerminalSearch";
+import { RegexTerminalSearch } from "./RegexTerminalSearch";
+import { compileTerminalPattern, matchLine } from "./regexEvaluation";
+import type { RegexRunner } from "./regexWorkerClient";
+const inlineRunner = (): RegexRunner => ({
+  run: async (batch) => {
+    const regex = compileTerminalPattern(batch.pattern);
+    if (!regex) throw new Error("Invalid regex");
+    return batch.lines.flatMap((row, index) =>
+      matchLine(row, batch.firstLine + index, regex, batch.limit),
+    );
+  },
+  dispose: () => {},
+});
+async function scan(search: RegexTerminalSearch, budget: number) {
+  let status = search.step(budget);
+  while (!status.complete) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    status = search.step(budget);
+  }
+  return status;
+}
 
 describe("regex terminal search patterns", () => {
+  it("does not evaluate another match after reaching the cap", () => {
+    const regex = /x/g;
+    const exec = vi.spyOn(regex, "exec");
+    expect(matchLine(["x", "x"], 0, regex, 1)).toHaveLength(1);
+    expect(exec).toHaveBeenCalledOnce();
+  });
   it("is smart-case and rejects invalid or empty-matching patterns", () => {
     expect(compileTerminalPattern("err")?.flags).toContain("i");
     expect(compileTerminalPattern("Err")?.flags).not.toContain("i");
@@ -57,7 +79,7 @@ describe("regex terminal search over a buffer", () => {
     core = await OarlockGhostty.loadBytes(Uint8Array.from(file).buffer);
   });
 
-  it("scans history in steps, selects matches and scrolls to them", () => {
+  it("scans history in steps, selects matches and scrolls to them", async () => {
     const model = new AdaptedGhosttyTerminalModel(core, {
       backend: "ghostty-webgpu",
       cols: 40,
@@ -71,11 +93,11 @@ describe("regex terminal search over a buffer", () => {
           ),
         );
       }
-      const search = new RegexTerminalSearch(model);
+      const search = new RegexTerminalSearch(model, () => {}, inlineRunner);
       expect(search.setQuery("error \\d+").pending).toBe(true);
       let status = search.step(10);
       expect(status.complete).toBe(false);
-      while (!status.complete) status = search.step(10);
+      status = await scan(search, 10);
       expect(status.totalMatches).toBe(3);
 
       status = search.select("previous");
@@ -100,7 +122,7 @@ describe("regex terminal search over a buffer", () => {
 
       // New output restarts the scan.
       model.write(new TextEncoder().encode("ERROR 7\r\n"));
-      status = search.step(100);
+      status = await scan(search, 100);
       expect(status.totalMatches).toBe(4);
       expect(status.selectedIndex).toBe(-1);
     } finally {

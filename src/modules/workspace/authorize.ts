@@ -13,10 +13,8 @@ import {
 type Grant = "root" | "folder" | "file";
 const GRANTS: readonly Grant[] = ["root", "folder", "file"];
 
-const GRANTED_CAP = 4096;
-// Authorizations never lapse in the backend, so a granted path needs no
-// second round trip.
-const granted = new Set<string>();
+// Requests for a spelling may be shared while in flight, but must be checked
+// again on a later explicit open: a symlink may now name a different target.
 const inFlight = new Map<string, Promise<boolean>>();
 
 const keyOf = (grant: Grant, path: string, env: WorkspaceEnv) =>
@@ -28,7 +26,6 @@ function authorize(
   env: WorkspaceEnv,
 ): Promise<boolean> {
   const key = keyOf(grant, path, env);
-  if (granted.has(key)) return Promise.resolve(true);
   const pending = inFlight.get(key);
   if (pending) return pending;
   const request = invoke<string>("workspace_authorize", {
@@ -37,11 +34,7 @@ function authorize(
     ...(grant !== "root" && { opened: grant }),
   })
     .then(
-      () => {
-        if (granted.size >= GRANTED_CAP) granted.clear();
-        granted.add(key);
-        return true;
-      },
+      () => true,
       () => false,
     )
     .finally(() => inFlight.delete(key));

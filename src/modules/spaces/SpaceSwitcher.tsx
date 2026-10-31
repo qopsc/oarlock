@@ -1,3 +1,4 @@
+import { workspaceUnavailableReason } from "@/modules/workspace/availability";
 import { Kbd } from "@/components/ui/kbd";
 import {
   Popover,
@@ -17,10 +18,11 @@ import {
   PlusSignIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { InlineRename } from "./components/InlineRename";
 import { accentFor } from "./lib/spaceColor";
+import { releaseSpaceDrag, spaceDragEndAction } from "./lib/dragEnd";
 import type { SpaceMeta } from "./lib/store";
 import { useSpaces } from "./lib/useSpaces";
 import { SpaceAvatar } from "./SpaceAvatar";
@@ -53,6 +55,8 @@ type DragState = {
   kind: "space" | "tab";
   id: string | number;
   active: boolean;
+  capture: Element;
+  previousSelection: string | null;
 };
 
 type DropTarget =
@@ -142,23 +146,30 @@ export function SpaceSwitcher({
       return next;
     });
 
-  const endDrag = (el: Element) => {
+  const endDrag = useCallback((updateState = true) => {
     const st = drag.current;
-    if (st) el.releasePointerCapture?.(st.pointerId);
+    // Clear ownership before releasing capture, which can itself emit an event.
     drag.current = null;
     dropRef.current = null;
-    setDragging(null);
-    setDrop(null);
-    setOverlay(null);
-    document.body.style.userSelect = "";
-  };
+    releaseSpaceDrag(st, document.body.style);
+    if (updateState) {
+      setDragging(null);
+      setDrop(null);
+      setOverlay(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open && drag.current) endDrag();
+  }, [open, endDrag]);
+  useEffect(() => () => endDrag(false), [endDrag]);
 
   const onPointerDown = (
     e: React.PointerEvent,
     kind: "space" | "tab",
     id: string | number,
   ) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || drag.current) return;
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
     drag.current = {
       pointerId: e.pointerId,
@@ -167,6 +178,8 @@ export function SpaceSwitcher({
       kind,
       id,
       active: false,
+      capture: e.currentTarget,
+      previousSelection: null,
     };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
@@ -177,6 +190,7 @@ export function SpaceSwitcher({
     if (!st.active) {
       if (Math.hypot(e.clientX - st.startX, e.clientY - st.startY) < 5) return;
       st.active = true;
+      st.previousSelection = document.body.style.userSelect;
       setDragging({ kind: st.kind, id: st.id });
       document.body.style.userSelect = "none";
     }
@@ -192,13 +206,15 @@ export function SpaceSwitcher({
       return;
     }
     const rect = hit.getBoundingClientRect();
-    const edge: Edge = e.clientY < rect.top + rect.height / 2 ? "top" : "bottom";
+    const edge: Edge =
+      e.clientY < rect.top + rect.height / 2 ? "top" : "bottom";
     const kind = hit.getAttribute("data-drop");
     let next: DropTarget | null = null;
     if (st.kind === "space") {
       if (kind === "space") {
         const spaceId = hit.getAttribute("data-space-id");
-        if (spaceId && spaceId !== st.id) next = { kind: "space", spaceId, edge };
+        if (spaceId && spaceId !== st.id)
+          next = { kind: "space", spaceId, edge };
       }
     } else if (kind === "tab") {
       const tabId = Number(hit.getAttribute("data-tab-id"));
@@ -236,10 +252,11 @@ export function SpaceSwitcher({
   const contentRef = useRef<HTMLDivElement>(null);
 
   const onPointerUp = (e: React.PointerEvent, onActivate?: () => void) => {
-    const st = drag.current;
-    if (st?.active) commit();
-    else if (st) onActivate?.();
-    endDrag(e.currentTarget);
+    const action = spaceDragEndAction(drag.current, e.pointerId, e.type);
+    if (action === "ignore") return;
+    if (action === "commit") commit();
+    else if (action === "activate") onActivate?.();
+    endDrag();
   };
 
   if (!current) return null;
@@ -431,10 +448,13 @@ function SpaceRow({
         data-space-id={space.id}
         role="button"
         tabIndex={editing ? -1 : 0}
-        onPointerDown={editing ? undefined : (e) => onPointerDown(e, "space", space.id)}
+        onPointerDown={
+          editing ? undefined : (e) => onPointerDown(e, "space", space.id)
+        }
         onPointerMove={onPointerMove}
         onPointerUp={editing ? undefined : (e) => onPointerUp(e, onSwitch)}
         onPointerCancel={(e) => onPointerUp(e)}
+        onLostPointerCapture={(e) => onPointerUp(e)}
         onKeyDown={(e) => {
           if (editing) return;
           if (e.key === "Enter") {
@@ -478,6 +498,11 @@ function SpaceRow({
         ) : (
           <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
             {space.name}
+            {workspaceUnavailableReason(space.env) && (
+              <span className="ml-2 font-normal text-muted-foreground">
+                Unavailable
+              </span>
+            )}
           </span>
         )}
         {!editing && (
@@ -494,7 +519,11 @@ function SpaceRow({
                 label="Rename space"
                 onClick={onStartRename}
               />
-              <RowAction icon={PlusSignIcon} label="New tab" onClick={onNewTab} />
+              <RowAction
+                icon={PlusSignIcon}
+                label="New tab"
+                onClick={onNewTab}
+              />
               {canDelete && (
                 <RowAction
                   icon={Delete02Icon}
@@ -575,6 +604,7 @@ function TabRow({
         onPointerMove={onPointerMove}
         onPointerUp={(e) => onPointerUp(e, onJump)}
         onPointerCancel={(e) => onPointerUp(e)}
+        onLostPointerCapture={(e) => onPointerUp(e)}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();

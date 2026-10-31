@@ -1,10 +1,10 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { native } from "../lib/native";
+import { native as defaultNative } from "../lib/native";
 import { checkWritableCanonical } from "../lib/security";
 import { newQueuedEditId, usePlanStore } from "../store/planStore";
 import { resolvePath, type ToolContext } from "./context";
-import { writtenEntry } from "./readCache";
+import { contentHash, writtenEntry } from "./readCache";
 
 type EditResult =
   | { ok: true; replacements: number; bytesWritten: number; path: string }
@@ -20,15 +20,21 @@ async function applyEdits(
   abs: string,
   edits: { old_string: string; new_string: string; replace_all?: boolean }[],
   kind: "edit" | "multi_edit",
-  readCache: Map<string, { size: number; hash: number }>,
+  ctx: ToolContext,
 ): Promise<EditResult> {
+  const native = ctx.native ?? defaultNative;
+  const readCache = ctx.readCache;
   const r = await native.readFile(abs);
-  if (r.kind === "binary")
-    return { error: "binary file refused", path: abs };
+  if (r.kind === "binary") return { error: "binary file refused", path: abs };
   if (r.kind === "toolarge")
     return { error: `file too large (${r.size} bytes)`, path: abs };
 
   const original = r.content;
+  const prior = readCache.get(abs);
+  const fullContent =
+    prior?.fullContent === true &&
+    prior.size === r.size &&
+    prior.hash === contentHash(original);
   let content = original;
   let totalReplacements = 0;
 
@@ -89,6 +95,7 @@ async function applyEdits(
 
   if (usePlanStore.getState().active) {
     usePlanStore.getState().enqueue({
+      workspace: ctx.workspace,
       id: newQueuedEditId(),
       kind,
       path: abs,
@@ -106,7 +113,7 @@ async function applyEdits(
 
   try {
     await native.writeFile(abs, content);
-    const entry = writtenEntry(content);
+    const entry = { ...writtenEntry(content), fullContent };
     readCache.set(abs, entry);
     return {
       ok: true,
@@ -120,6 +127,7 @@ async function applyEdits(
 }
 
 export function buildEditTools(ctx: ToolContext) {
+  const native = ctx.native ?? defaultNative;
   return {
     edit: tool({
       description:
@@ -128,13 +136,18 @@ export function buildEditTools(ctx: ToolContext) {
         path: z.string(),
         old_string: z
           .string()
-          .describe("Exact substring to replace. Must be unique unless replace_all."),
+          .describe(
+            "Exact substring to replace. Must be unique unless replace_all.",
+          ),
         new_string: z.string().describe("Replacement substring."),
         replace_all: z.boolean().optional(),
       }),
       execute: async ({ path, old_string, new_string, replace_all }) => {
         const reqPath = resolvePath(path, ctx.getCwd());
-        const safety = await checkWritableCanonical(reqPath, native.canonicalize);
+        const safety = await checkWritableCanonical(
+          reqPath,
+          native.canonicalize,
+        );
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
         if (!ctx.readCache.has(abs)) {
@@ -148,7 +161,7 @@ export function buildEditTools(ctx: ToolContext) {
           abs,
           [{ old_string, new_string, replace_all }],
           "edit",
-          ctx.readCache,
+          ctx,
         );
       },
     }),
@@ -170,7 +183,10 @@ export function buildEditTools(ctx: ToolContext) {
       }),
       execute: async ({ path, edits }) => {
         const reqPath = resolvePath(path, ctx.getCwd());
-        const safety = await checkWritableCanonical(reqPath, native.canonicalize);
+        const safety = await checkWritableCanonical(
+          reqPath,
+          native.canonicalize,
+        );
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
         if (!ctx.readCache.has(abs)) {
@@ -180,7 +196,7 @@ export function buildEditTools(ctx: ToolContext) {
             path: abs,
           };
         }
-        return applyEdits(abs, edits, "multi_edit", ctx.readCache);
+        return applyEdits(abs, edits, "multi_edit", ctx);
       },
     }),
   } as const;

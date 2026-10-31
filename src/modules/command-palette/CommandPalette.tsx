@@ -36,6 +36,8 @@ import { useCommandHistory } from "./hooks/useCommandHistory";
 import {
   CONTENT_SEARCH_MIN_QUERY,
   useContentSearch,
+  contentSearchOwnerCurrent,
+  type ContentSearchOwner,
 } from "./hooks/useContentSearch";
 import { fuzzyBest } from "./lib/fuzzy";
 import { MODE_HINTS, parseQuery } from "./lib/mode";
@@ -49,7 +51,11 @@ type Props = {
   initialMode?: "commands" | "content";
   commandItems: PaletteItem[];
   workspaceRoot: string | null;
-  onOpenContentHit: (path: string, line: number) => void;
+  onOpenContentHit: (
+    path: string,
+    line: number,
+    owner: ContentSearchOwner,
+  ) => void;
   insertCommand: ((cmd: string) => void) | null;
 };
 
@@ -176,9 +182,19 @@ export function CommandPalette({
 
   const openContent = useCallback(
     (path: string, line: number) => {
-      runAfterClose(() => onOpenContentHit(path, line));
+      const owner = content.resultsOwner;
+      if (
+        !owner ||
+        owner.root !== workspaceRoot ||
+        !contentSearchOwnerCurrent(owner)
+      )
+        return;
+      runAfterClose(() => {
+        if (contentSearchOwnerCurrent(owner))
+          onOpenContentHit(path, line, owner);
+      });
     },
-    [onOpenContentHit, runAfterClose],
+    [onOpenContentHit, runAfterClose, content.resultsOwner, workspaceRoot],
   );
 
   const runHistory = useCallback(

@@ -30,7 +30,8 @@ import {
   COMPACT_ITEM,
 } from "@/modules/explorer/lib/menuItemClass";
 import { usePreferencesStore } from "@/modules/settings/preferences";
-import { currentWorkspaceEnv } from "@/modules/workspace";
+import { currentWorkspaceEnv, useWorkspaceEnvStore, workspaceScopeKey } from "@/modules/workspace";
+import { cwdListingKey, loadCwdListing, type CwdListing } from "./lib/cwdListing";
 import {
   ArrowDown01Icon,
   Folder01Icon,
@@ -42,7 +43,6 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   createContext,
   type ReactElement,
-  useCallback,
   useContext,
   useEffect,
   useState,
@@ -301,31 +301,25 @@ function CurrentSegmentDropdown({
   onCd: (p: string) => void;
 }) {
   const showHidden = usePreferencesStore((s) => s.showHidden);
+  const workspace = useWorkspaceEnvStore((s) => s.env);
   const [open, setOpen] = useState(false);
-  const [children, setChildren] = useState<string[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      const dirs = await invoke<string[]>("list_subdirs", {
-        path,
-        showHidden,
-        workspace: currentWorkspaceEnv(),
-      });
-      setChildren(dirs);
-    } catch (e) {
-      setError(String(e));
-      setChildren([]);
-    }
-  }, [path, showHidden]);
+  const [listing, setListing] = useState<CwdListing | null>(null);
+  const key = cwdListingKey(path, showHidden, workspace);
+  const children = listing?.key === key ? listing.children : null;
+  const error = listing?.key === key ? listing.error : null;
 
   useEffect(() => {
-    if (open) load();
-  }, [open, load]);
+    if (!open) return;
+    let alive = true;
+    setListing(null);
+    void loadCwdListing(key, () => invoke<string[]>("list_subdirs", {
+      path, showHidden, workspace,
+    }), () => alive, setListing);
+    return () => { alive = false; };
+  }, [open, key, path, showHidden, workspace]);
 
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
+    <DropdownMenu open={open} onOpenChange={(next) => { setListing(null); setOpen(next); }}>
       <PathMenu path={path}>
         <DropdownMenuTrigger asChild>
           <BreadcrumbPage className="flex cursor-pointer items-center gap-1 rounded-sm px-1 py-0.5 text-foreground hover:bg-accent">
@@ -362,9 +356,10 @@ function CurrentSegmentDropdown({
           children.map((name) => (
             <DropdownMenuItem
               key={name}
-              onSelect={() =>
-                onCd(path.endsWith("/") ? `${path}${name}` : `${path}/${name}`)
-              }
+              onSelect={() => {
+                if (workspaceScopeKey(currentWorkspaceEnv()) !== workspaceScopeKey(workspace)) return;
+                onCd(path.endsWith("/") ? `${path}${name}` : `${path}/${name}`);
+              }}
             >
               <HugeiconsIcon
                 icon={Folder01Icon}

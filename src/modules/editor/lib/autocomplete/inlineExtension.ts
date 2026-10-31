@@ -1,3 +1,4 @@
+import type { CompletionRequest } from "./prompt";
 import {
   type EditorState,
   type Extension,
@@ -16,6 +17,7 @@ import {
   type ViewUpdate,
   WidgetType,
 } from "@codemirror/view";
+import { hasCompletionProvider } from "./configuration";
 import { normalizeIndent } from "./normalizeIndent";
 import { type CompletionDeps, requestCompletion } from "./provider";
 
@@ -28,6 +30,7 @@ export type AutocompleteContext = {
   getPrefs: () => AutocompletePrefs;
   getPath: () => string | null;
   getLanguage: () => string | null;
+  getDocument: () => CompletionRequest["document"];
 };
 
 type Suggestion = {
@@ -190,49 +193,66 @@ const CHAIN_DELAY_MS = 80;
 const MIN_PREFIX_CHARS = 2;
 const MAX_LINES = 6;
 const CACHE_SIZE = 32;
-const CACHE_TAIL = 512;
-const CACHE_HEAD = 128;
 const PREFIX_WINDOW = 4000;
 const SUFFIX_WINDOW = 2000;
 
-class LRU<K, V> {
-  private map = new Map<K, V>();
+class LRU {
+  private map = new Map<string, string>();
+  private chars = 0;
   constructor(private readonly cap: number) {}
-  get(k: K): V | undefined {
+  get(k: string): string | undefined {
     const v = this.map.get(k);
     if (v === undefined) return undefined;
     this.map.delete(k);
     this.map.set(k, v);
     return v;
   }
-  set(k: K, v: V) {
-    if (this.map.has(k)) this.map.delete(k);
+  set(k: string, v: string) {
+    const previous = this.map.get(k);
+    if (previous !== undefined) {
+      this.chars -= k.length + previous.length;
+      this.map.delete(k);
+    }
     this.map.set(k, v);
-    if (this.map.size > this.cap) {
-      const first = this.map.keys().next().value;
-      if (first !== undefined) this.map.delete(first);
+    this.chars += k.length + v.length;
+    // Full prompt identities must not grow the old compact cache unchecked.
+    // Keep at most 64 KiB of estimated UTF-16 text, including JSON escaping.
+    while (this.map.size > this.cap || this.chars > 32 * 1024) {
+      const first = this.map.entries().next().value;
+      if (!first) break;
+      this.chars -= first[0].length + first[1].length;
+      this.map.delete(first[0]);
     }
   }
   clear() {
     this.map.clear();
+    this.chars = 0;
   }
 }
 
-function suggestionKey(
-  prefix: string,
-  suffix: string,
-  lang: string | null,
-): string {
-  const p = prefix.length > CACHE_TAIL ? prefix.slice(-CACHE_TAIL) : prefix;
-  const s = suffix.length > CACHE_HEAD ? suffix.slice(0, CACHE_HEAD) : suffix;
-  return `${lang ?? ""}\x01${p}\x00${s}`;
+function suggestionKey(prefix: string, suffix: string): string {
+  // Use the complete (already bounded) model context, without delimiter collisions.
+  return JSON.stringify([prefix, suffix]);
 }
 
-function hasProviderKey(prefs: AutocompletePrefs): boolean {
-  if (prefs.provider === "lmstudio") return !!prefs.lmstudioBaseURL;
-  if (prefs.provider === "openai-compatible")
-    return !!prefs.openaiCompatibleBaseURL;
-  return !!prefs.apiKey;
+function contextKey(ctx: AutocompleteContext, state: EditorState): string {
+  const p = ctx.getPrefs();
+  return JSON.stringify([
+    p.enabled,
+    p.trigger,
+    p.provider,
+    p.modelId,
+    p.apiKey,
+    p.credentialStatus,
+    p.lmstudioBaseURL,
+    p.mlxBaseURL,
+    p.ollamaBaseURL,
+    p.openaiCompatibleBaseURL,
+    ctx.getPath(),
+    ctx.getDocument(),
+    ctx.getLanguage(),
+    state.facet(indentUnit),
+  ]);
 }
 
 function shouldTrigger(
@@ -241,7 +261,10 @@ function shouldTrigger(
   isManual: boolean,
 ): boolean {
   if (!prefs.enabled) return false;
-  if (!hasProviderKey(prefs)) return false;
+  if (!hasCompletionProvider(prefs)) return false;
+  // Requests and suggestions describe one insertion point. Accepting one
+  // while multiple cursors exist would silently discard the other cursors.
+  if (state.selection.ranges.length !== 1) return false;
   const sel = state.selection.main;
   if (sel.from !== sel.to) return false;
   if (isManual) return true;
@@ -270,17 +293,33 @@ class CompletionDriver implements PluginValue {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private controller: AbortController | null = null;
   private inflightKey: string | null = null;
-  private cache = new LRU<string, string>(CACHE_SIZE);
+  private cache = new LRU(CACHE_SIZE);
+  private cacheContext: string | null = null;
 
   constructor(
     private readonly view: EditorView,
     private readonly ctx: AutocompleteContext,
   ) {
     drivers.set(view, this);
+    this.cacheContext = contextKey(ctx, view.state);
+  }
+
+  refreshConfiguration(force: boolean) {
+    const context = contextKey(this.ctx, this.view.state);
+    if (!force && this.cacheContext === context) return;
+    this.cancelTimer();
+    this.cancelInFlight();
+    this.cache.clear();
+    this.cacheContext = context;
+    this.clearGhost();
   }
 
   update(u: ViewUpdate) {
     if (!u.docChanged && !u.selectionSet) return;
+    // Formatting, reload and programmatic edits invalidate requests too. Abort
+    // immediately, rather than letting an old response win the debounce window.
+    this.cancelTimer();
+    this.cancelInFlight();
 
     let typed = false;
     let chained = false;
@@ -295,11 +334,7 @@ class CompletionDriver implements PluginValue {
       else if (ev === "undo" || ev === "redo") isUndo = true;
     }
 
-    if (isDelete || isUndo) {
-      this.cancelTimer();
-      this.cancelInFlight();
-      return;
-    }
+    if (isDelete || isUndo) return;
 
     const manual = this.ctx.getPrefs().trigger === "manual";
 
@@ -313,12 +348,6 @@ class CompletionDriver implements PluginValue {
     if (u.docChanged && typed && !manual) {
       this.schedule(false);
       return;
-    }
-
-    if (u.selectionSet && !u.docChanged) {
-      // Pure cursor move — drop pending work, ghost is cleared by the field.
-      this.cancelTimer();
-      this.cancelInFlight();
     }
   }
 
@@ -356,10 +385,13 @@ class CompletionDriver implements PluginValue {
   destroy() {
     this.cancelInFlight();
     this.cancelTimer();
+    this.cache.clear();
+    this.cacheContext = null;
     drivers.delete(this.view);
   }
 
   private async fire(isManual: boolean) {
+    this.refreshConfiguration(false);
     const prefs = this.ctx.getPrefs();
     const state = this.view.state;
     if (!shouldTrigger(state, prefs, isManual)) return;
@@ -373,7 +405,8 @@ class CompletionDriver implements PluginValue {
     );
 
     const lang = this.ctx.getLanguage();
-    const key = suggestionKey(prefix, suffix, lang);
+    const context = contextKey(this.ctx, state);
+    const key = suggestionKey(prefix, suffix);
 
     const cached = this.cache.get(key);
     if (cached !== undefined) {
@@ -395,6 +428,7 @@ class CompletionDriver implements PluginValue {
           prefix,
           suffix,
           filename: this.ctx.getPath(),
+          document: this.ctx.getDocument(),
           language: lang,
           indentUnit: state.facet(indentUnit) || null,
         },
@@ -414,6 +448,11 @@ class CompletionDriver implements PluginValue {
       this.controller = null;
       this.inflightKey = null;
     }
+    if (
+      this.view.state.doc !== doc ||
+      contextKey(this.ctx, this.view.state) !== context
+    )
+      return;
 
     const cursorLine = doc.lineAt(cursor);
     const lineSoFar = doc.sliceString(cursorLine.from, cursor);
@@ -583,6 +622,7 @@ export function reindentClosers(
 }
 
 function acceptSuggestion(view: EditorView): boolean {
+  drivers.get(view)?.refreshConfiguration(false);
   const sug = view.state.field(suggestionField, false);
   if (!sug) return false;
   view.dispatch({
@@ -595,6 +635,7 @@ function acceptSuggestion(view: EditorView): boolean {
 }
 
 function acceptWord(view: EditorView): boolean {
+  drivers.get(view)?.refreshConfiguration(false);
   const sug = view.state.field(suggestionField, false);
   if (!sug) return false;
   // Take the next contiguous chunk: leading whitespace + one word OR one
@@ -630,6 +671,11 @@ export function triggerInlineCompletion(view: EditorView): boolean {
   if (!driver) return false;
   driver.manualTrigger();
   return true;
+}
+
+/** Called outside CodeMirror updates by settings and credential notifications. */
+export function refreshInlineCompletion(view: EditorView, force = false): void {
+  drivers.get(view)?.refreshConfiguration(force);
 }
 
 export function inlineCompletion(ctx: AutocompleteContext): Extension {

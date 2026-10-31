@@ -1,24 +1,11 @@
-import { quoteShellArg } from "@/lib/shellQuote";
-import { parentDir } from "@/modules/explorer/lib/watch";
 import type { EditorFormatter } from "@/modules/settings/store";
-import { currentWorkspaceEnv } from "@/modules/workspace";
+import { currentWorkspaceEnv, type WorkspaceEnv } from "@/modules/workspace";
 import { invoke } from "@tauri-apps/api/core";
-
-type ReadResult = { kind: string; content?: string; mtime?: number };
-
-type CommandOutput = {
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-  timed_out: boolean;
-};
 
 export type ExternalFormatter = Exclude<EditorFormatter, "lsp">;
 
 type FormatterDef = {
   label: string;
-  /** In-place write command; the quoted file path is appended. */
-  command: string;
   /** languageResolver ids the global default applies to; explicit
    * per-language overrides bypass this gate. */
   langs: readonly string[];
@@ -30,12 +17,10 @@ export const FORMATTERS: Record<
 > = {
   biome: {
     label: "Biome",
-    command: "biome format --write",
     langs: ["js", "jsx", "ts", "tsx", "json", "css"],
   },
   prettier: {
     label: "Prettier",
-    command: "prettier --write",
     langs: [
       "js",
       "jsx",
@@ -50,20 +35,18 @@ export const FORMATTERS: Record<
       "yaml",
     ],
   },
-  ruff: { label: "Ruff", command: "ruff format", langs: ["py"] },
+  ruff: { label: "Ruff", langs: ["py"] },
   rustfmt: {
     label: "rustfmt",
-    command: "rustfmt --edition 2021",
     langs: ["rs"],
   },
-  gofmt: { label: "gofmt", command: "gofmt -w", langs: ["go"] },
+  gofmt: { label: "gofmt", langs: ["go"] },
   "clang-format": {
     label: "clang-format",
-    command: "clang-format -i",
     langs: ["c", "h", "cpp", "cc", "hpp"],
   },
-  shfmt: { label: "shfmt", command: "shfmt -w", langs: ["sh", "bash", "zsh"] },
-  zigfmt: { label: "zig fmt", command: "zig fmt", langs: ["zig"] },
+  shfmt: { label: "shfmt", langs: ["sh", "bash", "zsh"] },
+  zigfmt: { label: "zig fmt", langs: ["zig"] },
 };
 
 export const FORMATTER_LABELS: Record<EditorFormatter, string> = {
@@ -93,56 +76,21 @@ export function resolveFormatter(
   return langId && FORMATTERS[global].langs.includes(langId) ? global : "lsp";
 }
 
-function buildCommand(
-  formatter: ExternalFormatter,
-  path: string,
-  customTemplate: string,
-): string | null {
-  const quoted = quoteShellArg(path);
-  if (formatter === "custom") {
-    const template = customTemplate.trim();
-    if (!template) return null;
-    return template.includes("{file}")
-      ? template.split("{file}").join(quoted)
-      : `${template} ${quoted}`;
-  }
-  return `${FORMATTERS[formatter].command} ${quoted}`;
-}
-
-/** Returns null on success, an error message otherwise. */
+/** The native boundary runs stdin/stdout only and rejects unsupported legacy commands. */
 export async function runExternalFormatter(
   formatter: ExternalFormatter,
   path: string,
-  customTemplate = "",
-): Promise<string | null> {
-  const command = buildCommand(formatter, path, customTemplate);
-  if (!command) {
-    return "No custom format command configured in Settings.";
-  }
-  try {
-    const out = await invoke<CommandOutput>("shell_run_command", {
-      command,
-      cwd: parentDir(path),
-      timeoutSecs: 20,
-      workspace: currentWorkspaceEnv(),
-    });
-    if (out.timed_out) return `${formatter} timed out`;
-    if (out.exit_code !== 0) {
-      return out.stderr.trim().slice(-300) || `${formatter} failed`;
-    }
-    return null;
-  } catch (e) {
-    return String(e);
-  }
-}
-
-export async function readFileText(
-  path: string,
-): Promise<{ text: string; mtime: number } | null> {
-  const res = await invoke<ReadResult>("fs_read_file", {
+  content: string,
+  customCommand = "",
+  workspace: WorkspaceEnv = currentWorkspaceEnv(),
+  language: string | null = null,
+): Promise<{ content: string; size: number }> {
+  return invoke("fs_format_document", {
+    formatter,
     path,
-    workspace: currentWorkspaceEnv(),
-  }).catch(() => null);
-  if (res?.kind !== "text" || res.content == null) return null;
-  return { text: res.content, mtime: res.mtime ?? 0 };
+    content,
+    customCommand,
+    workspace,
+    ...(language ? { language } : {}),
+  });
 }

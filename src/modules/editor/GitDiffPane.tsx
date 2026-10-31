@@ -1,3 +1,11 @@
+import {
+  type WatchHealth,
+  watchHealth,
+} from "@/modules/explorer/lib/watchHealth";
+import { createLiveDiff } from "./lib/liveDiff";
+import { watchWorkingDiff } from "./lib/watchWorkingDiff";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
@@ -14,6 +22,8 @@ import {
   fetchCommitDiff,
   fetchWorkingDiff,
   getCachedDiff,
+  invalidateWorkingDiff,
+  onDiffInvalidated,
   workingDiffKey,
 } from "./lib/diffCache";
 import { UNIFIED_DIFF_THEME } from "./lib/diffTheme";
@@ -81,17 +91,36 @@ type LoadState =
       /** Resolved before mount: a late compartment reconfigure would leave
        * the merge view's deleted-chunk widgets unhighlighted. */
       langExt: Extension | null;
+      refreshing?: boolean;
     }
   | { kind: "error"; message: string };
 
-function cacheKey(source: WorkingSource | CommitSource): string {
+function cacheKey(
+  source: WorkingSource | CommitSource,
+  workspace: WorkspaceEnv,
+): string {
   return source.kind === "working"
-    ? workingDiffKey(source.repoRoot, source.path, source.mode)
-    : commitDiffKey(source.repoRoot, source.sha, source.path);
+    ? workingDiffKey(
+        source.repoRoot,
+        source.path,
+        source.mode,
+        workspace,
+        source.originalPath,
+      )
+    : commitDiffKey(
+        source.repoRoot,
+        source.sha,
+        source.path,
+        workspace,
+        source.originalPath,
+      );
 }
 
-function loadStateFromCache(source: WorkingSource | CommitSource): LoadState {
-  const hit = getCachedDiff(cacheKey(source));
+function loadStateFromCache(
+  source: WorkingSource | CommitSource,
+  workspace: WorkspaceEnv,
+): LoadState {
+  const hit = getCachedDiff(cacheKey(source, workspace));
   if (!hit) return { kind: "idle" };
   return {
     kind: "loaded",
@@ -104,38 +133,121 @@ function loadStateFromCache(source: WorkingSource | CommitSource): LoadState {
 }
 
 export function GitDiffPane({ source, chipLabel, active }: Props) {
+  const workspace = useOwnedWorkspace();
   const cmRef = useRef<ReactCodeMirrorRef>(null);
   const themeExt = useEditorThemeExt();
   const diffViewMode = usePreferencesStore((s) => s.diffViewMode);
   const [state, setState] = useState<LoadState>(() =>
-    active ? loadStateFromCache(source) : { kind: "idle" },
+    active && source.kind === "commit"
+      ? loadStateFromCache(source, workspace)
+      : { kind: "idle" },
   );
 
-  const key = cacheKey(source);
+  const key = cacheKey(source, workspace);
+  const [retry, setRetry] = useState(0);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: key captures source/workspace; Retry deliberately restarts the owner
   useEffect(() => {
     if (!active) return;
-    const cached = loadStateFromCache(source);
+    if (source.kind === "working") {
+      setState({ kind: "loading" });
+      // A hidden/unmounted working view has no watches, so never trust its old cache.
+      invalidateWorkingDiff(
+        source.repoRoot,
+        source.path,
+        source.mode,
+        workspace,
+      );
+      const reader = createLiveDiff({
+        read: () =>
+          Promise.all([
+            fetchWorkingDiff(
+              source.repoRoot,
+              source.path,
+              source.mode,
+              source.originalPath,
+              workspace,
+            ),
+            resolveLanguage(source.path).catch(() => null),
+          ]),
+        loading: () =>
+          setState((current) =>
+            current.kind === "loaded"
+              ? current.refreshing
+                ? current
+                : { ...current, refreshing: true }
+              : { kind: "loading" },
+          ),
+        loaded: ([res, lang]) =>
+          setState({ kind: "loaded", ...res, langExt: lang?.ext ?? null }),
+        failed: (error) =>
+          setState({
+            kind: "error",
+            message: `Could not refresh diff: ${String(error)}`,
+          }),
+      });
+      const unsubscribe = onDiffInvalidated(key, () => reader.invalidate());
+      let healthy = false;
+      const applyHealth = (status: WatchHealth) => {
+        if (status.error) {
+          healthy = false;
+          reader.fail(status.error);
+        } else if (!healthy) {
+          healthy = true;
+          invalidateWorkingDiff(
+            source.repoRoot,
+            source.path,
+            source.mode,
+            workspace,
+          );
+          reader.start();
+        }
+      };
+      const watch = watchWorkingDiff(
+        source.repoRoot,
+        source.path,
+        workspace,
+        () =>
+          invalidateWorkingDiff(
+            source.repoRoot,
+            source.path,
+            source.mode,
+            workspace,
+          ),
+        applyHealth,
+      );
+      void watch.ready
+        .then(() => applyHealth(watch.health()))
+        .catch((error) => {
+          watch.dispose();
+          reader.fail(error);
+        });
+      return () => {
+        reader.dispose();
+        unsubscribe();
+        watch.dispose();
+        invalidateWorkingDiff(
+          source.repoRoot,
+          source.path,
+          source.mode,
+          workspace,
+        );
+      };
+    }
+    const cached = loadStateFromCache(source, workspace);
     if (cached.kind === "loaded") {
       setState(cached);
       return;
     }
     let cancelled = false;
     setState({ kind: "loading" });
-    const promise =
-      source.kind === "working"
-        ? fetchWorkingDiff(
-            source.repoRoot,
-            source.path,
-            source.mode,
-            source.originalPath,
-          )
-        : fetchCommitDiff(
-            source.repoRoot,
-            source.sha,
-            source.path,
-            source.originalPath,
-          );
+    const promise = fetchCommitDiff(
+      source.repoRoot,
+      source.sha,
+      source.path,
+      source.originalPath,
+      workspace,
+    );
     Promise.all([promise, resolveLanguage(source.path).catch(() => null)])
       .then(([res, lang]) => {
         if (cancelled) return;
@@ -161,7 +273,7 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [active, key, source]);
+  }, [active, key, retry]);
 
   const path = source.path;
   const repoRoot = source.repoRoot;
@@ -244,6 +356,16 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-3 text-[10.5px] tabular-nums text-muted-foreground">
+          {loaded?.refreshing && (
+            <span
+              role="status"
+              aria-label="Refreshing diff"
+              className="flex items-center gap-1"
+            >
+              <Spinner className="size-3" />
+              Refreshing…
+            </span>
+          )}
           <span className="truncate max-w-80 font-mono">{repoRoot}</span>
           {!useFallback && <DiffViewToggle mode={diffViewMode} />}
           {useFallback ? (
@@ -267,7 +389,18 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
           </div>
         ) : state.kind === "error" ? (
           <div className="flex h-full items-center justify-center px-6 text-center text-[11.5px] text-destructive">
-            {state.message}
+            <div>
+              <p>{state.message}</p>
+              <button
+                type="button"
+                className="mt-3 cursor-pointer underline"
+                onClick={() => {
+                  void watchHealth.retry().then(() => setRetry((n) => n + 1));
+                }}
+              >
+                Retry
+              </button>
+            </div>
           </div>
         ) : useFallback ? (
           <ScrollArea className="h-full">

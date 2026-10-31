@@ -1,3 +1,4 @@
+import { installClipboardCopyBarrier } from "@/lib/clipboardWrite";
 import "../styles/globals.css";
 
 import { installNativeContextMenuGuard } from "@/lib/nativeContextMenu";
@@ -7,18 +8,23 @@ import { ThemeProvider } from "@/modules/theme";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactDOM from "react-dom/client";
 import { SettingsApp } from "./SettingsApp";
+import { Toaster } from "@/components/ui/sonner";
+import { installStoreSaveFailureReporting } from "@/lib/storeSaveFailures";
 
 if (USE_CUSTOM_WINDOW_CONTROLS) {
   document.documentElement.dataset.chrome = "borderless";
 }
 installNativeContextMenuGuard();
+installClipboardCopyBarrier();
 installWindowFrame();
+await installStoreSaveFailureReporting();
 
 ReactDOM.createRoot(
   document.getElementById("settings-root") as HTMLElement,
 ).render(
   <ThemeProvider>
     <SettingsApp />
+    <Toaster position="bottom-right" />
   </ThemeProvider>,
 );
 

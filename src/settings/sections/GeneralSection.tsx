@@ -14,6 +14,8 @@ import {
   testAgentOsNotification,
 } from "@/modules/agents/lib/notify";
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { readNativePreferences } from "@/modules/settings/nativePreferences";
+import { ShaderSelection } from "./shaderSelection";
 import type { ThemePref } from "@/modules/settings/store";
 import {
   parseSidebarPosition,
@@ -31,6 +33,7 @@ import {
   setTerminalCursorBlink,
   setTerminalCursorStyle,
   setTerminalCustomShader,
+  setTerminalCustomShaderAtRevision,
   setTerminalFontFamily,
   setTerminalFontFeatures,
   setTerminalFontSize,
@@ -126,27 +129,23 @@ export function GeneralSection() {
   const shaderInput = useRef<HTMLInputElement | null>(null);
   const [shaderError, setShaderError] = useState<string | null>(null);
 
-  // Compiled here first, so a shader that does not build never reaches the
-  // terminals and its errors show with their line numbers.
-  const chooseShader = async (file: File | undefined) => {
-    setShaderError(null);
-    if (!file) return;
-    if (file.size > TERMINAL_CUSTOM_SHADER_MAX_BYTES) {
-      setShaderError(`${file.name}: larger than 256 KiB`);
-      return;
-    }
-    try {
-      const source = await file.text();
-      const { validateCustomShader } = await import(
-        "@/modules/terminal/ghostty/webgl/customShader"
-      );
-      const error = validateCustomShader(source);
-      if (error) setShaderError(`${file.name}:\n${error}`);
-      else await setTerminalCustomShader({ name: file.name, source });
-    } catch (error) {
-      setShaderError(`${file.name}: ${String(error)}`);
-    }
-  };
+  // The selection owns delayed reads, compilation and writes until replaced.
+  const shaderSelection = useRef<ShaderSelection | null>(null);
+  useEffect(() => {
+    const owner = new ShaderSelection({
+      snapshot: readNativePreferences,
+      validate: async (source) => {
+        const { validateCustomShader } = await import("@/modules/terminal/ghostty/webgl/customShader");
+        return validateCustomShader(source);
+      },
+      save: setTerminalCustomShaderAtRevision,
+      remove: () => setTerminalCustomShader(null),
+      error: setShaderError,
+      maxBytes: TERMINAL_CUSTOM_SHADER_MAX_BYTES,
+    });
+    shaderSelection.current = owner;
+    return () => { owner.dispose(); if (shaderSelection.current === owner) shaderSelection.current = null; };
+  }, []);
   const terminalScreenReader = usePreferencesStore(
     (s) => s.terminalScreenReader,
   );
@@ -417,8 +416,7 @@ export function GeneralSection() {
                 size="sm"
                 className="h-7 px-2 text-[11px]"
                 onClick={() => {
-                  setShaderError(null);
-                  void setTerminalCustomShader(null);
+                  void shaderSelection.current?.reset();
                 }}
               >
                 Remove
@@ -430,7 +428,7 @@ export function GeneralSection() {
               accept=".glsl,.frag,.fs,.txt,text/plain"
               className="hidden"
               onChange={(event) => {
-                void chooseShader(event.target.files?.[0]);
+                void shaderSelection.current?.choose(event.target.files?.[0]);
                 event.target.value = "";
               }}
             />

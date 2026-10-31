@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
 import type { PreviewTab, Tab } from "@/modules/tabs";
 import { useEffect, useRef } from "react";
 import { PreviewPane, type PreviewPaneHandle } from "./PreviewPane";
@@ -16,6 +17,7 @@ export function PreviewStack({
   onUrlChange,
   registerHandle,
 }: Props) {
+  const activeSpace = useSpaces((s) => s.activeId);
   const previews = tabs.filter(
     (t): t is PreviewTab => t.kind === "preview" && !t.cold,
   );
@@ -65,7 +67,8 @@ export function PreviewStack({
   return (
     <div className="relative h-full w-full">
       {previews.map((t) => {
-        const visible = t.id === activeId;
+        const visible =
+          t.id === activeId && (!t.spaceId || t.spaceId === activeSpace);
         return (
           <div
             key={t.id}
@@ -79,6 +82,7 @@ export function PreviewStack({
               ref={getRefCallback(t.id)}
               url={t.url}
               visible={visible}
+              ownerKey={t.spaceId}
               onUrlChange={getUrlCallback(t.id)}
             />
           </div>

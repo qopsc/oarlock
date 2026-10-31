@@ -563,6 +563,7 @@ export const SHORTCUTS: Shortcut[] = defaultShortcuts(
 export const SHORTCUT_GROUPS: ShortcutGroup[] = [
   "General",
   "Tabs",
+  "Spaces",
   "Panes",
   "Terminal",
   "View",

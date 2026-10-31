@@ -1,5 +1,7 @@
 "use client";
 
+import { writeClipboardText } from "@/lib/clipboardWrite";
+
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/modules/ai/store/chatStore";
@@ -257,9 +259,8 @@ export function CopyButton({ text }: { text: string }) {
   useEffect(() => () => window.clearTimeout(tRef.current), []);
 
   const onCopy = async () => {
-    if (!navigator?.clipboard?.writeText) return;
     try {
-      await navigator.clipboard.writeText(text);
+      await writeClipboardText(text);
       setCopied(true);
       tRef.current = window.setTimeout(() => setCopied(false), 1500);
     } catch {

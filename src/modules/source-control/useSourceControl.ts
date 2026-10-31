@@ -1,5 +1,6 @@
+import { workspaceUnavailableReason } from "@/modules/workspace/availability";
 import {
-  native,
+  createNative,
   type GitRepoInfo,
   type GitStatusSnapshot,
 } from "@/modules/ai/lib/native";
@@ -12,7 +13,7 @@ import {
   workspaceScopeKey,
 } from "@/modules/workspace";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { gitWatchAdd, gitWatchRemove, listenGitChanged } from "./gitWatch";
+import { gitWatchAdd, listenGitChanged } from "./gitWatch";
 import {
   createRefreshCoalescer,
   finishedCommandLeaves,
@@ -28,17 +29,20 @@ const SC_STATUS_TTL_MS = 2000;
 const SIGNAL_QUIET_MS = 300;
 const SIGNAL_MAX_WAIT_MS = 1500;
 
+/** A fresh status is authoritative for branch and upstream metadata. */
+export function repositoryWithStatus(repo: GitRepoInfo, status: GitStatusSnapshot): GitRepoInfo {
+  return { ...repo, branch: status.branch, upstream: status.upstream, isDetached: status.isDetached };
+}
+
 type SourceControlRefreshMode = "auto" | "always" | "never";
 type SourceControlRemoteAction = "fetch" | "pull" | "push";
-type SourceControlRemoteActionMode =
-  | "contextual"
-  | SourceControlRemoteAction;
+type SourceControlRemoteActionMode = "contextual" | SourceControlRemoteAction;
 
 type SourceControlRemoteActionResult = {
   ok: boolean;
   action: SourceControlRemoteAction | null;
   error?: string;
-  blocked?: "diverged" | "missing-upstream" | "no-repo";
+  blocked?: "diverged" | "missing-upstream" | "no-repo" | "busy";
 };
 
 export type SourceControlSummary = {
@@ -57,9 +61,7 @@ export type SourceControlSummary = {
   applyStatus: (
     updater: (status: GitStatusSnapshot) => GitStatusSnapshot,
   ) => void;
-  refresh: (options?: {
-    remote?: SourceControlRefreshMode;
-  }) => Promise<void>;
+  refresh: (options?: { remote?: SourceControlRefreshMode }) => Promise<void>;
   runRemoteAction: (
     mode?: SourceControlRemoteActionMode,
   ) => Promise<SourceControlRemoteActionResult>;
@@ -256,7 +258,12 @@ export function useSourceControl(
   { live = true, leafCwd }: UseSourceControlOptions = {},
 ): SourceControlSummary {
   const workspaceEnv = useWorkspaceEnvStore((s) => s.env);
+  enabled = enabled && !workspaceUnavailableReason(workspaceEnv);
   const workspaceKey = workspaceScopeKey(workspaceEnv);
+  const native = useMemo(
+    () => createNative(() => workspaceEnv),
+    [workspaceEnv],
+  );
   const [state, setState] = useState<SourceControlSummaryState>({
     contextPath: null,
     repo: null,
@@ -270,6 +277,7 @@ export function useSourceControl(
   const stateRef = useRef(state);
   const requestIdRef = useRef(0);
   const inflightRef = useRef<InflightRefresh | null>(null);
+  const remoteActionsRef = useRef(new Set<string>());
   const autoFetchByRepoRef = useRef(new Map<string, number>());
   const enabledRef = useRef(enabled);
   const lastRefreshAtRef = useRef(0);
@@ -319,10 +327,7 @@ export function useSourceControl(
   const doRefresh = useCallback(
     async (remoteMode: SourceControlRefreshMode): Promise<void> => {
       const refreshContextKey = contextKey;
-      if (
-        !enabledRef.current ||
-        refreshContextKey !== contextKeyRef.current
-      ) {
+      if (!enabledRef.current || refreshContextKey !== contextKeyRef.current) {
         return;
       }
       const requestId = ++requestIdRef.current;
@@ -420,13 +425,14 @@ export function useSourceControl(
           return;
         }
 
+        if (status) repo = repositoryWithStatus(repo, status);
+
         let nextRemoteError = stateRef.current.lastRemoteError;
         const shouldAutoFetch =
           repo.upstream &&
           remoteMode !== "never" &&
           (remoteMode === "always" ||
-            Date.now() -
-              (autoFetchByRepoRef.current.get(repo.repoRoot) ?? 0) >=
+            Date.now() - (autoFetchByRepoRef.current.get(repo.repoRoot) ?? 0) >=
               AUTO_FETCH_THROTTLE_MS);
 
         if (shouldAutoFetch) {
@@ -437,6 +443,7 @@ export function useSourceControl(
             if (!isCurrentRequest()) return;
             status = await native.gitStatus(repo.repoRoot);
             if (!isCurrentRequest()) return;
+            repo = repositoryWithStatus(repo, status);
           } catch (error) {
             nextRemoteError = normalizeError(error);
           }
@@ -468,7 +475,7 @@ export function useSourceControl(
         }
       }
     },
-    [contextKey, contextPath],
+    [contextKey, contextPath, native],
   );
 
   const refresh = useCallback(
@@ -509,11 +516,15 @@ export function useSourceControl(
       if (!action) {
         return { ok: false, action: null, blocked: "diverged" };
       }
+      const actionKey = JSON.stringify([workspaceKey, repo.repoRoot]);
+      if (remoteActionsRef.current.has(actionKey)) {
+        return { ok: false, action: null, blocked: "busy" };
+      }
+      remoteActionsRef.current.add(actionKey);
 
       setState((current) => ({ ...current, busyAction: action }));
       const actionContextKey = contextKeyRef.current;
-      const isCurrentContext = () =>
-        actionContextKey === contextKeyRef.current;
+      const isCurrentContext = () => actionContextKey === contextKeyRef.current;
 
       try {
         if (action === "fetch") {
@@ -544,10 +555,12 @@ export function useSourceControl(
         }
         return { ok: false, action, error: message };
       } finally {
-        setState((current) => ({ ...current, busyAction: null }));
+        remoteActionsRef.current.delete(actionKey);
+        if (isCurrentContext())
+          setState((current) => ({ ...current, busyAction: null }));
       }
     },
-    [refresh],
+    [refresh, native, workspaceKey],
   );
 
   useEffect(() => {
@@ -635,7 +648,7 @@ export function useSourceControl(
         await refreshRef.current({ remote: "never" });
       },
     });
-    gitWatchAdd(repoRoot, workspace);
+    const releaseWatch = gitWatchAdd(repoRoot, workspace);
     let alive = true;
     let unlisten: (() => void) | undefined;
     void listenGitChanged((roots) => {
@@ -664,7 +677,7 @@ export function useSourceControl(
       unlisten?.();
       unsubscribe();
       coalescer.dispose();
-      gitWatchRemove(repoRoot, workspace);
+      releaseWatch();
     };
   }, [enabled, live, repoRoot]);
 

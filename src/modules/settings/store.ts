@@ -1,3 +1,4 @@
+import { loadCustomEndpoints, onCustomEndpoints } from "./endpoints";
 import {
   type AgentLaunchCommands,
   DEFAULT_AGENT_LAUNCH_COMMANDS,
@@ -9,10 +10,12 @@ import {
   DEFAULT_AUTOCOMPLETE_MODEL,
   DEFAULT_MODEL_ID,
   DEFAULT_STT_PROVIDER,
+  canonicalModelId,
+  LEGACY_COMPAT_MODEL_ID,
+  isCompatModelId,
   isResolvableModelId,
   LMSTUDIO_DEFAULT_BASE_URL,
   MLX_DEFAULT_BASE_URL,
-  migrateLegacyCompatEndpoint,
   OLLAMA_DEFAULT_BASE_URL,
   OPENAI_COMPATIBLE_DEFAULT_BASE_URL,
   type SttProvider,
@@ -37,7 +40,12 @@ import {
   MAX_PANES_PER_TAB,
 } from "@/modules/terminal/lib/panes";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { LazyStore } from "@tauri-apps/plugin-store";
+import {
+  readNativePreferences,
+  watchNativePreferences,
+  mutatePreferences,
+  type PreferenceSnapshot,
+} from "./nativePreferences";
 import {
   currentPlatform,
   defaultTerminalBehavior,
@@ -163,6 +171,10 @@ export type Preferences = {
   customInstructions: string;
   /** How new AI conversations start: gated tools ask, or run unasked. */
   aiApprovalMode: ApprovalMode;
+  /** Also stop this chat's explicit background jobs on Stop or deletion. */
+  aiStopBackgroundJobs: boolean;
+  aiStopSubagents: boolean;
+  aiAllowUnmanagedJobs: boolean;
   /** Selecting text in a terminal or the editor offers an Ask Oarlock button. */
   selectionAskAi: boolean;
   /** The reasoning effort last chosen for each model; absent is its default. */
@@ -183,6 +195,7 @@ export type Preferences = {
   openaiCompatibleModelId: string;
   openaiCompatibleContextLimit: number;
   customEndpoints: CustomEndpoint[];
+  customEndpointsError: string | null;
   openrouterModelId: string;
   sttProvider: SttProvider;
   groqSttModel: string;
@@ -286,7 +299,6 @@ export type LspCustomServer = {
   rootMarkers: string[];
 };
 
-const STORE_PATH = "oarlock-settings.json";
 const KEY_THEME = "theme";
 const KEY_THEME_ID = "themeId";
 const KEY_BG_KIND = "backgroundKind";
@@ -300,6 +312,9 @@ const KEY_EDITOR_THEME = "editorTheme";
 const KEY_EDITOR_FONT_SIZE = "editorFontSize";
 const KEY_CUSTOM_INSTRUCTIONS = "customInstructions";
 const KEY_AI_APPROVAL_MODE = "aiApprovalMode";
+const KEY_AI_ALLOW_UNMANAGED_JOBS = "aiAllowUnmanagedJobs";
+const KEY_AI_STOP_SUBAGENTS = "aiStopSubagents";
+const KEY_AI_STOP_BACKGROUND_JOBS = "aiStopBackgroundJobs";
 const KEY_SELECTION_ASK_AI = "selectionAskAi";
 const KEY_REASONING_EFFORT_BY_MODEL = "reasoningEffortByModel";
 const KEY_AUTOSTART = "autostart";
@@ -319,7 +334,6 @@ const KEY_OLLAMA_MODEL_ID = "ollamaModelId";
 const KEY_OPENAI_COMPAT_BASE_URL = "openaiCompatibleBaseURL";
 const KEY_OPENAI_COMPAT_MODEL_ID = "openaiCompatibleModelId";
 const KEY_OPENAI_COMPAT_CONTEXT_LIMIT = "openaiCompatibleContextLimit";
-const KEY_CUSTOM_ENDPOINTS = "customEndpoints";
 const KEY_OPENROUTER_MODEL_ID = "openrouterModelId";
 const KEY_STT_PROVIDER = "sttProvider";
 const KEY_GROQ_STT_MODEL = "groqSttModel";
@@ -474,6 +488,9 @@ export const DEFAULT_PREFERENCES: Preferences = {
   editorFontSize: EDITOR_FONT_SIZE_DEFAULT,
   customInstructions: "",
   aiApprovalMode: "ask",
+  aiStopBackgroundJobs: false,
+  aiStopSubagents: true,
+  aiAllowUnmanagedJobs: false,
   selectionAskAi: true,
   reasoningEffortByModel: {},
   autostart: false,
@@ -498,6 +515,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   openaiCompatibleModelId: "",
   openaiCompatibleContextLimit: 128_000,
   customEndpoints: [],
+  customEndpointsError: null,
   openrouterModelId: "",
   sttProvider: DEFAULT_STT_PROVIDER,
   groqSttModel: "whisper-large-v3-turbo",
@@ -552,38 +570,37 @@ export const DEFAULT_PREFERENCES: Preferences = {
   lspCustomServers: [],
 };
 
-const store = new LazyStore(STORE_PATH, { defaults: {}, autoSave: 200 });
-
-// LazyStore.onChange only fires within the writing process. The settings
-// page lives in a separate webview, so writes there never reach the main
-// window's subscribers. Mirror every setter through a Tauri event so any
-// window can listen.
-const PREFS_CHANGED_EVENT = "oarlock://prefs-changed";
-
 async function writePref<T>(key: string, value: T): Promise<void> {
-  await store.set(key, value);
-  await store.save();
-  await emit(PREFS_CHANGED_EVENT, { key, value });
+  await mutatePreferences({ kind: "set", key, value });
 }
 
 export async function loadPreferences(): Promise<Preferences> {
-  // Single IPC roundtrip — fetching keys individually fans out to one
-  // `plugin:store|get` per setting and is the dominant boot cost.
-  const entries = await store.entries();
-  const map = new Map<string, unknown>(entries);
-  const get = <T>(k: string): T | undefined => map.get(k) as T | undefined;
-  // An empty saved list means the user removed every endpoint; only a list
-  // never saved is migrated from the legacy single endpoint.
-  const customEndpoints =
-    get<CustomEndpoint[]>(KEY_CUSTOM_ENDPOINTS) ??
-    migrateLegacyCompatEndpoint(
-      get<string>(KEY_OPENAI_COMPAT_BASE_URL) ?? "",
-      get<string>(KEY_OPENAI_COMPAT_MODEL_ID) ?? "",
-      get<number>(KEY_OPENAI_COMPAT_CONTEXT_LIMIT) ?? 128_000,
-    );
-  // Ids of deleted or unfinished endpoints are dropped; the rest, custom
-  // endpoints included, survive a restart.
-  const usable = (id: string) => isResolvableModelId(id, customEndpoints);
+  let customEndpoints: CustomEndpoint[] = [];
+  let customEndpointsError: string | null = null;
+  try {
+    customEndpoints = await loadCustomEndpoints();
+  } catch (error) {
+    customEndpointsError = String(error);
+  }
+  const snapshot = await readNativePreferences();
+  return parsePreferences(
+    snapshot.values,
+    customEndpoints,
+    customEndpointsError,
+  );
+}
+
+export function parsePreferences(
+  values: Record<string, unknown>,
+  customEndpoints: CustomEndpoint[] = [],
+  customEndpointsError: string | null = null,
+): Preferences {
+  const get = <T>(key: string): T | undefined => values[key] as T | undefined;
+  // A failed read does not prove an endpoint was deleted. Keep its selection
+  // blocked until recovery instead of silently routing to a different provider.
+  const usable = (id: string) =>
+    (customEndpointsError !== null && isCompatModelId(id)) ||
+    isResolvableModelId(id, customEndpoints);
   return {
     theme: get<ThemePref>(KEY_THEME) ?? DEFAULT_PREFERENCES.theme,
     themeId: get<string>(KEY_THEME_ID) ?? DEFAULT_PREFERENCES.themeId,
@@ -600,8 +617,10 @@ export async function loadPreferences(): Promise<Preferences> {
     ),
     defaultModelId: ((): string => {
       const stored = get<string>(KEY_DEFAULT_MODEL);
-      return stored && usable(stored)
-        ? stored
+      // Keep an unresolved legacy choice blocked rather than silently routing
+      // it to the default provider after its migrated endpoint was removed.
+      return stored && (stored === LEGACY_COMPAT_MODEL_ID || usable(stored))
+        ? canonicalModelId(stored)
         : DEFAULT_PREFERENCES.defaultModelId;
     })(),
     editorTheme: ((): EditorThemePref => {
@@ -617,6 +636,9 @@ export async function loadPreferences(): Promise<Preferences> {
       get<string>(KEY_CUSTOM_INSTRUCTIONS) ??
       DEFAULT_PREFERENCES.customInstructions,
     aiApprovalMode: normalizeApprovalMode(get<unknown>(KEY_AI_APPROVAL_MODE)),
+    aiStopBackgroundJobs: get<unknown>(KEY_AI_STOP_BACKGROUND_JOBS) === true,
+    aiStopSubagents: get<unknown>(KEY_AI_STOP_SUBAGENTS) !== false,
+    aiAllowUnmanagedJobs: get<unknown>(KEY_AI_ALLOW_UNMANAGED_JOBS) === true,
     selectionAskAi: coerceSelectionAskAi(get<unknown>(KEY_SELECTION_ASK_AI)),
     reasoningEffortByModel: normalizeReasoningEffortByModel(
       get<unknown>(KEY_REASONING_EFFORT_BY_MODEL),
@@ -637,9 +659,10 @@ export async function loadPreferences(): Promise<Preferences> {
     autocompleteProvider:
       get<AutocompleteProviderId>(KEY_AUTOCOMPLETE_PROVIDER) ??
       DEFAULT_PREFERENCES.autocompleteProvider,
-    autocompleteModelId:
+    autocompleteModelId: canonicalModelId(
       get<string>(KEY_AUTOCOMPLETE_MODEL) ??
-      DEFAULT_PREFERENCES.autocompleteModelId,
+        DEFAULT_PREFERENCES.autocompleteModelId,
+    ),
     lmstudioBaseURL:
       get<string>(KEY_LMSTUDIO_BASE_URL) ?? DEFAULT_PREFERENCES.lmstudioBaseURL,
     lmstudioModelId:
@@ -660,6 +683,7 @@ export async function loadPreferences(): Promise<Preferences> {
       get<number>(KEY_OPENAI_COMPAT_CONTEXT_LIMIT) ??
       DEFAULT_PREFERENCES.openaiCompatibleContextLimit,
     customEndpoints,
+    customEndpointsError,
     openrouterModelId:
       get<string>(KEY_OPENROUTER_MODEL_ID) ??
       DEFAULT_PREFERENCES.openrouterModelId,
@@ -670,12 +694,23 @@ export async function loadPreferences(): Promise<Preferences> {
     whispercppBaseURL:
       get<string>(KEY_WHISPERCPP_BASE_URL) ??
       DEFAULT_PREFERENCES.whispercppBaseURL,
-    favoriteModelIds: (
-      get<string[]>(KEY_FAVORITE_MODELS) ?? DEFAULT_PREFERENCES.favoriteModelIds
-    ).filter(usable),
-    recentModelIds: (
-      get<string[]>(KEY_RECENT_MODELS) ?? DEFAULT_PREFERENCES.recentModelIds
-    ).filter(usable),
+    favoriteModelIds: [
+      ...new Set(
+        (
+          get<string[]>(KEY_FAVORITE_MODELS) ??
+          DEFAULT_PREFERENCES.favoriteModelIds
+        )
+          .map(canonicalModelId)
+          .filter(usable),
+      ),
+    ],
+    recentModelIds: [
+      ...new Set(
+        (get<string[]>(KEY_RECENT_MODELS) ?? DEFAULT_PREFERENCES.recentModelIds)
+          .map(canonicalModelId)
+          .filter(usable),
+      ),
+    ],
     vimMode: get<boolean>(KEY_VIM_MODE) ?? DEFAULT_PREFERENCES.vimMode,
     editorWordWrap:
       get<boolean>(KEY_EDITOR_WORD_WRAP) ?? DEFAULT_PREFERENCES.editorWordWrap,
@@ -806,13 +841,11 @@ export async function setLspActivation(
   id: string,
   value: LspActivation | null,
 ): Promise<void> {
-  const current =
-    ((await store.get(KEY_LSP_ACTIVATION)) as Record<string, LspActivation>) ??
-    {};
-  const next = { ...current };
-  if (value === null) delete next[id];
-  else next[id] = value;
-  await writePref(KEY_LSP_ACTIVATION, next);
+  await mutatePreferences({
+    kind: "patch",
+    key: KEY_LSP_ACTIVATION,
+    values: { [id]: value },
+  });
 }
 
 export async function setLspCustomServers(
@@ -826,7 +859,7 @@ export async function setTheme(value: ThemePref): Promise<void> {
 }
 
 export async function setThemeId(value: string): Promise<void> {
-  await writePref(KEY_THEME_ID, value);
+  await mutatePreferences({ kind: "themeselection", id: value });
 }
 
 /** Slider stores 0..1. Actual rendered opacity is halved in SurfaceLayer
@@ -887,6 +920,18 @@ export async function setCustomInstructions(value: string): Promise<void> {
 
 export async function setAiApprovalMode(value: ApprovalMode): Promise<void> {
   await writePref(KEY_AI_APPROVAL_MODE, normalizeApprovalMode(value));
+}
+
+export async function setAiAllowUnmanagedJobs(value: boolean): Promise<void> {
+  await writePref(KEY_AI_ALLOW_UNMANAGED_JOBS, value === true);
+}
+
+export async function setAiStopSubagents(value: boolean): Promise<void> {
+  await writePref(KEY_AI_STOP_SUBAGENTS, value !== false);
+}
+
+export async function setAiStopBackgroundJobs(value: boolean): Promise<void> {
+  await writePref(KEY_AI_STOP_BACKGROUND_JOBS, value === true);
 }
 
 export async function setSelectionAskAi(value: boolean): Promise<void> {
@@ -987,12 +1032,6 @@ export async function setOpenaiCompatibleContextLimit(
     ? Math.max(1_000, Math.round(value))
     : DEFAULT_PREFERENCES.openaiCompatibleContextLimit;
   await writePref(KEY_OPENAI_COMPAT_CONTEXT_LIMIT, clamped);
-}
-
-export async function setCustomEndpoints(
-  value: CustomEndpoint[],
-): Promise<void> {
-  await writePref(KEY_CUSTOM_ENDPOINTS, value);
 }
 
 export async function setOpenrouterModelId(value: string): Promise<void> {
@@ -1184,6 +1223,16 @@ export async function setTerminalCustomShader(
   );
 }
 
+export async function setTerminalCustomShaderAtRevision(
+  value: TerminalCustomShader | null,
+  revision: number,
+): Promise<void> {
+  await mutatePreferences({
+    kind: "set", key: KEY_TERMINAL_CUSTOM_SHADER,
+    value: normalizeTerminalCustomShader(value),
+  }, revision);
+}
+
 export async function setTerminalMinimumContrast(value: number): Promise<void> {
   await writePref(KEY_TERMINAL_MINIMUM_CONTRAST, clampMinimumContrast(value));
 }
@@ -1222,17 +1271,20 @@ export async function setTerminalPaneLimit(value: number): Promise<void> {
 export async function setTerminalBehavior(
   patch: Partial<TerminalBehavior>,
 ): Promise<void> {
-  const current = normalizeTerminalBehavior(
-    await store.get<unknown>(KEY_TERMINAL_BEHAVIOR),
+  const normalized = normalizeTerminalBehavior(
+    patch,
     DEFAULT_PREFERENCES.terminalBehavior,
   );
-  await writePref(
-    KEY_TERMINAL_BEHAVIOR,
-    normalizeTerminalBehavior(
-      { ...current, ...patch },
-      DEFAULT_PREFERENCES.terminalBehavior,
-    ),
+  const values = Object.fromEntries(
+    Object.keys(patch)
+      .filter((key) => key in normalized)
+      .map((key) => [key, normalized[key as keyof TerminalBehavior]]),
   );
+  await mutatePreferences({
+    kind: "patch",
+    key: KEY_TERMINAL_BEHAVIOR,
+    values,
+  });
 }
 
 export async function setConfirmCloseRunningTerminal(
@@ -1251,13 +1303,14 @@ export async function setLastWslDistro(value: string | null): Promise<void> {
  */
 export async function macFullDiskAccessSuggested(): Promise<boolean> {
   return (
-    (await store.get<boolean>(KEY_MAC_FULL_DISK_ACCESS_SUGGESTED)) === true
+    (await readNativePreferences()).values[
+      KEY_MAC_FULL_DISK_ACCESS_SUGGESTED
+    ] === true
   );
 }
 
 export async function setMacFullDiskAccessSuggested(): Promise<void> {
-  await store.set(KEY_MAC_FULL_DISK_ACCESS_SUGGESTED, true);
-  await store.save();
+  await writePref(KEY_MAC_FULL_DISK_ACCESS_SUGGESTED, true);
 }
 
 export async function setZoomLevel(value: number): Promise<void> {
@@ -1293,10 +1346,10 @@ export async function setEditorFormatter(
   await writePref(KEY_EDITOR_FORMATTER, value);
 }
 
-export async function setEditorFormatterByLang(
-  value: Record<string, EditorFormatter>,
+export async function patchEditorFormatterByLang(
+  values: Record<string, EditorFormatter | null>,
 ): Promise<void> {
-  await writePref(KEY_EDITOR_FORMATTER_BY_LANG, value);
+  await mutatePreferences({ kind: "patch", key: KEY_EDITOR_FORMATTER_BY_LANG, values });
 }
 
 export async function setEditorCustomFormatCommand(
@@ -1334,112 +1387,114 @@ export async function setShortcuts(
 
 export type PrefKey = keyof Preferences;
 
-/** Subscribe to changes from any window (settings → main). */
-export async function onPreferencesChange(
+/** Observe a revisioned snapshot, including startup, as one UI update. */
+export async function observePreferences(
+  cb: (preferences: Preferences) => void,
+  failed: (error: unknown) => void,
+  pending?: () => void,
+): Promise<UnlistenFn> {
+  let snapshot: PreferenceSnapshot | undefined;
+  let endpoints: CustomEndpoint[] = [];
+  let endpointsError: string | null = null;
+  let endpointsReady = false;
+  let previous: Preferences | undefined;
+  let recovering = false;
+  let parsedValues: Record<string, unknown> | undefined;
+  let parsedEndpoints: CustomEndpoint[] | undefined;
+  let parsedEndpointError: string | null = null;
+  const endpointDependent = new Set([
+    "defaultModelId",
+    "favoriteModelIds",
+    "recentModelIds",
+    "customEndpoints",
+    "customEndpointsError",
+  ]);
+  const publish = (recovered = false) => {
+    if (!snapshot || !endpointsReady || recovering) return;
+    const next = parsePreferences(snapshot.values, endpoints, endpointsError);
+    let changed = !previous || recovered;
+    for (const key of Object.keys(next) as (keyof Preferences)[]) {
+      if (
+        previous &&
+        ((parsedValues &&
+          Object.is(snapshot.values[key], parsedValues[key]) &&
+          (!endpointDependent.has(key) ||
+            (parsedEndpoints === endpoints &&
+              parsedEndpointError === endpointsError))) ||
+          Object.is(next[key], previous[key]) ||
+          JSON.stringify(next[key]) === JSON.stringify(previous[key]))
+      ) {
+        Object.assign(next, { [key]: previous[key] });
+      } else changed = true;
+    }
+    parsedValues = snapshot.values;
+    parsedEndpoints = endpoints;
+    parsedEndpointError = endpointsError;
+    if (changed) {
+      previous = next;
+      cb(next);
+    }
+  };
+  const results = await Promise.allSettled([
+    watchNativePreferences(
+      (next) => {
+        if (snapshot && next.revision <= snapshot.revision) return;
+        snapshot = next;
+        const recovered = recovering;
+        recovering = false;
+        publish(recovered);
+      },
+      (error) => {
+        recovering = true;
+        failed(error);
+      },
+      () => {
+        if (!recovering) {
+          recovering = true;
+          pending?.();
+        }
+      },
+    ),
+    onCustomEndpoints(
+      (value) => {
+        endpoints = value;
+        endpointsError = null;
+        endpointsReady = true;
+        publish();
+      },
+      (error) => {
+        endpointsError = String(error);
+        endpointsReady = true;
+        publish();
+      },
+    ),
+  ]);
+  const error = results.find((result) => result.status === "rejected");
+  if (error?.status === "rejected") {
+    for (const result of results)
+      if (result.status === "fulfilled") result.value();
+    throw error.reason;
+  }
+  return () => {
+    for (const result of results)
+      if (result.status === "fulfilled") result.value();
+  };
+}
+
+/** Compatibility observer; all values come from the same normalized snapshot. */
+export function onPreferencesChange(
   cb: (key: PrefKey, value: unknown) => void,
 ): Promise<UnlistenFn> {
-  const map: Record<string, PrefKey> = {
-    [KEY_THEME]: "theme",
-    [KEY_THEME_ID]: "themeId",
-    [KEY_BG_KIND]: "backgroundKind",
-    [KEY_BG_IMAGE_ID]: "backgroundImageId",
-    [KEY_BG_OPACITY]: "backgroundOpacity",
-    [KEY_BG_BLUR]: "backgroundBlur",
-    [KEY_WINDOW_VIBRANCY]: "windowVibrancy",
-    [KEY_TERMINAL_OPACITY]: "terminalOpacity",
-    [KEY_DEFAULT_MODEL]: "defaultModelId",
-    [KEY_EDITOR_THEME]: "editorTheme",
-    [KEY_EDITOR_FONT_SIZE]: "editorFontSize",
-    [KEY_CUSTOM_INSTRUCTIONS]: "customInstructions",
-    [KEY_AI_APPROVAL_MODE]: "aiApprovalMode",
-    [KEY_SELECTION_ASK_AI]: "selectionAskAi",
-    [KEY_REASONING_EFFORT_BY_MODEL]: "reasoningEffortByModel",
-    [KEY_AUTOSTART]: "autostart",
-    [KEY_RESTORE_WINDOW]: "restoreWindowState",
-    [KEY_AUTOCOMPLETE_ENABLED]: "autocompleteEnabled",
-    [KEY_AUTOCOMPLETE_TRIGGER]: "autocompleteTrigger",
-    [KEY_AUTOCOMPLETE_PROVIDER]: "autocompleteProvider",
-    [KEY_AUTOCOMPLETE_MODEL]: "autocompleteModelId",
-    [KEY_LMSTUDIO_BASE_URL]: "lmstudioBaseURL",
-    [KEY_LMSTUDIO_MODEL_ID]: "lmstudioModelId",
-    [KEY_MLX_BASE_URL]: "mlxBaseURL",
-    [KEY_MLX_MODEL_ID]: "mlxModelId",
-    [KEY_OLLAMA_BASE_URL]: "ollamaBaseURL",
-    [KEY_OLLAMA_MODEL_ID]: "ollamaModelId",
-    [KEY_OPENAI_COMPAT_BASE_URL]: "openaiCompatibleBaseURL",
-    [KEY_OPENAI_COMPAT_MODEL_ID]: "openaiCompatibleModelId",
-    [KEY_OPENAI_COMPAT_CONTEXT_LIMIT]: "openaiCompatibleContextLimit",
-    [KEY_CUSTOM_ENDPOINTS]: "customEndpoints",
-    [KEY_OPENROUTER_MODEL_ID]: "openrouterModelId",
-    [KEY_STT_PROVIDER]: "sttProvider",
-    [KEY_GROQ_STT_MODEL]: "groqSttModel",
-    [KEY_WHISPERCPP_BASE_URL]: "whispercppBaseURL",
-    [KEY_FAVORITE_MODELS]: "favoriteModelIds",
-    [KEY_RECENT_MODELS]: "recentModelIds",
-    [KEY_VIM_MODE]: "vimMode",
-    [KEY_EDITOR_WORD_WRAP]: "editorWordWrap",
-    [KEY_EDITOR_WORD_WRAP_COLUMN]: "editorWordWrapColumn",
-    [KEY_DIFF_VIEW_MODE]: "diffViewMode",
-    [KEY_EDITOR_DEFAULT_INDENT]: "editorDefaultIndent",
-    [KEY_SHOW_HIDDEN]: "showHidden",
-    [KEY_EXPLORER_GIT_DECORATIONS]: "explorerGitDecorations",
-    [KEY_SIDEBAR_POSITION]: "sidebarPosition",
-    [KEY_SOURCE_CONTROL_VIEW_MODE]: "sourceControlViewMode",
-    [KEY_APP_ALL_FOLDERS]: "appAllFolders",
-    [KEY_AI_ALL_FOLDERS]: "aiAllFolders",
-    [KEY_TERMINAL_LINKS_IN_PREVIEW]: "terminalLinksInPreview",
-    [KEY_TERMINAL_RENDERER]: "terminalRenderer",
-    [KEY_TERMINAL_SCREEN_READER]: "terminalScreenReader",
-    [KEY_TERMINAL_CURSOR_BLINK]: "terminalCursorBlink",
-    [KEY_TERMINAL_CURSOR_STYLE]: "terminalCursorStyle",
-    [KEY_TERMINAL_FONT_FAMILY]: "terminalFontFamily",
-    [KEY_TERMINAL_FONT_WEIGHT]: "terminalFontWeight",
-    [KEY_TERMINAL_SHELL]: "terminalShell",
-    [KEY_TERMINAL_LETTER_SPACING]: "terminalLetterSpacing",
-    [KEY_TERMINAL_LINE_HEIGHT]: "terminalLineHeight",
-    [KEY_TERMINAL_FONT_FEATURES]: "terminalFontFeatures",
-    [KEY_TERMINAL_MINIMUM_CONTRAST]: "terminalMinimumContrast",
-    [KEY_TERMINAL_CUSTOM_SHADER]: "terminalCustomShader",
-    [KEY_TERMINAL_LIGATURES]: "terminalLigatures",
-    [KEY_TERMINAL_FONT_SIZE]: "terminalFontSize",
-    [KEY_TERMINAL_SCROLLBACK]: "terminalScrollback",
-    [KEY_TERMINAL_PANE_LIMIT]: "terminalPaneLimit",
-    [KEY_NEW_TAB_POSITION]: "newTabPosition",
-    [KEY_TERMINAL_BEHAVIOR]: "terminalBehavior",
-    [KEY_CONFIRM_CLOSE_RUNNING_TERMINAL]: "confirmCloseRunningTerminal",
-    [KEY_LAST_WSL_DISTRO]: "lastWslDistro",
-    [KEY_ZOOM_LEVEL]: "zoomLevel",
-    [KEY_AGENT_NOTIFICATIONS]: "agentNotifications",
-    [KEY_AGENT_NOTIFICATION_SOUND]: "agentNotificationSound",
-    [KEY_AGENT_LAUNCH_COMMANDS]: "agentLaunchCommands",
-    [KEY_DEFAULT_WORKSPACE_ENV]: "defaultWorkspaceEnv",
-    [KEY_SHORTCUTS]: "shortcuts",
-    [KEY_EDITOR_AUTO_SAVE]: "editorAutoSave",
-    [KEY_EDITOR_AUTO_SAVE_DELAY]: "editorAutoSaveDelay",
-    [KEY_EDITOR_FORMAT_ON_SAVE]: "editorFormatOnSave",
-    [KEY_EDITOR_FORMATTER]: "editorFormatter",
-    [KEY_EDITOR_FORMATTER_BY_LANG]: "editorFormatterByLang",
-    [KEY_EDITOR_CUSTOM_FORMAT_COMMAND]: "editorCustomFormatCommand",
-    [KEY_LSP_ACTIVATION]: "lspActivation",
-    [KEY_LSP_CUSTOM_SERVERS]: "lspCustomServers",
-  };
-  // Same-process writes still fire onChange immediately; cross-window writes
-  // arrive via the Tauri event emitted by writePref().
-  const unsubLocal = await store.onChange<unknown>((key, value) => {
-    const mapped = map[key];
-    if (mapped) cb(mapped, value);
-  });
-  const unsubEvent = await listen<{ key: string; value: unknown }>(
-    PREFS_CHANGED_EVENT,
-    (e) => {
-      const mapped = map[e.payload.key];
-      if (mapped) cb(mapped, e.payload.value);
+  let previous: Preferences | undefined;
+  return observePreferences(
+    (next) => {
+      for (const key of Object.keys(next) as PrefKey[])
+        if (!previous || !Object.is(previous[key], next[key]))
+          cb(key, next[key]);
+      previous = next;
     },
+    (error) => console.error("[preferences]", error),
   );
-  return () => {
-    unsubLocal();
-    unsubEvent();
-  };
 }
 
 // API key changes are stored in OS keychain (not the prefs store),

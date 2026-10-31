@@ -1,7 +1,9 @@
+import { hasMcpRunLeases } from "../lib/mcpRunLeases";
+import { stopChat } from "./chatStop";
 import type { Chat, UIMessage } from "@ai-sdk/react";
 import { toast } from "sonner";
 import { create } from "zustand";
-import { DEFAULT_MODEL_ID, type ProviderId } from "../config";
+import { canonicalModelId, DEFAULT_MODEL_ID, type ProviderId } from "../config";
 import { useTodosStore } from "./todoStore";
 import {
   addUsage,
@@ -10,7 +12,7 @@ import {
   ZERO_USAGE,
 } from "../lib/usage";
 import {
-  EMPTY_PROVIDER_KEYS,
+  pendingProviderKeys,
   type ProviderKeys,
   type CustomEndpointKeys,
 } from "../lib/keyring";
@@ -32,6 +34,8 @@ import { type ApprovalMode, normalizeApprovalMode } from "../lib/approvalMode";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 
 export type Live = {
+  capture?: () => Live;
+  spaceId?: string;
   getCwd: () => string | null;
   getTerminalContext: () => string | null;
   isActiveTerminalPrivate: () => boolean;
@@ -147,6 +151,7 @@ type StoreState = {
   adoptSessionsList: (list: SessionMeta[]) => void;
   newSession: () => string;
   switchSession: (id: string) => void;
+  stopSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => void;
   renameSession: (id: string, title: string) => void;
   /** Chooses whether this conversation's gated tools ask or run unasked. */
@@ -205,7 +210,13 @@ export function touchChat(id: string, c: Chat<UIMessage>) {
   const activeId = useChatStore.getState().activeSessionId;
   for (const [key, chat] of chats) {
     if (chats.size <= CHATS_LRU_CAP) break;
-    if (key === id || key === activeId || isRunning(chat)) continue;
+    if (
+      key === id ||
+      key === activeId ||
+      isRunning(chat) ||
+      hasMcpRunLeases(key)
+    )
+      continue;
     flushPersistEntry(key);
     void chat.stop();
     chats.delete(key);
@@ -218,6 +229,8 @@ function isRunning(chat: Chat<UIMessage>): boolean {
 // Initial messages for a session, populated at hydration time and consumed
 // when the matching Chat is constructed.
 export const seedMessages = new Map<string, UIMessage[]>();
+let sessionSelection = 0;
+let pendingSessionId: string | null = null;
 
 // Per-token message persistence is scheduled, not debounced per token: see
 // `persistSchedule.ts`. Streaming saves are plain atomic replaces; the flush
@@ -272,7 +285,7 @@ export const useChatStore = create<StoreState>((set, get) => ({
     if (fn) fn(approvalId, approved);
   },
 
-  apiKeys: { ...EMPTY_PROVIDER_KEYS },
+  apiKeys: pendingProviderKeys(),
   setApiKeys: (keys) => set({ apiKeys: keys }),
   setApiKey: (provider, key) => {
     set({ apiKeys: { ...get().apiKeys, [provider]: key } });
@@ -283,6 +296,7 @@ export const useChatStore = create<StoreState>((set, get) => ({
 
   selectedModelId: DEFAULT_MODEL_ID,
   setSelectedModelId: (id) => {
+    id = canonicalModelId(id);
     set({ selectedModelId: id });
     void pushRecentModel(id);
   },
@@ -384,11 +398,12 @@ export const useChatStore = create<StoreState>((set, get) => ({
               s.id === reusable.id ? { ...s, approvalMode: mode } : s,
             );
       freshId = reusable.id;
-      if (nextSessions !== sessions) void saveSessionsList(nextSessions);
+      if (nextSessions !== sessions)
+        void saveSessionsList(nextSessions, sessions);
     } else {
       freshId = newSessionId();
       nextSessions = [newSessionMeta(freshId), ...sessions];
-      void saveSessionsList(nextSessions);
+      void saveSessionsList(nextSessions, sessions);
     }
     void saveActiveId(freshId);
 
@@ -406,33 +421,52 @@ export const useChatStore = create<StoreState>((set, get) => ({
   adoptSessionsList: (list) => {
     const state = get();
     if (JSON.stringify(list) === JSON.stringify(state.sessions)) return;
-    const active = state.activeSessionId;
+    const kept = new Set(list.map((s) => s.id));
+    for (const old of state.sessions) {
+      if (kept.has(old.id)) continue;
+      get().stopSession(old.id);
+      chats.delete(old.id);
+      seedMessages.delete(old.id);
+      const pending = pendingPersist.get(old.id);
+      if (pending) clearTimeout(pending.timer);
+      pendingPersist.delete(old.id);
+      lastPersistedAt.delete(old.id);
+    }
+    const active = state.activeSessionId ?? pendingSessionId;
     if (active === null || list.some((s) => s.id === active)) {
       set({ sessions: list });
       return;
     }
-    // Another window deleted the chat open here.
-    set({ sessions: list });
+    // Release the deleted selection while the replacement loads from disk.
+    set({ sessions: list, activeSessionId: null, agentMeta: IDLE_META });
+    void saveActiveId(null);
     if (list.length > 0) get().switchSession(list[0].id);
     else get().newSession();
   },
 
   newSession: () => {
+    sessionSelection++;
+    pendingSessionId = null;
     const id = newSessionId();
-    const next = [newSessionMeta(id), ...get().sessions];
+    const previous = get().sessions;
+    const next = [newSessionMeta(id), ...previous];
     set({ sessions: next, activeSessionId: id, agentMeta: IDLE_META });
-    void saveSessionsList(next);
+    void saveSessionsList(next, previous);
     void saveActiveId(id);
     return id;
   },
 
   switchSession: (id) => {
+    const selection = ++sessionSelection;
+    pendingSessionId = null;
     if (get().activeSessionId === id) return;
     if (!get().sessions.some((s) => s.id === id)) return;
 
+    pendingSessionId = id;
     // Lazily seed the chat with persisted messages the first time we open
     // this session. Subsequent switches reuse the cached Chat instance.
     const flip = () => {
+      pendingSessionId = null;
       set({ activeSessionId: id, agentMeta: IDLE_META });
       void saveActiveId(id);
     };
@@ -442,12 +476,23 @@ export const useChatStore = create<StoreState>((set, get) => ({
     }
     void loadMessages(id)
       .then((m) => {
+        if (
+          selection !== sessionSelection ||
+          !get().sessions.some((s) => s.id === id)
+        )
+          return;
         if (m && m.length > 0 && !chats.has(id)) seedMessages.set(id, m);
         flip();
       })
       .catch((error) => {
         // Stay on the current conversation: opening this one empty could later
         // overwrite a healthy file that was only momentarily unreadable.
+        if (
+          selection !== sessionSelection ||
+          !get().sessions.some((s) => s.id === id)
+        )
+          return;
+        pendingSessionId = null;
         toast.error("Could not open conversation", {
           id: `conversation-open:${id}`,
           description: String(error),
@@ -455,9 +500,31 @@ export const useChatStore = create<StoreState>((set, get) => ({
       });
   },
 
+  stopSession: (id) => {
+    const preferences = usePreferencesStore.getState();
+    const runtime = chats.get(id);
+    const stopped = stopChat(
+      id,
+      {
+        stopBackground: preferences.aiStopBackgroundJobs,
+        stopSubagents: preferences.aiStopSubagents !== false,
+      },
+      () => runtime?.stop(),
+    );
+    // Deletion and remote-list adoption may fire and forget; failure stays visible.
+    void stopped.catch(() => {});
+    return stopped;
+  },
+
   deleteSession: (id) => {
-    const remaining = get().sessions.filter((s) => s.id !== id);
-    chats.get(id)?.stop();
+    const wasActive = (get().activeSessionId ?? pendingSessionId) === id;
+    if (wasActive) {
+      sessionSelection++;
+      pendingSessionId = null;
+    }
+    const previous = get().sessions;
+    const remaining = previous.filter((s) => s.id !== id);
+    get().stopSession(id);
     chats.delete(id);
     seedMessages.delete(id);
     const pend = pendingPersist.get(id);
@@ -472,24 +539,29 @@ export const useChatStore = create<StoreState>((set, get) => ({
     if (remaining.length === 0) {
       const fresh = newSessionMeta(newSessionId());
       set({ sessions: [fresh], activeSessionId: fresh.id });
-      void saveSessionsList([fresh]);
+      void saveSessionsList([fresh], previous);
       void saveActiveId(fresh.id);
       return;
     }
 
-    const wasActive = get().activeSessionId === id;
-    const nextActive = wasActive ? remaining[0].id : get().activeSessionId;
-    set({ sessions: remaining, activeSessionId: nextActive });
-    void saveSessionsList(remaining);
-    if (wasActive) void saveActiveId(nextActive);
+    set({
+      sessions: remaining,
+      ...(wasActive ? { activeSessionId: null, agentMeta: IDLE_META } : {}),
+    });
+    void saveSessionsList(remaining, previous);
+    if (wasActive) {
+      void saveActiveId(null);
+      get().switchSession(remaining[0].id);
+    }
   },
 
   renameSession: (id, title) => {
-    const next = get().sessions.map((s) =>
+    const previous = get().sessions;
+    const next = previous.map((s) =>
       s.id === id ? { ...s, title, updatedAt: Date.now() } : s,
     );
     set({ sessions: next });
-    void saveSessionsList(next);
+    void saveSessionsList(next, previous);
   },
 
   setSessionApprovalMode: (id, mode) => {
@@ -501,10 +573,11 @@ export const useChatStore = create<StoreState>((set, get) => ({
       s.id === id ? { ...s, approvalMode: mode } : s,
     );
     set({ sessions: next });
-    void saveSessionsList(next);
+    void saveSessionsList(next, sessions);
   },
 
   persistMessages: (id, messages) => {
+    if (!get().sessions.some((s) => s.id === id)) return;
     // Streaming fires this per token; the write itself is scheduled.
     schedulePersist(id, messages);
 
@@ -528,7 +601,7 @@ export const useChatStore = create<StoreState>((set, get) => ({
       s.id === id ? { ...s, title: nextTitle, updatedAt } : s,
     );
     set({ sessions: next });
-    void saveSessionsList(next);
+    void saveSessionsList(next, sessions);
   },
 }));
 

@@ -38,13 +38,14 @@ let formCount = 0;
 function completer(
   serverId: string,
   ref: CompletionRef,
+  signal?: AbortSignal,
 ): ArgumentsFormRequest["complete"] {
   const server = useMcpExtras
     .getState()
     .servers.find((s) => s.serverId === serverId);
   if (!server?.completions) return undefined;
   return (field, value, values) =>
-    completeMcpArgument(serverId, ref, { name: field, value }, values);
+    completeMcpArgument(serverId, ref, { name: field, value }, values, signal);
 }
 
 export type PromptCallOutcome =
@@ -53,26 +54,34 @@ export type PromptCallOutcome =
   | { kind: "missing" }
   | { kind: "cancelled" };
 
-async function findPrompt(command: string): Promise<McpPromptCommand | null> {
+async function findPrompt(
+  command: string,
+  signal?: AbortSignal,
+): Promise<McpPromptCommand | null> {
   const find = () =>
     promptCommands(useMcpExtras.getState().servers).find(
       (c) => c.command === command,
     ) ?? null;
+  signal?.throwIfAborted();
   const found = find();
   if (found) return found;
   await ensureMcpExtras(true);
+  signal?.throwIfAborted();
   return find();
 }
 
 async function fetchPrompt(
   command: McpPromptCommand,
   args: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<{ block: string; images: PromptImage[]; notes: string[] }> {
   const result = await getMcpPrompt(
     command.serverId,
     command.prompt.name,
     args,
+    signal,
   );
+  signal?.throwIfAborted();
   const message = promptMessage(
     result,
     command.serverName,
@@ -90,11 +99,12 @@ async function fetchPrompt(
 export async function startPromptCall(
   command: string,
   showForm: (form: ArgumentsFormRequest) => void,
+  signal?: AbortSignal,
 ): Promise<PromptCallOutcome> {
-  const found = await findPrompt(command);
+  const found = await findPrompt(command, signal);
   if (!found) return { kind: "missing" };
   if (found.prompt.arguments.length === 0) {
-    return { kind: "message", ...(await fetchPrompt(found, {})) };
+    return { kind: "message", ...(await fetchPrompt(found, {}, signal)) };
   }
   const fields: ArgumentField[] = found.prompt.arguments.map((a) => ({
     name: a.name,
@@ -103,6 +113,19 @@ export async function startPromptCall(
     required: a.required,
   }));
   return new Promise<PromptCallOutcome>((resolve) => {
+    let settled = false;
+    const finish = (outcome: PromptCallOutcome) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", cancel);
+      resolve(outcome);
+    };
+    const cancel = () => finish({ kind: "cancelled" });
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) {
+      cancel();
+      return;
+    }
     showForm({
       id: `mcp-form-${++formCount}`,
       title: `/${found.command}`,
@@ -110,18 +133,25 @@ export async function startPromptCall(
       description: found.prompt.description ?? found.prompt.title,
       fields,
       submitLabel: "Send",
-      complete: completer(found.serverId, {
-        type: "ref/prompt",
-        name: found.prompt.name,
-      }),
+      complete: completer(
+        found.serverId,
+        {
+          type: "ref/prompt",
+          name: found.prompt.name,
+        },
+        signal,
+      ),
       submit: async (values) => {
+        if (settled) return;
+        signal?.throwIfAborted();
         const message = await fetchPrompt(
           found,
           filledArguments(fields, values),
+          signal,
         );
-        resolve({ kind: "message", ...message });
+        finish({ kind: "message", ...message });
       },
-      cancel: () => resolve({ kind: "cancelled" }),
+      cancel,
     });
   });
 }
@@ -133,29 +163,36 @@ export async function startPromptCall(
  */
 export async function runPromptCall(call: {
   command: string;
+  signal?: AbortSignal;
   /** Picked from the list (a chip), not typed. */
   picked: boolean;
   showForm: (form: ArgumentsFormRequest) => void;
-  send: (block: string, images: PromptImage[]) => void;
-  sendAsWritten: () => void;
+  send: (block: string, images: PromptImage[]) => void | Promise<void>;
+  sendAsWritten: () => void | Promise<void>;
 }): Promise<void> {
   try {
-    const outcome = await startPromptCall(call.command, call.showForm);
+    const outcome = await startPromptCall(
+      call.command,
+      call.showForm,
+      call.signal,
+    );
+    if (call.signal?.aborted) return;
     if (outcome.kind === "message") {
       if (outcome.notes.length > 0) {
         toast.message("Part of the prompt was left out", {
           description: outcome.notes.join(" "),
         });
       }
-      call.send(outcome.block, outcome.images);
+      await call.send(outcome.block, outcome.images);
     } else if (outcome.kind === "missing") {
       if (call.picked) {
         toast.error(`The prompt /${call.command} is not available`);
       } else {
-        call.sendAsWritten();
+        await call.sendAsWritten();
       }
     }
   } catch (e) {
+    if (call.signal?.aborted) return;
     toast.error(`Could not run /${call.command}`, {
       description: e instanceof Error ? e.message : String(e),
     });
@@ -169,8 +206,9 @@ function base64Blob(data: string, type: string): Blob {
   return new Blob([bytes], { type });
 }
 
-async function dataUrl(blob: Blob): Promise<string> {
+async function dataUrl(blob: Blob, signal?: AbortSignal): Promise<string> {
   const bytes = new Uint8Array(await blob.arrayBuffer());
+  signal?.throwIfAborted();
   let binary = "";
   for (let i = 0; i < bytes.length; i += 0x8000) {
     binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -182,6 +220,7 @@ async function attachmentOf(
   serverId: string,
   serverName: string,
   draft: ResourceDraft,
+  signal?: AbortSignal,
 ): Promise<FileAttachment | string> {
   const base = {
     id: `mcp:${serverId}:${draft.uri}:${draft.name}`,
@@ -204,13 +243,15 @@ async function attachmentOf(
   if (imageNeedsEncoding(draft.mediaType, draft.size)) {
     const encoded = await encodeForSending(
       base64Blob(draft.data, draft.mediaType),
+      signal,
     );
+    signal?.throwIfAborted();
     if (!encoded) {
       return `${draft.name}: the image could not be converted or made small enough.`;
     }
     mediaType = encoded.type;
     size = encoded.size;
-    url = await dataUrl(encoded);
+    url = await dataUrl(encoded, signal);
   }
   return {
     ...base,
@@ -229,11 +270,15 @@ async function filesOf(
   serverName: string,
   result: unknown,
   request: { uri: string; name: string },
+  signal?: AbortSignal,
 ): Promise<ResourceFiles> {
+  signal?.throwIfAborted();
   const { drafts, refused } = resourceAttachments(result, request);
   const files: FileAttachment[] = [];
   for (const draft of drafts) {
-    const file = await attachmentOf(serverId, serverName, draft);
+    signal?.throwIfAborted();
+    const file = await attachmentOf(serverId, serverName, draft, signal);
+    signal?.throwIfAborted();
     if (typeof file === "string") refused.push(file);
     else files.push(file);
   }
@@ -245,9 +290,10 @@ export async function resourceFiles(
   serverId: string,
   serverName: string,
   resource: { uri: string; name: string },
+  signal?: AbortSignal,
 ): Promise<ResourceFiles> {
-  const result = await readMcpResource(serverId, resource.uri);
-  return filesOf(serverId, serverName, result, resource);
+  const result = await readMcpResource(serverId, resource.uri, signal);
+  return filesOf(serverId, serverName, result, resource, signal);
 }
 
 /**
@@ -258,7 +304,9 @@ export function templateForm(
   item: { serverId: string; serverName: string; template: McpTemplateEntry },
   attach: (files: ResourceFiles) => void,
   cancel: () => void,
+  signal?: AbortSignal,
 ): ArgumentsFormRequest {
+  let closed = false;
   const { serverId, serverName, template } = item;
   const fields: ArgumentField[] = template.variables.map((name) => ({
     name,
@@ -272,30 +320,49 @@ export function templateForm(
     description: template.description ?? template.uriTemplate,
     fields,
     submitLabel: "Attach",
-    complete: completer(serverId, {
-      type: "ref/resource",
-      uri: template.uriTemplate,
-    }),
+    complete: completer(
+      serverId,
+      {
+        type: "ref/resource",
+        uri: template.uriTemplate,
+      },
+      signal,
+    ),
     submit: async (values) => {
+      if (closed) return;
+      signal?.throwIfAborted();
       const { uri, result } = await readMcpTemplate(
         serverId,
         template.uriTemplate,
         filledArguments(fields, values),
+        signal,
       );
       const tail = uri
         .replace(/[?#].*$/, "")
         .split("/")
         .filter(Boolean)
         .pop();
-      const files = await filesOf(serverId, serverName, result, {
-        uri,
-        name: labelText(tail ?? "", 120) || template.name,
-      });
+      const files = await filesOf(
+        serverId,
+        serverName,
+        result,
+        {
+          uri,
+          name: labelText(tail ?? "", 120) || template.name,
+        },
+        signal,
+      );
+      signal?.throwIfAborted();
+      if (closed) return;
       if (files.files.length === 0) {
         throw new Error(files.refused.join(" ") || "Nothing to attach.");
       }
+      closed = true;
       attach(files);
     },
-    cancel,
+    cancel: () => {
+      closed = true;
+      cancel();
+    },
   };
 }

@@ -31,6 +31,14 @@ const messages = (n: number) =>
 
 beforeEach(() => {
   vi.useFakeTimers();
+  useChatStore.setState({
+    sessions: ["s-1", "s-2", "s-3", "a", "b"].map((id) => ({
+      id,
+      title: "New chat",
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+  });
   sessions.saveMessages.mockClear();
 });
 afterEach(() => {

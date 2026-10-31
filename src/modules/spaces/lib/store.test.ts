@@ -7,6 +7,7 @@ const pluginStore = vi.hoisted(() => {
     data: Map<string, unknown>;
     get: ReturnType<typeof vi.fn>;
     set: ReturnType<typeof vi.fn>;
+    save: ReturnType<typeof vi.fn>;
     delete: ReturnType<typeof vi.fn>;
     entries: ReturnType<typeof vi.fn>;
   }[] = [];
@@ -16,6 +17,7 @@ const pluginStore = vi.hoisted(() => {
     set = vi.fn(async (key: string, value: unknown) => {
       this.data.set(key, value);
     });
+    save = vi.fn(async () => {});
     delete = vi.fn(async (key: string) => {
       this.data.delete(key);
     });
@@ -89,6 +91,12 @@ describe("space persistence", () => {
     expect(loaded.activeId).toBe("b");
     expect(loaded.states.get("a")).toEqual(state());
     expect(loaded.states.has("b")).toBe(false);
+  });
+
+  it("flushes pending space changes through the native store", async () => {
+    const mod = await reload();
+    await mod.saveSpacesStore();
+    expect(store().save).toHaveBeenCalledOnce();
   });
 
   it("ignores foreign keys while parsing stored entries", async () => {

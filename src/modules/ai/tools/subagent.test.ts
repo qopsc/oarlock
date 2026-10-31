@@ -4,7 +4,9 @@ import type { ToolContext } from "./context";
 
 const runSubagentMock = vi.hoisted(() => vi.fn());
 
-vi.mock("../agents/runSubagent", () => ({ runSubagent: runSubagentMock }));
+vi.mock("../agents/trackedSubagent", () => ({
+  runTrackedSubagent: runSubagentMock,
+}));
 vi.mock("../store/chatStore", () => ({
   useChatStore: {
     getState: () => ({
@@ -24,7 +26,7 @@ const modelConfig = vi.hoisted(() => ({
       contextLimit: 128_000,
     },
   ],
-  customEndpointKeys: { ep1: "sk-ep" },
+  customEndpointKeys: { ep1: { origin: "https://llm.example", key: "sk-ep" } },
 }));
 vi.mock("../store/modelConfig", () => ({
   liveModelConfig: () => modelConfig,
@@ -103,4 +105,29 @@ describe("run_subagent", () => {
     expect(r.type).toBe("reviewer");
     expect(r.error).toContain("boom");
   });
+});
+
+it("passes the parent cancellation signal into the child run", async () => {
+  const controller = new AbortController();
+  runSubagentMock.mockResolvedValue({
+    summary: "ok",
+    stepCount: 1,
+    durationMs: 1,
+  });
+  const execute = buildSubagentTools(makeContext()).run_subagent.execute;
+  if (!execute) throw new Error("run_subagent has no execute");
+  await execute(
+    { type: "explore", prompt: "look" },
+    { ...toolOptions, abortSignal: controller.signal },
+  );
+  expect(runSubagentMock).toHaveBeenCalledWith(
+    expect.objectContaining({ abortSignal: controller.signal }),
+  );
+  controller.abort();
+  runSubagentMock.mockClear();
+  await execute(
+    { type: "explore", prompt: "look" },
+    { ...toolOptions, abortSignal: controller.signal },
+  );
+  expect(runSubagentMock).not.toHaveBeenCalled();
 });

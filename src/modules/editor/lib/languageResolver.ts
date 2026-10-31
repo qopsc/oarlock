@@ -55,9 +55,16 @@ function match(base: string): {
   return { key: ext ? `ext:${ext}` : `name:${base}`, def: undefined };
 }
 
+export function resolveLanguageDefinition(
+  filename: string,
+): LanguageDefinition | undefined {
+  return match(basenameOf(filename)).def;
+}
+
 export function resolveDisplayName(filename: string | null): string {
   if (!filename) return "Plain Text";
   const base = basenameOf(filename);
+  if (extOf(base) === "txt") return "Plain Text";
   const { def } = match(base);
   if (def) return def.name;
   return base.charAt(0).toUpperCase() + base.slice(1);

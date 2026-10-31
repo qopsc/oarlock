@@ -1,4 +1,4 @@
-import { resolveLanguage } from "@/modules/editor/lib/languageResolver";
+import { documentLanguage } from "@/modules/editor/lib/documentLanguage";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { LspActivation } from "@/modules/settings/store";
 import { useWorkspaceEnvStore } from "@/modules/workspace";
@@ -51,25 +51,14 @@ export function lspHint(input: HintInput): LspHint | null {
   return detected ? { kind: "enable", preset } : { kind: "install", preset };
 }
 
-export function useLspHint(filePath: string | null): LspHint | null {
-  const [langId, setLangId] = useState<string | null>(null);
+export function useLspHint(
+  filePath: string | null,
+  overrideLanguage?: string | null,
+): LspHint | null {
+  const langId = filePath
+    ? documentLanguage(filePath, overrideLanguage).id
+    : null;
   const envKind = useWorkspaceEnvStore((s) => s.env.kind);
-
-  useEffect(() => {
-    if (!filePath) {
-      setLangId(null);
-      return;
-    }
-    let cancelled = false;
-    void resolveLanguage(filePath).then((result) => {
-      if (cancelled) return;
-      const ext = filePath.split(".").pop()?.toLowerCase() ?? null;
-      setLangId(result?.id || ext);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [filePath]);
 
   const customServers = usePreferencesStore((s) => s.lspCustomServers);
   const lspActivation = usePreferencesStore((s) => s.lspActivation);

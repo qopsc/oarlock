@@ -1879,8 +1879,13 @@ async function harness(options: { scale?: number; images?: boolean } = {}) {
     createBindGroup,
     draw: pass.draw,
     pass,
-    render: (budget?: { exhausted(allowance?: number): boolean }) =>
-      surface.prepareFrame(resources as never, budget),
+    // Non-budget tests must not depend on host scheduling. Budget tests inject
+    // exhaustion explicitly below the production surface's existing boundary.
+    render: (
+      budget: { exhausted(allowance?: number): boolean } = {
+        exhausted: () => false,
+      },
+    ) => surface.prepareFrame(resources as never, budget),
     encode: () =>
       surface.encode(
         pass as unknown as GPURenderPassEncoder,

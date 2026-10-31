@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 
 use bytes::Bytes;
 use futures_util::{future::Abortable, FutureExt, StreamExt};
@@ -11,8 +11,12 @@ use tauri::ipc::{InvokeBody, JavaScriptChannelId, Request, Response};
 use tauri::{State, WebviewWindow};
 
 mod clients;
+pub(crate) mod deadline;
+mod dns;
 pub mod image;
 mod ip;
+pub mod page;
+pub mod probe;
 mod stream;
 use super::ipc_body;
 pub(crate) use clients::{client_for, Profile};
@@ -48,15 +52,7 @@ async fn resolve_and_classify(host: &str) -> Result<(IpKind, Vec<IpAddr>), Strin
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Ok((ip_kind(ip), vec![ip]));
     }
-    let host_owned = host.to_string();
-    let lookup = tokio::task::spawn_blocking(move || {
-        (host_owned.as_str(), 0u16)
-            .to_socket_addrs()
-            .map(|it| it.map(|a| a.ip()).collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| format!("dns: {e}"))?;
+    let lookup = dns::lookup(host).await?;
     if lookup.is_empty() {
         return Err("dns: no addresses".into());
     }
@@ -177,8 +173,7 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
-#[tauri::command]
-pub async fn lm_ping(base_url: String) -> Result<u16, String> {
+async fn probe_endpoint(base_url: String) -> Result<u16, String> {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("empty base url".into());
@@ -220,20 +215,26 @@ fn build_request(
     Ok(req)
 }
 
-pub(crate) fn header_map_to_strings(headers: &HeaderMap) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(headers.len());
-    for (k, v) in headers {
-        if let Ok(s) = v.to_str() {
-            out.insert(k.as_str().to_ascii_lowercase(), s.to_string());
-        }
-    }
-    out
+/// Preserve repeated fields; flattening to a map loses authentication challenges
+/// and joining here would corrupt Set-Cookie values containing Expires commas.
+pub(crate) fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|text| (name.as_str().to_owned(), text.to_owned()))
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
 struct StreamHeaders {
     status: u16,
-    headers: HashMap<String, String>,
+    #[serde(rename = "statusText")]
+    status_text: &'static str,
+    headers: Vec<(String, String)>,
 }
 
 /// Packet kinds the webview decodes: 0 headers, 1 body, 2 end, 3 error.
@@ -259,10 +260,22 @@ pub(crate) fn request_body(body: &InvokeBody) -> Result<Option<Bytes>, String> {
     })
 }
 
+/// Reserve ownership/capacity before copying the IPC upload. Admission must
+/// release its locks before returning; a large copy must not block retirement.
+/// If body validation fails, the returned ownership guard drops automatically.
+pub(crate) fn admit_request_body<T>(
+    body: &InvokeBody,
+    admit: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<Bytes>), String> {
+    let owner = admit()?;
+    Ok((owner, request_body(body)?))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamRequest {
     request_id: String,
+    page_generation: String,
     url: String,
     method: String,
     headers: Option<HashMap<String, String>>,
@@ -274,6 +287,7 @@ struct StreamRequest {
 pub async fn ai_http_stream(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
+    pages: State<'_, page::NetworkPages>,
     request: Request<'_>,
 ) -> Result<(), String> {
     let metadata = request
@@ -284,6 +298,7 @@ pub async fn ai_http_stream(
         .ok_or("missing or oversized AI request metadata")?;
     let StreamRequest {
         request_id,
+        page_generation,
         url,
         method,
         headers,
@@ -291,8 +306,11 @@ pub async fn ai_http_stream(
         on_event,
     } = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
     let on_event = on_event.channel_on::<_, Response>(window.as_ref().clone());
-    let body = request_body(request.body())?;
-    let (lease, registration) = state.start(window.label(), &request_id)?;
+    let ((lease, registration), body) = admit_request_body(request.body(), || {
+        pages.with_page(window.label(), &page_generation, || {
+            state.start(window.label(), &request_id)
+        })
+    })?;
     tauri::async_runtime::spawn(async move {
         let run = async {
             let allow_private = allow_private_network.unwrap_or(false);
@@ -304,7 +322,8 @@ pub async fn ai_http_stream(
             let response = request.send().await.map_err(|e| error_chain(&e))?;
             let metadata = serde_json::to_vec(&StreamHeaders {
                 status: response.status().as_u16(),
-                headers: header_map_to_strings(response.headers()),
+                status_text: response.status().canonical_reason().unwrap_or(""),
+                headers: header_pairs(response.headers()),
             })
             .map_err(|e| e.to_string())?;
             on_event
@@ -377,11 +396,18 @@ where
             }
             continue;
         }
+        // Network activity is not consumer progress. Keep the same wait while
+        // absorbing data; only a credit notification may renew its deadline.
+        let changed = control.credit_changed();
+        tokio::pin!(changed);
         while !control.try_reserve(payload_len(&packet))? {
             let can_absorb = payload_len(&packet) < CHUNK_BYTES && carry.is_empty() && !ended;
             if can_absorb {
                 tokio::select! {
-                    changed = control.credit_changed() => changed?,
+                    result = &mut changed => {
+                        result?;
+                        changed.set(control.credit_changed());
+                    },
                     next = chunks.next() => match next {
                         Some(Ok(next)) => {
                             carry = next;
@@ -395,7 +421,8 @@ where
                     },
                 }
             } else {
-                control.credit_changed().await?;
+                changed.as_mut().await?;
+                changed.set(control.credit_changed());
             }
         }
         send(std::mem::replace(&mut packet, new_packet(1, 0)))?;
@@ -409,10 +436,14 @@ where
 pub async fn ai_http_cancel(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
+    pages: State<'_, page::NetworkPages>,
+    page_generation: String,
     request_id: String,
 ) -> Result<(), String> {
-    state.cancel(window.label(), &request_id);
-    Ok(())
+    pages.with_page(window.label(), &page_generation, || {
+        state.cancel(window.label(), &request_id);
+        Ok(())
+    })
 }
 
 /// Async so the acknowledgment never rides the main thread, which is where
@@ -421,10 +452,14 @@ pub async fn ai_http_cancel(
 pub async fn ai_http_ack(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
+    pages: State<'_, page::NetworkPages>,
+    page_generation: String,
     request_id: String,
     bytes: u64,
 ) -> Result<(), String> {
-    state.acknowledge(window.label(), &request_id, bytes)
+    pages.with_page(window.label(), &page_generation, || {
+        state.acknowledge(window.label(), &request_id, bytes)
+    })
 }
 
 #[cfg(test)]
@@ -657,6 +692,55 @@ mod tests {
     }
 
     #[test]
+    fn rejected_uploads_do_not_decode_bodies_and_bad_bodies_release_capacity() {
+        let pages = page::NetworkPages::default();
+        let state = AiStreamState::default();
+        pages.begin("main", || {}).unwrap();
+        let token = pages.finish("main").unwrap();
+        // An invalid body would fail decoding if admission did not run first.
+        let body = InvokeBody::Json(serde_json::json!("not a byte array"));
+        let stale = admit_request_body(&body, || {
+            pages.with_page("main", "expired", || state.start("main", "upload"))
+        });
+        assert!(matches!(stale, Err(error) if error.contains("expired")));
+        let held = state.start_bounded("main", "held", 1).unwrap();
+        let full = admit_request_body(&body, || {
+            pages.with_page("main", &token, || state.start_bounded("main", "upload", 1))
+        });
+        assert!(matches!(full, Err(error) if error.contains("too many")));
+        drop(held);
+        assert!(admit_request_body(&body, || {
+            pages.with_page("main", &token, || state.start_bounded("main", "upload", 1))
+        })
+        .is_err());
+        assert!(state.start_bounded("main", "upload", 1).is_ok());
+    }
+
+    #[test]
+    fn response_metadata_preserves_repeated_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "www-authenticate",
+            HeaderValue::from_static("Bearer realm=api"),
+        );
+        headers.append(
+            "www-authenticate",
+            HeaderValue::from_static("Basic realm=legacy"),
+        );
+        let metadata = serde_json::to_string(&StreamHeaders {
+            status: 401,
+            status_text: "Unauthorized",
+            headers: header_pairs(&headers),
+        })
+        .unwrap();
+        assert!(
+            metadata.contains("Bearer realm=api"),
+            "first challenge was discarded: {metadata}"
+        );
+        assert!(metadata.contains("Basic realm=legacy"));
+    }
+
+    #[test]
     fn ipv6_literal_hosts_resolve_without_dns() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -680,7 +764,9 @@ mod tests {
         assert_eq!(rt.block_on(host_is_private("10.0.0.7")), Ok(true));
         assert_eq!(rt.block_on(host_is_private("1.1.1.1")), Ok(false));
         assert!(rt.block_on(host_is_private("169.254.169.254")).is_err());
-        assert!(rt.block_on(host_is_private("[::ffff:169.254.169.254]")).is_err());
+        assert!(rt
+            .block_on(host_is_private("[::ffff:169.254.169.254]"))
+            .is_err());
         assert!(rt
             .block_on(host_is_private("metadata.google.internal"))
             .is_err());
@@ -858,5 +944,40 @@ mod tests {
             })
             .await;
         }
+
+        #[tokio::test(start_paused = true)]
+        async fn incoming_bytes_do_not_extend_a_stalled_consumers_deadline() {
+            local(async {
+                let (net_tx, net_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                let chunks: Chunks =
+                    Box::pin(futures_util::stream::unfold(net_rx, |mut rx| async move {
+                        rx.recv().await.map(|b| (Ok::<_, String>(b), rx))
+                    }));
+                let (task, rx, _state) = run_pump(chunks);
+                net_tx.send(Bytes::from(vec![0; 128 * 1024 + 1])).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rx.try_iter().count(), 2);
+                tokio::time::advance(std::time::Duration::from_secs(110)).await;
+                net_tx.send(Bytes::from_static(b"x")).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(std::time::Duration::from_secs(11)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    task.is_finished(),
+                    "incoming bytes reset the consumer deadline"
+                );
+                assert!(task.await.unwrap().unwrap_err().contains("stopped reading"));
+            })
+            .await;
+        }
     }
 }
+
+#[cfg(test)]
+mod clients_boundary_tests;

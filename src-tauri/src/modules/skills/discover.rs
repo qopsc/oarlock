@@ -310,7 +310,10 @@ mod tests {
         write(&root.join(".install-1/SKILL.md"), &skill_md("staged", "x"));
         write(&root.join("synced/SKILL.md"), &skill_md("synced", "x"));
         write(&root.join("loose.md"), "a file");
-        let scanned = scan(&source(root, SourceKind::Oarlock), &mut ParseCache::default());
+        let scanned = scan(
+            &source(root, SourceKind::Oarlock),
+            &mut ParseCache::default(),
+        );
         let names: Vec<_> = scanned
             .skills
             .iter()

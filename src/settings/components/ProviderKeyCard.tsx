@@ -1,3 +1,5 @@
+import { CredentialRecovery } from "./CredentialRecovery";
+import { maskKey } from "@/modules/ai/lib/maskKey";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,19 +22,18 @@ import { ProviderIcon } from "./ProviderIcon";
 type Props = {
   provider: ProviderInfo;
   currentKey: string | null;
+  credentialIssue?: string | null;
+  onRetryKey?: () => Promise<void>;
   onSave: (key: string) => Promise<void>;
   onClear: () => Promise<void>;
   onRemove?: () => void;
 };
 
-function maskKey(key: string): string {
-  if (key.length <= 8) return "•".repeat(key.length);
-  return `${key.slice(0, 4)}${"•".repeat(8)}${key.slice(-4)}`;
-}
-
 export function ProviderKeyCard({
   provider,
   currentKey,
+  credentialIssue,
+  onRetryKey,
   onSave,
   onClear,
   onRemove,
@@ -113,6 +114,11 @@ export function ProviderKeyCard({
         ) : null}
       </div>
 
+      <CredentialRecovery
+        problem={credentialIssue}
+        onRetry={onRetryKey}
+        onRemove={onClear}
+      />
       {editing ? (
         <div className="flex flex-col gap-1.5">
           <div className="flex gap-1.5">

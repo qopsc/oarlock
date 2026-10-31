@@ -17,7 +17,8 @@ import {
   unbindLeafPty,
 } from "@/modules/terminal/lib/ptyPresentation";
 import { tokenBytes } from "@/modules/terminal/lib/ptyWire";
-import { currentWorkspaceEnv } from "@/modules/workspace";
+import { currentWorkspaceEnv, type WorkspaceEnv } from "@/modules/workspace";
+import { networkPage } from "@/lib/networkPage";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
@@ -106,6 +107,7 @@ export async function openPty(
   blocks?: boolean,
   shell?: string,
   paneId?: number,
+  workspace: WorkspaceEnv = currentWorkspaceEnv(),
 ): Promise<PtySession> {
   const stream = outputHub();
   let id: number | null = null;
@@ -152,17 +154,19 @@ export async function openPty(
   const presentation =
     paneId === undefined ? undefined : leafPresentationClass(paneId);
   try {
+    const pageGeneration = await networkPage(new AbortController().signal);
     await ensureAgentActivityListener();
     await stream.ensureStream();
     id = await invoke<number>("pty_open", {
       cols,
       rows,
       cwd: cwd ?? null,
-      workspace: currentWorkspaceEnv(),
+      workspace,
       blocks: blocks ?? false,
       shell: shell ?? null,
       paneId: paneId ?? null,
       presentation: presentation ?? null,
+      pageGeneration,
     });
   } catch (error) {
     releaseHandlers();
@@ -214,10 +218,14 @@ export async function openPty(
  * True when the page may take it as the terminal's folder: on Linux and macOS
  * only where the shell or its foreground job really is (`pty_authorize_cwd`).
  */
-export function authorizePtyCwd(id: number, path: string): Promise<boolean> {
+export function authorizePtyCwd(
+  id: number,
+  path: string,
+  workspace: WorkspaceEnv = currentWorkspaceEnv(),
+): Promise<boolean> {
   return invoke<boolean>("pty_authorize_cwd", {
     id,
     path,
-    workspace: currentWorkspaceEnv(),
+    workspace,
   }).catch(() => false);
 }

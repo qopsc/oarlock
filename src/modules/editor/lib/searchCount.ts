@@ -1,3 +1,4 @@
+import { regexQuery } from "../search/regexState";
 import { type MatchCount, sameMatchCount } from "@/lib/matchCount";
 import { getSearchQuery, SearchQuery } from "@codemirror/search";
 import {
@@ -17,17 +18,6 @@ const SLICE_MS = 6;
 /** Edits re-count at once below this size, after a pause above it. */
 const IMMEDIATE_RECOUNT_CHARS = 128 * 1024;
 const RECOUNT_DELAY_MS = 200;
-/**
- * A regular expression that can match across lines is found in one pass (its
- * matches have no length bound to chunk by), so it is counted only up to this.
- */
-const MULTILINE_REGEX_COUNT_CHARS = 4 * 1024 * 1024;
-
-/** CodeMirror's own test for a regular expression that can span lines. */
-function regexSpansLines(source: string): boolean {
-  return /\\[sWDnr]|\n|\r|\[\^/.test(source);
-}
-
 /** The text a string query looks for, with `\n`, `\r`, `\t` unescaped as CodeMirror does. */
 function unquote(query: SearchQuery): string {
   if (query.literal) return query.search;
@@ -93,8 +83,8 @@ function documentWordQuery(
  * Finds a query's matches in a document in chunks, so a long document is
  * counted over several tasks instead of blocking one. Chunking never changes
  * the result: a string query's chunk reads on by the longest match it can
- * have and keeps the matches that start inside it; a single-line regular
- * expression is cut between lines, which its matches never cross. Stops at
+ * have and keeps the matches that start inside it; regular expressions
+ * are refused here and handled by the isolated editor worker. Stops at
  * `cap` matches.
  */
 export class MatchScan {
@@ -102,12 +92,11 @@ export class MatchScan {
   readonly to: number[] = [];
   capped = false;
   done = false;
-  /** The query could not be counted here (a multi-line regex in a huge document). */
+  /** Regular expressions must use the bounded worker. */
   readonly unsupported: boolean;
   private pos = 0;
   private readonly query: SearchQuery;
   private readonly overlap: number;
-  private readonly wholeDocument: boolean;
 
   constructor(
     private readonly state: EditorState,
@@ -116,10 +105,8 @@ export class MatchScan {
     private readonly chunk = CHUNK_CHARS,
   ) {
     this.query = documentWordQuery(query, state);
-    this.wholeDocument = query.regexp && regexSpansLines(query.search);
     this.overlap = query.regexp ? 0 : stringMatchBound(query);
-    this.unsupported =
-      this.wholeDocument && state.doc.length > MULTILINE_REGEX_COUNT_CHARS;
+    this.unsupported = query.regexp;
     if (this.unsupported) this.done = true;
   }
 
@@ -154,7 +141,6 @@ export class MatchScan {
 
   private chunkEnd(): number {
     const doc = this.state.doc;
-    if (this.wholeDocument) return doc.length;
     const target = Math.min(doc.length, this.pos + this.chunk);
     return this.query.regexp ? doc.lineAt(target).to : target;
   }
@@ -244,6 +230,12 @@ export class SearchCounter {
   }
 
   update(update: ViewUpdate): void {
+    if (update.state.field(regexQuery, false)) {
+      this.cancel();
+      this.scan = null;
+      this.scanState = null;
+      return;
+    }
     if (!this.hub.wanted) return;
     const query = getSearchQuery(update.state);
     const scanned = this.scanState ? getSearchQuery(this.scanState) : null;
@@ -264,6 +256,11 @@ export class SearchCounter {
     this.cancel();
     const state = this.view.state;
     const query = getSearchQuery(state);
+    if (state.field(regexQuery, false)) {
+      this.scan = null;
+      this.scanState = null;
+      return;
+    }
     if (!this.hub.wanted || !query.valid) {
       this.scan = null;
       this.scanState = null;

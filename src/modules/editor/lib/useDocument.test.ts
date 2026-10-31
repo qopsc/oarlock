@@ -11,7 +11,7 @@ vi.mock("@/modules/lsp", () => ({ notifyDocumentSaved: vi.fn() }));
 vi.mock("sonner", () => ({ toast: {} }));
 
 import { useWorkspaceEnvStore } from "@/modules/workspace";
-import { tauriDocumentIo } from "./useDocument";
+import { createDocumentIo } from "./useDocument";
 
 const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
 const host = { kind: "local" };
@@ -26,29 +26,45 @@ beforeEach(() => {
 });
 
 describe("the editor's document IO in a WSL window", () => {
-  it("reads, stats and saves a host file such as a theme on the host", async () => {
+  it("reads and conditionally saves a host file such as a theme on the host", async () => {
+    const tauriDocumentIo = createDocumentIo(ubuntu);
     await tauriDocumentIo.read(themeFile, false);
-    await tauriDocumentIo.mtime(themeFile);
-    await tauriDocumentIo.write(themeFile, "{}");
+    await tauriDocumentIo.write(themeFile, "{}", "baseline");
     expect(invoke.mock.calls).toEqual([
-      ["fs_read_file", { path: themeFile, workspace: host, force: false }],
-      ["fs_stat", { path: themeFile, workspace: host }],
       [
-        "fs_write_file",
-        { path: themeFile, content: "{}", workspace: host, source: "editor" },
+        "fs_read_file",
+        { path: themeFile, workspace: host, force: false, versioned: true },
+      ],
+      [
+        "fs_save_document",
+        {
+          path: themeFile,
+          content: "{}",
+          workspace: host,
+          expectedVersion: "baseline",
+        },
       ],
     ]);
   });
 
   it("keeps a file inside the distro in the window's environment", async () => {
     const file = "/home/me/project/README.md";
+    const tauriDocumentIo = createDocumentIo(ubuntu);
     await tauriDocumentIo.read(file, true);
-    await tauriDocumentIo.write(file, "# Notes");
+    await tauriDocumentIo.write(file, "# Notes", "baseline");
     expect(invoke.mock.calls).toEqual([
-      ["fs_read_file", { path: file, workspace: ubuntu, force: true }],
       [
-        "fs_write_file",
-        { path: file, content: "# Notes", workspace: ubuntu, source: "editor" },
+        "fs_read_file",
+        { path: file, workspace: ubuntu, force: true, versioned: true },
+      ],
+      [
+        "fs_save_document",
+        {
+          path: file,
+          content: "# Notes",
+          workspace: ubuntu,
+          expectedVersion: "baseline",
+        },
       ],
     ]);
   });

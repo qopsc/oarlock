@@ -47,6 +47,25 @@ beforeEach(() => {
 });
 
 describe("planRestoreGrants", () => {
+  it.each(["a", "b", "local"])(
+    "keeps shared WSL grants available with %s active",
+    (active) => {
+      const plan = planRestoreGrants(
+        [
+          space("a", "/repo", ubuntu),
+          space("b", "/repo", ubuntu),
+          space("local", null),
+        ],
+        [],
+        active,
+      );
+      expect(plan.now).toHaveLength(active === "local" ? 0 : 1);
+      for (const id of ["a", "b"]) {
+        expect(plan.later.has(id)).toBe(id !== active);
+      }
+    },
+  );
+
   it("authorizes roots, terminal folders and open files' folders, once each", () => {
     const plan = planRestoreGrants(
       [space("a", "/srv/app"), space("b", null)],

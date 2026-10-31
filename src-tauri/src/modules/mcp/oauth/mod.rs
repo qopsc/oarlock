@@ -23,6 +23,7 @@ mod flow;
 #[cfg(test)]
 mod live_tests;
 mod pkce;
+mod probe;
 mod store;
 
 use std::collections::HashMap;
@@ -77,6 +78,7 @@ struct Required {
 struct Pending {
     server_id: String,
     cancel: Arc<Notify>,
+    saving: bool,
 }
 
 /// Sign-in state the backend keeps in memory; the records themselves are in the keychain.
@@ -84,6 +86,7 @@ struct Pending {
 pub struct OAuthState {
     /// Token records read so far (None: known to have none).
     tokens: Mutex<HashMap<String, Option<Arc<TokenSet>>>>,
+    probes: probe::Probes,
     /// One refresh at a time per server.
     refreshing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     required: Mutex<HashMap<String, Required>>,
@@ -110,20 +113,43 @@ fn announce(app: &AppHandle, server_id: &str) {
 
 /// The token record of a server, read from the keychain once.
 async fn tokens(app: &AppHandle, server_id: &str) -> Option<Arc<TokenSet>> {
-    if let Some(cached) = lock(&state(app).tokens).get(server_id) {
+    let key = store::account(app, server_id, OauthItem::Tokens).ok()?;
+    if let Some(cached) = lock(&state(app).tokens).get(&key) {
         return cached.clone();
     }
-    let read = store::read::<TokenSet>(app, server_id, OauthItem::Tokens)
-        .await
-        .unwrap_or_else(|error| {
-            log::warn!("mcp: could not read the sign-in of {server_id}: {error}");
-            None
-        })
-        .map(Arc::new);
-    lock(&state(app).tokens)
-        .entry(server_id.to_owned())
-        .or_insert(read)
-        .clone()
+    let read = store::read_account::<TokenSet>(app, key.clone(), server_id).await;
+    accept_token_read(
+        &state(app).tokens,
+        key,
+        || store::account(app, server_id, OauthItem::Tokens).ok(),
+        read,
+    )
+    .unwrap_or_else(|error| {
+        log::warn!("mcp: could not read the sign-in of {server_id}: {error}");
+        None
+    })
+}
+
+fn accept_token_read(
+    cache: &Mutex<HashMap<String, Option<Arc<TokenSet>>>>,
+    key: String,
+    current_key: impl FnOnce() -> Option<String>,
+    read: Result<Option<TokenSet>, String>,
+) -> Result<Option<Arc<TokenSet>>, String> {
+    // Hold the cache lock through the version check and insertion: publication
+    // either changes the version first or purges this entry after we release it.
+    let mut cached = lock(cache);
+    if current_key().as_ref() != Some(&key) {
+        return Ok(None);
+    }
+    // A sign-in or sign-out completed while this read was pending.
+    if let Some(current) = cached.get(&key) {
+        return Ok(current.clone());
+    }
+    // A locked/unavailable keychain is not proof that the user has no sign-in.
+    let read = read?.map(Arc::new);
+    cached.insert(key, read.clone());
+    Ok(read)
 }
 
 /// The tokens of `server_id` when they were obtained for `url`, the server as configured now.
@@ -138,18 +164,34 @@ async fn save_tokens(
 ) -> Result<Arc<TokenSet>, String> {
     store::write(app, server_id, OauthItem::Tokens, &tokens).await?;
     let tokens = Arc::new(tokens);
-    lock(&state(app).tokens).insert(server_id.to_owned(), Some(tokens.clone()));
+    lock(&state(app).tokens).insert(
+        store::account(app, server_id, OauthItem::Tokens)?,
+        Some(tokens.clone()),
+    );
     Ok(tokens)
 }
 
-async fn forget_tokens(app: &AppHandle, server_id: &str) {
-    if let Err(error) = store::delete(app, server_id, OauthItem::Tokens).await {
-        log::warn!("mcp: could not delete the tokens of {server_id}: {error}");
-    }
-    lock(&state(app).tokens).insert(server_id.to_owned(), None);
+async fn forget_cached_tokens(
+    cache: &Mutex<HashMap<String, Option<Arc<TokenSet>>>>,
+    key: String,
+    delete: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    delete.await?;
+    lock(cache).insert(key, None);
+    Ok(())
 }
 
-fn refresh_lock(app: &AppHandle, server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+async fn forget_tokens(app: &AppHandle, server_id: &str) -> Result<(), String> {
+    let key = store::account(app, server_id, OauthItem::Tokens)?;
+    forget_cached_tokens(
+        &state(app).tokens,
+        key,
+        store::delete(app, server_id, OauthItem::Tokens),
+    )
+    .await
+}
+
+pub(super) fn refresh_lock(app: &AppHandle, server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     credential_lock(state(app), server_id)
 }
 
@@ -210,7 +252,11 @@ async fn client_of(app: &AppHandle, server_id: &str, tokens: &TokenSet) -> Resul
 }
 
 async fn configured_secret(app: &AppHandle, server_id: &str) -> Result<Option<String>, String> {
-    let account = secret_account(server_id, SecretKind::Oauth, OAUTH_CLIENT_SECRET)?;
+    let account = super::credentials::account(
+        app,
+        server_id,
+        secret_account(server_id, SecretKind::Oauth, OAUTH_CLIENT_SECRET)?,
+    )?;
     Ok(
         crate::modules::secrets::backend_get(app.clone(), SECRET_SERVICE, vec![account])
             .await?
@@ -267,7 +313,14 @@ async fn refresh(
         }
         Err(TokenError::Rejected(message)) => {
             log::info!("mcp: {server_id} sign-in expired: {message}");
-            forget_tokens(app, server_id).await;
+            if let Err(error) = forget_tokens(app, server_id).await {
+                log::warn!("mcp: could not remove expired tokens of {server_id}: {error}");
+                // A token the server rejected must not be retried in this process,
+                // even if the keychain is temporarily unavailable.
+                if let Ok(key) = store::account(app, server_id, OauthItem::Tokens) {
+                    lock(&state(app).tokens).insert(key, None);
+                }
+            }
             note_required(app, server_id, &current.server_url, Reason::Expired, None);
             None
         }
@@ -285,7 +338,15 @@ pub async fn bearer(
     server_id: &str,
     url: &Url,
     policy: &Policy,
+    revision: Option<u64>,
 ) -> Option<String> {
+    let guard = refresh_lock(app, server_id);
+    let _held = guard.lock().await;
+    if revision.is_some_and(|revision| {
+        super::credentials::check_revision(app, server_id, revision).is_err()
+    }) {
+        return None;
+    }
     let current = bound_tokens(app, server_id, url.as_str()).await?;
     let due = current
         .expires_at
@@ -293,14 +354,7 @@ pub async fn bearer(
     if !due || current.refresh_token.is_none() {
         return Some(current.access_token.clone());
     }
-    let guard = refresh_lock(app, server_id);
-    let _held = guard.lock().await;
-    // Another request may have refreshed while this one waited.
-    let latest = bound_tokens(app, server_id, url.as_str()).await?;
-    if latest.access_token != current.access_token {
-        return Some(latest.access_token.clone());
-    }
-    match refresh(app, server_id, policy, &latest).await {
+    match refresh(app, server_id, policy, &current).await {
         Some(fresh) => Some(fresh.access_token.clone()),
         None => bound_tokens(app, server_id, url.as_str())
             .await
@@ -322,6 +376,7 @@ pub enum Unauthorized {
 
 /// A request sent with `sent` (or no token) was answered 401 with `challenge` (its `Bearer`
 /// challenge, if any).
+#[allow(clippy::too_many_arguments)]
 pub async fn after_unauthorized(
     app: &AppHandle,
     server_id: &str,
@@ -329,21 +384,25 @@ pub async fn after_unauthorized(
     policy: &Policy,
     sent: Option<&str>,
     challenge: Option<Challenge>,
+    revision: Option<u64>,
 ) -> Unauthorized {
+    let guard = refresh_lock(app, server_id);
+    let _held = guard.lock().await;
+    if revision.is_some_and(|revision| {
+        super::credentials::check_revision(app, server_id, revision).is_err()
+    }) {
+        return Unauthorized::Other;
+    }
     let retry = match sent {
         None if challenge.is_none() => return Unauthorized::Other,
         None => None,
-        Some(sent) => {
-            let guard = refresh_lock(app, server_id);
-            let _held = guard.lock().await;
-            match bound_tokens(app, server_id, url.as_str()).await {
-                Some(latest) if latest.access_token != sent => Some(latest.access_token.clone()),
-                Some(latest) => refresh(app, server_id, policy, &latest)
-                    .await
-                    .map(|fresh| fresh.access_token.clone()),
-                None => None,
-            }
-        }
+        Some(sent) => match bound_tokens(app, server_id, url.as_str()).await {
+            Some(latest) if latest.access_token != sent => Some(latest.access_token.clone()),
+            Some(latest) => refresh(app, server_id, policy, &latest)
+                .await
+                .map(|fresh| fresh.access_token.clone()),
+            None => None,
+        },
     };
     match retry {
         Some(token) => Unauthorized::Retry(token),
@@ -389,6 +448,7 @@ pub struct AuthStatus {
     pub expires_at_ms: Option<u64>,
     pub can_refresh: bool,
     pub signing_in: bool,
+    pub saving: bool,
 }
 
 fn status_of(
@@ -417,22 +477,33 @@ fn status_of(
             .map(|s| s.saturating_mul(1000)),
         can_refresh: tokens.is_some_and(|t| t.refresh_token.is_some()),
         signing_in,
+        saving: false,
     }
 }
 
 async fn status(app: &AppHandle, server_id: &str, url: &str) -> AuthStatus {
+    // A cold keychain read would queue behind the write and hide the saving phase.
+    if lock(&state(app).pending)
+        .as_ref()
+        .is_some_and(|p| p.server_id == server_id && p.saving)
+    {
+        let mut status = status_of(server_id, url, None, None, true);
+        status.saving = true;
+        return status;
+    }
     let tokens = tokens(app, server_id).await;
     let required = lock(&state(app).required).get(server_id).cloned();
-    let signing_in = lock(&state(app).pending)
-        .as_ref()
-        .is_some_and(|p| p.server_id == server_id);
-    status_of(
+    let pending = lock(&state(app).pending);
+    let pending = pending.as_ref().filter(|p| p.server_id == server_id);
+    let mut status = status_of(
         server_id,
         url,
         tokens.as_deref(),
         required.as_ref(),
-        signing_in,
-    )
+        pending.is_some(),
+    );
+    status.saving = pending.is_some_and(|p| p.saving);
+    status
 }
 
 /// The server URL a sign-in command acts on: a project server's comes from its trusted
@@ -480,29 +551,192 @@ pub async fn mcp_oauth_status(
     Ok(out)
 }
 
-/// Looks for the server's protected resource metadata: a server that publishes it is
-/// protected, so Settings shows sign-in required before the first connection fails.
-#[tauri::command]
-pub async fn mcp_oauth_probe(
-    app: AppHandle,
-    window: WebviewWindow,
+/// Automatic metadata discovery acknowledges admission before doing async work.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeInput {
     server_id: String,
     url: String,
     shell: Option<String>,
-) -> Result<AuthStatus, String> {
+    revision: Option<u64>,
+}
+
+#[tauri::command]
+pub fn mcp_oauth_probe(
+    app: AppHandle,
+    window: WebviewWindow,
+    page_generation: String,
+    request_id: String,
+    input: ProbeInput,
+    on_event: tauri::ipc::Channel<Result<AuthStatus, String>>,
+) -> Result<(), String> {
     require_settings(&window)?;
-    require_server_id(&server_id)?;
+    require_server_id(&input.server_id)?;
+    let pages = app.state::<crate::modules::net::page::NetworkPages>();
+    let (lease, registration) = pages.with_page(window.label(), &page_generation, || {
+        state(&app)
+            .probes
+            .admit(window.label(), &request_id, &input.server_id)
+    })?;
+    tauri::async_runtime::spawn(async move {
+        let result = futures_util::future::Abortable::new(
+            discover_metadata(app, input, &lease),
+            registration,
+        )
+        .await
+        .unwrap_or_else(|_| Err("Metadata discovery cancelled".into()));
+        drop(lease);
+        let _ = on_event.send(result);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn mcp_oauth_probe_cancel(
+    app: AppHandle,
+    window: WebviewWindow,
+    page_generation: String,
+    request_id: String,
+) -> Result<(), String> {
+    require_settings(&window)?;
+    app.state::<crate::modules::net::page::NetworkPages>()
+        .with_page(window.label(), &page_generation, || {
+            state(&app).probes.cancel(window.label(), &request_id);
+            Ok(())
+        })
+}
+
+pub(crate) fn cancel_probe_window(app: &AppHandle, window: &str) {
+    if let Some(mcp) = app.try_state::<McpState>() {
+        mcp.oauth.probes.cancel_window(window);
+    }
+}
+pub(super) fn cancel_probe_server(app: &AppHandle, server: &str) {
+    state(app).probes.cancel_server(server);
+}
+
+fn validate_discovery(
+    app: &AppHandle,
+    id: &str,
+    url: &Url,
+    revision: Option<u64>,
+) -> Result<String, String> {
+    if super::project::is_project_server(id) {
+        let hash = super::project::settings_entry_hash(app, id)
+            .ok_or("Project metadata discovery is no longer authorized")?;
+        let records = super::settings::store(app)?
+            .get("projectServers")
+            .unwrap_or_default();
+        let record = &records[id];
+        if record["entryHash"] == hash && record["enabled"] == false {
+            return Err("MCP server is disabled".into());
+        }
+        Ok(hash)
+    } else {
+        let saved = super::credentials::server(app, id)?;
+        validate_global_discovery(&saved, url, revision)
+    }
+}
+
+fn validate_global_discovery(
+    saved: &serde_json::Value,
+    url: &Url,
+    revision: Option<u64>,
+) -> Result<String, String> {
+    if saved["enabled"] != true {
+        return Err("MCP server is disabled".into());
+    }
+    if revision != Some(saved["secretsRevision"].as_u64().unwrap_or(0)) {
+        return Err("MCP server credentials changed; reopen settings".into());
+    }
+    if saved["transport"]["url"]
+        .as_str()
+        .and_then(|s| Url::parse(s).ok())
+        .as_ref()
+        != Some(url)
+    {
+        return Err("MCP server URL changed; reopen settings".into());
+    }
+    Ok(serde_json::json!([
+        saved["transport"],
+        saved["secretsRevision"],
+        saved["credentialVersion"]
+    ])
+    .to_string())
+}
+
+async fn discover_metadata(
+    app: AppHandle,
+    input: ProbeInput,
+    lease: &probe::Lease,
+) -> Result<AuthStatus, String> {
+    let ProbeInput {
+        server_id,
+        url,
+        shell,
+        revision,
+    } = input;
     let url = server_url(&app, &server_id, &url, shell).await?;
+    let binding = validate_discovery(&app, &server_id, &url, revision)?;
+    let key = store::account(&app, &server_id, OauthItem::Tokens)?;
     let known = bound_tokens(&app, &server_id, url.as_str()).await.is_some()
-        || lock(&state(&app).required).contains_key(&server_id);
+        || lock(&state(&app).required)
+            .get(&server_id)
+            .is_some_and(|r| r.url == url.as_str());
     if !known {
+        if lock(&state(&app).pending)
+            .as_ref()
+            .is_some_and(|pending| pending.server_id == server_id)
+        {
+            return Err("Sign-in is already in progress; retry discovery after it finishes".into());
+        }
         let host = url.host_str().ok_or("mcp: the URL has no host")?;
         let policy = Policy::for_server(&url, crate::modules::net::host_is_private(host).await?);
-        if let Ok(Some(_)) = flow::resource_metadata(&policy, &url, None).await {
-            note_required(&app, &server_id, url.as_str(), Reason::Metadata, None);
+        if flow::resource_metadata(&policy, &url, None)
+            .await?
+            .is_some()
+        {
+            let mcp = app.state::<McpState>();
+            if validate_discovery(&app, &server_id, &url, revision)? != binding {
+                return Err("MCP server changed during discovery".into());
+            }
+            let _settings = mcp.settings.lock().await;
+            let guard = refresh_lock(&app, &server_id);
+            let _held = guard.lock().await;
+            // Discovery may have overlapped sign-in or a configuration edit. Never
+            // turn successful authentication back into a request to sign in.
+            if metadata_probe_is_current(
+                state(&app),
+                &server_id,
+                url.as_str(),
+                &key,
+                store::account(&app, &server_id, OauthItem::Tokens)
+                    .ok()
+                    .as_deref(),
+            ) {
+                lease.publish(|| {
+                    note_required(&app, &server_id, url.as_str(), Reason::Metadata, None)
+                })?;
+            }
         }
     }
     Ok(status(&app, &server_id, url.as_str()).await)
+}
+
+/// Called under the credential lock, immediately before publishing discovery.
+fn metadata_probe_is_current(
+    state: &OAuthState,
+    server_id: &str,
+    url: &str,
+    key: &str,
+    current_key: Option<&str>,
+) -> bool {
+    current_key == Some(key)
+        // No cache entry means the keychain read failed, not that it has no token.
+        && lock(&state.tokens).get(key).is_some_and(|tokens| {
+            tokens.as_ref().is_none_or(|tokens| tokens.server_url != url)
+        })
+        && !lock(&state.pending).as_ref().is_some_and(|p| p.server_id == server_id)
 }
 
 /// A client the user configured for a server.
@@ -605,8 +839,6 @@ async fn prepare(
                     let registration =
                         flow::register(policy, auth, &redirect_uri, scope.as_deref(), now_secs())
                             .await?;
-                    let guard = refresh_lock(app, server_id);
-                    let _held = guard.lock().await;
                     if !lock(&state(app).pending)
                         .as_ref()
                         .is_some_and(|p| std::ptr::eq(p.cancel.as_ref(), cancel))
@@ -709,16 +941,48 @@ async fn open_browser(app: &AppHandle, url: &Url) -> Result<(), String> {
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sign_in(
     app: &AppHandle,
     server_id: &str,
     server: &Url,
     input: &ClientInput,
     cancel: &Notify,
-) -> Result<TokenSet, String> {
+    revision: Option<u64>,
+) -> Result<(TokenSet, tokio::net::TcpStream), String> {
     let host = server.host_str().ok_or("mcp: the URL has no host")?;
     let policy = Policy::for_server(server, crate::modules::net::host_is_private(host).await?);
-    let prepared = prepare(app, server_id, server, &policy, input, cancel).await?;
+    let prepared = {
+        let guard = refresh_lock(app, server_id);
+        let _held = guard.lock().await;
+        let configured;
+        let input = if !super::project::is_project_server(server_id) {
+            let saved = super::credentials::launch(
+                app,
+                server_id,
+                revision.ok_or("mcp: missing configuration revision")?,
+            )?;
+            if saved["transport"]["url"]
+                .as_str()
+                .and_then(|url| Url::parse(url).ok())
+                .as_ref()
+                != Some(server)
+            {
+                return Err("mcp: server URL changed; reopen settings".into());
+            }
+            let oauth = &saved["transport"]["oauth"];
+            configured = ClientInput {
+                client_id: oauth["clientId"].as_str().map(str::to_owned),
+                has_secret: oauth["clientSecret"] == true,
+                scopes: oauth["scopes"].as_str().map(str::to_owned),
+                callback_port: oauth["callbackPort"].as_u64().map(|p| p as u16),
+            };
+            &configured
+        } else {
+            input
+        };
+        prepare(app, server_id, server, &policy, input, cancel).await?
+    };
     if !lock(&state(app).pending)
         .as_ref()
         .is_some_and(|p| std::ptr::eq(p.cancel.as_ref(), cancel))
@@ -732,19 +996,13 @@ async fn sign_in(
         () = tokio::time::sleep(SIGN_IN_TIMEOUT) => Err("sign-in timed out; start it again"),
     };
     let (params, mut stream) = waited.map_err(str::to_owned)?;
-    let result = finish(server, &policy, &prepared, &params).await;
-    let page = match &result {
-        Ok(_) => callback::page(
-            "Signed in",
-            "Oarlock is signed in to the server. You can close this tab.",
-        ),
-        Err(error) => callback::page(
-            "Sign-in failed",
-            &format!("{error}. You can close this tab and try again from Oarlock's Settings."),
-        ),
-    };
-    let _ = callback::respond(&mut stream, 200, &page).await;
-    result
+    match finish(server, &policy, &prepared, &params).await {
+        Ok(tokens) => Ok((tokens, stream)),
+        Err(error) => {
+            report_sign_in(&mut stream, &Err(error.clone())).await;
+            Err(error)
+        }
+    }
 }
 
 /// Signs in to a server: opens the system browser and waits (up to five minutes) for the
@@ -756,48 +1014,40 @@ pub async fn mcp_oauth_sign_in(
     server_id: String,
     url: String,
     client: Option<ClientInput>,
+    revision: Option<u64>,
     shell: Option<String>,
 ) -> Result<AuthStatus, String> {
     require_settings(&window)?;
     require_server_id(&server_id)?;
+    cancel_probe_server(&app, &server_id);
     let server = server_url(&app, &server_id, &url, shell).await?;
     let input = client.unwrap_or_default();
     let cancel = Arc::new(Notify::new());
-    if let Some(previous) = lock(&state(&app).pending).replace(Pending {
-        server_id: server_id.clone(),
-        cancel: cancel.clone(),
-    }) {
-        previous.cancel.notify_one();
+    if let Some(previous) = start_pending(state(&app), &server_id, cancel.clone())? {
+        announce(&app, &previous);
     }
     announce(&app, &server_id);
-    let result = sign_in(&app, &server_id, &server, &input, &cancel).await;
-    let guard = refresh_lock(&app, &server_id);
-    let _held = guard.lock().await;
-    let current = {
-        let pending = lock(&state(&app).pending);
-        pending
-            .as_ref()
-            .is_some_and(|p| Arc::ptr_eq(&p.cancel, &cancel))
-    };
-    if !current {
-        return Err("mcp: sign-in was cancelled".into());
-    }
-    {
-        let mut pending = lock(&state(&app).pending);
-        if pending
-            .as_ref()
-            .is_some_and(|p| Arc::ptr_eq(&p.cancel, &cancel))
-        {
-            *pending = None;
-        }
-    }
+    let result = sign_in(&app, &server_id, &server, &input, &cancel, revision).await;
+    let mut response = None;
     let outcome = match result {
-        Ok(tokens) => save_tokens(&app, &server_id, tokens).await.map(|_| {
-            clear_required(&app, &server_id);
-        }),
+        Ok((tokens, stream)) => {
+            response = Some(stream);
+            let guard = refresh_lock(&app, &server_id);
+            let _held = guard.lock().await;
+            commit_sign_in(state(&app), &cancel, || announce(&app, &server_id), async {
+                save_tokens(&app, &server_id, tokens).await.map(|_| {
+                    clear_required(&app, &server_id);
+                })
+            })
+            .await
+        }
         Err(error) => Err(error),
     };
+    finish_pending(state(&app), &cancel);
     announce(&app, &server_id);
+    if let Some(mut stream) = response {
+        report_sign_in(&mut stream, &outcome).await;
+    }
     outcome.map_err(|e| format!("mcp: {e}"))?;
     Ok(status(&app, &server_id, server.as_str()).await)
 }
@@ -809,7 +1059,8 @@ pub fn mcp_oauth_cancel(
     server_id: String,
 ) -> Result<(), String> {
     require_settings(&window)?;
-    cancel_pending(state(&app), &server_id);
+    cancel_pending(state(&app), &server_id)?;
+    announce(&app, &server_id);
     Ok(())
 }
 
@@ -825,30 +1076,256 @@ pub async fn mcp_oauth_sign_out(
     forget(&app, &server_id).await
 }
 
-fn cancel_pending(state: &OAuthState, server_id: &str) {
+/// The pending mutex is the commit boundary: cancellation and saving cannot both win.
+fn start_pending(
+    state: &OAuthState,
+    server_id: &str,
+    cancel: Arc<Notify>,
+) -> Result<Option<String>, String> {
+    let mut pending = lock(&state.pending);
+    if pending.as_ref().is_some_and(|p| p.saving) {
+        return Err("mcp: saving sign-in; wait for it to finish".into());
+    }
+    Ok(pending
+        .replace(Pending {
+            server_id: server_id.into(),
+            cancel,
+            saving: false,
+        })
+        .map(|previous| {
+            previous.cancel.notify_one();
+            previous.server_id
+        }))
+}
+
+fn begin_saving(state: &OAuthState, cancel: &Arc<Notify>) -> Result<(), String> {
+    let mut pending = lock(&state.pending);
+    let current = pending
+        .as_mut()
+        .filter(|p| Arc::ptr_eq(&p.cancel, cancel))
+        .ok_or("sign-in was cancelled")?;
+    current.saving = true;
+    Ok(())
+}
+
+fn finish_pending(state: &OAuthState, cancel: &Arc<Notify>) {
+    let mut pending = lock(&state.pending);
+    if pending
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(&p.cancel, cancel))
+    {
+        *pending = None;
+    }
+}
+
+async fn commit_sign_in(
+    state: &OAuthState,
+    cancel: &Arc<Notify>,
+    announce_saving: impl FnOnce(),
+    save: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    begin_saving(state, cancel)?;
+    announce_saving();
+    let result = save.await;
+    finish_pending(state, cancel);
+    result
+}
+
+fn cancel_pending(state: &OAuthState, server_id: &str) -> Result<(), String> {
     let mut pending = lock(&state.pending);
     if pending.as_ref().is_some_and(|p| p.server_id == server_id) {
+        if pending.as_ref().is_some_and(|p| p.saving) {
+            return Err("mcp: saving sign-in; wait for it to finish".into());
+        }
         if let Some(pending) = pending.take() {
             pending.cancel.notify_one();
         }
     }
+    Ok(())
+}
+
+async fn report_sign_in(stream: &mut tokio::net::TcpStream, result: &Result<(), String>) {
+    let page = match result {
+        Ok(()) => callback::page(
+            "Signed in",
+            "Oarlock is signed in to the server. You can close this tab.",
+        ),
+        Err(error) => callback::page(
+            "Sign-in failed",
+            &format!("{error}. You can close this tab and try again from Oarlock's Settings."),
+        ),
+    };
+    // A browser that stopped reading must not hold the IPC action open indefinitely.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        callback::respond(stream, 200, &page),
+    )
+    .await;
+}
+
+/// Called with the credential lock held, only after the new configuration is saved.
+/// Old disk records are unreachable through the new version even if cleanup fails.
+pub(super) fn configuration_changed(app: &AppHandle, server_id: &str) {
+    cancel_probe_server(app, server_id);
+    let _ = cancel_pending(state(app), server_id);
+    let prefix = format!("{server_id}/");
+    lock(&state(app).tokens).retain(|key, _| !key.starts_with(&prefix));
+    clear_required(app, server_id);
+    announce(app, server_id);
 }
 
 /// Forgets everything sign-in kept for a server (sign out, or the server was removed).
 pub async fn forget(app: &AppHandle, server_id: &str) -> Result<(), String> {
-    cancel_pending(state(app), server_id);
+    cancel_probe_server(app, server_id);
+    let _ = cancel_pending(state(app), server_id);
     let guard = refresh_lock(app, server_id);
     let _held = guard.lock().await;
-    forget_tokens(app, server_id).await;
-    store::delete(app, server_id, OauthItem::Client).await?;
+    forget_tokens(app, server_id).await?;
+    let cleanup = store::delete(app, server_id, OauthItem::Client).await;
+    // The tokens are already gone even if registration cleanup failed. Publish
+    // that committed state instead of leaving Settings labelled "Signed in".
     clear_required(app, server_id);
     announce(app, server_id);
-    Ok(())
+    cleanup
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_rejects_disabled_or_stale_saved_server_context() {
+        let url = Url::parse("https://example.com/mcp").unwrap();
+        let mut saved = serde_json::json!({"enabled":true,"secretsRevision":2,"transport":{"type":"http","url":url.as_str()}});
+        assert!(validate_global_discovery(&saved, &url, Some(2)).is_ok());
+        assert!(validate_global_discovery(&saved, &url, Some(1)).is_err());
+        assert!(validate_global_discovery(&saved, &url, None).is_err());
+        assert!(validate_global_discovery(
+            &saved,
+            &Url::parse("https://other.example/mcp").unwrap(),
+            Some(2)
+        )
+        .is_err());
+        saved["enabled"] = serde_json::json!(false);
+        assert!(validate_global_discovery(&saved, &url, Some(2)).is_err());
+    }
+
+    #[test]
+    fn late_metadata_cannot_undo_sign_in_or_relabel_another_configuration() {
+        let state = OAuthState::default();
+        let url = "https://example.com/mcp";
+        let key = "server/oauth/tokens@version";
+        // An unavailable keychain is not evidence that sign-in is required.
+        assert!(!metadata_probe_is_current(
+            &state,
+            "server",
+            url,
+            key,
+            Some(key)
+        ));
+        lock(&state.tokens).insert(key.into(), None);
+        assert!(metadata_probe_is_current(
+            &state,
+            "server",
+            url,
+            key,
+            Some(key)
+        ));
+        assert!(!metadata_probe_is_current(
+            &state,
+            "server",
+            url,
+            key,
+            Some("new-version")
+        ));
+        assert!(!metadata_probe_is_current(&state, "server", url, key, None));
+        let cancel = Arc::new(Notify::new());
+        start_pending(&state, "server", cancel.clone()).unwrap();
+        assert!(!metadata_probe_is_current(
+            &state,
+            "server",
+            url,
+            key,
+            Some(key)
+        ));
+        begin_saving(&state, &cancel).unwrap();
+        assert!(!metadata_probe_is_current(
+            &state,
+            "server",
+            url,
+            key,
+            Some(key)
+        ));
+        lock(&state.tokens).insert(key.into(), Some(Arc::new(tokens(url))));
+        finish_pending(&state, &cancel);
+        assert!(!metadata_probe_is_current(
+            &state,
+            "server",
+            url,
+            key,
+            Some(key)
+        ));
+    }
+
+    #[tokio::test]
+    async fn saving_is_a_commit_boundary_and_failed_writes_leave_it_retryable() {
+        for result in [Ok(()), Err("keychain locked".to_owned())] {
+            let state = Arc::new(OAuthState::default());
+            let cancel = Arc::new(Notify::new());
+            start_pending(&state, "server", cancel.clone()).unwrap();
+            let (saving, started) = tokio::sync::oneshot::channel();
+            let (finish, wait) = tokio::sync::oneshot::channel();
+            let task_state = state.clone();
+            let task = tokio::spawn(async move {
+                commit_sign_in(
+                    &task_state,
+                    &cancel,
+                    || {
+                        let _ = saving.send(());
+                    },
+                    async { wait.await.unwrap() },
+                )
+                .await
+            });
+            started.await.unwrap();
+            assert!(lock(&state.pending).as_ref().unwrap().saving);
+            assert!(cancel_pending(&state, "server").is_err());
+            assert!(start_pending(&state, "other", Arc::new(Notify::new())).is_err());
+            assert!(!task.is_finished(), "success must wait for persistence");
+            finish.send(result.clone()).unwrap();
+            assert_eq!(task.await.unwrap(), result);
+            assert!(lock(&state.pending).is_none());
+            assert!(start_pending(&state, "server", Arc::new(Notify::new())).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_commit_never_polls_the_keychain_write() {
+        let state = OAuthState::default();
+        let cancel = Arc::new(Notify::new());
+        start_pending(&state, "server", cancel.clone()).unwrap();
+        cancel_pending(&state, "server").unwrap();
+        let result = commit_sign_in(
+            &state,
+            &cancel,
+            || panic!("must not announce saving"),
+            async { panic!("must not write cancelled tokens") },
+        )
+        .await;
+        assert!(result.unwrap_err().contains("cancelled"));
+    }
+
+    #[test]
+    fn an_obsolete_completion_does_not_clear_the_replacement_sign_in() {
+        let state = OAuthState::default();
+        let old = Arc::new(Notify::new());
+        let new = Arc::new(Notify::new());
+        start_pending(&state, "server", old.clone()).unwrap();
+        start_pending(&state, "server", new.clone()).unwrap();
+        assert!(begin_saving(&state, &old).is_err());
+        finish_pending(&state, &old);
+        assert!(begin_saving(&state, &new).is_ok());
+    }
 
     #[tokio::test]
     async fn sign_out_serializes_after_an_in_flight_refresh() {
@@ -877,15 +1354,17 @@ mod tests {
         *lock(&state.pending) = Some(Pending {
             server_id: "server".into(),
             cancel: cancel.clone(),
+            saving: false,
         });
-        cancel_pending(&state, "other");
+        cancel_pending(&state, "other").unwrap();
         assert!(lock(&state.pending).is_some());
-        cancel_pending(&state, "server");
+        cancel_pending(&state, "server").unwrap();
         assert!(lock(&state.pending).is_none());
         let replacement = Arc::new(Notify::new());
         *lock(&state.pending) = Some(Pending {
             server_id: "server".into(),
             cancel: replacement,
+            saving: false,
         });
         assert!(!lock(&state.pending)
             .as_ref()
@@ -910,6 +1389,87 @@ mod tests {
     }
 
     const URL: &str = "https://mcp.example.com/mcp";
+
+    #[test]
+    fn failed_token_reads_remain_retryable_and_retired_versions_stay_uncached() {
+        let cache = Mutex::new(HashMap::new());
+        let key = "server/oauth/tokens@version".to_owned();
+        assert!(accept_token_read(
+            &cache,
+            key.clone(),
+            || Some(key.clone()),
+            Err("keychain locked".into())
+        )
+        .is_err());
+        assert!(lock(&cache).is_empty());
+        assert!(accept_token_read(
+            &cache,
+            key.clone(),
+            || Some("new version".into()),
+            Ok(Some(tokens(URL)))
+        )
+        .unwrap()
+        .is_none());
+        assert!(lock(&cache).is_empty());
+        assert!(accept_token_read(
+            &cache,
+            key.clone(),
+            || Some(key.clone()),
+            Ok(Some(tokens(URL)))
+        )
+        .unwrap()
+        .is_some());
+        assert!(lock(&cache).get(&key).unwrap().is_some());
+        // A delayed failed read cannot conceal a newer successful sign-in.
+        assert!(accept_token_read(
+            &cache,
+            key.clone(),
+            || Some(key.clone()),
+            Err("old read failed".into())
+        )
+        .unwrap()
+        .is_some());
+        // Nor can a delayed successful read resurrect a confirmed sign-out.
+        lock(&cache).insert(key.clone(), None);
+        assert!(accept_token_read(
+            &cache,
+            key.clone(),
+            || Some(key.clone()),
+            Ok(Some(tokens(URL)))
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_sign_out_preserves_the_cached_sign_in_and_reports_the_failure() {
+        let original = Arc::new(tokens(URL));
+        let key = "server/oauth/tokens@version".to_owned();
+        let cache = Mutex::new(HashMap::from([(key.clone(), Some(original.clone()))]));
+        let error =
+            forget_cached_tokens(&cache, key.clone(), async { Err("keychain locked".into()) })
+                .await;
+        assert_eq!(error.unwrap_err(), "keychain locked");
+        assert!(Arc::ptr_eq(
+            lock(&cache).get(&key).unwrap().as_ref().unwrap(),
+            &original
+        ));
+        assert_eq!(
+            status_of(
+                "server",
+                URL,
+                lock(&cache).get(&key).unwrap().as_deref(),
+                None,
+                false
+            )
+            .state,
+            AuthState::SignedIn
+        );
+        forget_cached_tokens(&cache, key.clone(), async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(lock(&cache).get(&key).unwrap().is_none());
+    }
 
     #[test]
     fn the_status_the_page_gets_never_carries_a_token() {

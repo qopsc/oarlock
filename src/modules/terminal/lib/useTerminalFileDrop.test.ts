@@ -5,6 +5,22 @@ vi.mock("@/lib/platform", () => ({ IS_WINDOWS: false }));
 import { createTerminalPathDropTarget } from "./useTerminalFileDrop";
 
 describe("createTerminalPathDropTarget", () => {
+  it("preserves the Explorer source distribution for native conversion", () => {
+    const paste = vi.fn(() => true);
+    const target = createTerminalPathDropTarget({
+      leafIdAtPoint: () => 7,
+      paste,
+      setTarget: vi.fn(),
+    });
+    target.dropPath(["/home/file"], 1, 2, () => false, {
+      kind: "wsl",
+      distro: "Ubuntu",
+    });
+    expect(paste).toHaveBeenCalledWith(7, ["/home/file"], {
+      kind: "wsl",
+      distro: "Ubuntu",
+    });
+  });
   it("tracks the terminal leaf under the pointer", () => {
     const setTarget = vi.fn();
     const target = createTerminalPathDropTarget({
@@ -19,7 +35,7 @@ describe("createTerminalPathDropTarget", () => {
     expect(setTarget).toHaveBeenLastCalledWith(null);
   });
 
-  it("clears the target and pastes a shell-quoted path", () => {
+  it("clears the target and passes raw paths for owned preparation", () => {
     const paste = vi.fn(() => true);
     const setTarget = vi.fn();
     const target = createTerminalPathDropTarget({
@@ -30,10 +46,12 @@ describe("createTerminalPathDropTarget", () => {
 
     expect(target.dropPath(["/repo/My File.ts"], 40, 50)).toBe(true);
     expect(setTarget).toHaveBeenCalledWith(null);
-    expect(paste).toHaveBeenCalledWith(11, "'/repo/My File.ts' ");
+    expect(paste).toHaveBeenCalledWith(11, ["/repo/My File.ts"], {
+      kind: "local",
+    });
   });
 
-  it("pastes multiple dropped paths quoted", () => {
+  it("passes all dropped paths for owned preparation", () => {
     const paste = vi.fn(() => true);
     const setTarget = vi.fn();
     const target = createTerminalPathDropTarget({
@@ -42,13 +60,12 @@ describe("createTerminalPathDropTarget", () => {
       setTarget,
     });
 
-    expect(
-      target.dropPath(["/repo/a.ts", "/repo/b file.ts"], 40, 50),
-    ).toBe(true);
-    expect(paste).toHaveBeenCalledWith(
-      11,
-      "/repo/a.ts '/repo/b file.ts' ",
+    expect(target.dropPath(["/repo/a.ts", "/repo/b file.ts"], 40, 50)).toBe(
+      true,
     );
+    expect(paste).toHaveBeenCalledWith(11, ["/repo/a.ts", "/repo/b file.ts"], {
+      kind: "local",
+    });
   });
 
   it("clears stale state when a drop misses every terminal", () => {
@@ -110,7 +127,7 @@ describe("createTerminalPathDropTarget", () => {
     calls.length = 0;
     target.updateTarget(10, 20);
     expect(target.dropPath(["/b c"], 150, 20)).toBe(true);
-    expect(paste).toHaveBeenCalledWith(8, "'/b c' ");
+    expect(paste).toHaveBeenCalledWith(8, ["/b c"], { kind: "local" });
     expect(calls).toEqual(["offer 7 10,20", "leave 7", "drop 8 /b c"]);
   });
 

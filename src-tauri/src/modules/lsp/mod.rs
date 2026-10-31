@@ -1,5 +1,6 @@
 pub(crate) mod env;
 mod framing;
+mod ownership;
 mod session;
 
 use std::collections::HashMap;
@@ -9,20 +10,21 @@ use std::sync::{Arc, RwLock};
 use tauri::ipc::{Channel, Response};
 use tauri::Manager;
 
+use crate::modules::net::page::NetworkPages;
 use crate::modules::workspace::{
     authorize_spawn_cwd, is_plain_name, WorkspaceEnv, WorkspaceRegistry,
 };
 use session::LspSession;
 
 pub struct LspState {
-    sessions: RwLock<HashMap<u32, Arc<LspSession>>>,
+    sessions: RwLock<ownership::Ownership<Arc<LspSession>>>,
     next_id: AtomicU32,
 }
 
 impl Default for LspState {
     fn default() -> Self {
         Self {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(ownership::Ownership::default()),
             next_id: AtomicU32::new(1),
         }
     }
@@ -30,12 +32,35 @@ impl Default for LspState {
 
 impl LspState {
     pub(super) fn take(&self, id: u32) -> Option<Arc<LspSession>> {
-        self.sessions.write().unwrap().remove(&id)
+        self.sessions
+            .write()
+            .unwrap()
+            .entries
+            .remove(&id)
+            .and_then(|e| e.value)
+    }
+
+    pub fn release_window(&self, window: &str) {
+        let sessions = self.sessions.write().unwrap().release_window(window);
+        // Process termination must not block the page/window lifecycle callback.
+        if !sessions.is_empty() {
+            tauri::async_runtime::spawn_blocking(move || {
+                for session in sessions {
+                    session.kill();
+                }
+            });
+        }
     }
 
     pub fn kill_all(&self) {
-        let drained: Vec<Arc<LspSession>> =
-            self.sessions.write().unwrap().drain().map(|(_, s)| s).collect();
+        let drained: Vec<Arc<LspSession>> = self
+            .sessions
+            .write()
+            .unwrap()
+            .entries
+            .drain()
+            .filter_map(|(_, e)| e.value)
+            .collect();
         for session in drained {
             session.kill();
         }
@@ -66,6 +91,11 @@ pub async fn lsp_spawn(
     app: tauri::AppHandle,
     state: tauri::State<'_, LspState>,
     registry: tauri::State<'_, WorkspaceRegistry>,
+    pages: tauri::State<'_, NetworkPages>,
+    window: tauri::WebviewWindow,
+    page_generation: String,
+    preset_id: String,
+    generation: u64,
     command: String,
     args: Vec<String>,
     env: Option<HashMap<String, String>>,
@@ -84,6 +114,16 @@ pub async fn lsp_spawn(
         .ok_or("lsp: workspace root is required")?;
 
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    pages.with_page(window.label(), &page_generation, || {
+        state.sessions.write().unwrap().reserve(
+            id,
+            window.label(),
+            &page_generation,
+            &preset_id,
+            generation,
+        )
+    })?;
+    let worker_app = app.clone();
     let spawn_log = format!("cmd={command} root={}", root.display());
     let session = tauri::async_runtime::spawn_blocking(move || {
         let server_env = env::server_env_overlay(shell);
@@ -96,6 +136,16 @@ pub async fn lsp_spawn(
             }
         })?;
         let extra_env = env.unwrap_or_default();
+        if !worker_app
+            .state::<LspState>()
+            .sessions
+            .read()
+            .unwrap()
+            .entries
+            .contains_key(&id)
+        {
+            return Err("lsp: startup cancelled".into());
+        }
         session::spawn(
             id,
             app,
@@ -110,19 +160,28 @@ pub async fn lsp_spawn(
         )
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let session = match session {
+        Ok(session) => session,
+        Err(error) => {
+            state.take(id);
+            return Err(error);
+        }
+    };
 
-    state.sessions.write().unwrap().insert(id, session);
-    // The server can die before this insert; the waiter's reap then ran with
-    // the id absent. Re-check so a dead session isn't stranded in the map.
-    let exited = state
-        .sessions
-        .read()
-        .unwrap()
-        .get(&id)
-        .map(|s| s.exited.load(Ordering::Acquire))
-        .unwrap_or(false);
-    if exited {
+    let published = pages.with_page(window.label(), &page_generation, || {
+        let mut sessions = state.sessions.write().unwrap();
+        sessions.publish(id, session.clone())
+    });
+    if let Err(error) = published {
+        state.take(id);
+        tauri::async_runtime::spawn_blocking(move || session.kill())
+            .await
+            .map_err(|e| e.to_string())?;
+        return Err(error);
+    }
+    if session.exited.load(Ordering::Acquire) {
         state.take(id);
     }
     log::info!("lsp spawned id={id} {spawn_log}");
@@ -175,27 +234,76 @@ fn resolve_root(registry: &WorkspaceRegistry, path: &str, markers: &[String]) ->
 #[tauri::command]
 pub async fn lsp_send(
     state: tauri::State<'_, LspState>,
+    pages: tauri::State<'_, NetworkPages>,
+    window: tauri::WebviewWindow,
+    page_generation: String,
     id: u32,
     message: String,
 ) -> Result<(), String> {
-    let session = state
-        .sessions
-        .read()
-        .unwrap()
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| format!("lsp_send: unknown id={id}"))?;
-    tauri::async_runtime::spawn_blocking(move || session.write_message(&message))
-        .await
-        .map_err(|e| e.to_string())?
+    let session = pages.with_page(window.label(), &page_generation, || {
+        let sessions = state.sessions.read().unwrap();
+        if !sessions.owned(id, window.label(), &page_generation) {
+            return Err("lsp: session not owned by page".into());
+        }
+        sessions
+            .entries
+            .get(&id)
+            .and_then(|e| e.value.clone())
+            .ok_or_else(|| format!("lsp_send: unknown id={id}"))
+    })?;
+    session.send(message).await
 }
 
 #[tauri::command]
-pub fn lsp_kill(state: tauri::State<'_, LspState>, id: u32) {
-    if let Some(session) = state.take(id) {
-        session.kill();
-        log::info!("lsp killed id={id}");
+pub async fn lsp_kill(
+    state: tauri::State<'_, LspState>,
+    pages: tauri::State<'_, NetworkPages>,
+    window: tauri::WebviewWindow,
+    page_generation: String,
+    id: u32,
+) -> Result<(), String> {
+    let session = pages.with_page(window.label(), &page_generation, || {
+        let mut sessions = state.sessions.write().unwrap();
+        if !sessions.owned(id, window.label(), &page_generation) {
+            return Ok(None);
+        }
+        Ok(sessions.entries.remove(&id).and_then(|e| e.value))
+    })?;
+    if let Some(session) = session {
+        tauri::async_runtime::spawn_blocking(move || session.kill())
+            .await
+            .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lsp_retire_generation(
+    state: tauri::State<'_, LspState>,
+    pages: tauri::State<'_, NetworkPages>,
+    window: tauri::WebviewWindow,
+    page_generation: String,
+    preset_id: String,
+    generation: u64,
+) -> Result<(), String> {
+    let sessions = pages.with_page(window.label(), &page_generation, || {
+        Ok(state.sessions.write().unwrap().retire(
+            window.label(),
+            &page_generation,
+            &preset_id,
+            generation,
+        ))
+    })?;
+    if !sessions.is_empty() {
+        tauri::async_runtime::spawn_blocking(move || {
+            for session in sessions {
+                session.kill();
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]

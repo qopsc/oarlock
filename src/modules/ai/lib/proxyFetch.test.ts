@@ -1,5 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createProxyFetch, proxyFetch } from "@/modules/ai/lib/proxyFetch";
+
+vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "test-page" }));
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const bridge = vi.hoisted(() => ({
   channels: [] as { onmessage: (value: ArrayBuffer) => void }[],
@@ -50,6 +53,102 @@ const calls = (command: string) =>
   bridge.invoke.mock.calls.filter(([name]) => name === command);
 
 describe("native AI fetch transport", () => {
+  it("retains the native status description for an empty error response", async () => {
+    const pending = proxyFetch("https://example.test");
+    await started();
+    packet(
+      0,
+      JSON.stringify({
+        status: 503,
+        statusText: "Service Unavailable",
+        headers: [],
+      }),
+    );
+    packet(2);
+    const response = await pending;
+    expect(await response.text()).toBe("");
+    expect(response.statusText).toBe("Service Unavailable");
+  });
+
+  it("preserves repeated authentication and cookie response headers", async () => {
+    const pending = proxyFetch("https://example.test");
+    await started();
+    const cookies = [
+      "a=1; Expires=Wed, 21 Oct 2037 07:28:00 GMT",
+      "b=2; Path=/",
+    ];
+    packet(
+      0,
+      JSON.stringify({
+        status: 401,
+        headers: [
+          ["www-authenticate", "Bearer realm=api"],
+          ["www-authenticate", "Basic realm=legacy"],
+          ...cookies.map((value) => ["set-cookie", value]),
+        ],
+      }),
+    );
+    const response = await pending;
+    expect(response.headers.get("www-authenticate")).toBe(
+      "Bearer realm=api, Basic realm=legacy",
+    );
+    expect(response.headers.getSetCookie()).toEqual(cookies);
+    packet(2);
+    expect(await response.text()).toBe("");
+  });
+
+  it("preserves the caller's abort reason before request admission", async () => {
+    const owner = new AbortController();
+    const reason = new DOMException("Deadline exceeded", "TimeoutError");
+    owner.abort(reason);
+    await expect(
+      proxyFetch("https://example.test", { signal: owner.signal }),
+    ).rejects.toBe(reason);
+    expect(bridge.invoke).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending request-body read with its original reason and sends no request", async () => {
+    const owner = new AbortController();
+    const reason = new Error("Upload cancelled by its owner");
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const pending = proxyFetch("https://example.test", {
+      method: "POST",
+      body,
+      signal: owner.signal,
+      duplex: "half",
+    } as RequestInit);
+    const rejected = expect(pending).rejects.toBe(reason);
+    await Promise.resolve();
+    owner.abort(reason);
+    await rejected;
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(bridge.invoke).not.toHaveBeenCalled();
+  });
+
+  it("preserves abort reasons while waiting for response headers or body", async () => {
+    for (const established of [false, true]) {
+      const owner = new AbortController();
+      const reason = new DOMException("Deadline exceeded", "TimeoutError");
+      const pending = proxyFetch("https://example.test", {
+        signal: owner.signal,
+      });
+      await started();
+      let rejected: Promise<void>;
+      if (established) {
+        headers();
+        rejected = expect((await pending).text()).rejects.toBe(reason);
+      } else {
+        rejected = expect(pending).rejects.toBe(reason);
+      }
+      owner.abort(reason);
+      await rejected;
+      expect(calls("ai_http_cancel").length).toBeGreaterThan(0);
+      bridge.channels.length = 0;
+      bridge.invoke.mockClear();
+    }
+  });
+
   it("sends binary bodies and preserves Request input, headers, and Unicode metadata", async () => {
     const request = new Request("https://example.test/日本語", {
       method: "POST",
@@ -63,6 +162,7 @@ describe("native AI fetch transport", () => {
     expect(new TextDecoder().decode(body)).toBe("hello 日本語");
     expect(JSON.parse(options.headers["x-oarlock-ai-request"])).toMatchObject({
       method: "POST",
+      pageGeneration: "test-page",
       headers: { "x-test": "yes" },
       allowPrivateNetwork: true,
       onEvent: "__CHANNEL__:1",
@@ -91,7 +191,10 @@ describe("native AI fetch transport", () => {
     expect((await reader.read()).value).toEqual(chunk);
     expect((await reader.read()).value).toEqual(chunk);
     await vi.waitFor(() => expect(calls("ai_http_ack")).toHaveLength(1));
-    expect(calls("ai_http_ack")[0][1].bytes).toBe(128 * 1024);
+    expect(calls("ai_http_ack")[0][1]).toMatchObject({
+      bytes: 128 * 1024,
+      pageGeneration: "test-page",
+    });
     packet(2);
     expect((await reader.read()).done).toBe(true);
   });
@@ -165,6 +268,7 @@ describe("native AI fetch transport", () => {
     abort.abort();
     await rejected;
     expect(calls("ai_http_cancel")).toHaveLength(1);
+    expect(calls("ai_http_cancel")[0][1].pageGeneration).toBe("test-page");
     finishStart();
     await vi.waitFor(() => expect(calls("ai_http_cancel")).toHaveLength(2));
     packet(0, "ignored after cancellation");
@@ -233,6 +337,7 @@ describe("MCP sessions", () => {
     const metadata = JSON.parse(options.headers["x-oarlock-mcp-request"]);
     expect(metadata).toMatchObject({
       session: 7,
+      pageGeneration: "test-page",
       url: "https://mcp.example.com/mcp",
       method: "POST",
     });

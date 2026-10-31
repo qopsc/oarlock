@@ -77,8 +77,9 @@ export async function pasteClipboardFiles(
       toast.message("No files on the clipboard");
       return [];
     }
-    copyStarted = true;
     await authorizeSources(sources);
+    if (!isCurrent()) return [];
+    copyStarted = true;
     const result = await invoke<CopyResult>("fs_copy", {
       sources,
       destDir,

@@ -19,8 +19,6 @@ function modelConfigOf(
     mlxModelId: prefs.mlxModelId,
     ollamaBaseURL: prefs.ollamaBaseURL,
     ollamaModelId: prefs.ollamaModelId,
-    openaiCompatibleBaseURL: prefs.openaiCompatibleBaseURL,
-    openaiCompatibleModelId: prefs.openaiCompatibleModelId,
     openrouterModelId: prefs.openrouterModelId,
     customEndpoints: prefs.customEndpoints,
     customEndpointKeys,

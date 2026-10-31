@@ -407,7 +407,9 @@ fn collect(app: &AppHandle, scope: Scope) -> Snapshot {
         project_trust::is_allowed(app, &project.key, kind, hash)
     };
     let mut snapshot = collect_from(&global_sources(app), &projects, all, &disabled, &allowed);
-    snapshot.oarlock_dir = oarlock_dir(app).map(|dir| to_canon(&dir)).unwrap_or_default();
+    snapshot.oarlock_dir = oarlock_dir(app)
+        .map(|dir| to_canon(&dir))
+        .unwrap_or_default();
     snapshot.user_dir = user_dir().map(|dir| to_canon(&dir));
     if all {
         snapshot.projects = projects

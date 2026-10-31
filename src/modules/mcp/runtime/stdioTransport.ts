@@ -7,12 +7,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 export type StdioLaunch = {
   serverId: string;
-  command: string;
-  args: string[];
-  /** Plain values; secret ones are named in `secretEnv` and read natively. */
-  env: Record<string, string>;
-  secretEnv: string[];
-  cwd: string | null;
+  revision: number;
   /** The terminal shell set in Settings, whose environment the server gets. */
   shell: string | null;
   /**
@@ -20,6 +15,7 @@ export type StdioLaunch = {
    * trusted `.mcp.json` declares it, ignoring the command and values here.
    */
   project?: boolean;
+  projectKey?: string;
 };
 
 export type StdioExit = {
@@ -89,17 +85,14 @@ export class TauriStdioTransport implements Transport {
     this.id = this.launch.project
       ? await invoke<number>("mcp_project_spawn", {
           serverId: this.launch.serverId,
+          projectKey: this.launch.projectKey,
           shell: this.launch.shell,
           onMessage,
           onExit,
         })
       : await invoke<number>("mcp_spawn", {
           serverId: this.launch.serverId,
-          command: this.launch.command,
-          args: this.launch.args,
-          env: this.launch.env,
-          secretEnv: this.launch.secretEnv,
-          cwd: this.launch.cwd,
+          revision: this.launch.revision,
           shell: this.launch.shell,
           onMessage,
           onExit,

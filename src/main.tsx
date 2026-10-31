@@ -1,3 +1,4 @@
+import { installClipboardCopyBarrier } from "@/lib/clipboardWrite";
 import "./styles/globals.css";
 
 import { invoke } from "@tauri-apps/api/core";
@@ -8,13 +9,16 @@ import { initLaunchDir, isOpenedNow } from "./lib/launchDir";
 import { installNativeContextMenuGuard } from "./lib/nativeContextMenu";
 import { USE_CUSTOM_WINDOW_CONTROLS } from "./lib/platform";
 import { installWindowFrame } from "./lib/windowFrame";
+import { installStoreSaveFailureReporting } from "./lib/storeSaveFailures";
 import { terminalDiagnosticsEnabled } from "@/modules/terminal/lib/terminalDiagnosticsEnabled";
 
 if (USE_CUSTOM_WINDOW_CONTROLS) {
   document.documentElement.dataset.chrome = "borderless";
 }
 installNativeContextMenuGuard();
+installClipboardCopyBarrier();
 installWindowFrame();
+await installStoreSaveFailureReporting();
 
 // Render-instrumentation overlay, opt-in: `VITE_REACT_SCAN=true bun run dev`.
 // Dev-only dynamic import so it never reaches the production bundle.

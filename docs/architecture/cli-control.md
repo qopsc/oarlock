@@ -25,6 +25,9 @@ The app must already be running. A command launched inside an Oarlock pane targe
 - `scripts/build-cli.mjs` builds the target-specific helper expected by Tauri's `externalBin` bundler.
 
 Rust handles `ping`, `capabilities`, authentication, and file validation directly. Actions that must mutate React state are emitted to the main webview and completed through `control_respond`. This keeps OS validation in Rust without duplicating the tab model outside React.
+The frontend responds once it accepts the tab and queues editor navigation; it
+does not wait for a paint, since `--no-focus` can target a hidden window. Pending
+focus operations and queued events cannot open tabs after their bridge is disposed.
 
 ## Transport and authentication
 

@@ -1,4 +1,5 @@
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { preferencesReady } from "@/modules/settings/readiness";
 import {
   createScrollbackKey,
   encodeScrollbackFile,
@@ -173,7 +174,7 @@ export class TerminalScrollbackRegistry {
     this.source = source;
     this.unsubscribe = this.options.settings.subscribe(() => {
       if (this.source === source)
-        void this.persist(source(), { assignKeys: false });
+        void this.persist(source(), { assignKeys: false }).catch(() => undefined);
     });
     return () => {
       if (this.source !== source) return;
@@ -187,21 +188,21 @@ export class TerminalScrollbackRegistry {
    * Close-time save of panes that already have keys. Never rejects and never
    * waits longer than `timeoutMs`, so closing cannot hang on it.
    */
-  async flush(timeoutMs: number): Promise<{ timedOut: boolean }> {
+  async flush(timeoutMs: number): Promise<{ timedOut: boolean; failed?: boolean }> {
     const source = this.source;
     if (!source) return { timedOut: false };
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => resolve(true), timeoutMs);
+    const timedOut = new Promise<{ timedOut: boolean; failed?: boolean }>((resolve) => {
+      timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
     });
     const done = Promise.resolve()
       .then(() => this.persist(source(), { assignKeys: false }))
       .then(
-        () => false,
-        () => false,
+        () => ({ timedOut: false }),
+        () => ({ timedOut: false, failed: true }),
       );
     try {
-      return { timedOut: await Promise.race([done, timedOut]) };
+      return await Promise.race([done, timedOut]);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -244,7 +245,12 @@ export class TerminalScrollbackRegistry {
 
   private async write(targets: readonly number[]): Promise<void> {
     const { backend, settings } = this.options;
-    await settings.ready();
+    try {
+      await settings.ready();
+    } catch (error) {
+      console.warn("[oarlock] cannot save scrollback until preferences are available:", error);
+      return;
+    }
     if (!settings.enabled()) {
       if (this.purged) return;
       try {
@@ -253,6 +259,7 @@ export class TerminalScrollbackRegistry {
         this.saved = new WeakMap();
       } catch (error) {
         console.warn("[oarlock] could not delete terminal scrollback:", error);
+        throw error;
       }
       return;
     }
@@ -287,6 +294,7 @@ export class TerminalScrollbackRegistry {
     }
     if (failure !== null) {
       console.warn("[oarlock] could not save terminal scrollback:", failure);
+      throw failure;
     }
   }
 }
@@ -394,15 +402,16 @@ function restoreEnabled(state: {
 }
 
 const preferenceSettings: ScrollbackSettings = {
-  ready: () =>
-    usePreferencesStore
-      .getState()
-      .init()
-      .catch(() => undefined),
+  ready: async () => {
+    await usePreferencesStore.getState().init();
+    if (!preferencesReady(usePreferencesStore.getState()))
+      throw new Error("Preferences are not synchronized");
+  },
   enabled: () => restoreEnabled(usePreferencesStore.getState()),
   subscribe: (listener) =>
     usePreferencesStore.subscribe((state, previous) => {
-      if (restoreEnabled(state) !== restoreEnabled(previous)) listener();
+      if (restoreEnabled(state) !== restoreEnabled(previous) ||
+          preferencesReady(state) !== preferencesReady(previous)) listener();
     }),
 };
 

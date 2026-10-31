@@ -1,14 +1,17 @@
+import { toast } from "sonner";
 import { syncAllFolders } from "@/modules/workspace/allFolders";
 import { create } from "zustand";
 import {
   DEFAULT_PREFERENCES,
-  loadPreferences,
-  onPreferencesChange,
+  observePreferences,
   type Preferences,
 } from "./store";
 
 type State = Preferences & {
+  /** A valid snapshot has loaded; a later synchronization error does not erase it. */
   hydrated: boolean;
+  error: string | null;
+  syncing: boolean;
   /** Subscribe & hydrate. Idempotent — safe to call from multiple windows. */
   init: () => Promise<void>;
 };
@@ -49,26 +52,66 @@ export function readBgFastPath(): {
 export const usePreferencesStore = create<State>((set) => ({
   ...DEFAULT_PREFERENCES,
   hydrated: false,
+  error: null,
+  syncing: true,
   init: () => {
     if (initPromise) return initPromise;
     initPromise = (async () => {
       try {
-        const prefs = await loadPreferences();
-        set({ ...prefs, hydrated: true });
+        await observePreferences(
+          (prefs) => {
+            const before = usePreferencesStore.getState();
+            set({ ...prefs, hydrated: true, error: null, syncing: false });
+            if (before.error) toast.dismiss("preferences-recovery");
+            if (
+              !before.hydrated ||
+              before.backgroundKind !== prefs.backgroundKind ||
+              before.backgroundImageId !== prefs.backgroundImageId
+            )
+              mirrorBgFastPath(prefs.backgroundKind, prefs.backgroundImageId);
+          },
+          (error) => {
+            set({ error: String(error), syncing: false });
+            toast.error("Preferences could not be synchronized", {
+              id: "preferences-recovery",
+              duration: Infinity,
+              description: String(error),
+              action: {
+                label: "Retry",
+                onClick: (event) => {
+                  event.preventDefault();
+                  void import("./nativePreferences")
+                    .then((m) => m.readNativePreferences())
+                    .catch(() => {});
+                },
+              },
+            });
+          },
+          () => set({ syncing: true }),
+        );
         syncAllFolders(usePreferencesStore);
-        mirrorBgFastPath(prefs.backgroundKind, prefs.backgroundImageId);
-        void onPreferencesChange((key, value) => {
-          set({ [key]: value } as Partial<State>);
-          if (key === "backgroundKind" || key === "backgroundImageId") {
-            const s = usePreferencesStore.getState();
-            mirrorBgFastPath(s.backgroundKind, s.backgroundImageId);
-          }
-        });
       } catch (e) {
         initPromise = null;
+        set({ error: String(e), hydrated: false, syncing: false });
+        toast.error("Preferences could not be loaded", {
+          id: "preferences-recovery",
+          duration: Infinity,
+          description: String(e),
+          action: {
+            label: "Retry",
+            onClick: (event) => {
+              event.preventDefault();
+              void usePreferencesStore
+                .getState()
+                .init()
+                .catch(() => {});
+            },
+          },
+        });
         throw e;
       }
     })();
+    void initPromise.catch(() => {});
     return initPromise;
   },
 }));

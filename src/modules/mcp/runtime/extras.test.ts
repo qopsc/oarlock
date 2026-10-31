@@ -93,11 +93,47 @@ async function connect(server: McpServer): Promise<Client> {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   useMcpExtras.getState().setServers([]);
   notes.length = 0;
 });
 
 describe("McpExtras", () => {
+  it("does not let an old initial prompt list replace a newer notification refresh", async () => {
+    vi.useFakeTimers();
+    let changed!: () => void;
+    let old!: (value: unknown) => void;
+    const client = {
+      setNotificationHandler: (_schema: unknown, handler: () => void) => {
+        changed = handler;
+      },
+      listPrompts: vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              old = resolve;
+            }),
+        )
+        .mockResolvedValueOnce({
+          prompts: [{ name: "new_prompt", arguments: [] }],
+        }),
+    } as unknown as Client;
+    const extras = new McpExtras();
+    extras.connected(config(), client, { prompts: { listChanged: true } });
+    changed();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(useMcpExtras.getState().servers[0].prompts[0].name).toBe(
+      "new_prompt",
+    );
+    old({ prompts: [{ name: "removed_prompt", arguments: [] }] });
+    await extras.waitForLists();
+    expect(useMcpExtras.getState().servers[0].prompts[0].name).toBe(
+      "new_prompt",
+    );
+    extras.ended("s1");
+  });
+
   it("waits for the initial prompt list before a first-use lookup", async () => {
     const server = docsServer();
     const client = await connect(server);

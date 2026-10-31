@@ -141,6 +141,7 @@ describe("the AI tools' file and shell calls", () => {
     ["shell_session_open", () => native.shellSessionOpen(dir)],
     ["shell_session_run", () => native.shellSessionRun(1, "ls", dir)],
     ["shell_bg_spawn", () => native.shellBgSpawn("bun run dev", dir)],
+    ["shell_detached_spawn", () => native.shellDetachedSpawn("daemon", dir)],
   ];
 
   // Without it the backend applies the app's setting, which must never
@@ -169,6 +170,7 @@ describe("the AI tools' file and shell calls", () => {
       "shell_session_close",
       "shell_bg_logs",
       "shell_bg_kill",
+      "shell_bg_kill_chat",
       "shell_bg_list",
     ];
     expect(named.filter((c) => !pathless.includes(c)).sort()).toEqual(
@@ -187,10 +189,11 @@ describe("the AI tools' file and shell calls", () => {
 });
 
 describe("file and shell commands in the AI module", () => {
-  // Attach to Agent, an @ mention and the @ file list serve what the user
-  // picked: the app's own features, under the app's setting. (A file dropped
-  // on the composer is read through native, as the agent's.)
-  const appFeatures = ["lib/pathAttachment.ts", "hooks/useWorkspaceFiles.ts"];
+  // UI discovery may list paths. Attachment content uses ai_import_attachment,
+  // whose native boundary validates canonical paths and opened handles.
+  const appFeatures: Record<string, string> = {
+    "hooks/useWorkspaceFiles.ts": "fs_list_files",
+  };
 
   it("go through native, which tags them as the AI tools'", async () => {
     const { readdirSync, readFileSync, statSync } = await import("node:fs");
@@ -206,11 +209,31 @@ describe("file and shell commands in the AI module", () => {
       }
     };
     walk(root);
-    const direct = files.filter((file) =>
-      /invoke<?[^(]*>?\(\s*"(?:fs|shell)_/.test(
-        readFileSync(`${root}/${file}`, "utf8"),
-      ),
+    const direct = files.filter((file) => {
+      const commands = [
+        ...readFileSync(`${root}/${file}`, "utf8").matchAll(
+          /invoke<?[^(]*>?\(\s*"((?:fs|shell)_[^"]+)"/g,
+        ),
+      ].map((match) => match[1]);
+      if (file !== "lib/native.ts" && commands.length) {
+        expect(commands).toEqual([appFeatures[file]]);
+      }
+      return commands.length > 0;
+    });
+    expect(direct.sort()).toEqual(
+      ["lib/native.ts", ...Object.keys(appFeatures)].sort(),
     );
-    expect(direct.sort()).toEqual(["lib/native.ts", ...appFeatures].sort());
   });
+});
+
+it("binds file and shell IPC to the captured environment", async () => {
+  const { createNative } = await import("./native");
+  const client = createNative(() => ubuntu);
+  const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
+  useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Debian" } });
+  await client.writeFile("/home/me/file", "Ubuntu buffer");
+  await client.readFile("/home/me/file");
+  await client.shellSessionOpen("/home/me");
+  for (const [, args] of invoke.mock.calls)
+    expect(args.workspace).toEqual(ubuntu);
 });

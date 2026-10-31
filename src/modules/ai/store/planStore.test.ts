@@ -6,7 +6,10 @@ const native = vi.hoisted(() => ({
   canonicalize: vi.fn(),
 }));
 
-vi.mock("@/modules/ai/lib/native", () => ({ native }));
+vi.mock("@/modules/ai/lib/native", () => ({
+  native,
+  createNative: () => native,
+}));
 
 import { type QueuedEdit, usePlanStore } from "@/modules/ai/store/planStore";
 
@@ -138,7 +141,9 @@ describe("plan mode store", () => {
     expect(native.createDir).not.toHaveBeenCalled();
     // Refused edits stay visible with the refusal rather than vanishing.
     expect(
-      usePlanStore.getState().queue.map((q) => [q.id, q.error?.startsWith("Refused")]),
+      usePlanStore
+        .getState()
+        .queue.map((q) => [q.id, q.error?.startsWith("Refused")]),
     ).toEqual([
       ["q-1", true],
       ["q-2", true],

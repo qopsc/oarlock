@@ -423,6 +423,34 @@ mod tests {
         drop(leases);
     }
 
+    #[tokio::test]
+    async fn queued_admission_after_window_cleanup_is_rejected() {
+        let state = AiStreamState::default();
+        let pages = Arc::new(super::super::page::NetworkPages::default());
+        pages.begin("main", || {}).unwrap();
+        let old_page = pages.finish("main").unwrap();
+        let queued_state = state.clone();
+        let queued_pages = pages.clone();
+        let (resume, admitted) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(async move {
+            admitted.await.unwrap();
+            queued_pages.with_page("main", &old_page, || {
+                queued_state.start("main", "old-page-request")
+            })
+        });
+        pages.begin("main", || state.cancel_window("main")).unwrap();
+        let new_page = pages.finish("main").unwrap();
+        resume.send(()).unwrap();
+        assert!(
+            queued.await.unwrap().is_err(),
+            "a retired page admitted new network work"
+        );
+        assert!(pages
+            .with_page("main", &new_page, || state
+                .start("main", "new-page-request"))
+            .is_ok());
+    }
+
     #[test]
     fn packets_fill_to_the_chunk_limit_and_carry_the_remainder() {
         let mut packet = new_packet(1, 0);

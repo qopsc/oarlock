@@ -13,6 +13,7 @@ export function fileWatchTargets(tabs: readonly Tab[]): {
   const files = new Set<string>();
   for (const tab of tabs) {
     if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
+    if (tab.kind === "editor" && tab.detached) continue;
     dirs.add(parentDir(tab.path));
     files.add(tab.path);
   }

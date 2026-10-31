@@ -1,8 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
+import { requestRemoteImage } from "./remoteImageRequest";
 
-/** `[u8 type length][type][bytes]` from `markdown_remote_image`. */
-export function decodeImagePayload(buffer: ArrayBuffer): Blob {
-  const bytes = new Uint8Array(buffer);
+/** `[u8 type length][type][bytes]` from the native image result. */
+export function decodeImagePayload(
+  buffer: ArrayBuffer | Uint8Array<ArrayBuffer>,
+): Blob {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   if (bytes.length === 0) throw new Error("empty image payload");
   const typeEnd = 1 + bytes[0];
   if (typeEnd > bytes.length) throw new Error("truncated image payload");
@@ -10,73 +12,107 @@ export function decodeImagePayload(buffer: ArrayBuffer): Blob {
   return new Blob([bytes.subarray(typeEnd)], { type });
 }
 
-type Entry = { refs: number; url: Promise<string> };
+type Entry = {
+  refs: number;
+  promise: Promise<string>;
+  controller: AbortController;
+  objectUrl?: string;
+  bytes: number;
+};
+export type ImageLease = { url: Promise<string>; release: () => void };
 
-/**
- * Object URLs for remote images, shared by every preview showing them.
- * Images on screen stay alive; up to `idleLimit` unused ones are kept for a
- * re-render (a refreshed preview remounts its images), older ones are
- * revoked. A failed load is forgotten so the next mount tries again.
- */
+/** Each consumer releases exactly its acquisition, once. Pending work belongs
+ * to live consumers; only completed unused images enter the bounded idle cache. */
 export class RemoteImageCache {
   private readonly entries = new Map<string, Entry>();
-  // Unused URLs, oldest first.
-  private readonly idle: string[] = [];
+  private readonly idle = new Map<string, Entry>();
+  private idleBytes = 0;
 
   constructor(
-    private readonly load: (url: string) => Promise<Blob>,
+    private readonly load: (url: string, signal: AbortSignal) => Promise<Blob>,
     private readonly create: (blob: Blob) => string,
     private readonly revoke: (objectUrl: string) => void,
     private readonly idleLimit = 32,
+    private readonly idleByteLimit = 32 * 1024 * 1024,
   ) {}
 
-  acquire(url: string): Promise<string> {
+  acquire(url: string): ImageLease {
     let entry = this.entries.get(url);
     if (entry) {
-      const i = this.idle.indexOf(url);
-      if (i !== -1) this.idle.splice(i, 1);
+      this.removeIdle(url, entry);
     } else {
+      const controller = new AbortController();
       const created: Entry = {
         refs: 0,
-        url: this.load(url).then(this.create, (error) => {
-          if (this.entries.get(url) === created) this.drop(url);
-          throw error;
-        }),
+        bytes: 0,
+        controller,
+        promise: Promise.resolve()
+          .then(() => {
+            controller.signal.throwIfAborted();
+            return this.load(url, controller.signal);
+          })
+          .then((blob) => {
+            controller.signal.throwIfAborted();
+            created.bytes = blob.size;
+            created.objectUrl = this.create(blob);
+            return created.objectUrl;
+          })
+          .catch((error) => {
+            this.drop(url, created);
+            throw error;
+          }),
       };
       entry = created;
       this.entries.set(url, entry);
     }
-    entry.refs += 1;
-    return entry.url;
+    entry.refs++;
+    const owned = entry;
+    let released = false;
+    return {
+      url: owned.promise,
+      release: () => {
+        if (released) return;
+        released = true;
+        owned.refs--;
+        if (owned.refs > 0 || this.entries.get(url) !== owned) return;
+        if (owned.objectUrl === undefined) {
+          this.entries.delete(url);
+          owned.controller.abort();
+          return;
+        }
+        this.idle.set(url, owned);
+        this.idleBytes += owned.bytes;
+        while (
+          this.idle.size > this.idleLimit ||
+          this.idleBytes > this.idleByteLimit
+        ) {
+          const first = this.idle.entries().next().value;
+          if (!first) break;
+          this.drop(...first);
+        }
+      },
+    };
   }
 
-  release(url: string): void {
-    const entry = this.entries.get(url);
-    if (!entry || entry.refs === 0) return;
-    entry.refs -= 1;
-    if (entry.refs > 0) return;
-    this.idle.push(url);
-    while (this.idle.length > this.idleLimit) {
-      const oldest = this.idle.shift();
-      if (oldest === undefined) break;
-      const evicted = this.entries.get(oldest);
-      this.entries.delete(oldest);
-      void evicted?.url.then(this.revoke, () => {});
+  private removeIdle(url: string, entry: Entry): void {
+    if (this.idle.get(url) !== entry) return;
+    this.idle.delete(url);
+    this.idleBytes -= entry.bytes;
+  }
+
+  private drop(url: string, entry: Entry): void {
+    this.removeIdle(url, entry);
+    if (this.entries.get(url) === entry) this.entries.delete(url);
+    if (entry.objectUrl !== undefined) {
+      this.revoke(entry.objectUrl);
+      entry.objectUrl = undefined;
     }
-  }
-
-  private drop(url: string): void {
-    this.entries.delete(url);
-    const i = this.idle.indexOf(url);
-    if (i !== -1) this.idle.splice(i, 1);
   }
 }
 
 export const remoteImages = new RemoteImageCache(
-  async (url) =>
-    decodeImagePayload(
-      await invoke<ArrayBuffer>("markdown_remote_image", { url }),
-    ),
+  async (url, signal) =>
+    decodeImagePayload(await requestRemoteImage(url, signal)),
   (blob) => URL.createObjectURL(blob),
   (objectUrl) => URL.revokeObjectURL(objectUrl),
 );

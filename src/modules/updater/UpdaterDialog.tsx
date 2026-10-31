@@ -1,3 +1,4 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -61,9 +62,8 @@ function UpdatePrompt() {
   const ready = status.kind === "ready";
 
   const copyCommand = async () => {
-    if (!navigator?.clipboard?.writeText) return;
     try {
-      await navigator.clipboard.writeText(activeCommand);
+      await writeClipboardText(activeCommand);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {

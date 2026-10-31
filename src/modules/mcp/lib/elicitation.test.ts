@@ -305,3 +305,17 @@ describe("validateElicitation", () => {
     });
   });
 });
+
+it("preserves prototype-named elicitation defaults, errors and content", () => {
+  const form = fields(
+    JSON.parse('{"__proto__":{"type":"string","default":"answer"}}'),
+    ["__proto__"],
+  );
+  expect(JSON.stringify(initialValues(form))).toBe('{"__proto__":"answer"}');
+  expect(
+    validateElicitation(form, Object.fromEntries([["__proto__", ""]])).content,
+  ).toBeNull();
+  expect(
+    JSON.stringify(validateElicitation(form, initialValues(form)).content),
+  ).toBe('{"__proto__":"answer"}');
+});

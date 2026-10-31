@@ -4,73 +4,19 @@ import type {
   GhosttyTerminalModelApi,
 } from "../GhosttyTerminalModel";
 
-/** Matches kept; a pattern matching more stops counting there. */
-export const MAX_REGEX_MATCHES = 10_000;
-
-type Match = {
-  /** Buffer line (0 is the oldest line of history). */
-  readonly line: number;
-  readonly startColumn: number;
-  /** Exclusive. */
-  readonly endColumn: number;
-};
-
-/**
- * Compiles a terminal search pattern: a JavaScript regular expression,
- * case-insensitive unless it contains an upper-case letter (smart case, as in
- * editors). Returns null for an invalid pattern or one that can match empty
- * text (which would highlight every cell).
- */
-export function compileTerminalPattern(pattern: string): RegExp | null {
-  if (!pattern) return null;
-  let regex: RegExp;
-  try {
-    regex = new RegExp(pattern, /\p{Lu}/u.test(pattern) ? "gu" : "giu");
-  } catch {
-    return null;
-  }
-  return regex.test("") ? null : regex;
-}
-
-/**
- * The matches of `regex` in one line of cells. Cells hold a grapheme each
- * (" " when blank) and "" for the second half of a wide character, so string
- * offsets map back to columns through the cell starts.
- */
-export function matchLine(
-  cells: readonly string[],
-  line: number,
-  regex: RegExp,
-  limit: number,
-): Match[] {
-  let text = "";
-  const columnAt: number[] = [];
-  for (let column = 0; column < cells.length; column++) {
-    const cell = cells[column] ?? "";
-    for (let unit = 0; unit < cell.length; unit++) columnAt.push(column);
-    text += cell;
-  }
-  columnAt.push(cells.length);
-  const matches: Match[] = [];
-  regex.lastIndex = 0;
-  for (
-    let found = regex.exec(text);
-    found && matches.length < limit;
-    found = regex.exec(text)
-  ) {
-    if (found[0].length === 0) {
-      regex.lastIndex +=
-        (text.codePointAt(regex.lastIndex) ?? 0) > 0xffff ? 2 : 1;
-      continue;
-    }
-    const startColumn = columnAt[found.index];
-    const last = columnAt[found.index + found[0].length - 1];
-    // A match ending on a wide character covers its second cell too.
-    const endColumn = cells[last + 1] === "" ? last + 2 : last + 1;
-    matches.push({ line, startColumn, endColumn });
-  }
-  return matches;
-}
+import {
+  MAX_REGEX_MATCHES,
+  REGEX_BATCH_CELLS,
+  REGEX_BATCH_UNITS,
+  REGEX_BATCH_LINES,
+  REGEX_PATTERN_UNITS,
+  REGEX_TOTAL_UNITS,
+  REGEX_TOTAL_MS,
+  type RegexMatch,
+  type RegexBatch,
+} from "./regexProtocol";
+import { createRegexRunner, type RegexRunner } from "./regexWorkerClient";
+export { MAX_REGEX_MATCHES } from "./regexProtocol";
 
 /**
  * Regular-expression search over the whole buffer, in budgeted steps like
@@ -80,49 +26,201 @@ export function matchLine(
  * span a wrap). Any content change restarts the scan.
  */
 export class RegexTerminalSearch {
-  private regex: RegExp | null = null;
-  private matches: Match[] = [];
+  private pattern = "";
+  private error: string | undefined;
+  private runner: RegexRunner | null = null;
+  private pending = false;
+  private disposed = false;
+  private suspended = false;
+  private revisionTimer: ReturnType<typeof setTimeout> | null = null;
+  private scannedUnits = 0;
+  private startedAt: number | null = null;
+  private operation = 0;
+  private matches: RegexMatch[] = [];
   private nextLine = 0;
   private totalLines = 0;
   private revision = -1;
   private selected = -1;
   private generation = 0;
 
-  constructor(private readonly model: GhosttyTerminalModelApi) {}
+  constructor(
+    private readonly model: GhosttyTerminalModelApi,
+    private readonly changed: () => void = () => {},
+    private readonly makeRunner: () => RegexRunner = createRegexRunner,
+  ) {}
 
   setQuery(pattern: string): GhosttySearchStatus {
-    this.regex = compileTerminalPattern(pattern);
+    if (this.disposed) return this.status();
+    this.pattern = pattern;
+    this.error = undefined;
     this.restart();
+    if (pattern.length > REGEX_PATTERN_UNITS)
+      this.fail("Regex is too long. Use at most 4,096 characters.");
     return this.status();
   }
 
   clear(): void {
-    this.regex = null;
-    this.restart();
+    this.cancel();
+    this.pattern = "";
+    this.error = undefined;
+    this.matches = [];
+    this.selected = -1;
+    this.nextLine = this.totalLines = 0;
+    this.generation++;
   }
 
-  /** Scans up to `budget` lines; restarts first if the buffer changed. */
+  dispose(): void {
+    this.clear();
+    this.disposed = true;
+  }
+  suspend(): void {
+    this.suspended = true;
+    this.cancel();
+    this.revision = -1;
+  }
+  resume(): void {
+    this.suspended = false;
+  }
+  failure(): string | undefined {
+    return this.error;
+  }
+  restoreFailure(message: string): void {
+    this.fail(message);
+  }
+  retry(): void {
+    if (!this.disposed && this.error) this.setQuery(this.pattern);
+  }
+
+  /** Output bursts revoke in-flight work immediately, then wait for a quiet frame. */
+  invalidate(): void {
+    if (
+      this.disposed ||
+      this.suspended ||
+      !this.pattern ||
+      this.error ||
+      this.model.revision() === this.revision
+    )
+      return;
+    this.restart();
+    this.revisionTimer = setTimeout(() => {
+      this.revisionTimer = null;
+      if (!this.disposed && !this.suspended) this.changed();
+    }, 100);
+  }
+
+  /** Reads bounded rows on the UI thread; all regex compilation/execution is in the worker. */
   step(budget: number): GhosttySearchStatus {
-    if (!this.regex) return this.status();
-    if (this.model.revision() !== this.revision) this.restart();
-    const end = Math.min(this.totalLines, this.nextLine + Math.max(1, budget));
-    if (this.nextLine < end && this.matches.length < MAX_REGEX_MATCHES) {
-      const lines = this.readLines(this.nextLine, end - 1);
-      for (let index = 0; index < lines.length; index++) {
-        const remaining = MAX_REGEX_MATCHES - this.matches.length;
-        if (remaining <= 0) break;
-        this.matches.push(
-          ...matchLine(
-            lines[index],
-            this.nextLine + index,
-            this.regex,
-            remaining,
-          ),
-        );
-      }
+    if (this.disposed || this.suspended || !this.pattern || this.error)
+      return this.status();
+    if (this.model.revision() !== this.revision) {
+      this.invalidate();
+      return this.status();
     }
-    this.nextLine =
-      this.matches.length >= MAX_REGEX_MATCHES ? this.totalLines : end;
+    if (
+      this.pending ||
+      this.revisionTimer !== null ||
+      this.nextLine >= this.totalLines
+    )
+      return this.status();
+    if (this.startedAt === null) this.startedAt = performance.now();
+    const remainingMs = REGEX_TOTAL_MS - (performance.now() - this.startedAt);
+    if (remainingMs <= 0) {
+      this.fail(
+        "Regex search took too long. Refine the pattern or use literal search.",
+      );
+      return this.status();
+    }
+    const lines: string[][] = [];
+    let units = 0;
+    let cells = 0;
+    const end = Math.min(
+      this.totalLines,
+      this.nextLine + Math.max(1, Math.min(budget, REGEX_BATCH_LINES)),
+    );
+    const readAt = performance.now();
+    for (let line = this.nextLine; line < end; line++) {
+      const row = [
+        ...(this.model.readCellLines?.(line, line)?.[0] ??
+          this.model.readCellLine?.(line) ??
+          []),
+      ];
+      const length = row.reduce((sum, cell) => sum + cell.length, 0);
+      if (length > REGEX_BATCH_UNITS || row.length > REGEX_BATCH_CELLS) {
+        this.fail(
+          "A terminal row is too large for regex search. Use literal search.",
+        );
+        return this.status();
+      }
+      if (
+        units + length > REGEX_BATCH_UNITS ||
+        cells + row.length > REGEX_BATCH_CELLS
+      )
+        break;
+      lines.push(row);
+      units += length;
+      cells += row.length;
+      if (performance.now() - readAt >= 4) break;
+    }
+    if (this.scannedUnits + units > REGEX_TOTAL_UNITS) {
+      this.fail(
+        "Terminal history is too large for regex search. Use literal search.",
+      );
+      return this.status();
+    }
+    this.scannedUnits += units;
+    const operation = ++this.operation;
+    const revision = this.revision;
+    const firstLine = this.nextLine;
+    this.pending = true;
+    try {
+      this.runner ??= this.makeRunner();
+      const batch: RegexBatch = {
+        pattern: this.pattern,
+        lines,
+        firstLine,
+        limit: MAX_REGEX_MATCHES - this.matches.length,
+      };
+      void this.runner.run(batch, Math.min(1000, remainingMs)).then(
+        (matches) => {
+          if (operation !== this.operation || this.disposed || this.suspended)
+            return;
+          this.pending = false;
+          if (this.model.revision() !== revision) {
+            this.invalidate();
+            return;
+          }
+          this.matches.push(...matches);
+          this.nextLine =
+            this.matches.length >= MAX_REGEX_MATCHES
+              ? this.totalLines
+              : firstLine + lines.length;
+          if (this.nextLine >= this.totalLines) {
+            this.runner?.dispose();
+            this.runner = null;
+          }
+          this.generation++;
+          this.changed();
+        },
+        (error: unknown) => {
+          if (operation !== this.operation || this.disposed || this.suspended)
+            return;
+          if (this.model.revision() !== revision) {
+            this.invalidate();
+            return;
+          }
+          this.fail(
+            error instanceof Error ? error.message : "Regex search failed.",
+          );
+          this.changed();
+        },
+      );
+    } catch (error) {
+      this.fail(
+        error instanceof Error
+          ? error.message
+          : "Regex search could not start.",
+      );
+    }
     return this.status();
   }
 
@@ -174,7 +272,7 @@ export class RegexTerminalSearch {
   }
 
   status(): GhosttySearchStatus {
-    const active = this.regex !== null;
+    const active = !!this.pattern && !this.error;
     return {
       active,
       pending: active && this.nextLine < this.totalLines,
@@ -185,30 +283,40 @@ export class RegexTerminalSearch {
     };
   }
 
+  private cancel(): void {
+    this.operation++;
+    this.runner?.dispose();
+    this.runner = null;
+    this.pending = false;
+    if (this.revisionTimer !== null) clearTimeout(this.revisionTimer);
+    this.revisionTimer = null;
+  }
+
+  private fail(message: string): void {
+    this.cancel();
+    this.error = message;
+    this.matches = [];
+    this.selected = -1;
+    this.nextLine = this.totalLines;
+    this.generation++;
+  }
+
   private restart(): void {
+    this.cancel();
     this.matches = [];
     this.nextLine = 0;
     this.selected = -1;
     this.revision = this.model.revision();
-    const { history } = this.model.scrollPosition();
-    this.totalLines = this.regex ? history + this.model.rows : 0;
-    this.generation += 1;
-  }
-
-  private readLines(
-    first: number,
-    last: number,
-  ): readonly (readonly string[])[] {
-    if (this.model.readCellLines) return this.model.readCellLines(first, last);
-    const lines: (readonly string[])[] = [];
-    for (let line = first; line <= last; line++) {
-      lines.push(this.model.readCellLine?.(line) ?? []);
-    }
-    return lines;
+    this.totalLines = this.pattern
+      ? this.model.scrollPosition().history + this.model.rows
+      : 0;
+    this.scannedUnits = 0;
+    this.startedAt = null;
+    this.generation++;
   }
 
   /** Scrolls so the match is visible, keeping the viewport when it already is. */
-  private reveal(match: Match): void {
+  private reveal(match: RegexMatch): void {
     const top = this.model.viewportOriginLine();
     if (match.line >= top && match.line < top + this.model.rows) return;
     const { history } = this.model.scrollPosition();

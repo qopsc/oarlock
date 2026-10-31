@@ -1,8 +1,8 @@
 use tauri::{AppHandle, Manager};
 
 use crate::modules::git::types::{
-    DiscardEntry, GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult,
-    GitDiffResult, GitLogEntry, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
+    GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
+    GitLogEntry, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
     GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeRemoveResult,
 };
 use crate::modules::git::{operations, worktree};
@@ -69,6 +69,19 @@ pub async fn git_status(
     let workspace = WorkspaceEnv::from_option(workspace);
     blocking(app, move |r| {
         operations::status(r, &repo_root, &workspace).map_err(Into::into)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn git_ai_staged_diff(
+    repo_root: String,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<super::ai_diff::AiStagedDiff, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    blocking(app, move |r| {
+        super::ai_diff::staged_diff(r, &repo_root, &workspace).map_err(Into::into)
     })
     .await
 }
@@ -155,16 +168,12 @@ pub async fn git_unstage(
 
 #[tauri::command]
 pub async fn git_discard(
-    repo_root: String,
-    entries: Vec<DiscardEntry>,
-    workspace: Option<WorkspaceEnv>,
     app: AppHandle,
+    window: tauri::WebviewWindow,
+    token: String,
+    id: String,
 ) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    blocking(app, move |r| {
-        operations::discard(r, &repo_root, &entries, &workspace).map_err(Into::into)
-    })
-    .await
+    super::discard::execute(app, window.label().into(), token, id).await
 }
 
 #[tauri::command]
@@ -185,12 +194,14 @@ pub async fn git_commit(
 pub async fn git_undo_commit(
     repo_root: String,
     expected_head: String,
+    expected_branch: String,
     workspace: Option<WorkspaceEnv>,
     app: AppHandle,
 ) -> Result<(), String> {
     let workspace = WorkspaceEnv::from_option(workspace);
     blocking(app, move |r| {
-        operations::undo_last_commit(r, &repo_root, &expected_head, &workspace).map_err(Into::into)
+        operations::undo_last_commit(r, &repo_root, &expected_head, &expected_branch, &workspace)
+            .map_err(Into::into)
     })
     .await
 }
@@ -229,7 +240,10 @@ pub async fn git_pull_ff_only(
     app: AppHandle,
 ) -> Result<(), String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
+        let root = crate::modules::workspace::resolve_path(&repo_root, &workspace)?;
+        crate::modules::fs::native_store::refuse_write(&owner, &root)?;
         operations::pull_ff_only(r, &repo_root, &workspace).map_err(Into::into)
     })
     .await
@@ -360,7 +374,10 @@ pub async fn git_checkout_branch(
     app: AppHandle,
 ) -> Result<(), String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
+        let root = crate::modules::workspace::resolve_path(&repo_root, &workspace)?;
+        crate::modules::fs::native_store::refuse_write(&owner, &root)?;
         operations::checkout_branch(r, &repo_root, &branch, &workspace).map_err(Into::into)
     })
     .await
@@ -377,8 +394,10 @@ pub async fn git_worktree_add(
     app: AppHandle,
 ) -> Result<GitWorktreeAddResult, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
-        worktree::add(r, &repo_root, &branch, path.as_deref(), &workspace).map_err(Into::into)
+        worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,
+            &|folder| crate::modules::fs::native_store::refuse_write(&owner, folder)).map_err(Into::into)
     })
     .await
 }
@@ -393,8 +412,10 @@ pub async fn git_worktree_remove(
     app: AppHandle,
 ) -> Result<GitWorktreeRemoveResult, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
-        worktree::remove(r, &repo_root, &path, force, &workspace).map_err(Into::into)
+        worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,
+            &|folder| crate::modules::fs::native_store::refuse_write(&owner, folder)).map_err(Into::into)
     })
     .await
 }

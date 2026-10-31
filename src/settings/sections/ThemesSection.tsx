@@ -11,6 +11,9 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { currentNativePreferences, mutatePreferences, readNativePreferences } from "@/modules/settings/nativePreferences";
+import { ImportGate, importBackground, importThemes, removeBackground, type ImportPhase } from "./importPublication";
+import { cleanupBackgroundImports, withBackgroundImportLock } from "./backgroundCleanup";
 import {
   EDITOR_THEME_AUTO,
   EDITOR_THEME_LABELS,
@@ -18,8 +21,6 @@ import {
   EDITOR_THEMES,
   type EditorThemePref,
   setBackgroundBlur,
-  setBackgroundImageId,
-  setBackgroundKind,
   setBackgroundOpacity,
   setEditorTheme,
   setTerminalOpacity,
@@ -28,13 +29,15 @@ import {
 } from "@/modules/settings/store";
 import { currentPlatform } from "@/modules/settings/terminalBehavior";
 import { useTheme } from "@/modules/theme";
+import { deleteThemeSelection } from "@/modules/theme/themeDeletion";
 import {
   deleteBgImage,
   importBgImageFromFile,
+  staleBgImages,
 } from "@/modules/theme/bgImageStore";
 import {
   deleteCustomTheme,
-  saveCustomThemes,
+  createImportedThemes,
 } from "@/modules/theme/customThemes";
 import {
   deleteThemeFile,
@@ -43,10 +46,7 @@ import {
 } from "@/modules/theme/themeFiles";
 import { listBuiltinThemes } from "@/modules/theme/themes";
 import { DEFAULT_THEME_ID, type Theme } from "@/modules/theme/types";
-import {
-  type Backdrop,
-  getBackdropKind,
-} from "@/modules/theme/vibrancy";
+import { type Backdrop, getBackdropKind } from "@/modules/theme/vibrancy";
 import { Edit02Icon, PlusSignIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -59,7 +59,15 @@ import { ThemePastePanel } from "../components/ThemePastePanel";
 const loadThemeImporter = () => import("@/modules/theme/schemes/importTheme");
 
 export function ThemesSection() {
-  const { themeId, setThemeId, resolvedMode, customThemes } = useTheme();
+  const {
+    themeId,
+    setThemeId,
+    resolvedMode,
+    customThemes,
+    customThemesError,
+    customThemesReady,
+    retryCustomThemes,
+  } = useTheme();
   const builtinThemes = listBuiltinThemes();
   const themes = useMemo(
     () => [...builtinThemes, ...customThemes],
@@ -70,9 +78,23 @@ export function ThemesSection() {
     [customThemes],
   );
 
+  const selectedTheme = useRef(themeId);
+  selectedTheme.current = themeId;
+
   const [importError, setImportError] = useState<string | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [bgError, setBgError] = useState<string | null>(null);
+  const [themePhase, setThemePhase] = useState<ImportPhase>("idle");
+  const [bgPhase, setBgPhase] = useState<ImportPhase>("idle");
+  const themeGate = useRef<ImportGate | null>(null);
+  const bgGate = useRef<ImportGate | null>(null);
+  useEffect(() => {
+    const theme = new ImportGate(setThemePhase);
+    const background = new ImportGate(setBgPhase);
+    themeGate.current = theme;
+    bgGate.current = background;
+    return () => { theme.dispose(); background.dispose(); themeGate.current = null; bgGate.current = null; };
+  }, []);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const bgInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -102,92 +124,110 @@ export function ThemesSection() {
     };
   }, []);
 
-  const commitImported = async (imported: Theme[], errors: string[]) => {
-    const problems = [...errors];
-    if (imported.length > 0) {
-      try {
-        await saveCustomThemes(imported);
-        setThemeId(imported[0].id);
-      } catch (e) {
-        console.error("[oarlock] saving imported themes failed:", e);
-        problems.push("Could not save the imported theme.");
-      }
-    }
-    setImportError(problems.length > 0 ? problems.join("\n") : null);
-    return imported.length > 0 && problems.length === 0;
+  const initialPreferences = async () => {
+    const snapshot = currentNativePreferences();
+    if (!snapshot) throw new Error("Preferences are still loading. Retry when they are ready.");
+    return snapshot;
   };
-
-  const handleThemeFiles = async (files: FileList | null) => {
-    setImportError(null);
-    if (!files || files.length === 0) return;
-    const selected = Array.from(files);
-    try {
-      const { importThemeFiles } = await loadThemeImporter();
-      const { themes: imported, errors } = await importThemeFiles(
-        selected,
-        themes.map((t) => t.id),
-      );
-      await commitImported(imported, errors);
-    } catch (e) {
-      console.error("[oarlock] theme import failed:", e);
-      setImportError("Could not import the theme.");
-    }
-  };
-
-  const importText = async (text: string) => {
+  const runThemeImport = async (prepare: () => Promise<{ themes: Theme[]; errors: string[] }>) => {
+    const gate = themeGate.current;
+    if (!gate || !customThemesReady) return false;
     setImportError(null);
     try {
-      const { importThemeText } = await loadThemeImporter();
-      const result = importThemeText(text, {
-        takenIds: themes.map((t) => t.id),
+      const result = await importThemes(gate, {
+        snapshot: initialPreferences,
+        prepare,
+        save: createImportedThemes,
+        select: (theme, revision) => mutatePreferences({ kind: "themeselection", id: theme.id }, revision),
       });
-      if (!result.ok) {
-        setImportError(result.error);
+      if (result.outcome === "cancelled") return false;
+      if (result.outcome === "superseded") {
+        setImportError("Settings changed while importing, so the imported theme was not selected.");
         return false;
       }
-      return await commitImported(result.themes, []);
-    } catch (e) {
-      console.error("[oarlock] theme import failed:", e);
-      setImportError("Could not import the theme.");
+      setImportError(result.errors.length ? result.errors.join("\n") : null);
+      return result.outcome === "saved" && result.errors.length === 0;
+    } catch (error) {
+      setImportError(`Could not import the theme: ${String(error)}`);
       return false;
     }
+  };
+  const handleThemeFiles = async (files: FileList | null) => {
+    if (!files?.length) return;
+    const selected = Array.from(files);
+    await runThemeImport(async () => {
+      const { importThemeFiles } = await loadThemeImporter();
+      return importThemeFiles(selected, themes.map((theme) => theme.id));
+    });
+  };
+  const importText = (text: string) => runThemeImport(async () => {
+    const { importThemeText } = await loadThemeImporter();
+    const result = importThemeText(text, { takenIds: themes.map((theme) => theme.id) });
+    return result.ok ? { themes: result.themes, errors: [] } : { themes: [], errors: [result.error] };
+  });
+  const closePaste = () => {
+    if (themeGate.current?.cancel() !== false) setPasteOpen(false);
   };
 
   const onPickThemeFile = () => fileInputRef.current?.click();
 
   const onRemoveCustomTheme = async (id: string) => {
-    if (themeId === id) setThemeId(DEFAULT_THEME_ID);
-    await deleteCustomTheme(id);
-    void deleteThemeFile(id);
+    try {
+      await deleteThemeSelection(
+        id,
+        deleteCustomTheme,
+        () => selectedTheme.current,
+        () => setThemeId(DEFAULT_THEME_ID),
+      );
+      await deleteThemeFile(id);
+    } catch (error) {
+      setImportError(String(error));
+    }
   };
 
   const onPickBgFile = () => bgInputRef.current?.click();
 
+  const backgroundDeps = {
+    snapshot: initialPreferences,
+    latest: readNativePreferences,
+    importFile: importBgImageFromFile,
+    publish: (id: string | null, revision?: number) => mutatePreferences({ kind: "background", imageId: id }, revision),
+    removeFile: deleteBgImage,
+    withLock: withBackgroundImportLock,
+    cleanup: () => cleanupBackgroundImports({
+      stale: staleBgImages,
+      snapshot: readNativePreferences,
+      barrier: (snapshot) => mutatePreferences({
+        kind: "themeselection",
+        id: typeof snapshot.values.themeId === "string" ? snapshot.values.themeId : DEFAULT_THEME_ID,
+      }, snapshot.revision),
+      remove: deleteBgImage,
+    }),
+  };
   const handleBgFiles = async (files: FileList | null) => {
-    setBgError(null);
-    if (!files || files.length === 0) return;
+    if (!files?.length || !bgGate.current) return;
     const file = files[0];
+    setBgError(null);
     if (!file.type.startsWith("image/")) {
       setBgError(`${file.name}: not an image`);
       return;
     }
     try {
-      const prev = backgroundImageId;
-      const { id } = await importBgImageFromFile(file);
-      await setBackgroundImageId(id);
-      await setBackgroundKind("image");
-      if (prev && prev !== id) await deleteBgImage(prev).catch(() => undefined);
-    } catch (e) {
-      setBgError(e instanceof Error ? e.message : "failed to import image");
+      const result = await importBackground(file, bgGate.current, backgroundDeps);
+      if (result === "superseded") setBgError("Settings changed while importing, so the new background was not selected.");
+    } catch (error) {
+      setBgError(error instanceof Error ? error.message : String(error));
     }
   };
-
   const onRemoveBackground = async () => {
+    if (!bgGate.current) return;
     setBgError(null);
-    const prev = backgroundImageId;
-    await setBackgroundKind("none");
-    await setBackgroundImageId(null);
-    if (prev) await deleteBgImage(prev).catch(() => undefined);
+    try { await removeBackground(bgGate.current, backgroundDeps); }
+    catch (error) {
+      setBgError(String(error).includes("PREFERENCES_REVISION_CHANGED")
+        ? "The background changed in another window. Try again."
+        : error instanceof Error ? error.message : String(error));
+    }
   };
 
   return (
@@ -196,6 +236,31 @@ export function ThemesSection() {
         title="Themes"
         description="Theme, background image, and customization."
       />
+
+      {customThemesError ? (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 p-3 text-sm"
+        >
+          <p>
+            Custom themes could not be loaded. Your files have been preserved.
+          </p>
+          <p className="mt-1 break-words text-xs text-muted-foreground">
+            {customThemesError}
+          </p>
+          <Button
+            className="mt-2"
+            variant="outline"
+            onClick={retryCustomThemes}
+          >
+            Retry
+          </Button>
+        </div>
+      ) : !customThemesReady ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Loading custom themes…
+        </p>
+      ) : null}
 
       {backdrop === "none" ? null : (
         <SettingRow
@@ -241,6 +306,7 @@ export function ThemesSection() {
         }}
         onDrop={(e) => {
           e.preventDefault();
+          if (themePhase === "saving") return;
           if (e.dataTransfer.files.length > 0) {
             void handleThemeFiles(e.dataTransfer.files);
             return;
@@ -252,10 +318,15 @@ export function ThemesSection() {
         <div className="flex items-center justify-between">
           <Label>Theme</Label>
           <div className="flex items-center gap-1.5">
+            {themePhase === "saving" ? <span role="status" className="text-xs text-muted-foreground">Saving…</span> : null}
+            {themePhase === "preparing" && !pasteOpen ? (
+              <Button variant="ghost" size="sm" onClick={() => themeGate.current?.cancel()}>Cancel</Button>
+            ) : null}
             <Button
               variant="outline"
               size="sm"
               className="h-7 gap-1.5 px-2 text-[11px]"
+              disabled={!customThemesReady}
               onClick={onCreateTheme}
             >
               <HugeiconsIcon icon={PlusSignIcon} size={11} strokeWidth={2} />
@@ -266,6 +337,7 @@ export function ThemesSection() {
               size="sm"
               className="h-7 px-2 text-[11px]"
               title="Import a .oarlock-theme, or a Ghostty, iTerm2, Alacritty or Windows Terminal colour scheme"
+              disabled={!customThemesReady || themePhase === "saving"}
               onClick={onPickThemeFile}
             >
               Import…
@@ -274,10 +346,11 @@ export function ThemesSection() {
               variant="outline"
               size="sm"
               className="h-7 px-2 text-[11px]"
+              disabled={!customThemesReady || themePhase === "saving"}
               aria-expanded={pasteOpen}
               onClick={() => {
                 setImportError(null);
-                setPasteOpen((open) => !open);
+                if (pasteOpen) closePaste(); else setPasteOpen(true);
               }}
             >
               Paste
@@ -295,13 +368,14 @@ export function ThemesSection() {
           />
         </div>
         <p className="text-[11px] text-muted-foreground">
-          Import, paste or drop a .oarlock-theme, or a Ghostty, iTerm2, Alacritty
-          or Windows Terminal colour scheme.
+          Import, paste or drop a .oarlock-theme, or a Ghostty, iTerm2,
+          Alacritty or Windows Terminal colour scheme.
         </p>
         {pasteOpen ? (
           <ThemePastePanel
             onImport={importText}
-            onClose={() => setPasteOpen(false)}
+            onClose={closePaste}
+            saving={themePhase === "saving"}
           />
         ) : null}
         {importError ? (
@@ -327,7 +401,7 @@ export function ThemesSection() {
               <button
                 key={t.id}
                 type="button"
-                onClick={() => setThemeId(t.id)}
+                onClick={() => { themeGate.current?.cancel(); setThemeId(t.id); }}
                 className={cn(
                   "group flex items-center gap-3 rounded-lg border p-2.5 text-left transition-all",
                   selected
@@ -370,7 +444,7 @@ export function ThemesSection() {
                       className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                       onClick={(e) => {
                         e.stopPropagation();
-                        onEditTheme(t.id);
+                        if (customThemesReady) onEditTheme(t.id);
                       }}
                     >
                       <HugeiconsIcon
@@ -385,7 +459,7 @@ export function ThemesSection() {
                       className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-destructive"
                       onClick={(e) => {
                         e.stopPropagation();
-                        void onRemoveCustomTheme(t.id);
+                        if (customThemesReady) void onRemoveCustomTheme(t.id);
                       }}
                     >
                       ×
@@ -448,6 +522,7 @@ export function ThemesSection() {
         }}
         onDrop={(e) => {
           e.preventDefault();
+          if (bgPhase === "saving") return;
           void handleBgFiles(e.dataTransfer.files);
         }}
       >
@@ -459,6 +534,7 @@ export function ThemesSection() {
                 variant="ghost"
                 size="sm"
                 className="h-7 px-2 text-[11px] text-muted-foreground hover:text-destructive"
+                disabled={bgPhase === "saving"}
                 onClick={() => void onRemoveBackground()}
               >
                 Remove
@@ -468,10 +544,14 @@ export function ThemesSection() {
               variant="outline"
               size="sm"
               className="h-7 px-2 text-[11px]"
+              disabled={bgPhase === "saving"}
               onClick={onPickBgFile}
             >
-              {backgroundKind === "image" ? "Replace image" : "Choose image"}
+              {bgPhase === "saving" ? "Saving…" : backgroundKind === "image" ? "Replace image" : "Choose image"}
             </Button>
+            {bgPhase === "preparing" ? (
+              <Button variant="ghost" size="sm" onClick={() => bgGate.current?.cancel()}>Cancel</Button>
+            ) : null}
             <input
               ref={bgInputRef}
               type="file"

@@ -14,6 +14,7 @@ export class GhosttyBlockSession {
   model: GhosttyTerminalModelApi | null = null;
   focus: (() => void) | null = null;
   paste: ((text: string) => void) | null = null;
+  pathInsertion: (() => ((text: string) => boolean) | null) | null = null;
   keyDown: ((event: KeyboardEvent) => boolean) | null = null;
   /** Current cell height in CSS px, supplied by the surface owner. */
   cellHeight: () => number = () => 0;
@@ -152,6 +153,7 @@ export class GhosttyBlockSession {
     this.detach();
     this.focus = null;
     this.paste = null;
+    this.pathInsertion = null;
     this.keyDown = null;
     this.draft = "";
     this.modeEffect = null;

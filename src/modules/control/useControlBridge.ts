@@ -107,15 +107,25 @@ export function useControlBridge({
     if (!ready) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    const requireLiveBridge = () => {
+      if (disposed)
+        throw new RequestError(
+          "frontend_unavailable",
+          "Oarlock UI context closed; retry the request",
+        );
+    };
 
     const handleRequest = async (request: ControlRequest) => {
       try {
+        requireLiveBridge();
         const context = resolveControlContext(
           tabsRef.current ?? [],
           activeTabIdRef.current ?? 0,
           activeSpaceIdRef.current ?? DEFAULT_SPACE_ID,
           request.caller.pane_id,
         );
+        if (!context)
+          throw new RequestError("caller_unavailable", "The calling terminal pane is no longer available");
         if (request.method === "identify") {
           await respond(request.id, { ok: true, result: context });
           return;
@@ -127,11 +137,21 @@ export function useControlBridge({
             const window = getCurrentWindow();
             try {
               await window.show();
+              requireLiveBridge();
               await window.setFocus();
               focused = true;
             } catch (error) {
               console.warn("[oarlock] could not focus control target:", error);
             }
+          }
+          requireLiveBridge();
+          if (request.caller.pane_id != null) {
+            const current = resolveControlContext(
+              tabsRef.current ?? [], activeTabIdRef.current ?? 0,
+              activeSpaceIdRef.current ?? DEFAULT_SPACE_ID, request.caller.pane_id,
+            );
+            if (!current || current.space_id !== context.space_id || current.tab_id !== context.tab_id)
+              throw new RequestError("caller_unavailable", "The calling terminal pane changed before the request completed");
           }
           const tabId = onOpen({ ...open, spaceId: context.space_id });
           if (tabId === null) {
@@ -140,9 +160,9 @@ export function useControlBridge({
               "Oarlock could not create an editor tab",
             );
           }
-          await new Promise<void>((resolve) =>
-            requestAnimationFrame(() => resolve()),
-          );
+          // onOpen has accepted the tab and queued any editor navigation. A
+          // background window may never paint; protocol completion cannot wait
+          // for a presentation frame.
           await respond(request.id, {
             ok: true,
             result: {

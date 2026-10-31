@@ -58,7 +58,13 @@ describe("the explorer's drop target", () => {
     expect(target.updateTarget(10, 10)).toBe(true);
     expect(terminal.updateTarget).toHaveBeenCalledWith(10, 10);
     expect(target.dropPath(["/repo/a.ts"], 1, 2, isDir)).toBe(true);
-    expect(terminal.dropPath).toHaveBeenCalledWith(["/repo/a.ts"], 1, 2, isDir);
+    expect(terminal.dropPath).toHaveBeenCalledWith(
+      ["/repo/a.ts"],
+      1,
+      2,
+      isDir,
+      undefined,
+    );
     expect(delivered).toEqual([]);
     expect(over).toEqual([false, false]);
   });

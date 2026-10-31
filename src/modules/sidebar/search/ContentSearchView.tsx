@@ -7,6 +7,8 @@ import { cn } from "@/lib/utils";
 import {
   CONTENT_SEARCH_MIN_QUERY,
   useContentSearch,
+  contentSearchOwnerCurrent,
+  type ContentSearchOwner,
 } from "@/modules/command-palette/hooks/useContentSearch";
 import { FileIcon } from "@/modules/explorer/FileIcon";
 import {
@@ -48,7 +50,7 @@ let rememberedQuery = "";
 type Props = {
   /** The workspace folder searched. */
   root: string | null;
-  onOpenHit: (path: string, line: number) => void;
+  onOpenHit: (path: string, line: number, owner: ContentSearchOwner) => void;
   /** Focus the field once shown (the user opened the view, not a restore). */
   autoFocus?: boolean;
 };
@@ -165,9 +167,14 @@ export function ContentSearchView({ root, onOpenHit, autoFocus }: Props) {
   const activate = useCallback(
     (row: ContentSearchRow) => {
       if (row.kind === "file") toggleFile(row.group.path);
-      else onOpenHit(row.hit.path, row.hit.line);
+      else if (
+        search.resultsOwner &&
+        search.resultsOwner.root === root &&
+        contentSearchOwnerCurrent(search.resultsOwner)
+      )
+        onOpenHit(row.hit.path, row.hit.line, search.resultsOwner);
     },
-    [onOpenHit, toggleFile],
+    [onOpenHit, toggleFile, search.resultsOwner, root],
   );
 
   // Rows never take focus: the list keeps it, so keys always reach one handler.

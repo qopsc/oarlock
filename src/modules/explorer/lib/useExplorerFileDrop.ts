@@ -56,6 +56,7 @@ export function useExplorerFileDrop({
 
     void getCurrentWebview()
       .onDragDropEvent((e) => {
+        if (disposed) return;
         const p = e.payload;
         const { rootPath, isDir, onCopied } = optsRef.current;
         if (p.type === "enter" || p.type === "over") {
@@ -72,15 +73,21 @@ export function useExplorerFileDrop({
           if (!rootPath || !dir || p.paths.length === 0) return;
           const workspace = currentWorkspaceEnv();
           void authorizeSources(p.paths)
-            .then(() =>
-              invoke<CopyResult>("fs_copy", {
+            .then(async () => {
+              if (
+                disposed ||
+                optsRef.current.rootPath !== rootPath ||
+                currentWorkspaceEnv() !== workspace
+              )
+                return;
+              const result = await invoke<CopyResult>("fs_copy", {
                 sources: p.paths,
                 destDir: dir,
                 root: rootPath,
                 workspace,
-              }),
-            )
-            .then((result) => reportCopyFailures(result, dir))
+              });
+              reportCopyFailures(result, dir);
+            })
             .catch((err) =>
               showFileError(`Copy failed: ${String(err)}`, {
                 path: dir,

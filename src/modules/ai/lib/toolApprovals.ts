@@ -8,7 +8,10 @@ type ApprovalFields = {
 };
 
 export const SUPERSEDED_APPROVAL_REASON =
-  "Not run: the user sent a new message instead of approving this tool call.";
+  "Approval closed: the user sent a new message instead of continuing this tool call.";
+
+export const EXPIRED_APPROVAL_REASON =
+  "This approval expired because its original session is no longer available. Send a new request to continue.";
 
 function isToolPart(part: Part): boolean {
   return part.type === "dynamic-tool" || part.type.startsWith("tool-");
@@ -52,10 +55,18 @@ export function denyUnansweredApprovals(
       parts: message.parts.map((part) => {
         if (!isUnanswered(part)) return part;
         const fields = part as ApprovalFields;
+        const explanation =
+          fields.state === "approval-responded"
+            ? `This tool was already approved and may have started. Check its effects before retrying. ${reason}`
+            : reason;
         return {
           ...part,
           state: "output-denied",
-          approval: { ...fields.approval, approved: false, reason },
+          approval: {
+            ...fields.approval,
+            approved: false,
+            reason: explanation,
+          },
         } as Part;
       }),
     };
