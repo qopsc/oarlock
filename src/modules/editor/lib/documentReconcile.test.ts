@@ -16,9 +16,15 @@ async function openSession() {
   return session;
 }
 
+function bindingSnapshot(session: DocumentSession) {
+  const snapshot = session.bindingSnapshot();
+  if (!snapshot) throw new Error("Expected an open document binding");
+  return snapshot;
+}
+
 it("recovers a missed rename without losing the draft and is idempotent", async () => {
   const session = await openSession();
-  const snapshot = session.bindingSnapshot()!;
+  const snapshot = bindingSnapshot(session);
   const update = vi.fn();
   applyReconciledBinding(snapshot, "/repo/new", session, update);
   applyReconciledBinding(snapshot, "/repo/new", session, update);
@@ -31,7 +37,7 @@ it("recovers a missed rename without losing the draft and is idempotent", async 
 
 it("marks a renamed-away draft detached and preserves its contents", async () => {
   const session = await openSession();
-  const snapshot = session.bindingSnapshot()!;
+  const snapshot = bindingSnapshot(session);
   const update = vi.fn();
   applyReconciledBinding(snapshot, null, session, update);
   applyReconciledBinding(snapshot, null, session, update);
@@ -44,7 +50,7 @@ it("marks a renamed-away draft detached and preserves its contents", async () =>
 
 it("refuses a result captured for a different editor session", async () => {
   const first = await openSession();
-  const snapshot = first.bindingSnapshot()!;
+  const snapshot = bindingSnapshot(first);
   const replacement = await openSession();
   const update = vi.fn();
   expect(() => applyReconciledBinding(snapshot, "/repo/new", replacement, update))
