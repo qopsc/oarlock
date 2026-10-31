@@ -38,6 +38,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@/modules/workspace", () => ({
   currentWorkspaceEnv: () => mocks.workspace,
 }));
+vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "page-generation" }));
 
 // The bridge owns a process-wide hub, so every test gets a fresh module graph.
 async function load() {
@@ -197,6 +198,7 @@ describe("PTY bridge over the multiplexed stream", () => {
       blocks: true,
       shell: "zsh",
       paneId: 9,
+      pageGeneration: "page-generation",
     });
     expect(open).not.toHaveProperty("onData");
     expect(open).not.toHaveProperty("onExit");

@@ -18,6 +18,7 @@ import {
 } from "@/modules/terminal/lib/ptyPresentation";
 import { tokenBytes } from "@/modules/terminal/lib/ptyWire";
 import { currentWorkspaceEnv, type WorkspaceEnv } from "@/modules/workspace";
+import { networkPage } from "@/lib/networkPage";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
@@ -153,6 +154,7 @@ export async function openPty(
   const presentation =
     paneId === undefined ? undefined : leafPresentationClass(paneId);
   try {
+    const pageGeneration = await networkPage(new AbortController().signal);
     await ensureAgentActivityListener();
     await stream.ensureStream();
     id = await invoke<number>("pty_open", {
@@ -164,6 +166,7 @@ export async function openPty(
       shell: shell ?? null,
       paneId: paneId ?? null,
       presentation: presentation ?? null,
+      pageGeneration,
     });
   } catch (error) {
     releaseHandlers();

@@ -26,6 +26,7 @@ use portable_pty::PtySize;
 use tauri::Manager;
 
 use crate::modules::control::ControlState;
+use crate::modules::net::page::NetworkPages;
 use crate::modules::workspace::{
     resolve_path, user_spawn_cwd_or_home, WorkspaceEnv, WorkspaceRegistry,
 };
@@ -174,13 +175,36 @@ fn reap(id: u32, session: Arc<Session>, reason: &str) {
         .expect("spawn pty drop thread");
 }
 
+/// Publication shares the page lock with reload/close, so retirement either
+/// sees the registered session or prevents it from being registered at all.
+fn publish_for_page(
+    state: &PtyState,
+    pages: &NetworkPages,
+    label: &str,
+    generation: &str,
+    id: u32,
+    session: Arc<Session>,
+) -> Result<(), String> {
+    let result = pages.with_page(label, generation, || {
+        unpoisoned(state.sessions.write()).insert(id, session.clone());
+        Ok(())
+    }).map_err(|_| "Terminal startup was cancelled because its window closed or reloaded".to_string());
+    if result.is_err() {
+        state.hub.submit(Command::Unregister { id });
+        reap(id, session, "expired page during startup");
+    }
+    result
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn pty_open(
     app: tauri::AppHandle,
     webview: tauri::Webview,
     state: tauri::State<'_, PtyState>,
+    pages: tauri::State<'_, NetworkPages>,
     control: tauri::State<'_, ControlState>,
+    page_generation: String,
     cols: u16,
     rows: u16,
     cwd: Option<String>,
@@ -190,6 +214,10 @@ pub async fn pty_open(
     pane_id: Option<u32>,
     presentation: Option<PresentationClass>,
 ) -> Result<u32, String> {
+    let label = webview.label().to_owned();
+    pages.with_page(&label, &page_generation, || Ok(())).map_err(|_| {
+        "Terminal startup was cancelled because its window closed or reloaded".to_string()
+    })?;
     let workspace = WorkspaceEnv::from_option(workspace);
     let blocks = blocks.unwrap_or(false);
     // A Windows helper cannot execute inside WSL without explicit path and
@@ -235,7 +263,7 @@ pub async fn pty_open(
         log::error!("pty_open failed: {e}");
         e
     })?;
-    unpoisoned(state.sessions.write()).insert(id, session);
+    publish_for_page(&state, &pages, &label, &page_generation, id, session)?;
     // The shell can exit before this insert (instant failure, `exit` in an rc
     // file); the waiter's reap then ran with the id absent. Re-check and reap
     // so the pseudoconsole isn't stranded.
@@ -788,5 +816,42 @@ mod tests {
         if let Some(session) = state.take(2) {
             reap(2, session, "test cleanup");
         }
+    }
+
+    #[test]
+    fn a_startup_finishing_after_page_reload_or_close_is_reaped() {
+        for reload in [false, true] {
+            let state = Arc::new(PtyState::default());
+            let pages = NetworkPages::default();
+            pages.begin("main", || {}).unwrap();
+            let generation = pages.finish("main").unwrap();
+            // Hold a real spawned shell outside the registry, like a slow pty_open.
+            let session = open_running(&state, 42, "main", "sleep 30");
+            let pid = session.shell_pid as i32;
+            drop(state.take(42));
+            if reload {
+                pages.begin("main", || {}).unwrap();
+                pages.finish("main").unwrap();
+            } else {
+                pages.close("main", || {});
+            }
+            assert!(publish_for_page(&state, &pages, "main", &generation, 42, session).is_err());
+            assert!(!unpoisoned(state.sessions.read()).contains_key(&42));
+            wait_for("the late-starting shell to be killed", || unsafe { libc::kill(pid, 0) != 0 });
+        }
+    }
+
+    #[test]
+    fn a_current_page_can_publish_and_close_its_terminal() {
+        let state = Arc::new(PtyState::default());
+        let pages = NetworkPages::default();
+        pages.begin("main", || {}).unwrap();
+        let generation = pages.finish("main").unwrap();
+        let session = open(&state, 43, "main");
+        drop(state.take(43));
+        publish_for_page(&state, &pages, "main", &generation, 43, session).unwrap();
+        assert!(unpoisoned(state.sessions.read()).contains_key(&43));
+        pages.close("main", || state.destroy_webview("main"));
+        assert!(!unpoisoned(state.sessions.read()).contains_key(&43));
     }
 }
