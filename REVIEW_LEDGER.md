@@ -4042,3 +4042,7 @@ R061 is fixed: delayed repository resolution for the Git graph is accepted only 
 ## Tier 2: R064 fresh Git status metadata
 
 R064 is fixed: each successful status read updates the repository's branch, upstream and detached state before the automatic-fetch decision and again after a fetch. Linked-worktree metadata remains intact. The regression covers adding and removing an upstream after a branch change. The full frontend suite passed (5,536 passed, 2 skipped), with the focused regression rerun after a test-only type correction; types and lint passed. Tier 2 remaining in the ownership group: 22.
+
+## Tier 2: R214 first-load Git gutter
+
+R214 is fixed: Git baseline reads start only after the editor view exists, and an obsolete read cannot dispatch to a retired view. A regression demonstrates that the first baseline marks changed lines when the view appears and that cancelled reads do not update it. The full frontend suite passed (5,538 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 21.

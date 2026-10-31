@@ -59,7 +59,6 @@ import {
 import { diagnosticsReporter } from "./lib/diagnosticsReporter";
 import { useDiagnosticsStore } from "./lib/diagnosticsStore";
 import { editorClaimedModKey, editorKeymap } from "./lib/editorKeymap";
-import { normalizeToLf } from "./lib/eol";
 import {
   buildSharedExtensions,
   DEFAULT_INDENT,
@@ -72,7 +71,8 @@ import {
   wrapCompartment,
 } from "./lib/extensions";
 import { resolveFormatter, runExternalFormatter } from "./lib/externalFormat";
-import { gitChangeGutter, setGitBase } from "./lib/gitGutter";
+import { gitChangeGutter } from "./lib/gitGutter";
+import { loadGitBaseline } from "./lib/gitBaseline";
 import { onHeadMoved } from "./lib/gitSignals";
 import { defaultIndentUnit, detectIndentUnit } from "./lib/indent";
 import {
@@ -674,18 +674,8 @@ export const EditorPane = memo(
         return;
       if (!mediaActive) return;
       void headMoves;
-      let cancelled = false;
-      const apply = (base: string | null) => {
-        if (cancelled) return;
-        cmRef.current?.view?.dispatch({
-          effects: setGitBase.of(base === null ? null : normalizeToLf(base)),
-        });
-      };
-      native.gitFileBase(path).then(apply, () => apply(null));
-      return () => {
-        cancelled = true;
-      };
-    }, [doc, path, mediaActive, headMoves, native.gitFileBase, detached]);
+      return loadGitBaseline(editorView, () => native.gitFileBase(path));
+    }, [doc, path, mediaActive, headMoves, native.gitFileBase, detached, editorView]);
 
     const syntaxReady = doc.status === "ready" && doc.size <= SYNTAX_MAX_BYTES;
     const lspOwner = useRef({ active: mediaActive, generation: 0 });
