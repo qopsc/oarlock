@@ -4344,3 +4344,39 @@ The original register at `858b340` contains 167 rows marked MAJOR; the later gro
 | Compatibility, data semantics and UI | R001, R007, R023, R032, R043, R044, R048, R049, R053, R055, R056, R057, R063, R072, R082, R086, R093, R095, R112, R113, R116, R118, R122, R123, R171, R177, R187, R191, R200, R215, R217 | 31 |
 
 These are membership lists, not current-status counts. AI/MCP and Windows/WSL entries remain in the accounting but are held or moved to the port section as applicable. Triage results and evidence are recorded separately below.
+
+### Persistence and durability triage (21 reconstructed members)
+
+| ID | Status / tier | Current evidence |
+| --- | --- | --- |
+| R014 | Closed | `bac09a5`: failed layout saves retry, the store is flushed, and close reports failure. |
+| R028 | Closed for macOS | Production copy uses `copyfile` metadata preservation; ACL/xattr regression exists. Linux copy is unavailable. |
+| R030 | Closed for macOS | Production staging is outside worktrees and checked; the original destination staging helper is test-only. |
+| R033 | Windows port | The timestamp-only Windows watcher remains a port finding. |
+| R059 | Closed for Oarlock branch switching | Undo and Oarlock's branch switch share the existing worktree-keyed lock. A real-Git test reproduced Undo succeeding after a switch and now checks serialization, including an alias to the same worktree. Other same-user programs remain best effort. Git probes found `symref-verify` and updating its referent cannot be combined in one transaction, and holding `HEAD.lock` also blocks Git's own ref update. |
+| R077 | Closed | `5e0c020`: scrollback refuses work until preferences are current. |
+| R100 | Open, Tier 1 | Both font generators delete the current assets before generating replacements; failure can leave a broken working tree. Source revalidated; no destructive rebuild attempted. |
+| R102 | Closed | `5e0c020`: aborted image deletion rejects rather than hanging. |
+| R106 | Closed | `6d26ec1`: native per-language patches merge independent formatter edits. |
+| R110 | Closed | `4b875dc` and follow-ups use the shared metadata-preserving writer. |
+| R132, R140, R145, R146, R164, R165, R170, R175 | AI/MCP on hold | Retained from the original register; not re-reviewed while the backend is on hold. |
+| R203 | Closed | `5569b73`: existing theme files are preserved and differences are surfaced. |
+| R204 | Open, Tier 2 | Theme selection updates the live state and fast-path shadow before fire-and-forget persistence; failure is not handled locally. Source revalidated. |
+| R209 | Closed | `691b691`: no-op theme mutations verify disk and refuse damaged or missing storage. |
+
+Counts: **10 closed; 1 Tier 1 and 1 Tier 2 open; 8 AI/MCP held; 1 Windows-port item**. R235 is a separate later MAJOR for a future non-atomic-save choice, not one of these original 21.
+
+R059 validation: the real-Git race test failed before the worktree lock and passed afterward, including when branch switching used a directory alias. The full macOS native suite passed 1,533 library tests (four ignored) and all integration suites; the full frontend suite passed 5,608 tests with two skipped. Strict Clippy, type checking and lint passed; lint remained at 80 warnings. A terminal or another program changing HEAD is not serialized by this in-process lock.
+
+### Failure reporting and recovery triage (6 reconstructed members)
+
+| ID | Status / tier | Current evidence |
+| --- | --- | --- |
+| R002 | Dormant, Tier 2 | The update dialog still omits the error state, but `UPDATES_ENABLED` is false. |
+| R058 | Open, Tier 2 | `git_show_text` still maps any nonzero Git exit to Missing, and branch listing still replaces failures with empty results. |
+| R060 | Closed | `549ab52`: Source Control shows an error and Retry instead of “No repository.” |
+| R091 | Open, Tier 2 | A rejected WebGL image-layer import remains cached while the loading flag stays set; no user-visible retry is provided. |
+| R092 | Open, Tier 2 | Context restoration marks the WebGL context healthy before required resource creation can throw. |
+| R114 | Dormant, Tier 2 | Updater artifacts remain disabled; the release job still treats download failures as missing assets. |
+
+Counts: **1 closed; 3 Tier 2 open; 2 dormant Tier 2**. R078, an original MINOR outside these six, was fixed in `1736685`. These source checks do not claim a live GPU or updater failure reproduction.

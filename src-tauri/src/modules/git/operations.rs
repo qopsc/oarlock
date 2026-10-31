@@ -672,8 +672,8 @@ pub fn commit(
 /// Undoes the newest commit the way `git reset --soft HEAD~1` does: the branch moves back to
 /// the commit's first parent and its changes stay staged, so nothing is lost. `expected_head`
 /// is the commit the user chose: the move compares the confirmed branch's tip,
-/// so an intervening commit is not undone in its place. Symbolic HEAD is checked
-/// before dispatch; atomic HEAD/ref verification still needs the isolated publisher.
+/// so an intervening commit is not undone in its place. Oarlock's branch switches
+/// share the worktree lock; changes by other processes remain best effort.
 pub fn undo_last_commit(
     registry: &WorkspaceRegistry,
     repo_root: &str,
@@ -681,64 +681,77 @@ pub fn undo_last_commit(
     expected_branch: &str,
     workspace: &WorkspaceEnv,
 ) -> Result<()> {
+    undo_last_commit_with_hook(registry, repo_root, expected_head, expected_branch, workspace, || {})
+}
+
+fn undo_last_commit_with_hook(
+    registry: &WorkspaceRegistry,
+    repo_root: &str,
+    expected_head: &str,
+    expected_branch: &str,
+    workspace: &WorkspaceEnv,
+    after_head_check: impl FnOnce(),
+) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    if expected_head.len() != 40 || !sha_is_safe(expected_head) {
-        return Err(GitError::command(
-            "undo commit",
-            "expected a full commit sha",
-        ));
-    }
-    validate_branch_name(expected_branch)?;
-    let expected_ref = format!("refs/heads/{expected_branch}");
-    if repo_root
-        .line(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])?
-        .as_deref()
-        != Some(expected_ref.as_str())
-    {
-        return Err(GitError::command(
-            "undo commit",
-            "The checked-out branch changed since confirmation; refresh and try again",
-        ));
-    }
-    // This preflight rejects stale confirmations but is not the final ownership
-    // boundary. The isolated native ref publisher must verify symbolic HEAD
-    // under its publication locks. Always name the confirmed ref below so an
-    // intervening checkout cannot redirect this update to a different branch.
-    // The parent comes from the chosen commit, not from HEAD, so a racing commit cannot
-    // change which commit is undone.
-    let parent = repo_root
-        .line([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{expected_head}^"),
-        ])?
-        .ok_or_else(|| GitError::command("undo commit", "the first commit cannot be undone"))?;
-    let output = repo_root.run(
-        [
-            "update-ref",
-            "-m",
-            "reset: moving to HEAD~1",
-            "--no-deref",
-            expected_ref.as_str(),
-            &parent,
-            expected_head,
-        ],
-        DEFAULT_TIMEOUT_SECS,
-    )?;
-    if output.timed_out || output.exit_code != Some(0) {
-        return Err(GitError::command(
-            "undo commit",
-            "HEAD moved since the history was loaded; refresh and try again",
-        ));
-    }
-    // As `git reset` does; it is also what tells Source Control's watcher HEAD moved.
-    let _ = repo_root.run(
-        ["update-ref", "ORIG_HEAD", expected_head],
-        DEFAULT_TIMEOUT_SECS,
-    );
-    Ok(())
+    crate::modules::fs::document_save::with_lock(&repo_root.local_path, || {
+        if expected_head.len() != 40 || !sha_is_safe(expected_head) {
+            return Err(GitError::command(
+                "undo commit",
+                "expected a full commit sha",
+            ));
+        }
+        validate_branch_name(expected_branch)?;
+        let expected_ref = format!("refs/heads/{expected_branch}");
+        if repo_root
+            .line(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])?
+            .as_deref()
+            != Some(expected_ref.as_str())
+        {
+            return Err(GitError::command(
+                "undo commit",
+                "The checked-out branch changed since confirmation; refresh and try again",
+            ));
+        }
+        after_head_check();
+        // The worktree lock serializes Oarlock checkouts with this check and update.
+        // Always name the confirmed ref so an external checkout cannot redirect the
+        // update to a different branch; external races remain best effort.
+        // The parent comes from the chosen commit, not from HEAD, so a racing commit cannot
+        // change which commit is undone.
+        let parent = repo_root
+            .line([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{expected_head}^"),
+            ])?
+            .ok_or_else(|| GitError::command("undo commit", "the first commit cannot be undone"))?;
+        let output = repo_root.run(
+            [
+                "update-ref",
+                "-m",
+                "reset: moving to HEAD~1",
+                "--no-deref",
+                expected_ref.as_str(),
+                &parent,
+                expected_head,
+            ],
+            DEFAULT_TIMEOUT_SECS,
+        )?;
+        if output.timed_out || output.exit_code != Some(0) {
+            return Err(GitError::command(
+                "undo commit",
+                "HEAD moved since the history was loaded; refresh and try again",
+            ));
+        }
+        // As `git reset` does; it is also what tells Source Control's watcher HEAD moved.
+        let _ = repo_root.run(
+            ["update-ref", "ORIG_HEAD", expected_head],
+            DEFAULT_TIMEOUT_SECS,
+        );
+        Ok(())
+    })
 }
 
 /// The first remote-tracking branch that already contains `sha`, if any: undoing such a commit
@@ -1229,12 +1242,14 @@ pub fn checkout_branch(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    validate_branch_name(branch_name)?;
-    // `git checkout <name>` falls back to restoring a file of that name when no such branch
-    // exists (one deleted since the list was loaded), discarding its changes. `switch` only
-    // ever switches branches.
-    let output = repo_root.run(["switch", branch_name], DEFAULT_TIMEOUT_SECS)?;
-    ensure_success(&output, "git switch failed")
+    crate::modules::fs::document_save::with_lock(&repo_root.local_path, || {
+        validate_branch_name(branch_name)?;
+        // `git checkout <name>` falls back to restoring a file of that name when no such branch
+        // exists (one deleted since the list was loaded), discarding its changes. `switch` only
+        // ever switches branches.
+        let output = repo_root.run(["switch", branch_name], DEFAULT_TIMEOUT_SECS)?;
+        ensure_success(&output, "git switch failed")
+    })
 }
 
 #[cfg(test)]
@@ -1256,6 +1271,59 @@ mod tests {
             .current_dir(dir)
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn undo_and_branch_switch_do_not_cross_after_confirmation() {
+        use std::{sync::mpsc, time::Duration};
+        let repo = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(git(&root, &["init", "-q", "-b", "main"]));
+        std::fs::write(root.join("file"), "one\n").unwrap();
+        assert!(git(&root, &["add", "file"]));
+        assert!(git(&root, &["commit", "-q", "-m", "one"]));
+        std::fs::write(root.join("file"), "two\n").unwrap();
+        assert!(git(&root, &["commit", "-q", "-a", "-m", "two"]));
+        assert!(git(&root, &["branch", "other"]));
+        let head = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&root).output().unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let path = root.to_string_lossy().to_string();
+        #[cfg(unix)]
+        let alias = {
+            let parent = tempfile::tempdir().unwrap();
+            let link = parent.path().join("alias");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            (parent, link.to_string_lossy().to_string())
+        };
+        #[cfg(unix)]
+        let switch_path = &alias.1;
+        #[cfg(not(unix))]
+        let switch_path = &path;
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (switch_tx, switch_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let undo_registry = &registry;
+            let undo_path = &path;
+            let undo_head = &head;
+            let undo = scope.spawn(move || undo_last_commit_with_hook(undo_registry, undo_path, undo_head, "main", &WorkspaceEnv::Local, || {
+                checked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            scope.spawn(|| { switch_tx.send(checkout_branch(&registry, switch_path, "other", &WorkspaceEnv::Local)).unwrap(); });
+            let early = switch_rx.recv_timeout(Duration::from_secs(2)).ok();
+            resume_tx.send(()).unwrap();
+            let undo = undo.join().unwrap();
+            let switched_early = early.is_some();
+            let switch = early.unwrap_or_else(|| switch_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            assert!(switch.is_ok(), "switch failed: {switch:?}");
+            assert!(!switched_early || undo.is_err(), "undo succeeded after another window switched branches");
+            if !switched_early { assert!(undo.is_ok(), "undo failed: {undo:?}"); }
+        });
     }
 
     #[test]
