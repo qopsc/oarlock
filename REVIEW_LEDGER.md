@@ -4038,3 +4038,7 @@ R047 is fixed: definition and reference requests share a per-editor ordering, an
 ## Tier 2: R061 Git graph context
 
 R061 is fixed: delayed repository resolution for the Git graph is accepted only while its originating space, environment, tab and repository context remain current, and a newer request or unmount supersedes it. The guard follows the existing repository-targeting request ownership pattern. Regression tests cover out-of-order resolution and closure of the owning context. The full frontend suite passed (5,535 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 23.
+
+## Tier 2: R064 fresh Git status metadata
+
+R064 is fixed: each successful status read updates the repository's branch, upstream and detached state before the automatic-fetch decision and again after a fetch. Linked-worktree metadata remains intact. The regression covers adding and removing an upstream after a branch change. The full frontend suite passed (5,536 passed, 2 skipped), with the focused regression rerun after a test-only type correction; types and lint passed. Tier 2 remaining in the ownership group: 22.

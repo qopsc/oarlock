@@ -29,6 +29,11 @@ const SC_STATUS_TTL_MS = 2000;
 const SIGNAL_QUIET_MS = 300;
 const SIGNAL_MAX_WAIT_MS = 1500;
 
+/** A fresh status is authoritative for branch and upstream metadata. */
+export function repositoryWithStatus(repo: GitRepoInfo, status: GitStatusSnapshot): GitRepoInfo {
+  return { ...repo, branch: status.branch, upstream: status.upstream, isDetached: status.isDetached };
+}
+
 type SourceControlRefreshMode = "auto" | "always" | "never";
 type SourceControlRemoteAction = "fetch" | "pull" | "push";
 type SourceControlRemoteActionMode = "contextual" | SourceControlRemoteAction;
@@ -419,6 +424,8 @@ export function useSourceControl(
           return;
         }
 
+        if (status) repo = repositoryWithStatus(repo, status);
+
         let nextRemoteError = stateRef.current.lastRemoteError;
         const shouldAutoFetch =
           repo.upstream &&
@@ -435,6 +442,7 @@ export function useSourceControl(
             if (!isCurrentRequest()) return;
             status = await native.gitStatus(repo.repoRoot);
             if (!isCurrentRequest()) return;
+            repo = repositoryWithStatus(repo, status);
           } catch (error) {
             nextRemoteError = normalizeError(error);
           }
