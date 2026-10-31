@@ -32,9 +32,9 @@ import { disposeSession } from "@/modules/terminal/lib/terminalSessionApi";
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
+  type SetStateAction,
 } from "react";
 import { appendTab, newTabInserter, type TabInserter } from "./newTabPosition";
 
@@ -809,7 +809,7 @@ function allowEnvironmentMove(from: string, to: string): boolean {
 }
 
 export function useTabs(initial?: Partial<TerminalTab>) {
-  const [tabs, setTabs] = useState<Tab[]>(() => {
+  const [tabs, publishTabs] = useState<Tab[]>(() => {
     const tabId = 1;
     const leafId = 2;
     return [
@@ -825,7 +825,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       },
     ];
   });
-  const [activeId, setActiveId] = useState(1);
+  const [activeId, publishActiveId] = useState(1);
   // Gates warming until boot resolves the restore, so no shell spawns before it.
   const [booted, setBooted] = useState(false);
   const nextIdRef = useRef(3);
@@ -833,13 +833,19 @@ export function useTabs(initial?: Partial<TerminalTab>) {
   const tabsRef = useRef(tabs);
   const activeIdRef = useRef(activeId);
 
-  useLayoutEffect(() => {
-    tabsRef.current = tabs;
-  }, [tabs]);
-
-  useLayoutEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
+  // Every mutation uses the same synchronous owner. React can defer rendering,
+  // but callers that return a pane ID or dispose a session must see the update
+  // and all earlier updates before they return.
+  const setTabs = useCallback((change: SetStateAction<Tab[]>) => {
+    const next = typeof change === "function" ? change(tabsRef.current) : change;
+    tabsRef.current = next;
+    publishTabs(next);
+  }, []);
+  const setActiveId = useCallback((change: SetStateAction<number>) => {
+    const next = typeof change === "function" ? change(activeIdRef.current) : change;
+    activeIdRef.current = next;
+    publishActiveId(next);
+  }, []);
 
   // Activating a cold tab warms it: one choke point for every activation path.
   useEffect(() => {
@@ -849,7 +855,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       if (!t?.cold) return curr;
       return curr.map((x) => (x.id === activeId ? { ...x, cold: false } : x));
     });
-  }, [activeId, booted]);
+  }, [activeId, booted, setTabs]);
 
   const allocId = useCallback(() => nextIdRef.current++, []);
 
@@ -865,7 +871,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     activeIdRef.current = nextActiveId;
     setTabs(next);
     setActiveId(nextActiveId);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   // Appends a cold terminal tab to a space without stealing focus, so the
   // overview can populate a space in place; it spawns when first opened.
@@ -886,7 +892,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       },
     ]);
     return tabId;
-  }, []);
+  }, [setTabs]);
 
   // Reassigns a tab to another space. Returns true when the moved tab was active
   // and emptied its source space, so the caller should follow it into the target.
@@ -909,7 +915,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       }
       return true;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   // Positions a tab next to a target tab, inheriting the target's space. Returns
@@ -943,7 +949,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       }
       return true;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const removeTabsForSpace = useCallback(
@@ -965,7 +971,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       });
       for (const lid of toDispose) disposeSession(lid);
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const newTab = useCallback((cwd?: string) => {
@@ -985,7 +991,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     );
     setActiveId(tabId);
     return tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const newBlockTab = useCallback((cwd?: string) => {
     const tabId = nextIdRef.current++;
@@ -1005,7 +1011,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     );
     setActiveId(tabId);
     return tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   useEffect(() => {
     if (!import.meta.env?.DEV || typeof window === "undefined") return;
@@ -1038,7 +1044,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId(tabId);
       return { tabId, leafIds: agentLeafIds };
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const newAgentTab = useCallback(
@@ -1067,7 +1073,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     );
     setActiveId(tabId);
     return tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   /**
    * Opens a file in an editor tab.
@@ -1096,7 +1102,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       if (activate) setActiveId(plan.tabId);
       return plan.tabId;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   /**
@@ -1113,7 +1119,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         return t;
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const openAiDiffTab = useCallback(
     (input: {
@@ -1152,7 +1158,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       if (targetId !== null) setActiveId(targetId);
       return targetId as number | null;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const setAiDiffStatus = useCallback(
@@ -1165,7 +1171,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         ),
       );
     },
-    [],
+    [setTabs],
   );
 
   const closeAiDiffTab = useCallback((approvalId: string) => {
@@ -1186,7 +1192,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId((active) => (target.id === active ? fallback : active));
       return next;
     });
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const newPreviewTab = useCallback((url: string) => {
     const id = nextIdRef.current++;
@@ -1202,7 +1208,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     );
     setActiveId(id);
     return id;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   // Mirrors tabsRef like openFileTab instead of using a functional update: a
   // batch that opens a markdown file before a regular one (multi-file "Open
@@ -1223,7 +1229,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     }
     setActiveId(plan.tabId);
     return plan.tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const setOverrideLanguage = useCallback((id: number, lang: string | null) => {
     setTabs((curr) =>
@@ -1235,7 +1241,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const setMarkdownView = useCallback(
     (id: number, mode: "rendered" | "raw") => {
@@ -1273,7 +1279,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         }),
       );
     },
-    [],
+    [setTabs],
   );
 
   const openGitDiffTab = useCallback((input: GitDiffOpenInput, pin = false) => {
@@ -1292,7 +1298,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     }
     setActiveId(plan.targetId);
     return plan.targetId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const openCommitHistoryTab = useCallback(
     (input: { repoRoot: string; branch?: string | null }) => {
@@ -1311,7 +1317,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId(plan.targetId);
       return plan.targetId;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const openCommitFileDiffTab = useCallback(
@@ -1360,7 +1366,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId(id);
       return id;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const closeTab = useCallback((id: number) => {
@@ -1377,7 +1383,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       return next;
     });
     for (const lid of toDispose) disposeSession(lid);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const closeTabs = useCallback(
     (anchorId: number, plan: CloseTabsPlan): number[] => {
@@ -1390,7 +1396,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       for (const leafId of result.disposeLeafIds) disposeSession(leafId);
       return result.closeIds;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const updateTab = useCallback((id: number, patch: TabPatch) => {
@@ -1443,14 +1449,14 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const selectByIndex = useCallback(
     (idx: number, spaceId?: string) => {
       const t = spaceId ? pickTabBySpaceIndex(tabs, idx, spaceId) : tabs[idx];
       if (t) setActiveId(t.id);
     },
-    [tabs],
+    [tabs, setActiveId],
   );
 
   /** Update a leaf's cwd; mirror to the tab's `cwd` when the leaf is active.
@@ -1472,7 +1478,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       });
       return changed ? next : curr;
     });
-  }, []);
+  }, [setTabs]);
 
   const focusPane = useCallback((tabId: number, leafId: number) => {
     setTabs((curr) =>
@@ -1489,7 +1495,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const focusNextPaneInTab = useCallback((tabId: number, delta: 1 | -1) => {
     setTabs((curr) =>
@@ -1506,7 +1512,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   /** Focus the pane next to the active one in a direction (live layout). */
   const focusPaneInDirection = useCallback(
@@ -1531,7 +1537,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         }),
       );
     },
-    [],
+    [setTabs],
   );
 
   /** Shows the active pane alone, or the whole split again. */
@@ -1545,7 +1551,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         return { ...t, zoomedLeafId: t.activeLeafId };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const swapActivePaneInDirection = useCallback(
     (tabId: number, direction: PaneDirection, bounds?: PaneBounds[]) => {
@@ -1562,7 +1568,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         }),
       );
     },
-    [],
+    [setTabs],
   );
 
   /** Split the active leaf of `tabId` along `dir`. Returns the new leaf id. */
@@ -1594,7 +1600,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       );
       return newLeafId;
     },
-    [],
+    [setTabs],
   );
 
   /**
@@ -1640,7 +1646,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId(destinationTabId);
       return plan.leaf.id;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   /**
@@ -1670,7 +1676,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId(newTabId);
       return { tabId: newTabId, leafId: moved };
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const closePaneByLeaf = useCallback((leafId: number): void => {
@@ -1708,7 +1714,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       );
     });
     if (didRemove) disposeSession(leafId);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const closeActivePane = useCallback((tabId: number): boolean => {
     let closedTab = false;
@@ -1744,11 +1750,11 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     });
     if (removedLeaf !== null) disposeSession(removedLeaf);
     return closedTab;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const reorderTabByGap = useCallback((fromId: number, toGapIndex: number) => {
     setTabs((prev) => reorderTabsByGap(prev, fromId, toGapIndex));
-  }, []);
+  }, [setTabs]);
 
   return {
     tabs,
