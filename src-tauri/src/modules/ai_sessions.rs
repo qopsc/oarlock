@@ -48,10 +48,86 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+fn check_state_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!("State directory is not a plain directory: {}", path.display())),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn state_directory(path: &Path, create: bool) -> Result<cap_std::fs::Dir, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    check_state_directory(path)?;
+    if create { fs::create_dir_all(path).map_err(|e| e.to_string())?; }
+    let file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path).map_err(|e| e.to_string())?;
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+#[cfg(not(unix))]
+fn state_directory(_: &Path, _: bool) -> Result<cap_std::fs::Dir, String> {
+    Err("Safe conversation storage is unavailable on this platform".into())
+}
+
+fn state_file(path: &Path) -> std::io::Result<fs::File> {
+    let file = super::fs::open_store_file(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata()?.nlink() != 1 {
+            return Err(std::io::Error::other("State file has additional hard links"));
+        }
+    }
+    Ok(file)
+}
+
+fn verify_state_entry(path: &Path) -> Result<(), String> {
+    match state_file(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => Ok(()),
+        Err(error) => Err(format!("Cannot safely open state file {}: {error}", path.display())),
+    }
+}
+
+fn rename_state_entry(path: &Path, target: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("missing state directory")?;
+    if target.parent() != Some(parent) { return Err("state rename left its directory".into()); }
+    let owner = state_directory(parent, false)?;
+    verify_state_entry(path)?;
+    verify_state_entry(target)?;
+    owner.rename(path.file_name().ok_or("missing state name")?, &owner,
+        target.file_name().ok_or("missing state name")?).map_err(|e| e.to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_new_state(owner: &cap_std::fs::Dir, source: &std::ffi::OsStr, target: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+    let source = std::ffi::CString::new(source.as_bytes()).map_err(std::io::Error::other)?;
+    let target = std::ffi::CString::new(target.as_bytes()).map_err(std::io::Error::other)?;
+    let fd = owner.as_raw_fd();
+    #[cfg(target_os = "macos")]
+    let result = unsafe { libc::renameatx_np(fd, source.as_ptr(), fd, target.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let result = unsafe { libc::renameat2(fd, source.as_ptr(), fd, target.as_ptr(), libc::RENAME_NOREPLACE) };
+    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_new_state(_: &cap_std::fs::Dir, _: &std::ffi::OsStr, _: &std::ffi::OsStr) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Atomic state publication is unavailable"))
+}
+
 fn message_path(root: &Path, id: &str) -> Result<PathBuf, String> {
     if !valid_id(id) {
         return Err("invalid conversation id".into());
     }
+    check_state_directory(root)?;
+    check_state_directory(&root.join("conversations"))?;
     Ok(root
         .join("conversations")
         .join(format!("session-{id}.json")))
@@ -100,11 +176,14 @@ enum Stored {
 }
 
 fn read_stored(path: &Path) -> Result<Stored, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Stored::Missing),
+    let file = match state_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => return Ok(Stored::Missing),
         Err(error) => return Err(error.to_string()),
     };
+    let mut bytes = Vec::new();
+    file.take(MAX_CONVERSATION_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_CONVERSATION_BYTES {
         return Err("conversation is too large to open".into());
     }
@@ -128,7 +207,7 @@ fn read_messages(root: &Path, id: &str) -> Result<Option<Vec<u8>>, String> {
         Stored::Valid(bytes) => return Ok(Some(bytes)),
         Stored::Missing => {}
         Stored::Invalid(reason) => {
-            let moved = fs::rename(&path, quarantine_path(&path));
+            let moved = rename_state_entry(&path, &quarantine_path(&path));
             log::warn!("conversation {id} is unreadable ({reason}); quarantined: {moved:?}");
             damage = Some(reason);
         }
@@ -153,7 +232,7 @@ fn read_messages(root: &Path, id: &str) -> Result<Option<Vec<u8>>, String> {
         }
         Stored::Missing => damage.map_or(Ok(None), |reason| Err(format!("corrupt: {reason}"))),
         Stored::Invalid(reason) => {
-            let moved = fs::rename(&backup, quarantine_path(&backup));
+            let moved = rename_state_entry(&backup, &quarantine_path(&backup));
             log::warn!("conversation {id} backup is unreadable ({reason}); quarantined: {moved:?}");
             Err(format!("corrupt: {}", damage.unwrap_or(reason)))
         }
@@ -163,8 +242,7 @@ fn read_messages(root: &Path, id: &str) -> Result<Option<Vec<u8>>, String> {
 fn message_file_is_valid(root: &Path, id: &str) -> bool {
     message_path(root, id)
         .ok()
-        .and_then(|path| fs::read(path).ok())
-        .is_some_and(|bytes| validate_conversation(&bytes).is_ok())
+        .is_some_and(|path| matches!(read_stored(&path), Ok(Stored::Valid(_))))
 }
 
 #[derive(Clone, Copy)]
@@ -218,7 +296,8 @@ fn routine_sync(file: &fs::File) -> std::io::Result<()> {
 
 fn atomic_write(path: &Path, bytes: &[u8], commit: Commit) -> Result<(), String> {
     let parent = path.parent().ok_or("missing conversation directory")?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let _owner = state_directory(parent, true)?;
+    verify_state_entry(path)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     temporary.write_all(bytes).map_err(|e| e.to_string())?;
     commit_file(temporary, path, commit)
@@ -238,6 +317,13 @@ fn commit_with(
     commit: Commit,
     flush: impl Fn(&fs::File, Flush) -> std::io::Result<()>,
 ) -> Result<(), String> {
+    let parent = path.parent().ok_or("missing conversation directory")?;
+    let owner = state_directory(parent, false)?;
+    if temporary.path().parent() != Some(parent) { return Err("Temporary state file is outside its directory".into()); }
+    let name = path.file_name().ok_or("missing state name")?;
+    let temporary_name = temporary.path().file_name().ok_or("missing temporary state name")?;
+    verify_state_entry(path)?;
+    if commit.keep_previous { verify_state_entry(&backup_path(path))?; }
     let level = if commit.durable {
         Flush::Full
     } else {
@@ -246,18 +332,17 @@ fn commit_with(
     flush(temporary.as_file(), level).map_err(|e| e.to_string())?;
     if commit.replace {
         if commit.keep_previous {
-            keep_previous(path);
+            keep_previous(&owner, path);
         }
-        temporary.persist(path).map_err(|e| e.error.to_string())?;
-    } else if let Err(error) = temporary.persist_noclobber(path) {
-        if error.error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.error.to_string());
+        owner.rename(temporary_name, &owner, name).map_err(|e| e.to_string())?;
+    } else if let Err(error) = rename_new_state(&owner, temporary_name, name) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.to_string());
         }
     }
     #[cfg(unix)]
     if commit.durable {
-        fs::File::open(path.parent().ok_or("missing conversation directory")?)
-            .and_then(|directory| directory.sync_all())
+        owner.into_std_file().sync_all()
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -267,11 +352,11 @@ fn commit_with(
 /// rename, not a copy, so it costs no data. A file that is not plausibly a
 /// complete array (empty, torn) is left alone: it must not push a good backup
 /// out. Failing to keep the previous version never fails the save.
-fn keep_previous(path: &Path) {
+fn keep_previous(owner: &cap_std::fs::Dir, path: &Path) {
     if !looks_complete(path) {
         return;
     }
-    if let Err(error) = fs::rename(path, backup_path(path)) {
+    if let Err(error) = owner.rename(path.file_name().unwrap_or_default(), owner, backup_path(path).file_name().unwrap_or_default()) {
         log::warn!("could not keep the previous version of {path:?}: {error}");
     }
 }
@@ -280,7 +365,7 @@ fn keep_previous(path: &Path) {
 /// reading a multi-megabyte conversation.
 fn looks_complete(path: &Path) -> bool {
     const EDGE: u64 = 64;
-    let Ok(mut file) = fs::File::open(path) else {
+    let Ok(mut file) = state_file(path) else {
         return false;
     };
     let Ok(length) = file.metadata().map(|m| m.len()) else {
@@ -302,10 +387,13 @@ fn looks_complete(path: &Path) -> bool {
 /// verified, so an interrupted run can still be recovered by hand.
 fn ensure_backup(root: &Path) -> Result<(), String> {
     let backup = root.join(LEGACY_BACKUP);
-    if backup.exists() {
-        return Ok(());
+    let _owner = state_directory(root, false)?;
+    match state_file(&backup) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.to_string()),
     }
-    let mut legacy = fs::File::open(root.join(LEGACY_STORE)).map_err(|e| e.to_string())?;
+    let mut legacy = state_file(&root.join(LEGACY_STORE)).map_err(|e| e.to_string())?;
     let mut temporary = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
     std::io::copy(&mut legacy, temporary.as_file_mut()).map_err(|e| e.to_string())?;
     commit_file(
@@ -388,14 +476,16 @@ fn write_messages(
 /// a conversation does not leave its text behind in the backup.
 fn scrub_backup(root: &Path, id: &str) -> Result<(), String> {
     let backup = root.join(LEGACY_BACKUP);
-    let bytes = match fs::read(&backup) {
-        Ok(bytes) => bytes,
+    let mut file = match state_file(&backup) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     let Ok(mut entries) = serde_json::from_slice::<Map<String, Value>>(&bytes) else {
         // An unreadable backup cannot be edited; it must not outlive the data.
-        return fs::remove_file(&backup).map_err(|e| e.to_string());
+        return remove_backup(root).map(|_| ());
     };
     if entries
         .remove(&format!("{LEGACY_KEY_PREFIX}{id}"))
@@ -407,7 +497,7 @@ fn scrub_backup(root: &Path, id: &str) -> Result<(), String> {
         .keys()
         .all(|key| !key.starts_with(LEGACY_KEY_PREFIX))
     {
-        return fs::remove_file(&backup).map_err(|e| e.to_string());
+        return remove_backup(root).map(|_| ());
     }
     let rewritten = serde_json::to_vec(&entries).map_err(|e| e.to_string())?;
     atomic_write(
@@ -424,13 +514,17 @@ fn scrub_backup(root: &Path, id: &str) -> Result<(), String> {
 fn delete_messages(root: &Path, id: &str) -> Result<(), String> {
     let path = message_path(root, id)?;
     let backup = backup_path(&path);
-    for target in [
+    let targets = [
         quarantine_path(&path),
         quarantine_path(&backup),
         backup,
         path,
-    ] {
-        match fs::remove_file(target) {
+    ];
+    if !root.join("conversations").exists() { return scrub_backup(root, id); }
+    let owner = state_directory(&root.join("conversations"), false)?;
+    for target in &targets { verify_state_entry(target)?; }
+    for target in targets {
+        match owner.remove_file(target.file_name().ok_or("missing state name")?) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
@@ -487,11 +581,13 @@ impl<'de> Deserialize<'de> for IsArray {
 /// files: valid ids whose stored value is an array. `None` when the copy
 /// exists but cannot be read, so nothing can be verified against it.
 fn legacy_conversation_ids(root: &Path) -> Result<Option<Vec<String>>, String> {
-    let bytes = match fs::read(root.join(LEGACY_BACKUP)) {
-        Ok(bytes) => bytes,
+    let mut file = match state_file(&root.join(LEGACY_BACKUP)) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
         Err(error) => return Err(error.to_string()),
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     let Ok(entries) = serde_json::from_slice::<std::collections::HashMap<String, IsArray>>(&bytes)
     else {
         return Ok(None);
@@ -525,7 +621,9 @@ fn finish_migration(root: &Path, ids: &[String]) -> Result<bool, String> {
 }
 
 fn remove_backup(root: &Path) -> Result<bool, String> {
-    match fs::remove_file(root.join(LEGACY_BACKUP)) {
+    verify_state_entry(&root.join(LEGACY_BACKUP))?;
+    let owner = state_directory(root, false)?;
+    match owner.remove_file(LEGACY_BACKUP) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.to_string()),
@@ -535,7 +633,7 @@ fn remove_backup(root: &Path) -> Result<bool, String> {
 /// Backups left by an earlier build, where nothing is waiting to migrate, are
 /// removed once they are old enough.
 fn prune_backup(root: &Path, max_age: Duration, now: SystemTime) -> Result<bool, String> {
-    let modified = match fs::metadata(root.join(LEGACY_BACKUP)).and_then(|m| m.modified()) {
+    let modified = match state_file(&root.join(LEGACY_BACKUP)).and_then(|file| file.metadata()).and_then(|m| m.modified()) {
         Ok(modified) => modified,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
@@ -668,6 +766,66 @@ pub async fn ai_session_prune_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn conversation_storage_refuses_linked_directories_and_entries() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target.json");
+        fs::write(&target, b"[1]").unwrap();
+        symlink(outside.path(), root.path().join("conversations")).unwrap();
+        assert!(read_messages(root.path(), "test").is_err());
+        assert!(write_messages(root.path(), "test", b"[2]", false, false).is_err());
+        assert!(delete_messages(root.path(), "test").is_err());
+        fs::remove_file(root.path().join("conversations")).unwrap();
+        fs::create_dir(root.path().join("conversations")).unwrap();
+        let entry = message_path(root.path(), "test").unwrap();
+        for hard in [false, true] {
+            if hard { fs::hard_link(&target, &entry).unwrap(); }
+            else { symlink(&target, &entry).unwrap(); }
+            assert!(read_messages(root.path(), "test").is_err());
+            assert!(write_messages(root.path(), "test", b"[2]", false, false).is_err());
+            assert!(delete_messages(root.path(), "test").is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"[1]");
+            fs::remove_file(&entry).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversation_backup_operations_refuse_linked_entries() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("backup.json");
+        fs::write(&target, b"{}").unwrap();
+        let backup = root.path().join(LEGACY_BACKUP);
+        for hard in [false, true] {
+            if hard { fs::hard_link(&target, &backup).unwrap(); }
+            else { symlink(&target, &backup).unwrap(); }
+            assert!(ensure_backup(root.path()).is_err());
+            assert!(scrub_backup(root.path(), "test").is_err());
+            assert!(legacy_conversation_ids(root.path()).is_err());
+            assert!(remove_backup(root.path()).is_err());
+            assert!(prune_backup(root.path(), Duration::ZERO, SystemTime::now()).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"{}");
+            fs::remove_file(&backup).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_migration_publishes_one_link_without_temporary_aliases() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(LEGACY_STORE), b"{}").unwrap();
+        write_messages(root.path(), "test", b"[1]", true, true).unwrap();
+        let path = message_path(root.path(), "test").unwrap();
+        assert_eq!(fs::metadata(path).unwrap().nlink(), 1);
+        assert_eq!(fs::read_dir(root.path().join("conversations")).unwrap().count(), 1);
+    }
 
     fn json(text: &str) -> Vec<u8> {
         text.as_bytes().to_vec()
