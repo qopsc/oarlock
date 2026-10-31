@@ -18,7 +18,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -113,10 +112,8 @@ fn write_registry(path: &Path, windows: &[String]) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&RegistryFile {
         windows: windows.to_vec(),
     })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(&bytes)?;
-    temporary.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    super::fs::native_store::write(path, &bytes, 64 * 1024, |_| Ok(()))
+        .map_err(std::io::Error::other)
 }
 
 /// What to reopen at launch, from the list saved at quit.
@@ -818,6 +815,19 @@ pub fn app_quit_ready(app: AppHandle, window: tauri::Window, round: u64, ticket:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_save_refuses_a_symlink_and_preserves_its_target() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(REGISTRY_FILE);
+        let target = root.path().join("other.json");
+        fs::write(&target, b"keep").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(write_registry(&path, &["main".into()]).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"keep");
+    }
 
     fn labels(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()

@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -72,6 +72,9 @@ fn key_of(file_name: &str) -> Option<&str> {
 }
 
 fn create_directory(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::other("Scrollback directory is a symbolic link"));
+    }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -82,8 +85,37 @@ fn create_directory(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
-fn remove_if_present(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
+fn validate_root(root: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err("Window state root is not a plain directory".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+#[cfg(not(unix))]
+fn open_directory(_: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Safe scrollback access is unavailable"))
+}
+
+fn remove_if_present(root: &Path, key: &str) -> Result<(), String> {
+    let path = scrollback_path(root, key)?;
+    let dir = match open_directory(&directory(root)) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    match dir.remove_file(path.file_name().ok_or("missing scrollback name")?) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
@@ -92,6 +124,7 @@ fn remove_if_present(path: &Path) -> Result<(), String> {
 
 /// Replaces the pane's file; an empty body deletes it.
 fn save(root: &Path, key: &str, bytes: &[u8]) -> Result<(), String> {
+    validate_root(root)?;
     let path = scrollback_path(root, key)?;
     if bytes.len() > MAX_SCROLLBACK_BYTES {
         return Err(format!(
@@ -100,40 +133,21 @@ fn save(root: &Path, key: &str, bytes: &[u8]) -> Result<(), String> {
         ));
     }
     if bytes.is_empty() {
-        return remove_if_present(&path);
+        return remove_if_present(root, key);
     }
     std::str::from_utf8(bytes).map_err(|_| "scrollback must be UTF-8 text")?;
+    create_directory(root).map_err(|e| e.to_string())?;
     let parent = path.parent().ok_or("missing scrollback directory")?;
     create_directory(parent).map_err(|e| e.to_string())?;
-    // tempfile creates the file with mode 0600 on Unix, and the rename keeps it.
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    temporary.write_all(bytes).map_err(|e| e.to_string())?;
-    temporary.persist(&path).map_err(|e| e.error.to_string())?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_regular(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_regular(path: &Path) -> std::io::Result<fs::File> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::other("scrollback file is a link"));
-    }
-    fs::File::open(path)
+    super::fs::native_store::write_private(&path, bytes, MAX_SCROLLBACK_BYTES as u64, |_| Ok(()))
 }
 
 /// The stored bytes, empty when the pane has none. A link or a directory in
 /// the file's place reads as no history; it is never followed.
 fn load(root: &Path, key: &str) -> Result<Vec<u8>, String> {
+    validate_root(root)?;
     let path = scrollback_path(root, key)?;
-    let file = match open_regular(&path) {
+    let file = match super::fs::open_store_file(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -162,6 +176,7 @@ fn load(root: &Path, key: &str) -> Result<Vec<u8>, String> {
 /// by an interrupted save, and returns how many went. Subdirectories are left
 /// alone: nothing here creates them.
 fn retain(root: &Path, keys: &[String]) -> Result<usize, String> {
+    validate_root(root)?;
     if keys.len() > MAX_RETAINED_KEYS {
         return Err("too many scrollback keys".into());
     }
@@ -170,11 +185,12 @@ fn retain(root: &Path, keys: &[String]) -> Result<usize, String> {
         .map(String::as_str)
         .filter(|key| valid_key(key))
         .collect();
-    let entries = match fs::read_dir(directory(root)) {
-        Ok(entries) => entries,
+    let dir = match open_directory(&directory(root)) {
+        Ok(dir) => dir,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error.to_string()),
     };
+    let entries = dir.entries().map_err(|e| e.to_string())?;
     let mut removed = 0;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -190,13 +206,28 @@ fn retain(root: &Path, keys: &[String]) -> Result<usize, String> {
         if file_type.is_dir() {
             continue;
         }
-        match fs::remove_file(entry.path()) {
+        match dir.remove_file(&name) {
             Ok(()) => removed += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!("could not remove stale scrollback {name:?}: {error}"),
         }
     }
     Ok(removed)
+}
+
+fn checked_window_root(root: &Path, label: &str) -> Result<PathBuf, String> {
+    validate_root(root)?;
+    if label != windows::MAIN {
+        for path in [root.join("windows"), windows::data_root(root, label)] {
+            match fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Ok(_) => return Err("Window state directory is not a plain directory".into()),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    Ok(windows::data_root(root, label))
 }
 
 /// The calling window's scrollback lives under this root.
@@ -206,7 +237,7 @@ fn data_dir(app: &tauri::AppHandle, webview: &tauri::Webview) -> Result<PathBuf,
         return Err("scrollback is kept for open app windows only".into());
     }
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(windows::data_root(&root, label))
+    checked_window_root(&root, label)
 }
 
 /// Body: the scrollback as UTF-8 bytes; empty deletes it. Header
@@ -427,16 +458,65 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
         assert!(load(root.path(), "linked").unwrap().is_empty());
-        save(root.path(), "linked", b"history").unwrap();
+        assert!(save(root.path(), "linked", b"history").is_err());
         assert_eq!(
             fs::read(&outside).unwrap(),
             b"secret",
             "the target is untouched"
         );
-        assert_eq!(load(root.path(), "linked").unwrap(), b"history");
+        assert!(load(root.path(), "linked").unwrap().is_empty());
 
         std::os::unix::fs::symlink(&outside, directory(root.path()).join("other.vt")).unwrap();
         assert_eq!(retain(root.path(), &[]).unwrap(), 2);
         assert_eq!(fs::read(&outside).unwrap(), b"secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_scrollback_or_window_directories_cannot_redirect_operations() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("pane.vt");
+        fs::write(&target, b"private").unwrap();
+        symlink(outside.path(), directory(root.path())).unwrap();
+        assert!(load(root.path(), "pane").unwrap().is_empty());
+        assert!(save(root.path(), "pane", b"changed").is_err());
+        assert!(save(root.path(), "pane", b"").is_err());
+        assert!(retain(root.path(), &[]).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"private");
+
+        let linked_root = root.path().join("window");
+        symlink(outside.path(), &linked_root).unwrap();
+        assert!(load(&linked_root, "pane").is_err());
+        assert!(save(&linked_root, "pane", b"changed").is_err());
+        assert!(retain(&linked_root, &[]).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_windows_parent_is_refused_before_access() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("w-1")).unwrap();
+        symlink(outside.path(), root.path().join("windows")).unwrap();
+        assert!(checked_window_root(root.path(), "w-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_never_opened_as_scrollback() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        create_directory(&directory(root.path())).unwrap();
+        let fifo = scrollback_path(root.path(), "pipe").unwrap();
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = root.path().to_path_buf();
+        std::thread::spawn(move || { let _ = tx.send(load(&path, "pipe")); });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap().is_empty());
     }
 }

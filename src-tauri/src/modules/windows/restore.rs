@@ -8,6 +8,7 @@ use super::{
 use crate::modules::fs::access_control::AccessControl;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use cap_std::fs::Dir;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -33,6 +34,24 @@ fn fail(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
 
+#[cfg(unix)]
+fn pin_root(root: &Path) -> io::Result<Dir> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(unix))]
+fn pin_root(_: &Path) -> io::Result<Dir> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Safe window-state storage is unavailable"))
+}
+
+fn relative<'a>(root: &Path, path: &'a Path) -> io::Result<&'a Path> {
+    path.strip_prefix(root).map_err(|_| fail("Window state path left its root"))
+}
+
 // Hash incrementally: adoption does not load scrollback into memory. Names are
 // length-framed and sorted; links/special files are refused, never traversed.
 fn fingerprint(path: &Path) -> io::Result<Option<String>> {
@@ -44,7 +63,7 @@ fn fingerprint(path: &Path) -> io::Result<Option<String>> {
         if meta.is_file() {
             hash.update(b"file");
             hash.update(meta.len().to_le_bytes());
-            let mut file = File::open(path)?;
+            let mut file = crate::modules::fs::open_store_file(path)?;
             let mut bytes = [0; 64 * 1024];
             loop {
                 let n = file.read(&mut bytes)?;
@@ -108,7 +127,12 @@ fn read_json(path: &Path) -> io::Result<Option<serde_json::Value>> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
-        Ok(meta) if meta.is_file() => Ok(Some(serde_json::from_slice(&fs::read(path)?)?)),
+        Ok(meta) if meta.is_file() => {
+            let mut file = crate::modules::fs::open_store_file(path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(serde_json::from_slice(&bytes)?))
+        },
         Ok(_) => Err(fail(format!(
             "Expected a regular state file: {}",
             path.display()
@@ -149,6 +173,7 @@ fn validate_source_directories(root: &Path, from: &str) -> io::Result<()> {
     Ok(())
 }
 fn prepare(root: &Path, plan: &RestorePlan) -> io::Result<()> {
+    let owner = pin_root(root)?;
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(io::Error::new(io::ErrorKind::Unsupported,
             "Safe window-state migration requires private staging and metadata preservation, which are not supported on this platform yet"));
@@ -209,23 +234,26 @@ fn prepare(root: &Path, plan: &RestorePlan) -> io::Result<()> {
         None,
     )?;
     sync_dir(journal)?;
-    fs::rename(journal, root.join(JOURNAL))?;
-    sync_dir(root)
+    owner.rename(relative(root, journal)?, &owner, JOURNAL)?;
+    owner.into_std_file().sync_all()
 }
 fn move_durable(
+    owner: &Dir,
+    root: &Path,
     from: &Path,
     to: &Path,
     checkpoint: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
-    fs::rename(from, to)?;
-    sync_dir(from.parent().ok_or_else(|| fail("Missing source parent"))?)?;
-    sync_dir(
-        to.parent()
-            .ok_or_else(|| fail("Missing destination parent"))?,
-    )?;
+    owner.rename(relative(root, from)?, owner, relative(root, to)?)?;
+    for parent in [from.parent(), to.parent()] {
+        let parent = parent.ok_or_else(|| fail("Missing state parent"))?;
+        let path = relative(root, parent)?;
+        owner.open_dir(if path.as_os_str().is_empty() { Path::new(".") } else { path })?.into_std_file().sync_all()?;
+    }
     checkpoint()
 }
 fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let owner = pin_root(root)?;
     let journal = root.join(JOURNAL);
     match fs::symlink_metadata(&journal) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -264,11 +292,11 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
                         destination.display()
                     )));
                 }
-                move_durable(destination, &backup, checkpoint)?;
+                move_durable(&owner, root, destination, &backup, checkpoint)?;
             }
             match (fingerprint(source)?, fingerprint(destination)?) {
                 (Some(current), None) if Some(current.as_str()) == item.source.as_deref() => {
-                    move_durable(source, destination, checkpoint)?
+                    move_durable(&owner, root, source, destination, checkpoint)?
                 }
                 (None, current) if current == item.source => (),
                 _ => {
@@ -290,13 +318,15 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
         }
         // A crash can leave an incomplete pre-commit marker. It contains no
         // user state and is rebuilt only after validating every published item.
-        match fs::remove_file(journal.join("commit-ready")) {
+        match owner.remove_file(relative(root, &journal.join("commit-ready"))?) {
             Ok(()) => (),
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e),
         }
         write_new(&journal.join("commit-ready"), b"committed\n", None)?;
         move_durable(
+            &owner,
+            root,
             &journal.join("commit-ready"),
             &journal.join("committed"),
             checkpoint,
@@ -309,8 +339,8 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
     let retired = tempfile::Builder::new()
         .prefix(".oarlock-restore-retired-")
         .tempdir_in(root)?;
-    fs::rename(&journal, retired.path())?;
-    sync_dir(root)?;
+    owner.rename(relative(root, &journal)?, &owner, relative(root, retired.path())?)?;
+    owner.try_clone()?.into_std_file().sync_all()?;
     // A failed cleanup keeps backups in a private retired directory, harmless to
     // subsequent launches. It must not prevent opening fully committed state.
     if let Err(error) = retired.close() {
@@ -321,6 +351,7 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
 
 pub(super) fn run(root: &Path) -> io::Result<RestorePlan> {
     fs::create_dir_all(root)?;
+    let _owner = pin_root(root)?;
     let result: io::Result<RestorePlan> = (|| {
         recover(root, &mut || Ok(()))?;
         let plan = restore_plan(read_registry(&root.join(REGISTRY_FILE))?);

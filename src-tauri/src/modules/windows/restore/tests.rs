@@ -248,6 +248,18 @@ fn source_directory_alias_does_not_move_external_state() {
 
 #[cfg(unix)]
 #[test]
+fn a_linked_state_root_cannot_start_restoration() {
+    let root = fixture();
+    let wrapper = tempfile::tempdir().unwrap();
+    let alias = wrapper.path().join("linked-root");
+    std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+    assert!(run(&alias).is_err());
+    assert_eq!(fs::read_to_string(root.path().join("oarlock-spaces.json")).unwrap(), "old spaces");
+    assert_eq!(fs::read_to_string(root.path().join("windows/w-a/oarlock-spaces.json")).unwrap(), "saved spaces");
+}
+
+#[cfg(unix)]
+#[test]
 fn ordinary_launch_does_not_replace_the_saved_registry() {
     use std::os::unix::fs::MetadataExt;
     let dir = fixture();

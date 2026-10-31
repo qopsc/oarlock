@@ -19,13 +19,49 @@ struct Work {
     entries: Vec<DiscardEntry>,
 }
 impl Work {
-    fn execute(&self, registry: &WorkspaceRegistry) -> Result<(), String> {
+    fn execute(&self, registry: &WorkspaceRegistry, guard: &impl Fn(&std::path::Path) -> Result<(), String>) -> Result<(), String> {
         let repo = self
             .repo
             .as_ref()
             .ok_or("Prepared repository ownership is missing")?;
+        for entry in &self.entries {
+            let path = utils::git_worktree_entry(&repo.local_path, &entry.path).map_err(|e| e.to_string())?;
+            guard_tree(&path, guard)?;
+        }
         operations::discard_owned(registry, repo, &self.entries).map_err(|e| e.to_string())
     }
+}
+
+#[cfg(unix)]
+fn guard_tree(path: &std::path::Path, guard: &impl Fn(&std::path::Path) -> Result<(), String>) -> Result<(), String> {
+    use std::{fs, os::unix::fs::MetadataExt};
+    guard(path)?;
+    let mut pending = vec![path.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(current) = pending.pop() {
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !meta.is_dir() { continue; }
+        for entry in fs::read_dir(&current).map_err(|e| e.to_string())? {
+            visited += 1;
+            if visited > 32_768 { return Err("Too many discard entries to verify safely".into()); }
+            let entry = entry.map_err(|e| e.to_string())?;
+            let meta = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+            if meta.is_dir() { pending.push(entry.path()); }
+            else if meta.file_type().is_symlink() || meta.is_file() && meta.nlink() > 1 {
+                guard(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn guard_tree(_: &std::path::Path, _: &impl Fn(&std::path::Path) -> Result<(), String>) -> Result<(), String> {
+    Err("Safe Git discard checks are unavailable on this platform".into())
 }
 #[derive(Clone, Serialize)]
 struct Scope {
@@ -562,7 +598,7 @@ pub async fn execute(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            work.execute(&app.state::<WorkspaceRegistry>())
+            work.execute(&app.state::<WorkspaceRegistry>(), &|path| crate::modules::fs::native_store::refuse_write(&app, path))
         }))
         .unwrap_or_else(|_| {
             Err("Git Discard failed unexpectedly; editor drafts were retained".into())
@@ -927,7 +963,7 @@ mod identity_tests {
         .unwrap();
         fs::rename(&a, root.join("original-a")).unwrap();
         std::os::unix::fs::symlink(&b, &a).unwrap();
-        assert!(work.execute(&registry).is_err());
+        assert!(work.execute(&registry, &|_| Ok(())).is_err());
         assert_eq!(fs::read_to_string(b.join("file")).unwrap(), "keep B edits");
     }
 
@@ -1001,13 +1037,42 @@ mod identity_tests {
         .unwrap();
         fs::rename(a.join(".git"), a.join("old-git")).unwrap();
         std::os::unix::fs::symlink(b.join(".git"), a.join(".git")).unwrap();
-        let result = work.execute(&registry);
+        let result = work.execute(&registry, &|_| Ok(()));
         assert!(
             result.is_err(),
             "discard succeeded using replacement metadata; A now contains {:?}",
             fs::read_to_string(a.join("file")).unwrap()
         );
         assert_eq!(fs::read_to_string(a.join("file")).unwrap(), "a draft");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn protected_file_is_not_discarded() {
+        let (_temp, repo, _other, registry) = repositories();
+        let (_, work) = plan(&registry, repo.to_str().unwrap().into(), vec![DiscardEntry {
+            path: "file".into(), untracked: false,
+        }], WorkspaceEnv::Local).unwrap();
+        let protected = repo.join("file");
+        assert!(work.execute(&registry, &|path| {
+            if path == protected { Err("Protected native store".into()) } else { Ok(()) }
+        }).is_err());
+        assert_eq!(fs::read_to_string(protected).unwrap(), "a draft");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn protected_alias_inside_discarded_folder_is_detected() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("untracked");
+        fs::create_dir(&folder).unwrap();
+        let protected = root.path().join("protected");
+        let alias = folder.join("alias");
+        fs::write(&protected, "keep").unwrap();
+        fs::hard_link(&protected, &alias).unwrap();
+        assert!(guard_tree(&folder, &|path| {
+            if path == alias { Err("Protected native store".into()) } else { Ok(()) }
+        }).is_err());
+        assert_eq!(fs::read_to_string(protected).unwrap(), "keep");
+        assert!(alias.exists());
     }
     #[cfg(unix)]
     #[test]

@@ -11,7 +11,6 @@ pub(crate) fn write(
     write_with_policy(path, bytes, limit, after_staging, false)
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) fn write_private(
     path: &Path,
     bytes: &[u8],
@@ -74,6 +73,7 @@ pub(crate) fn refuse_write(app: &tauri::AppHandle, target: &Path) -> Result<(), 
     let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let mut stores: Vec<PathBuf> = NATIVE_FILES.iter().map(|name| data.join(name)).collect();
     stores.push(app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("secrets.json"));
+    stores.push(app.path().app_config_dir().map_err(|e| e.to_string())?.join(".window-state.json"));
     stores.extend(crate::modules::agent::protected_settings_paths()?);
     check(target, &stores)?;
     check_trees(target, &[
