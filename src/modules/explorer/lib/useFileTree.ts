@@ -23,6 +23,7 @@ import {
 } from "./batchMove";
 import { refreshTargets } from "./refreshTargets";
 import { dirname } from "./treePaths";
+import { createDirectoryReadOrder } from "./directoryReadOrder";
 import { listenFsChanged, createFileWatchClient } from "./watch";
 import { createWatchRegistry, planVisibilityEdge } from "./watchRegistry";
 
@@ -132,6 +133,7 @@ export function useFileTree(rootPath: string | null, options?: Options) {
   const scopeKey = `${workspaceKey}\u0000${rootPath ?? ""}`;
   const scopeKeyRef = useRef(scopeKey);
   const scopeGenerationRef = useRef(0);
+  const [directoryReads] = useState(createDirectoryReadOrder);
   const conflictPromptsRef = useRef<Map<string | number, () => void>>(
     new Map(),
   );
@@ -154,17 +156,19 @@ export function useFileTree(rootPath: string | null, options?: Options) {
     if (scopeKeyRef.current !== scopeKey) {
       cancelConflictPrompts();
       scopeGenerationRef.current += 1;
+      directoryReads.reset();
     }
     scopeKeyRef.current = scopeKey;
-  }, [scopeKey, cancelConflictPrompts]);
+  }, [scopeKey, cancelConflictPrompts, directoryReads]);
 
   useEffect(
     () => () => {
       scopeKeyRef.current = "";
       scopeGenerationRef.current += 1;
+      directoryReads.reset();
       cancelConflictPrompts();
     },
-    [cancelConflictPrompts],
+    [cancelConflictPrompts, directoryReads],
   );
 
   useEffect(() => {
@@ -190,12 +194,14 @@ export function useFileTree(rootPath: string | null, options?: Options) {
     async (path: string) => {
       if (scopeKeyRef.current !== scopeKey) return false;
       const generation = scopeGenerationRef.current;
-      const isCurrent = () => generation === scopeGenerationRef.current;
+      const latest = directoryReads.begin(path);
+      const isCurrent = () => generation === scopeGenerationRef.current && latest();
       if (nodesRef.current[path]?.status !== "loaded") {
-        setNodes((s) => ({ ...s, [path]: { status: "loading" } }));
+        setNodes((s) => isCurrent() ? ({ ...s, [path]: { status: "loading" } }) : s);
       }
       try {
         await authorizationSettled(path, workspace);
+        if (!isCurrent()) return false;
         const entries = await invoke<DirEntry[]>("fs_read_dir", {
           path,
           showHidden: showHiddenRef.current,
@@ -235,6 +241,7 @@ export function useFileTree(rootPath: string | null, options?: Options) {
         }
 
         setNodes((s) => {
+          if (!isCurrent()) return s;
           const next: TreeState = {};
           for (const [k, v] of Object.entries(s)) if (!dead.has(k)) next[k] = v;
           next[path] = { status: "loaded", entries };
@@ -243,24 +250,25 @@ export function useFileTree(rootPath: string | null, options?: Options) {
 
         if (dead.size > 0) {
           setExpanded((c) => {
+            if (!isCurrent()) return c;
             let changed = false;
             const n = new Set(c);
             for (const d of dead) if (n.delete(d)) changed = true;
             return changed ? n : c;
           });
+          directoryReads.forget(dead);
           watches.removeMany([...dead]);
         }
         return true;
       } catch (e) {
         if (!isCurrent()) return false;
-        setNodes((s) => ({
-          ...s,
-          [path]: { status: "error", message: String(e) },
-        }));
+        setNodes((s) => {
+          return isCurrent() ? { ...s, [path]: { status: "error" as const, message: String(e) } } : s;
+        });
         return false;
       }
     },
-    [scopeKey, workspace, watches],
+    [scopeKey, workspace, watches, directoryReads],
   );
 
   // Root change → restore the cached expansion for this root, re-scope watches,
