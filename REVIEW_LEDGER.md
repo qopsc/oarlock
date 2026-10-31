@@ -4162,3 +4162,22 @@ Tab and active-tab changes now update the existing refs synchronously before sch
 ### R238: intermittent hard-link save refusal
 
 **MAJOR, fixed.** The agent-settings hard-link regression failed once in the full native run and passed in isolation. A real macOS probe concurrently opened two hard links to one file: `F_GETPATH` returned the other link's name in 2,099 of 20,000 reads. This was not established as shared temporary test state: the production validation incorrectly assumed an open file has one stable path. Agent settings now compare the opened file's identity with the requested directory entry; the shared conditional writer likewise matches the opened file against its pinned entry and validates the pinned destination, instead of relying on the file handle's reported hard-link name. Symlinks and changed identities remain refused, and the previously accepted final external-writer race remains best effort. Regressions cover changed identity, hard links in different directories, the original flaky case and existing symlink protections. The full macOS native suite passed (1,495 library tests, 4 ignored, plus integration suites); strict Clippy passed. Linux runtime validation of this adjustment remains outstanding.
+
+## Trust and authorization: 15-finding triage
+
+This pass checks current non-AI code and documentation. The six AI/MCP rows remain on hold and have not been re-reviewed; Windows remains a later port. Findings below marked source-confirmed still need the stated regression or end-to-end verification. No non-held row is claimed fixed or duplicate solely because related Git or Explorer work exists.
+
+| ID | Disposition / rank | Current evidence |
+| --- | --- | --- |
+| R022 | Open, Tier 2 | `authorize.ts` still caches a grant indefinitely by the requested spelling; native grants the resolved destination. A retargeted alias can therefore fail on a later explicit open. |
+| R029 | Accepted same-user race | `fs_open_default` reauthorizes after consent but does not bind the earlier classification to the opened file. Changing the already-checked file or permissions requires a concurrent external writer; the approved same-user race policy applies. |
+| R034 | Open, BLOCKER / security | `plan_repo_watch` authorizes the worktree but `git_dir_of` follows a `.git` pointer and the plan lists/stats its destination without calling the existing Git metadata authorization. A static untrusted repository can direct the watch outside its workspace. |
+| R067 | Open, Tier 1 / security | PTY write, resize, close and foreground queries still accept a process-wide ID without the owning webview check already used by cwd and drop commands. A cross-window IPC reproduction remains to be added. |
+| R073 | Windows port | The reported unverified cwd fallback is Windows-specific and outside this release's port scope. |
+| R120 | Open, Tier 1 | The integration-fixture Git runner still inherits `GIT_DIR`, `GIT_WORK_TREE` and related context. The production Git guard is separate and does not protect fixture setup. |
+| R121 | Open, Tier 2 | `SECURITY.md` and the security-model introduction claim no disk storage; README and the detailed Linux section describe the Linux user-only secrets file. Documentation disagrees without inspecting the held AI backend. |
+| R134, R139, R147, R156, R184, R185 | AI/MCP on hold | Not re-reviewed under the user's backend hold. |
+| R211 | Accepted same-user race | Formatter validation and launch still resolve a path separately. The reported redirection requires a concurrent external alias change; the approved same-user race policy applies. |
+| R216 | Open, Tier 1 pending validation | The plugin wrapper rejects protected names but does not inspect disk aliases. Whether a restricted component can create a useful alias without an independently acting same-user program has not been established; do not downgrade or claim exploitation yet. |
+
+Counts: 6 open non-held findings (including R034), 2 accepted external races, 1 Windows-port item, and 6 AI/MCP-held findings. R034 is a release blocker under the guaranteed untrusted-repository boundary; severity and reproduction for R067 and R216 remain subject to depth validation.
