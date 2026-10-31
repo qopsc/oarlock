@@ -4424,7 +4424,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R099 | Closed | Raster work checks its budget after any attempted queue item, including deferred glyphs. A regression checks yielding with all fonts still loading. |
 | R103 | Open, Tier 3 | Background image import decodes a static image before resizing or checking decoded dimensions; animated files bypass resizing. |
 | R104 | Closed | Theme TOML inline tables reject nesting deeper than 64 with a clear error; tests cover accepted and rejected boundaries. |
-| R107 | Open, Tier 3 | Shell history initialization uses whole-file reads, including a possible inherited FIFO, before checking file type or size. |
+| R107 | Closed | History reads open nonblocking, reject non-regular files and retain at most the latest 8 MiB per shell history. Tests exercise a real FIFO and discard a partial zsh continuation at the truncation boundary. |
 | R117 | Open, Tier 3 | The build-script capture helper buffers output without a byte cap and waits for inherited pipes after killing only its direct child. |
 | R133 | Closed | Earlier R216 conversation-storage work bounds reads before allocation; large-file stress testing was not performed. |
 | R137 | AI/MCP on hold | OAuth callback listener work is held with the backend. |
@@ -4444,7 +4444,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Open, Tier 3 | Theme batch upserts clone and repeatedly scan the catalog before the serialized size check. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **10 closed; 14 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **11 closed; 13 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4453,3 +4453,5 @@ Resource checkpoint: selected 16 KiB as the LSP header limit and 64 as the theme
 R011 policy: search stops collecting when hit text and paths would exceed 8 MiB, using the existing truncated indicator. The bound is on retained UTF-8 data, not the size of its later JSON encoding; serialization is still bounded by a constant multiple of that amount.
 
 R041: replacement output is bounded before joining, including in Vim’s fallback worker path. The Vim implementation preserves native JavaScript replacement semantics for captures, named groups, prefix/suffix tokens, zero-width matches and Unicode, with 420 compatibility combinations plus overflow tests. Pathological regex execution still uses the existing disposable-worker deadline.
+
+R107 policy: history indexing reads up to the newest 8 MiB per history file and discards the first potentially partial record; zsh continuation lines are skipped through their end. A normal symlink to a history file remains supported. Network filesystem operations can still block at the OS level.

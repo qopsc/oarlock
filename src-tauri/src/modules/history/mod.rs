@@ -4,7 +4,8 @@ mod parse;
 use index::HistoryIndex;
 use parse::{demetafy, parse_bash, parse_fish, parse_zsh};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,25 +30,75 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+const MAX_HISTORY_BYTES: u64 = 8 * 1024 * 1024;
+
+// Keep the newest complete records and never block on a pipe named as HISTFILE.
+fn read_history_tail(path: &Path, limit: u64, zsh: bool) -> io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "History path is not a regular file",
+        ));
+    }
+    let start = meta.len().saturating_sub(limit);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    if start > 0 {
+        let mut end = 0;
+        loop {
+            let Some(relative) = bytes[end..].iter().position(|&byte| byte == b'\n') else {
+                return Ok(Vec::new());
+            };
+            let newline = end + relative;
+            let line = bytes[end..newline]
+                .strip_suffix(b"\r")
+                .unwrap_or(&bytes[end..newline]);
+            let continued =
+                zsh && line.iter().rev().take_while(|&&byte| byte == b'\\').count() % 2 == 1;
+            end = newline + 1;
+            if !continued {
+                break;
+            }
+        }
+        bytes.drain(..end);
+    }
+    Ok(bytes)
+}
+
 fn read_histories() -> Vec<(String, i64)> {
     let mut all = Vec::new();
     let home = dirs::home_dir();
 
     let dotdir = zsh_dotdir();
     if let Some(path) = zsh_histfile(std::env::var_os("HISTFILE"), dotdir.as_ref(), home.as_ref()) {
-        if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(bytes) = read_history_tail(&path, MAX_HISTORY_BYTES, true) {
             let content = String::from_utf8_lossy(&demetafy(&bytes)).into_owned();
             all.extend(parse_zsh(&content));
         }
     }
     if let Some(home) = home.as_ref() {
-        if let Ok(content) = std::fs::read_to_string(home.join(".bash_history")) {
-            all.extend(parse_bash(&content));
+        if let Ok(bytes) = read_history_tail(&home.join(".bash_history"), MAX_HISTORY_BYTES, false)
+        {
+            if let Ok(content) = String::from_utf8(bytes) {
+                all.extend(parse_bash(&content));
+            }
         }
     }
     if let Some(path) = fish_histfile(std::env::var_os("XDG_DATA_HOME"), home.as_ref()) {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            all.extend(parse_fish(&content));
+        if let Ok(bytes) = read_history_tail(&path, MAX_HISTORY_BYTES, false) {
+            if let Ok(content) = String::from_utf8(bytes) {
+                all.extend(parse_fish(&content));
+            }
         }
     }
     all
@@ -282,6 +333,60 @@ pub async fn history_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_tail_keeps_recent_records_and_drops_partial_continuations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history");
+        std::fs::write(&path, b"old-command\\\ncontinued\nrecent\n").unwrap();
+        let bytes = read_history_tail(&path, 25, true).unwrap();
+        assert_eq!(bytes, b"recent\n");
+        assert_eq!(
+            read_history_tail(&path, 100, true).unwrap(),
+            b"old-command\\\ncontinued\nrecent\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_fifo_is_refused_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history-fifo");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(read_history_tail(&path, 1024, false).is_err())
+                .unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            let descriptor =
+                unsafe { libc::open(name.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if descriptor >= 0 {
+                unsafe {
+                    libc::close(descriptor);
+                }
+            }
+        }
+        assert!(result.unwrap());
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_to_a_regular_history_remains_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("real-history");
+        let link = directory.path().join("history-link");
+        std::fs::write(&target, b"echo hello\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_history_tail(&link, 1024, false).unwrap(), b"echo hello\n");
+    }
 
     #[test]
     fn only_cold_builds_leave_the_async_worker() {
