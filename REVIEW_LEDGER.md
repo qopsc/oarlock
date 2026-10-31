@@ -4213,3 +4213,9 @@ Current trust triage: R022, R034, R067, R120 and R121 fixed; R029 and R211 accep
 ### Focused Linux verification
 
 An offline Linux arm64 container compiled the current native source. On tmpfs, all five hard-link-filtered tests passed, including same-directory and cross-directory agent settings, identity replacement, and hard-link reconciliation. The unauthorized gitfile, valid linked-worktree watch, and terminal ownership regressions also passed. The first hard-link run used the container's overlay filesystem: three tests passed and two save tests refused because that filesystem is outside the ACL-preservation allowlist. The tmpfs rerun passed all five. The build emitted two existing Linux warnings. This is focused native validation, not a full Linux suite or packaged desktop test; WSL remains untested.
+
+### R026-U: overlay filesystem follow-up
+
+The Linux ACL check now accepts overlayfs as a POSIX-ACL filesystem, while still reading and verifying each file's ACL and extended attributes. A new conditional-save test on the container's actual overlay filesystem failed before this change and passes afterward, retaining file mode; the three focused ACL/extended-attribute tests also passed there, including a real nontrivial POSIX ACL round trip. macOS document-save tests and strict Clippy passed. The container reports two existing Linux warnings.
+
+**Still open:** this addresses the reported overlay filesystem, not every filesystem lacking ACL support. Other filesystems remain refused by the existing ACL-model allowlist because absence of a POSIX ACL xattr alone does not establish absence of a different native ACL model. The requested general per-file policy still needs an implementation that can distinguish those cases without losing access rules. No non-atomic fallback was added.

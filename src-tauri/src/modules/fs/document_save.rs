@@ -254,6 +254,24 @@ pub fn write_checked(
 mod tests {
     use super::*;
     use std::{io::Write, sync::Barrier};
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replacement_preserves_permissions_on_overlay_filesystem() {
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document");
+        fs::write(&path, b"base").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let mut state = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(unsafe { libc::fstatfs(file.as_raw_fd(), state.as_mut_ptr()) }, 0);
+        if unsafe { state.assume_init() }.f_type as u64 != 0x794c7630 {
+            return;
+        }
+        save(&path, b"draft", Some(&disk_version(&path))).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"draft");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+    }
     #[cfg(target_os = "macos")]
     #[test]
     fn replacement_preserves_quarantine_and_file_tags() {

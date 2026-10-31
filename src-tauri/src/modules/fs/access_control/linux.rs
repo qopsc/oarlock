@@ -11,7 +11,7 @@ pub fn read(file: &File) -> io::Result<Acl> {
         return Err(io::Error::last_os_error());
     }
     let kind = unsafe { state.assume_init() }.f_type as u64;
-    if !matches!(kind, 0xef53 | 0x58465342 | 0x9123683e | 0x01021994) {
+    if !matches!(kind, 0xef53 | 0x58465342 | 0x9123683e | 0x01021994 | 0x794c7630) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ACL preservation is not supported for this filesystem; file not replaced",
