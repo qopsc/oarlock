@@ -4193,3 +4193,7 @@ Oarlock no longer treats a requested path spelling as a permanent proof of its c
 ### R034: repository watch metadata authorization
 
 Repository watch planning now calls the same native Git metadata authorization used by Git operations before it lists or registers the Git directory. Tests refuse an external gitfile target and a `.git` symlink, accept separately authorized metadata, and retain verified linked-worktree support. Focused watch tests (25), the full macOS native suite (1,498 library tests, 4 ignored, plus integration suites) and strict Clippy passed. R034 is closed for the macOS release. WSL watch behavior with Linux-absolute gitfile paths has not been validated and remains part of the later Windows/WSL port; same-user changes after validation retain the accepted best-effort race.
+
+### R067: terminal operation ownership
+
+PTY write, resize, close and both foreground queries now check the calling webview against the session's existing owner, as cwd and path-drop commands already did. Close checks ownership and removes the entry under one registry lock; closing an already absent session remains idempotent. A native regression uses two real shell sessions to verify cross-window lookup/removal is refused and each owner can still access and close its own terminal. This test exercises the native ownership gate, not a packaged two-window IPC exploit. The focused test, full macOS native suite (1,499 library tests, 4 ignored, plus integration suites) and strict Clippy passed. R067 is closed for the established window-ownership contract.

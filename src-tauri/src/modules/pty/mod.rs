@@ -70,6 +70,26 @@ impl Default for PtyState {
 }
 
 impl PtyState {
+    fn owned(&self, id: u32, label: &str) -> Result<Arc<Session>, String> {
+        unpoisoned(self.sessions.read())
+            .get(&id)
+            .filter(|session| &*session.owner == label)
+            .cloned()
+            .ok_or_else(|| "no session".to_string())
+    }
+
+    fn take_owned(&self, id: u32, label: &str) -> Result<Option<Arc<Session>>, String> {
+        let session = {
+            let mut sessions = unpoisoned(self.sessions.write());
+            if sessions.get(&id).is_some_and(|session| &*session.owner != label) {
+                return Err("no session".into());
+            }
+            sessions.remove(&id)
+        };
+        if session.is_some() { self.hub.submit(Command::Unregister { id }); }
+        Ok(session)
+    }
+
     /// Removes a session from the registry and from the hub's delivery set.
     pub(super) fn take(&self, id: u32) -> Option<Arc<Session>> {
         let session = unpoisoned(self.sessions.write()).remove(&id);
@@ -287,6 +307,7 @@ pub async fn pty_open(
 // serialization of every keystroke on both sides of the IPC boundary.
 #[tauri::command]
 pub async fn pty_write(
+    webview: tauri::Webview,
     state: tauri::State<'_, PtyState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<(), String> {
@@ -299,13 +320,7 @@ pub async fn pty_write(
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("pty_write: expected raw body".to_string());
     };
-    let session = unpoisoned(state.sessions.read())
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| {
-            log::warn!("pty_write: unknown id={id}");
-            "no session".to_string()
-        })?;
+    let session = state.owned(id, webview.label())?;
     // One ordered queue per session feeds a dedicated writer thread: no task
     // spawn or lock per keystroke, and the result is the real pipe write's.
     session.write(bytes.clone()).await.map_err(|e| {
@@ -316,18 +331,13 @@ pub async fn pty_write(
 
 #[tauri::command]
 pub fn pty_resize(
+    webview: tauri::Webview,
     state: tauri::State<PtyState>,
     id: u32,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let session = unpoisoned(state.sessions.read())
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| {
-            log::warn!("pty_resize: unknown id={id}");
-            "no session".to_string()
-        })?;
+    let session = state.owned(id, webview.label())?;
     let result = session
         .resize(PtySize {
             rows,
@@ -343,10 +353,10 @@ pub fn pty_resize(
 }
 
 #[tauri::command]
-pub fn pty_close(state: tauri::State<PtyState>, id: u32) -> Result<(), String> {
+pub fn pty_close(webview: tauri::Webview, state: tauri::State<PtyState>, id: u32) -> Result<(), String> {
     // Detached drop: on Windows `ClosePseudoConsole` can block until conhost
     // drains, which would freeze this Tauri worker thread and stall IPC.
-    match state.take(id) {
+    match state.take_owned(id, webview.label())? {
         Some(session) => {
             log::info!("pty closed id={id}");
             reap(id, session, "close");
@@ -357,12 +367,8 @@ pub fn pty_close(state: tauri::State<PtyState>, id: u32) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn pty_has_foreground_process(state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
-    let sessions = unpoisoned(state.sessions.read());
-    let session = sessions.get(&id).ok_or_else(|| {
-        log::warn!("pty_has_foreground_process: unknown session id={id}");
-        "no session".to_string()
-    })?;
+pub fn pty_has_foreground_process(webview: tauri::Webview, state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
+    let session = state.owned(id, webview.label())?;
     let shell_pid = session.shell_pid;
     if shell_pid == 0 {
         return Ok(false);
@@ -375,12 +381,8 @@ pub fn pty_has_foreground_process(state: tauri::State<PtyState>, id: u32) -> Res
 // pty_has_foreground_process, which counts background children too. Windows
 // has no foreground group: there, a child built for the console subsystem.
 #[tauri::command]
-pub fn pty_has_foreground_job(state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
-    let sessions = unpoisoned(state.sessions.read());
-    let session = sessions.get(&id).ok_or_else(|| {
-        log::warn!("pty_has_foreground_job: unknown session id={id}");
-        "no session".to_string()
-    })?;
+pub fn pty_has_foreground_job(webview: tauri::Webview, state: tauri::State<PtyState>, id: u32) -> Result<bool, String> {
+    let session = state.owned(id, webview.label())?;
     let shell_pid = session.shell_pid;
     if shell_pid == 0 {
         return Ok(false);
@@ -815,6 +817,26 @@ mod tests {
         assert!(!survivor.queue_closed());
         if let Some(session) = state.take(2) {
             reap(2, session, "test cleanup");
+        }
+    }
+
+    #[test]
+    fn terminal_operations_require_the_owning_window() {
+        let state = Arc::new(PtyState::default());
+        let main = open_running(&state, 11, "main", "sleep 30");
+        let quick = open_running(&state, 12, "quick", "sleep 30");
+        // Write, resize and both foreground queries use owned(); close uses
+        // take_owned() under the same registry lock as removal.
+        assert!(state.owned(11, "quick").is_err());
+        assert!(state.owned(12, "main").is_err());
+        assert!(state.take_owned(11, "quick").is_err());
+        assert!(state.take_owned(12, "main").is_err());
+        assert!(Arc::ptr_eq(&state.owned(11, "main").unwrap(), &main));
+        assert!(Arc::ptr_eq(&state.owned(12, "quick").unwrap(), &quick));
+        for (id, owner) in [(11, "main"), (12, "quick")] {
+            let session = state.take_owned(id, owner).unwrap().unwrap();
+            reap(id, session, "test cleanup");
+            assert!(state.take_owned(id, owner).unwrap().is_none());
         }
     }
 
