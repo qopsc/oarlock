@@ -1669,10 +1669,16 @@ R216 remains in progress. Preference and theme catalog reads use a retained
 directory and check the opened file against its entry; preference commits use
 the conditional metadata-preserving writer with their own 64 MiB limit. The
 local `tauri-plugin-store` fork checks every store read and write without
-following a final symlink and refuses hard-linked entries. Workspace file saves
+following symlinks below its data root and refuses hard-linked entries. Its
+autosave failures emit an event displayed in each app window. Workspace file saves
 and Explorer mutations check known native store and agent-settings identities.
 The inventory and remaining gaps are recorded in `REVIEW_LEDGER.md`; these
 partial changes do not yet establish the complete native-store boundary.
+
+On Linux the replacement writer checks each file's POSIX ACL and supported
+extended attributes instead of choosing by filesystem type. It refuses an
+NFSv4 ACL it cannot preserve and any metadata it cannot enumerate or reproduce;
+an unsupported POSIX ACL operation alone is not treated as a saved ACL.
 
 Validation for native revisioned preferences: 4,770 frontend tests pass across
 514 files, and 1,298 Rust tests pass with three ignored. Types, Clippy, production

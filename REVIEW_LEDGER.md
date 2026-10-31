@@ -4237,3 +4237,28 @@ The shared conditional writer now accepts a caller-specific limit, retaining the
 **Triage checkpoint:** R110 has been addressed as above. The rest of the original 21-finding persistence/durability group has not yet been systematically revalidated or ranked; the six-finding failure-reporting group has not been started. The batch stops at the user's three-re-edit tripwire on `document_save.rs`; no remaining finding is inferred closed from this partial work.
 
 Verification at this checkpoint: full macOS native tests and integration tests passed; the fork's focused alias regression and strict Clippy passed; frontend tests passed 5,589 with two skipped, type checking passed, and lint passed with 83 existing warnings. The final code also passed the overlay save regression in the offline Linux container, which emitted two existing Linux warnings. No packaged desktop or cross-window exploit test was run.
+
+## R026-U and R216 follow-up in progress
+
+The three warnings introduced since the 80-warning baseline were identified by comparing actual Biome diagnostics against commit `5b5e167`: all three were non-null assertions in `documentReconcile.test.ts`. They were removed in `414f3b7`; the focused test, type check, lint and full frontend retry passed. The first full run timed out in two regex-worker tests while other work ran; those tests passed individually and the full retry passed.
+
+R026-U removes the filesystem-type ACL allowlist and queries each file instead. POSIX ACLs and supported extended attributes continue to be captured and checked after applying them; unsupported NFSv4 ACLs are refused, and metadata that cannot be enumerated is not assumed absent. A real RAM filesystem without ACL or xattr support produced the old allowlist refusal; the final code successfully saved there with the original mode. A real cross-filesystem attribute test captured an overlay xattr, refused to apply it on RAM filesystem staging, and verified the source attribute remained intact. This tests metadata refusal but does not exercise a complete save across filesystems, which the writer does not permit. Two pre-existing Linux warnings remain. The explicit refusal when metadata cannot be enumerated remains a limit on the request for unconditional support of every filesystem: the file's hidden metadata cannot be identified or preserved safely in that case.
+
+R216's plugin now opens directories below its data root one component at a time without following symlinks, and reports autosave failures through an event shown as a persistent notice in main, Settings and quick-terminal pages. Unit tests cover a symlinked parent, ordinary nested stores and the frontend notice; a packaged app test and an actual native autosave-failure-to-notice test remain outstanding. Shutdown after all windows are gone can still leave only a log entry.
+
+The store inventory is **partial, not an assurance of coverage**:
+
+| Store / path | Current evidence and remaining work |
+| --- | --- |
+| Native preferences and theme catalog | Entry reads and conditional writes use handle-bound checks; migration sources are separately retained. |
+| Agent hook settings and Pi extension | Existing AP005 verifies a resolved target and its symlink binding; workspace identity guard includes their known paths. |
+| General plugin stores, including spaces | Final entries and directories below app data now reject aliases; explicit saves return errors and background failures emit a visible notice. Startup, shutdown and packaged behavior still need validation. |
+| Project-trust decisions | `project_trust.rs` uses path-based `fs::read` and temporary-file publication. The workspace guard lists `project-trust.json`, but native handle-bound access and recovery remain to audit and implement. |
+| Window registry and migration | `windows.rs` / `windows/restore` use `oarlock-windows.json` and per-window folders; they are not yet covered by the native-store identity inventory. |
+| Terminal scrollback | `terminal_scrollback.rs` has a no-follow final read but path-based directory and write handling; parent aliases, FIFO behavior and workspace identity coverage remain open. |
+| Linux secrets | `secrets.rs` uses a separate local-data directory and `secrets.json`; its workspace identity and parent ownership coverage remain to audit. |
+| Endpoint, MCP, conversation, agent, subagent and skill storage | Known native and plugin paths exist, including a separate skill config directory. The AI hold remains in force except for the explicitly requested shared-store boundary; these owners still require a focused inventory and boundary audit. |
+
+Mutation paths checked so far: `fs_write_file`, `fs_save_document`, `fs_create_file`, `fs_rename`, `fs_move`, `fs_delete` and `fs_delete_batch` invoke the native identity guard. `fs_copy`, directory creation, Git operations that change a worktree, other native mutation paths, and native store changes remain to be audited against protected identities; terminal commands are separate user-controlled processes. The inventory cannot yet be described as complete. R216 remains open.
+
+The earlier tripwire assessment was corrected: edits made before the plugin change's first passing test are exempt under the user's adjusted rule. Persistence/durability still has R110 closed and 20 initially planned findings untriaged; failure-reporting/recovery has six untriaged. Counts are planning counts pending assignment and revalidation, not confirmed current open findings.

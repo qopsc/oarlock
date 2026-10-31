@@ -193,7 +193,9 @@ impl Extended {
             }
         }
         for (name, bytes) in &self.values {
-            set(file, name, Some(bytes))?;
+            set(file, name, Some(bytes)).map_err(|error| io::Error::new(
+                error.kind(), format!("Cannot preserve extended attribute {:?}: {error}", name.to_string_lossy()),
+            ))?;
         }
         #[cfg(target_os = "macos")]
         if unsafe { libc::fchflags(file.as_raw_fd(), self.flags) } != 0 {
@@ -211,6 +213,18 @@ impl Extended {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refuses_when_a_staging_file_cannot_preserve_an_existing_attribute() {
+        let Some(source_dir) = std::env::var_os("OARLOCK_TEST_XATTR_SOURCE_DIR") else { return };
+        let source = tempfile::tempfile_in(source_dir).unwrap();
+        let candidate = tempfile::tempfile().unwrap();
+        set(&source, c"user.oarlock-test", Some(b"must survive")).unwrap();
+        let metadata = Extended::capture(&source).unwrap();
+        let error = metadata.apply(&candidate).unwrap_err();
+        assert!(error.to_string().contains("Cannot preserve extended attribute"));
+        assert_eq!(value(&source, c"user.oarlock-test", MAX_VALUE).unwrap(), b"must survive");
+    }
     #[test]
     fn attributes_are_exact_and_unknown_metadata_is_refused() {
         let source = tempfile::tempfile().unwrap();

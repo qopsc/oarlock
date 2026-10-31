@@ -5,17 +5,18 @@ pub struct Acl(Option<Vec<u8>>);
 const NAME: &std::ffi::CStr = c"system.posix_acl_access";
 
 pub fn read(file: &File) -> io::Result<Acl> {
-    // Do not infer POSIX ACL absence on remote/NFSv4/custom ACL filesystems.
-    let mut state = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(file.as_raw_fd(), state.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+    // A non-POSIX ACL can grant access to a private staging directory even
+    // after chmod; do not treat an unsupported POSIX ACL query as its absence.
+    let other_acl = unsafe {
+        libc::fgetxattr(file.as_raw_fd(), c"system.nfs4_acl".as_ptr(), std::ptr::null_mut(), 0)
+    };
+    if other_acl >= 0 {
+        return Err(io::Error::new(io::ErrorKind::Unsupported,
+            "NFSv4 ACL preservation is unsupported; file not replaced"));
     }
-    let kind = unsafe { state.assume_init() }.f_type as u64;
-    if !matches!(kind, 0xef53 | 0x58465342 | 0x9123683e | 0x01021994 | 0x794c7630) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ACL preservation is not supported for this filesystem; file not replaced",
-        ));
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+        return Err(error);
     }
     let mut bytes = vec![0; 65536];
     let count = unsafe {
@@ -28,7 +29,7 @@ pub fn read(file: &File) -> io::Result<Acl> {
     };
     if count < 0 {
         let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENODATA) {
+        return if matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
             Ok(Acl(None))
         } else {
             Err(error)
@@ -52,7 +53,7 @@ pub fn apply(acl: &Acl, file: &File) -> io::Result<()> {
     };
     if result != 0 {
         let error = io::Error::last_os_error();
-        if acl.0.is_some() || error.raw_os_error() != Some(libc::ENODATA) {
+        if acl.0.is_some() || !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
             return Err(error);
         }
     }
@@ -71,7 +72,7 @@ pub fn privatize(file: &File) -> io::Result<()> {
 
 #[allow(dead_code)]
 pub fn inherit_directory(source: &File, target: &File) -> io::Result<()> {
-    read(source)?; // Refuse filesystems with a different ACL model.
+    read(source)?;
     const DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";
     let mut bytes = vec![0; 65536];
     let count = unsafe {
@@ -84,12 +85,12 @@ pub fn inherit_directory(source: &File, target: &File) -> io::Result<()> {
     };
     if count < 0 {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENODATA) {
+        if matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
             // The private probe may itself have inherited a temp-directory
             // default ACL. Absence at the real destination must remove it.
             if unsafe { libc::fremovexattr(target.as_raw_fd(), DEFAULT.as_ptr()) } != 0 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ENODATA) {
+                if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
                     return Err(error);
                 }
             }
@@ -141,7 +142,11 @@ mod tests {
             bytes.extend_from_slice(&permissions.to_le_bytes());
             bytes.extend_from_slice(&id.to_le_bytes());
         }
-        apply(&Acl(Some(bytes.clone())), &source).unwrap();
+        if let Err(error) = apply(&Acl(Some(bytes.clone())), &source) {
+            assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+            assert_eq!(read(&source).unwrap(), Acl(None));
+            return;
+        }
         let original = AccessControl::capture(&source).unwrap();
         let candidate = tempfile::tempfile().unwrap();
         AccessControl::prepare_staging(&candidate).unwrap();
