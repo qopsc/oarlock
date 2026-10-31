@@ -4030,3 +4030,7 @@ R017 is fixed: a commit-file diff is reused only when its owning space also matc
 ## Tier 2: R018 cancelled space drags
 
 R018 is fixed: pointer cancellation and lost capture abandon a drag without moving or activating anything, and only the initiating pointer can commit. Closing or unmounting the switcher releases the captured pointer and restores the prior text-selection style; cleanup also handles a capture that the browser already revoked. Regressions cover cancellation, unrelated pointers, normal completion and cleanup after revoked capture. The full frontend suite passed (5,531 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 25.
+
+## Tier 2: R047 LSP navigation ownership
+
+R047 is fixed: definition and reference requests share a per-editor ordering, and a response or results-panel selection is ignored if superseded, the document or selection changed, the editor was destroyed, or its pane became hidden and visible again. This uses the editor's existing visibility signal and LSP view lifetime; no persisted state or native interface was added. Regressions exercise overlapping definition/reference requests, edits, cursor movement, pane visibility changes and destruction. The full frontend suite passed (5,533 passed, 2 skipped), followed by the focused navigation tests after a test-only type correction; types and lint passed. Tier 2 remaining in the ownership group: 24.

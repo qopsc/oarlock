@@ -11,6 +11,7 @@ export function useLspExtension(
   path: string,
   langId: string | null,
   ready: boolean,
+  owner?: { current: { active: boolean; generation: number } },
 ): Extension | null {
   const workspace = workspaceEnvForPath(path, useOwnedWorkspace());
   const [attached, setAttached] = useState<{
@@ -44,7 +45,7 @@ export function useLspExtension(
     }
     let cancelled = false;
     let handle: LspDocHandle | null = null;
-    acquireDocExtension(path, langId, workspace)
+    acquireDocExtension(path, langId, workspace, owner)
       .then((h) => {
         if (!h) return;
         if (cancelled) {
@@ -60,7 +61,7 @@ export function useLspExtension(
       handle?.release();
       setAttached(null);
     };
-  }, [path, langId, ready, activation, generation, presetId, workspace, key]);
+  }, [path, langId, ready, activation, generation, presetId, workspace, key, owner]);
 
   return attached?.key === key ? attached.ext : null;
 }

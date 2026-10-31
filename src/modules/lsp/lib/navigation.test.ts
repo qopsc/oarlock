@@ -77,3 +77,66 @@ it("keeps references at different columns on the same line", async () => {
   expect(items).toHaveLength(2);
   expect(items[0].label).not.toBe(items[1].label);
 });
+
+it("ignores older results and replies for changed documents, selections or hidden panes", async () => {
+  const completions: ((value: unknown) => void)[] = [];
+  const client = {
+    textDocumentDefinition: () => new Promise((resolve) => completions.push(resolve)),
+  } as unknown as OarlockLspClient;
+  const open = vi.fn();
+  const owner = { current: { active: true, generation: 0 } };
+  const state = EditorState.create({
+    doc: "symbol",
+    extensions: lspInteractions({ client, documentUri: "file:///repo/a.ts", rootPath: "/repo", onExternal: open, owner }),
+  });
+  const fakeView = { state, plugin: () => ({ active: true }), dispatch: vi.fn(), focus: vi.fn() };
+  const view = fakeView as unknown as EditorView;
+  const run = () => state.facet(keymap).flat().find((binding) => binding.key === "F12")?.run?.(view);
+  const result = (name: string) => ({ uri: `file:///repo/${name}.ts`, range: { start: { line: 0, character: 0 } } });
+  const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
+
+  run(); run();
+  completions[1](result("new"));
+  await flush();
+  completions[0](result("old"));
+  await flush();
+  expect(open).toHaveBeenCalledTimes(1);
+  expect(open).toHaveBeenCalledWith("file:///repo/new.ts", 1);
+
+  run();
+  fakeView.state = fakeView.state.update({ changes: { from: 0, insert: "x" } }).state;
+  completions[2](result("edited"));
+  await flush();
+  run();
+  fakeView.state = fakeView.state.update({ selection: { anchor: 1 } }).state;
+  completions[3](result("moved"));
+  await flush();
+  run();
+  owner.current = { active: false, generation: 1 };
+  owner.current = { active: true, generation: 2 };
+  completions[4](result("hidden"));
+  await flush();
+  expect(open).toHaveBeenCalledTimes(1);
+});
+
+it("a newer references request supersedes an older definition request", async () => {
+  let finishDefinition!: (value: unknown) => void;
+  let finishReferences!: (value: unknown) => void;
+  const client = {
+    textDocumentDefinition: () => new Promise((resolve) => { finishDefinition = resolve; }),
+    textDocumentReferences: () => new Promise((resolve) => { finishReferences = resolve; }),
+  } as unknown as OarlockLspClient;
+  const open = vi.fn();
+  const state = EditorState.create({ doc: "symbol", extensions: lspInteractions({
+    client, documentUri: "file:///repo/a.ts", rootPath: "/repo", onExternal: open,
+  }) });
+  const view = { state, plugin: () => ({ active: true }), dispatch: vi.fn(), focus: vi.fn() } as unknown as EditorView;
+  for (const key of ["F12", "Shift-F12"])
+    state.facet(keymap).flat().find((binding) => binding.key === key)?.run?.(view);
+  const location = { uri: "file:///repo/b.ts", range: { start: { line: 0, character: 0 } } };
+  finishReferences([location]);
+  await Promise.resolve();
+  finishDefinition(location);
+  await Promise.resolve();
+  expect(open).toHaveBeenCalledOnce();
+});

@@ -228,7 +228,21 @@ export function lspInteractions(opts: {
   documentUri: string;
   rootPath: string;
   onExternal: (uri: string, line: number) => void;
+  owner?: { current: { active: boolean; generation: number } };
 }): Extension {
+  const requests = new WeakMap<EditorView, number>();
+  const startNavigation = (view: EditorView) => {
+    const lifetime = view.plugin(navigationLifetime);
+    if (!lifetime?.active || opts.owner?.current.active === false) return null;
+    const request = (requests.get(view) ?? 0) + 1;
+    requests.set(view, request);
+    const document = view.state.doc;
+    const selection = view.state.selection;
+    const generation = opts.owner?.current.generation;
+    return () => lifetime.active && requests.get(view) === request &&
+      view.state.doc === document && view.state.selection.eq(selection) &&
+      (opts.owner === undefined || (opts.owner.current.active && opts.owner.current.generation === generation));
+  };
   const navigate = (view: EditorView, loc: LspLocation): void => {
     if (!view.plugin(navigationLifetime)?.active) return;
     if (sameFileUri(loc.uri, opts.documentUri)) {
@@ -263,8 +277,9 @@ export function lspInteractions(opts: {
     view: EditorView,
     title: string,
     locs: LspLocation[],
+    current: () => boolean,
   ): void => {
-    if (locs.length === 0) return;
+    if (!current() || locs.length === 0) return;
     if (locs.length === 1) {
       navigate(view, locs[0]);
       return;
@@ -282,11 +297,12 @@ export function lspInteractions(opts: {
     openLocationsPanel(view, {
       title,
       items,
-      onPick: (item) =>
-        navigate(view, {
+      onPick: (item) => {
+        if (current()) navigate(view, {
           uri: item.uri,
           range: { start: { line: item.line, character: item.character } },
-        }),
+        });
+      },
     });
   };
 
@@ -299,8 +315,8 @@ export function lspInteractions(opts: {
     view: EditorView,
     pos: number,
   ): Promise<void> => {
-    const lifetime = view.plugin(navigationLifetime);
-    if (!lifetime?.active) return;
+    const current = startNavigation(view);
+    if (!current) return;
     let result: DefinitionResult;
     try {
       result = await opts.client.textDocumentDefinition({
@@ -310,16 +326,16 @@ export function lspInteractions(opts: {
     } catch {
       return;
     }
-    if (lifetime.active)
-      showResults(view, "Definitions", normalizeLocations(result));
+    if (current())
+      showResults(view, "Definitions", normalizeLocations(result), current);
   };
 
   const findReferences = async (
     view: EditorView,
     pos: number,
   ): Promise<void> => {
-    const lifetime = view.plugin(navigationLifetime);
-    if (!lifetime?.active) return;
+    const current = startNavigation(view);
+    if (!current) return;
     let result: LspLocation[] | null;
     try {
       result = await opts.client.textDocumentReferences({
@@ -330,8 +346,8 @@ export function lspInteractions(opts: {
     } catch {
       return;
     }
-    if (lifetime.active)
-      showResults(view, "References", normalizeLocations(result));
+    if (current())
+      showResults(view, "References", normalizeLocations(result), current);
   };
 
   return [

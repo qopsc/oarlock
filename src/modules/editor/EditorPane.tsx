@@ -688,7 +688,10 @@ export const EditorPane = memo(
     }, [doc, path, mediaActive, headMoves, native.gitFileBase, detached]);
 
     const syntaxReady = doc.status === "ready" && doc.size <= SYNTAX_MAX_BYTES;
-    const lspExt = useLspExtension(path, langId, syntaxReady && !detached);
+    const lspOwner = useRef({ active: mediaActive, generation: 0 });
+    if (lspOwner.current.active !== mediaActive)
+      lspOwner.current = { active: mediaActive, generation: lspOwner.current.generation + 1 };
+    const lspExt = useLspExtension(path, langId, syntaxReady && !detached, lspOwner);
     useEffect(() => {
       lspActiveRef.current = lspExt !== null;
       if (!editorView || doc.status !== "ready") return;

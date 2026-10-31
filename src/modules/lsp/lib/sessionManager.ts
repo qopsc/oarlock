@@ -77,6 +77,7 @@ export async function acquireDocExtension(
   path: string,
   langId: string,
   workspace: WorkspaceEnv = currentWorkspaceEnv(),
+  owner?: { current: { active: boolean; generation: number } },
 ): Promise<LspDocHandle | null> {
   if (workspace.kind !== "local") return null;
   const prefs = usePreferencesStore.getState();
@@ -142,6 +143,7 @@ export async function acquireDocExtension(
       client: managed.client,
       documentUri: uri,
       rootPath: managed.root.replace(/\\/g, "/"),
+      owner,
       onExternal: (extUri, line) => {
         const target = fileUriToPath(extUri);
         if (target) getLspNavigator()?.openFile(target, line);
