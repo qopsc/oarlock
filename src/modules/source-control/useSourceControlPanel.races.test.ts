@@ -207,6 +207,20 @@ afterEach(() => {
   for (const effect of fake.effectCells) effect.cleanup?.();
   vi.unstubAllGlobals();
 });
+it("shows a repository refresh failure instead of no repository", () => {
+  const failed = summary("/repo");
+  Object.assign(failed, {
+    repo: null,
+    hasRepo: false,
+    isLoading: false,
+    status: null,
+    localError: "permission denied",
+  });
+  render(failed);
+  const panel = render(failed);
+  expect(panel.panelState).toBe("error");
+  expect(panel.statusError).toBe("permission denied");
+});
 it("does not apply a prior repository's discard confirmation to the new repository", async () => {
   const a = summary("/repo-a"),
     b = summary("/repo-b");
