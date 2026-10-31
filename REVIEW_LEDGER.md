@@ -4050,3 +4050,7 @@ R214 is fixed: Git baseline reads start only after the editor view exists, and a
 ## Tier 2: R085 terminal history lifetimes
 
 R085 is fixed: each command-editor view owns its latest history lookup and debounce, and dismissing, editing or destroying the view invalidates pending results. Failed lookups are handled without leaving the popover pending. Regressions cover Escape during a pending open, out-of-order results, a cancelled timer, view disposal and rejected lookups. The full frontend suite passed (5,541 passed, 2 skipped); focused tests were rerun after the final error-handling adjustment, and types and lint passed. Tier 2 remaining in the ownership group: 20.
+
+## Tier 2: R097 installed-font retries
+
+R097 is fixed: an empty or failed installed-font lookup is cached for the native scanner's ten-second rescan interval, then retried on demand. Returning focus to a window with expired negative results notifies existing font subscribers, so newly installed fonts or recovered lookups can load without restarting Oarlock. No idle timer is kept; if a font is installed while the window remains focused, the next relevant render or focus return initiates the retry. The regression covers a failed lookup, the cooldown, focus return and successful declaration. Full frontend tests passed (5,543 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 19.

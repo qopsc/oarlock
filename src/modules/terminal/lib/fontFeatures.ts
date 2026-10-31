@@ -191,8 +191,9 @@ export function resolveSourceUrls(src: string, base: string): string {
 const derived = new Map<string, string>();
 /** Whether `@font-face` rules declare a family, by lowercase name. */
 const declaredFamilies = new Map<string, boolean>();
-/** Installed families: the derived name once declared, null when none. */
-const installed = new Map<string, string | null | Promise<void>>();
+/** Negative results may retry after the native font scanner's rescan window. */
+const installed = new Map<string, string | { retryAt: number } | Promise<void>>();
+const FONT_RETRY_MS = 10_000;
 /** Every derived family name, for `loadFeatureFamilies`. */
 const derivedNames = new Set<string>();
 let revision = 0;
@@ -233,8 +234,22 @@ export function fontFeaturesRevision(): number {
 }
 
 export function subscribeFontFeatures(listener: () => void): () => void {
+  if (listeners.size === 0 && typeof window !== "undefined")
+    window.addEventListener("focus", retryMissingFonts);
   listeners.add(listener);
-  return () => listeners.delete(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && typeof window !== "undefined")
+      window.removeEventListener("focus", retryMissingFonts);
+  };
+}
+
+function retryMissingFonts(): void {
+  const now = Date.now();
+  if (![...installed.values()].some((entry) =>
+    typeof entry === "object" && !(entry instanceof Promise) && entry.retryAt <= now)) return;
+  revision += 1;
+  for (const listener of listeners) listener();
 }
 
 /**
@@ -316,7 +331,7 @@ function installedFamily(family: string, settings: string): string | null {
   const key = `${family.toLowerCase()}\u0000${settings}`;
   const known = installed.get(key);
   if (typeof known === "string") return known;
-  if (known === undefined) {
+  if (known === undefined || (typeof known === "object" && !(known instanceof Promise) && known.retryAt <= Date.now())) {
     installed.set(key, declareInstalled(family, settings, key));
   }
   return null;
@@ -337,7 +352,7 @@ async function declareInstalled(
     faces = [];
   }
   if (faces.length === 0) {
-    installed.set(key, null);
+    installed.set(key, { retryAt: Date.now() + FONT_RETRY_MS });
     return;
   }
   const name = derivedFamilyName(family);
