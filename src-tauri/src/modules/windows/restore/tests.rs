@@ -293,3 +293,39 @@ fn ordinary_launch_does_not_replace_the_saved_registry() {
     assert_eq!(fs::metadata(&path).unwrap().ino(), before);
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_registry_and_manifest_are_refused() {
+    let registry_case = fixture();
+    let registry = registry_case.path().join(REGISTRY_FILE);
+    let other = registry_case.path().join("external-registry-copy");
+    fs::hard_link(&registry, &other).unwrap();
+    let old = fs::read(&other).unwrap();
+    assert!(run(registry_case.path()).is_err());
+    assert_eq!(fs::read(&other).unwrap(), old);
+    assert!(registry_case.path().join("windows/w-a/oarlock-spaces.json").exists());
+
+    let manifest_case = fixture();
+    prepared(manifest_case.path());
+    let manifest = manifest_case.path().join(JOURNAL).join("manifest.json");
+    let alias = manifest_case.path().join("external-manifest-copy");
+    fs::hard_link(&manifest, &alias).unwrap();
+    let old = fs::read(&alias).unwrap();
+    assert!(recover(manifest_case.path(), &mut || Ok(())).is_err());
+    assert_eq!(fs::read(&alias).unwrap(), old);
+    assert!(manifest_case.path().join("windows/w-a/oarlock-spaces.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_source_state_is_preserved_and_not_adopted() {
+    let dir = fixture();
+    let source = dir.path().join("windows/w-a/oarlock-spaces.json");
+    let alias = dir.path().join("linked-spaces");
+    fs::hard_link(&source, &alias).unwrap();
+    assert!(run(dir.path()).is_err());
+    assert_eq!(fs::read(&source).unwrap(), b"saved spaces");
+    assert_eq!(fs::read(&alias).unwrap(), b"saved spaces");
+    assert_eq!(fs::read(dir.path().join("oarlock-spaces.json")).unwrap(), b"old spaces");
+}
