@@ -4189,3 +4189,7 @@ The security policy and the security-model introduction now agree with README an
 ### R022: reauthorize explicit opens
 
 Oarlock no longer treats a requested path spelling as a permanent proof of its canonical target. A later explicit open goes back through the existing native authorization, so a retargeted link receives the appropriate grant; simultaneous identical requests still coalesce, and refused requests remain retryable. The regression covers the same spelling resolving differently and concurrent sharing. Focused tests (12), the full frontend suite (5,589 passed, 2 skipped), types and lint passed. R022 is closed. This adds one native authorization request per later explicit open or browse, not per terminal output event.
+
+### R034: repository watch metadata authorization
+
+Repository watch planning now calls the same native Git metadata authorization used by Git operations before it lists or registers the Git directory. Tests refuse an external gitfile target and a `.git` symlink, accept separately authorized metadata, and retain verified linked-worktree support. Focused watch tests (25), the full macOS native suite (1,498 library tests, 4 ignored, plus integration suites) and strict Clippy passed. R034 is closed for the macOS release. WSL watch behavior with Linux-absolute gitfile paths has not been validated and remains part of the later Windows/WSL port; same-user changes after validation retain the accepted best-effort race.

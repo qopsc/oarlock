@@ -822,6 +822,9 @@ fn plan_repo_watch(
     if !root.is_dir() || !registry.is_authorized(&root) {
         return None;
     }
+    // A gitfile can name another repository. Use the same authorization and
+    // reciprocal-linked-worktree rules as Git before listing its metadata.
+    crate::modules::git::ownership::authorize_repository_metadata(registry, &root).ok()?;
     let git_dir = git_dir_of(&root, workspace)?;
     let git_dir_key = to_canon(&git_dir);
     let files = GIT_STATE_FILES
@@ -1345,6 +1348,47 @@ mod tests {
         let registry = WorkspaceRegistry::default();
         let spelling = root.to_string_lossy().into_owned();
         assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, spelling).is_none());
+    }
+
+    #[test]
+    fn a_gitfile_cannot_watch_unauthorized_external_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("HEAD"), "outside state").unwrap();
+        std::fs::write(root.join(".git"), format!("gitdir: {}\n", outside.display())).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let spelling = root.to_string_lossy().into_owned();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, spelling.clone()).is_none());
+        registry.authorize(&outside).unwrap();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, spelling).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_symlink_cannot_watch_external_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".git")).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, root.to_string_lossy().into_owned()).is_none());
+    }
+
+    #[test]
+    fn a_valid_linked_worktree_can_watch_its_verified_metadata() {
+        let (tmp, root, _) = repo_fixture();
+        let linked = tmp.path().join("linked");
+        git(&root, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "linked-watch"]);
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&linked).unwrap();
+        assert!(plan_repo_watch(&registry, &WorkspaceEnv::Local, linked.to_string_lossy().into_owned()).is_some());
     }
 
     #[test]

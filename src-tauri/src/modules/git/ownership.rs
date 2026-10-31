@@ -138,7 +138,7 @@ pub(super) fn unowned_metadata_paths(root: &Path) -> Result<(PathBuf, PathBuf)> 
 }
 
 /// Check metadata trust before invoking Git, including read-only discovery.
-pub(super) fn authorize_repository_metadata(
+pub(crate) fn authorize_repository_metadata(
     registry: &WorkspaceRegistry,
     root: &Path,
 ) -> Result<()> {
