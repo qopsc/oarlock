@@ -104,26 +104,67 @@ export function capture(
     const child = spawn(command[0], command.slice(1), {
       cwd: options.cwd,
       env: options.env,
+      detached: process.platform !== "win32",
       stdio: ["inherit", "pipe", "pipe"],
     });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
-    child.stdout?.on("data", (chunk: Buffer) => out.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
+    const maxBytes = 32 * 1024 * 1024;
+    let bytes = 0;
+    let settled = false;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const terminate = () => {
+      if (process.platform !== "win32" && child.pid !== undefined) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // The process group may already have exited.
+        }
+      }
+      child.kill("SIGKILL");
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+    const abort = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(drainTimer);
+      terminate();
+      fail(error);
+    };
+    const collect = (target: Buffer[], chunk: Buffer) => {
+      if (settled) return;
+      if (chunk.length > maxBytes - bytes) {
+        abort(new Error("capture output exceeds 32 MiB"));
+        return;
+      }
+      bytes += chunk.length;
+      target.push(chunk);
+    };
+    child.stdout?.on("data", (chunk: Buffer) => collect(out, chunk));
+    child.stderr?.on("data", (chunk: Buffer) => collect(err, chunk));
     let timedOut = false;
     const timer =
       options.timeoutSeconds === undefined
         ? undefined
         : setTimeout(() => {
             timedOut = true;
-            child.kill("SIGKILL");
+            terminate();
           }, options.timeoutSeconds * 1000);
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      fail(error);
+    child.once("error", abort);
+    child.once("exit", () => {
+      if (settled) return;
+      // A descendant can inherit the pipes after the command exits.
+      drainTimer = setTimeout(() => {
+        abort(new Error("capture pipes remained open after the command exited"));
+      }, 1000);
     });
     child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      clearTimeout(drainTimer);
       const stdoutBytes = Buffer.concat(out);
       done({
         status: returncode(code, signal),

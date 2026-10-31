@@ -4425,7 +4425,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R103 | Open, Tier 3 | Background image import decodes a static image before resizing or checking decoded dimensions; animated files bypass resizing. |
 | R104 | Closed | Theme TOML inline tables reject nesting deeper than 64 with a clear error; tests cover accepted and rejected boundaries. |
 | R107 | Closed | History reads open nonblocking, reject non-regular files and retain at most the latest 8 MiB per shell history. Tests exercise a real FIFO and discard a partial zsh continuation at the truncation boundary. |
-| R117 | Open, Tier 3 | The build-script capture helper buffers output without a byte cap and waits for inherited pipes after killing only its direct child. |
+| R117 | Closed | The developer-script capture helper bounds combined output to 32 MiB, kills the Unix process group on timeout or overflow, and refuses pipes still open one second after the command exits. Regression tests reproduce both the inherited-pipe stall and excess output. |
 | R133 | Closed | Earlier R216 conversation-storage work bounds reads before allocation; large-file stress testing was not performed. |
 | R137 | AI/MCP on hold | OAuth callback listener work is held with the backend. |
 | R138 | Windows/WSL port | Windows MCP process ownership is deferred with both the port and MCP. |
@@ -4444,7 +4444,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **12 closed; 12 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **13 closed; 11 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4457,3 +4457,15 @@ R041: replacement output is bounded before joining, including in Vim’s fallbac
 R107 policy: history indexing reads up to the newest 8 MiB per history file and discards the first potentially partial record; zsh continuation lines are skipped through their end. A normal symlink to a history file remains supported. Network filesystem operations can still block at the OS level.
 
 R207 policy: theme changes over the existing 50 MiB serialized storage limit are rejected before cloning the catalog, even when duplicate entries might have reduced the eventual result. Final snapshots are serialized into a bounded buffer. The IPC layer still receives the incoming payload before this native validation.
+
+R117 policy: capture rejects combined output over 32 MiB and pipes remaining open one second after the direct child exits. Unix subprocesses run in their own process group for timeout and failure cleanup. Detached descendants can escape that group; Windows process-tree supervision remains port work.
+
+### AP017 proposed — bounded incoming LSP delivery (R052)
+
+Status: awaiting decision; no transport change implemented. The native reader sends decoded messages into a Tauri channel without knowing when the webview consumes them. The frontend additionally queues messages before startup and before a listener attaches. A JavaScript-only queue limit cannot bound messages already waiting in the native/webview channel if the page is stalled.
+
+Options: (1) cap only the frontend queue, improving startup behavior but leaving channel memory unbounded; (2) terminate sessions after a fixed lifetime traffic allowance, which breaks otherwise healthy long-running servers; or (3) add acknowledged, per-session delivery credits, reusing the ownership and cumulative-ack principles of the PTY transport. Recommend option 3: allow at most 64 MiB and 256 unacknowledged messages per session (one existing maximum-sized LSP frame fits), pause native reads at the limit, and fail the session visibly with Restart if delivery makes no progress for 30 seconds. Acknowledgments must identify the page and session, reject invalid boundaries, and release credits only after delivery to the consumer; close/reload releases waiting readers. This adds native/frontend IPC and changes the LSP delivery contract, so it requires approval.
+
+Proposed tests: flood while startup or listener registration is delayed; stall the page and verify the byte/message bound; resume in order; reject duplicate, forged or stale-page acknowledgments; close or restart while blocked; exercise the maximum permitted frame and visible failure on a persistent stall.
+
+R117 validation note: two default-concurrency full frontend runs timed out in unrelated real regex-worker tests (editor, Vim and terminal across the runs); the editor worker passed alone, and the complete suite passed with four workers. No test timeout was changed. This is a test-reliability observation, not a claim that a product failure was reproduced.

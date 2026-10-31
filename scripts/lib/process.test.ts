@@ -51,4 +51,27 @@ describe("capture", () => {
     expect(slow.timedOut).toBe(true);
     expect(returncode(null, "SIGKILL")).toBe(-9);
   });
+
+  it("finishes promptly when a timed-out command leaves inherited pipes open", async () => {
+    const result = await Promise.race([
+      capture(["sh", "-c", "sleep 3 & exit 0"], { timeoutSeconds: 0.05 }),
+      new Promise<"stalled">((resolve) => setTimeout(() => resolve("stalled"), 800)),
+    ]);
+    expect(result).not.toBe("stalled");
+    expect(result).toMatchObject({ timedOut: true });
+  });
+
+  it("fails when an exited command leaves pipes open without a timeout", async () => {
+    await expect(capture(["sh", "-c", "sleep 3 & exit 0"])).rejects.toThrow(
+      "capture pipes remained open after the command exited",
+    );
+  });
+
+  it("rejects output beyond the capture limit", async () => {
+    const rejected = await capture(["sh", "-c", "head -c 33554433 /dev/zero"]).then(
+      () => false,
+      (error: Error) => error.message.includes("capture output exceeds 32 MiB"),
+    );
+    expect(rejected).toBe(true);
+  });
 });
