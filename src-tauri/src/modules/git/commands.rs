@@ -404,8 +404,10 @@ pub async fn git_worktree_remove(
     app: AppHandle,
 ) -> Result<GitWorktreeRemoveResult, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
-        worktree::remove(r, &repo_root, &path, force, &workspace).map_err(Into::into)
+        worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,
+            &|folder| crate::modules::fs::native_store::refuse_write(&owner, folder)).map_err(Into::into)
     })
     .await
 }

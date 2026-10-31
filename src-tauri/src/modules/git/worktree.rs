@@ -485,12 +485,13 @@ fn count_changes(
 /// Removes a linked worktree, then prunes the records of worktrees whose folder is gone. One
 /// with uncommitted or untracked changes is only removed when `force` is set; otherwise the
 /// result reports them and nothing changes.
-pub fn remove(
+pub fn remove_with_guard(
     registry: &WorkspaceRegistry,
     repo_root: &str,
     path: &str,
     force: bool,
     workspace: &WorkspaceEnv,
+    guard: &impl Fn(&Path) -> std::result::Result<(), String>,
 ) -> Result<GitWorktreeRemoveResult> {
     let repo = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo.workspace)?;
@@ -503,11 +504,13 @@ pub fn remove(
     })?;
     ensure_removable(worktree)?;
     // A folder deleted by hand leaves only git's record, which pruning drops.
+    let folder = resolve_path(&worktree.path, &repo.workspace).map_err(|error| GitError::command("workspace", error))?;
     let folder_gone = matches!(
-        std::fs::symlink_metadata(resolve_path(&worktree.path, &repo.workspace).map_err(|error| GitError::command("workspace", error))?),
+        std::fs::symlink_metadata(&folder),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     );
     if !folder_gone {
+        guard(&folder).map_err(|error| GitError::command("remove worktree", error))?;
         if !force {
             let changes = count_changes(registry, &repo.workspace, &worktree.path)?;
             if changes > 0 {
@@ -535,6 +538,17 @@ pub fn remove(
         removed: true,
         changes: 0,
     })
+}
+
+#[cfg(test)]
+fn remove(
+    registry: &WorkspaceRegistry,
+    repo_root: &str,
+    path: &str,
+    force: bool,
+    workspace: &WorkspaceEnv,
+) -> Result<GitWorktreeRemoveResult> {
+    remove_with_guard(registry, repo_root, path, force, workspace, &|_| Ok(()))
 }
 
 #[cfg(test)]
@@ -1255,6 +1269,46 @@ mod tests {
         assert!(result.removed);
         assert!(!dir.exists());
         assert_eq!(fx.worktree_paths(), vec![fx.root()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_removal_does_not_follow_store_aliases() {
+        use std::os::unix::fs::symlink;
+        let Some(fx) = Fixture::new() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let target = store.path().join("item");
+        std::fs::write(&target, "a\n").unwrap();
+        for (index, kind) in ["hard", "leaf", "parent"].iter().enumerate() {
+            let wt = fx.add(new_branch(&format!("alias-{index}"), None), None).unwrap();
+            let dir = PathBuf::from(&wt.path);
+            match *kind {
+                "hard" => {
+                    std::fs::remove_file(dir.join("a.txt")).unwrap();
+                    std::fs::hard_link(&target, dir.join("a.txt")).unwrap();
+                }
+                "leaf" => {
+                    std::fs::remove_file(dir.join("a.txt")).unwrap();
+                    symlink(&target, dir.join("a.txt")).unwrap();
+                }
+                _ => symlink(store.path(), dir.join("linked-parent")).unwrap(),
+            }
+            assert!(fx.remove(&wt.path, true).unwrap().removed);
+            assert_eq!(std::fs::read(&target).unwrap(), b"a\n", "{kind}");
+        }
+    }
+
+    #[test]
+    fn refuses_worktree_removal_when_it_contains_a_protected_store() {
+        let Some(fx) = Fixture::new() else { return };
+        let wt = fx.add(new_branch("contains-store", None), None).unwrap();
+        let protected = PathBuf::from(&wt.path).join("state/preferences.json");
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, "keep").unwrap();
+        let result = remove_with_guard(&fx.registry, &fx.root(), &wt.path, true, &WorkspaceEnv::Local,
+            &|folder| if protected.starts_with(folder) { Err("contains a protected store".into()) } else { Ok(()) });
+        assert!(result.unwrap_err().to_string().contains("protected store"));
+        assert_eq!(std::fs::read(&protected).unwrap(), b"keep");
     }
 
     #[test]
