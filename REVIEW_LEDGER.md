@@ -4405,7 +4405,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 
 | ID | Disposition | Evidence |
 | --- | --- | --- |
-| R011 | Open, Tier 3 | `fs/grep.rs::search_tree` copies complete matching lines and has a count cap but no aggregate response-byte cap. |
+| R011 | Closed | Search retains at most 8 MiB of hit text and paths, then uses the existing truncated-result signal. A real-filesystem regression with three multi-megabyte matching lines failed before the fix and passes after it. |
 | R024 | Windows/WSL port | WSL-only discovery and shell probes are outside this release. |
 | R031 | Open, Tier 3 | `watch.rs::release_window` takes the shared set lock; `resolve_changes` still calls file stamping while holding that lock. |
 | R041 | Open, Tier 3 | `editor/search/regexEvaluation.ts` builds expanded replacement text before enforcing its output budget; Vim substitution needs the same check. |
@@ -4444,8 +4444,10 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Open, Tier 3 | Theme batch upserts clone and repeatedly scan the catalog before the serialized size check. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **8 closed; 16 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **9 closed; 15 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
 Resource checkpoint: selected 16 KiB as the LSP header limit and 64 as the theme inline-table depth limit. These are local admission limits; over-limit inputs fail explicitly. Regression tests for R045, R089, R096, R099 and R104 failed before their fixes and passed afterward.
+
+R011 policy: search stops collecting when hit text and paths would exceed 8 MiB, using the existing truncated indicator. The bound is on retained UTF-8 data, not the size of its later JSON encoding; serialization is still bounded by a constant multiple of that amount.

@@ -16,6 +16,7 @@ use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv};
 const FILE_SIZE_CAP: u64 = 5 * 1024 * 1024;
 const DEFAULT_MAX_RESULTS: usize = 200;
 const HARD_MAX_RESULTS: usize = 2000;
+const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Who runs a live content search. Each caller's new query cancels its own
 /// previous walk on its worker threads, never another caller's: typing in the
@@ -47,6 +48,12 @@ pub struct GrepResponse {
     pub files_scanned: usize,
     /// Stopped early because a newer query replaced this one.
     pub cancelled: bool,
+}
+
+#[derive(Default)]
+struct CollectedHits {
+    hits: Vec<GrepHit>,
+    bytes: usize,
 }
 
 fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>, String> {
@@ -94,7 +101,7 @@ fn search_tree(
         .threads(WALK_THREADS)
         .build_parallel();
 
-    let hits: Arc<Mutex<Vec<GrepHit>>> = Arc::new(Mutex::new(Vec::new()));
+    let hits = Arc::new(Mutex::new(CollectedHits::default()));
     let scanned = Arc::new(AtomicUsize::new(0));
     let truncated = Arc::new(AtomicBool::new(false));
 
@@ -151,17 +158,24 @@ fn search_tree(
                     if cancel() {
                         return Ok(false);
                     }
-                    let line_text = text.trim_end_matches('\n').to_string();
+                    let line_text = text.trim_end_matches('\n');
                     let mut guard = hits.lock().unwrap();
-                    if guard.len() >= cap {
+                    let size = line_text
+                        .len()
+                        .saturating_add(abs.len())
+                        .saturating_add(rel_clone.len());
+                    if guard.hits.len() >= cap
+                        || size > MAX_RESULT_BYTES.saturating_sub(guard.bytes)
+                    {
                         truncated.store(true, Ordering::Relaxed);
                         return Ok(false);
                     }
-                    guard.push(GrepHit {
+                    guard.bytes += size;
+                    guard.hits.push(GrepHit {
                         path: abs.clone(),
                         rel: rel_clone.clone(),
                         line: line_num,
-                        text: line_text,
+                        text: line_text.to_string(),
                     });
                     Ok(true)
                 }),
@@ -176,7 +190,7 @@ fn search_tree(
         .unwrap_or_default();
 
     GrepResponse {
-        hits: final_hits,
+        hits: final_hits.hits,
         truncated: truncated.load(Ordering::Relaxed),
         files_scanned: scanned.load(Ordering::Relaxed),
         cancelled: cancel(),
@@ -380,6 +394,31 @@ mod tests {
     fn escape_literal_escapes_regex_meta() {
         assert_eq!(escape_literal("a.b(c)"), "a\\.b\\(c\\)");
         assert_eq!(escape_literal("plain text"), "plain text");
+    }
+
+    #[test]
+    fn search_results_are_bounded_by_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("needle{}", "x".repeat(3 * 1024 * 1024));
+        for index in 0..3 {
+            std::fs::write(dir.path().join(format!("{index}.txt")), &line).unwrap();
+        }
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let workspace = WorkspaceEnv::from_option(None);
+        let root = dir.path().to_string_lossy().to_string();
+        let result = search_tree(dir.path(), &root, &workspace, &matcher, &None, 100, &|| {
+            false
+        });
+        assert!(result.truncated);
+        assert!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.text.len() + hit.path.len() + hit.rel.len())
+                .sum::<usize>()
+                <= 8 * 1024 * 1024
+        );
+        assert_eq!(result.hits.len(), 2);
     }
 
     #[test]
