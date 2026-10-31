@@ -5,6 +5,7 @@ const fake = vi.hoisted(() => ({
   invoke: vi.fn(async () => true),
   show: vi.fn(async () => {}),
   focus: vi.fn(async () => {}),
+  context: vi.fn<() => { space_id: string; tab_id: number } | null>(),
 }));
 vi.mock("react", () => ({
   useEffect: (fn: () => () => void) => {
@@ -22,7 +23,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ show: fake.show, setFocus: fake.focus }),
 }));
 vi.mock("./lib/context", () => ({
-  resolveControlContext: () => ({ space_id: "original" }),
+  resolveControlContext: () => fake.context(),
 }));
 vi.mock("@/modules/tabs/lib/useTabs", () => ({ DEFAULT_SPACE_ID: "default" }));
 import { useControlBridge } from "./useControlBridge";
@@ -30,12 +31,12 @@ const flush = async () => {
   for (let i = 0; i < 12; i++) await Promise.resolve();
 };
 const open = vi.fn(() => 7);
-function request(focus: boolean) {
+function request(focus: boolean, paneId?: number) {
   fake.receive?.({
     payload: {
       id: "request-1",
       method: "open",
-      caller: {},
+      caller: paneId === undefined ? {} : { pane_id: paneId },
       params: { path: "/repo/file", focus },
     },
   });
@@ -43,6 +44,7 @@ function request(focus: boolean) {
 beforeEach(async () => {
   vi.clearAllMocks();
   fake.show.mockResolvedValue();
+  fake.context.mockReturnValue({ space_id: "original", tab_id: 5 });
   vi.stubGlobal("requestAnimationFrame", vi.fn());
   useControlBridge({
     ready: true,
@@ -95,4 +97,18 @@ it("refuses an event already queued when the bridge closes", async () => {
   request(false);
   await flush();
   expect(open).not.toHaveBeenCalled();
+});
+
+it("refuses an explicit caller that disappeared before or during focus", async () => {
+  fake.context.mockReturnValueOnce(null);
+  request(false, 9);
+  await flush();
+  expect(open).not.toHaveBeenCalled();
+  fake.context.mockReturnValueOnce({ space_id: "original", tab_id: 5 }).mockReturnValueOnce(null);
+  request(true, 9);
+  await flush();
+  expect(open).not.toHaveBeenCalled();
+  expect(fake.invoke).toHaveBeenCalledWith("control_respond", expect.objectContaining({
+    response: expect.objectContaining({ ok: false, error: expect.objectContaining({ code: "caller_unavailable" }) }),
+  }));
 });

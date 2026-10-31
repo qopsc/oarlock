@@ -75,6 +75,14 @@ impl PaneIds {
             .map(|(window, pane)| (window.as_str(), *pane))
     }
 
+    fn resolve_caller(&self, id: Option<u32>) -> Result<Option<(String, u32)>, &'static str> {
+        match id {
+            None => Ok(None),
+            Some(id) => self.resolve(id).map(|(window, pane)| Some((window.to_owned(), pane)))
+                .ok_or("The calling terminal pane is no longer available"),
+        }
+    }
+
     fn forget_window(&mut self, window: &str) {
         self.panes.retain(|_, (owner, _)| owner != window);
     }
@@ -557,15 +565,15 @@ fn forward_to_frontend(
     // A shell's request goes to its own window, with its pane as that window
     // knows it; anything else to the window in front.
     let mut caller = request.caller;
-    let resolved = caller.pane_id.and_then(|id| {
-        state
+    let resolved = match state
             .0
             .panes
             .lock()
             .expect("control panes poisoned")
-            .resolve(id)
-            .map(|(window, pane)| (window.to_owned(), pane))
-    });
+            .resolve_caller(caller.pane_id) {
+        Ok(resolved) => resolved,
+        Err(message) => return ControlResponse::failure(request.id, "caller_unavailable", message),
+    };
     let target = match resolved {
         Some((window, pane)) => {
             caller.pane_id = Some(pane);
@@ -1058,10 +1066,13 @@ mod tests {
         assert_ne!(main, other);
         assert_eq!(ids.resolve(main), Some(("main", 1)));
         assert_eq!(ids.resolve(other), Some(("w-a", 1)));
+        assert_eq!(ids.resolve_caller(None), Ok(None));
+        assert_eq!(ids.resolve_caller(Some(main)), Ok(Some(("main".to_string(), 1))));
         // A restarted shell keeps its pane's id.
         assert_eq!(ids.assign("w-a", 1), other);
         ids.forget_window("w-a");
         assert_eq!(ids.resolve(other), None);
+        assert!(ids.resolve_caller(Some(other)).is_err());
         assert_eq!(ids.resolve(main), Some(("main", 1)));
         assert_eq!(ids.resolve(0), None);
     }

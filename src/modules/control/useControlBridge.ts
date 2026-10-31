@@ -124,6 +124,8 @@ export function useControlBridge({
           activeSpaceIdRef.current ?? DEFAULT_SPACE_ID,
           request.caller.pane_id,
         );
+        if (!context)
+          throw new RequestError("caller_unavailable", "The calling terminal pane is no longer available");
         if (request.method === "identify") {
           await respond(request.id, { ok: true, result: context });
           return;
@@ -143,6 +145,14 @@ export function useControlBridge({
             }
           }
           requireLiveBridge();
+          if (request.caller.pane_id != null) {
+            const current = resolveControlContext(
+              tabsRef.current ?? [], activeTabIdRef.current ?? 0,
+              activeSpaceIdRef.current ?? DEFAULT_SPACE_ID, request.caller.pane_id,
+            );
+            if (!current || current.space_id !== context.space_id || current.tab_id !== context.tab_id)
+              throw new RequestError("caller_unavailable", "The calling terminal pane changed before the request completed");
+          }
           const tabId = onOpen({ ...open, spaceId: context.space_id });
           if (tabId === null) {
             throw new RequestError(

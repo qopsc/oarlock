@@ -4064,3 +4064,7 @@ R109 is fixed: each Settings view invalidates older shader reads and compilation
 ## Tier 2: R010 Explorer directory ordering
 
 R010 is fixed: each folder's latest listing supersedes older reads and delayed state updates without cancelling independent folders. Workspace changes and removed subtrees invalidate their pending reads, and superseded authorization waits do not start a directory read. The ordering records follow the existing tree lifetime and are cleared with its workspace or removed nodes. Regressions cover out-of-order completions, independent directories, removal and workspace reset. The full frontend suite passed (5,551 passed, 2 skipped); focused tests, types and lint were rerun after the final supersession check. Tier 2 remaining in the ownership group: 17.
+
+## Tier 2: R004 control caller ownership
+
+R004 is fixed: an explicit pane caller that no longer resolves returns `caller_unavailable` instead of falling back to the active window or space. The frontend also rechecks that caller after asynchronous window focus, so closing or moving it during the wait cannot redirect an open request. External CLI requests without a caller retain their existing active-context behavior. Regressions cover absent native callers, stale frontend callers and closure during focus. Full frontend tests passed (5,552 passed, 2 skipped); the full native suite passed (1,488 library tests, 4 ignored, plus integration suites); strict all-target Clippy, types and lint passed. Tier 2 remaining in the ownership group: 16.
