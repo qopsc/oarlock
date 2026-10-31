@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    io::Read,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -208,36 +208,79 @@ fn validate(snapshot: &Snapshot) -> Result<(), String> {
     }
     Ok(())
 }
+struct JsonBudget {
+    count: usize,
+    bytes: Option<Vec<u8>>,
+}
+impl Write for JsonBudget {
+    fn write(&mut self, chunk: &[u8]) -> io::Result<usize> {
+        if chunk.len() > (MAX_BYTES as usize).saturating_sub(self.count) {
+            return Err(io::Error::other("Themes exceed 50 MiB"));
+        }
+        self.count += chunk.len();
+        if let Some(bytes) = &mut self.bytes {
+            bytes.extend_from_slice(chunk);
+        }
+        Ok(chunk.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+fn bounded_json<T: Serialize>(value: &T, retain: bool) -> Result<Vec<u8>, String> {
+    let mut writer = JsonBudget {
+        count: 0,
+        bytes: retain.then(Vec::new),
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+    Ok(writer.bytes.unwrap_or_default())
+}
 fn apply(current: &Snapshot, change: Change) -> Result<Snapshot, String> {
-    let mut next = current.clone();
-    match change {
+    match &change {
         Change::Create { themes } => {
+            bounded_json(themes, false)?;
+            let existing: std::collections::HashSet<_> = current
+                .themes
+                .iter()
+                .filter_map(|theme| theme["id"].as_str())
+                .collect();
             let mut ids = std::collections::HashSet::new();
-            for theme in &themes {
+            for theme in themes {
                 let id = validate_theme(theme)?;
-                if !ids.insert(id) || current.themes.iter().any(|existing| existing["id"] == id) {
+                if !ids.insert(id) || existing.contains(id) {
                     return Err("A theme with this ID already exists; retry the import".into());
                 }
             }
-            next.themes.extend(themes);
         }
         Change::Upsert { themes } => {
-            // Validate the entire batch before changing anything. Last duplicate wins.
-            for theme in &themes {
-                validate_theme(theme)?;
-            }
+            bounded_json(themes, false)?;
             for theme in themes {
-                let id = theme["id"].as_str().expect("validated id");
-                next.themes.retain(|t| t["id"] != id);
-                next.themes.push(theme);
+                validate_theme(theme)?;
             }
         }
         Change::Delete { id } => {
-            if !valid_id(&id) {
+            if !valid_id(id) {
                 return Err("Invalid theme id".into());
             }
-            next.themes.retain(|t| t["id"] != id);
         }
+    }
+    let mut next = current.clone();
+    match change {
+        Change::Create { themes } => next.themes.extend(themes),
+        Change::Upsert { themes } => {
+            // Match sequential upserts: the last duplicate wins and moves last.
+            let mut ids = std::collections::HashSet::new();
+            let mut selected: Vec<_> = themes
+                .into_iter()
+                .rev()
+                .filter(|theme| ids.insert(theme["id"].as_str().expect("validated id").to_string()))
+                .collect();
+            selected.reverse();
+            next.themes
+                .retain(|theme| !ids.contains(theme["id"].as_str().unwrap_or("")));
+            next.themes.extend(selected);
+        }
+        Change::Delete { id } => next.themes.retain(|theme| theme["id"] != id),
     }
     if next.themes != current.themes {
         next.revision = current
@@ -248,6 +291,7 @@ fn apply(current: &Snapshot, change: Change) -> Result<Snapshot, String> {
     }
     Ok(next)
 }
+
 fn read_json(path: &Path) -> Result<Option<Value>, String> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err("Theme storage must be a regular file, not a symbolic link".into());
@@ -282,10 +326,7 @@ fn persist(path: &Path, snapshot: &Snapshot, expected: Option<&Snapshot>) -> Res
     let parent = path.parent().ok_or("Themes directory is missing")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let target = super::fs::store_target(path).map_err(|e| e.to_string())?;
-    let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err("Themes exceed 50 MiB".into());
-    }
+    let bytes = bounded_json(snapshot, true)?;
     document_save::with_lock(&target, || {
         let version = if let Some(expected) = expected {
             let mut file =
@@ -471,6 +512,49 @@ mod tests {
         Change::Upsert {
             themes: vec![theme(id)],
         }
+    }
+    #[test]
+    fn oversized_theme_batches_are_refused_before_applying() {
+        let current = Snapshot {
+            revision: 0,
+            themes: vec![theme("existing")],
+        };
+        let mut large = theme("large-theme");
+        large["name"] = json!("x".repeat(MAX_BYTES as usize + 1));
+        assert!(bounded_json(&large, true).is_err());
+        assert!(apply(
+            &current,
+            Change::Upsert {
+                themes: vec![large]
+            }
+        )
+        .is_err());
+        assert_eq!(current.themes, vec![theme("existing")]);
+    }
+
+    #[test]
+    fn upsert_preserves_last_duplicate_order() {
+        let current = Snapshot {
+            revision: 0,
+            themes: vec![theme("alpha"), theme("beta"), theme("gamma")],
+        };
+        let mut last_beta = theme("beta");
+        last_beta["name"] = json!("last beta");
+        let next = apply(
+            &current,
+            Change::Upsert {
+                themes: vec![theme("beta"), theme("delta"), theme("alpha"), last_beta],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next.themes
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["gamma", "delta", "alpha", "beta"]
+        );
+        assert_eq!(next.themes.last().unwrap()["name"], "last beta");
     }
     #[test]
     fn interrupted_import_cannot_overwrite_an_existing_selected_theme() {

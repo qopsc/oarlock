@@ -4441,10 +4441,10 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R186 | AI/MCP on hold | MCP result formatting is held with the backend. |
 | R190 | Open, Tier 3 | `asset_all_folders.rs` reads an unranged file into memory and starts blocking work without an aggregate admission limit. |
 | R192 | Open, Tier 3 | Mermaid rendering cannot interrupt an already-running render, and its 32-entry cache has no byte limit. |
-| R207 | Open, Tier 3 | Theme batch upserts clone and repeatedly scan the catalog before the serialized size check. |
+| R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **11 closed; 13 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **12 closed; 12 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4455,3 +4455,5 @@ R011 policy: search stops collecting when hit text and paths would exceed 8 MiB,
 R041: replacement output is bounded before joining, including in Vim’s fallback worker path. The Vim implementation preserves native JavaScript replacement semantics for captures, named groups, prefix/suffix tokens, zero-width matches and Unicode, with 420 compatibility combinations plus overflow tests. Pathological regex execution still uses the existing disposable-worker deadline.
 
 R107 policy: history indexing reads up to the newest 8 MiB per history file and discards the first potentially partial record; zsh continuation lines are skipped through their end. A normal symlink to a history file remains supported. Network filesystem operations can still block at the OS level.
+
+R207 policy: theme changes over the existing 50 MiB serialized storage limit are rejected before cloning the catalog, even when duplicate entries might have reduced the eventual result. Final snapshots are serialized into a bounded buffer. The IPC layer still receives the incoming payload before this native validation.
