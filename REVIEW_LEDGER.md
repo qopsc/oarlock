@@ -4120,3 +4120,7 @@ Repeated Retry clicks now coalesce while registration is in flight. This prevent
 ### R075: delayed terminal restart
 
 After waiting for the old PTY to close, restart now checks the original session identity, generation and disposal state before clearing fields or starting the replacement. A close failure from an obsolete restart is ignored; a current failure remains visible. Regression tests cover two overlapping restarts, a replaced or closed session and a current close failure. Focused tests (18), the full frontend suite (5,577 passed, 2 skipped), types and lint passed. R075 is closed; Tier 3 remaining = 12, including six AI-on-hold.
+
+### R021: quick terminal replacement
+
+An exited quick-terminal shell is disposed and its pane is removed while the native window hides. A new pane starts only when the window next receives focus. The regression exercises three exit/hide/show cycles and confirms no replacement pane exists while hidden. The focused test, full frontend suite (5,577 passed, 2 skipped), types and lint passed. R021 is closed; Tier 3 remaining = 11, including six AI-on-hold.

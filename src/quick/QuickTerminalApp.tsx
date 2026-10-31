@@ -17,7 +17,9 @@ export function QuickTerminalApp() {
   const autohide = usePreferencesStore(
     (state) => state.terminalBehavior.quickTerminalAutohide,
   );
-  const [leafId, setLeafId] = useState(1);
+  const [leafId, setLeafId] = useState<number | null>(1);
+  const lastLeafId = useRef(1);
+  const restartOnFocus = useRef(false);
   const [focused, setFocused] = useState(true);
   const autohideRef = useRef(autohide);
   autohideRef.current = autohide;
@@ -33,6 +35,10 @@ export function QuickTerminalApp() {
     void window
       .onFocusChanged(({ payload: hasFocus }) => {
         setFocused(hasFocus);
+        if (hasFocus && restartOnFocus.current) {
+          restartOnFocus.current = false;
+          setLeafId(++lastLeafId.current);
+        }
         if (!hasFocus && autohideRef.current) void window.hide();
       })
       .then((stop) => {
@@ -46,15 +52,17 @@ export function QuickTerminalApp() {
   }, []);
 
   const onExit = useCallback(() => {
+    if (leafId === null) return;
     disposeSession(leafId);
-    setLeafId(leafId + 1);
+    restartOnFocus.current = true;
+    setLeafId(null);
     void getCurrentWindow().hide();
   }, [leafId]);
 
   return (
     <TooltipProvider>
       <main className="h-screen w-screen overflow-hidden bg-background p-1.5">
-        {hydrated ? (
+        {hydrated && leafId !== null ? (
           <TerminalPane
             key={leafId}
             leafId={leafId}
