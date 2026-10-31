@@ -569,7 +569,7 @@ Each module is self-contained, exports a thin barrel via `index.ts`, and owns it
 
 BYOK. Cloud providers via `@ai-sdk/*`: **OpenAI, Anthropic, Google, xAI, Cerebras, Groq, DeepSeek, Mistral, OpenRouter**, plus **OpenAI-compatible** for any custom base URL. Settings' Add provider menu also offers ready-made custom endpoints (`lib/endpointPresets.ts`): **OpenCode Go** fills the name and the gateway's OpenAI-compatible base URL (`https://opencode.ai/zen/go/v1`, which gets the `x-opencode-session` header), and the user saves the key (keychain, like any endpoint's) and picks a model from the gateway's `/models` list with Browse. Local / offline providers (key-optional, model id supplied at runtime): **LM Studio, MLX, Ollama**. Provider list in `config.ts` (`PROVIDERS`); model registry includes `DEFAULT_MODEL_ID` + `DEFAULT_AUTOCOMPLETE_MODEL`.
 
-- **Key storage**: OS keychain via `keyring` (Rust). Frontend reads/writes through `secrets_*` commands. Service `KEYRING_SERVICE = "oarlock-ai"`. Never persist keys to disk, settings store, or `localStorage`.
+- **Key storage**: macOS Keychain and Windows Credential Manager via `keyring`; Linux uses a user-only file in the app data directory. Frontend reads/writes through `secrets_*` commands. Service `KEYRING_SERVICE = "oarlock-ai"`. Keys do not go in the settings store or `localStorage`.
 - **Agent** (`lib/agent.ts`): `runAgentStream` calls `streamText` with the tools, the run's approval policy (`toolApproval: buildToolApproval(...)`, see Tools) and `stopWhen: isStepCount(MAX_AGENT_STEPS)`, and the system prompt from `config.ts`. Provider branching happens here (`buildLanguageModel`). `lib/transport.ts` (`createContextAwareTransport`) is the chat transport and returns `toUIMessageStream(...)`; the rest of the system depends on AI SDK v7 chat semantics. Each run asks `project_memory_read` for the workspace's `AGENTS.md` (the system prompt's project section): only the window's open project, while the user allows its current content (project trust) and inside the folders the AI's file tools reach; otherwise the run goes on with no project memory. Nothing is cached, so a withdrawn answer or a change outside Oarlock stops it on the next run. The whole file is sent, whatever its size. The system prompt counts against the model's context before the history (`compact.ts`: four characters a token), so compaction starts earlier beside a large `AGENTS.md`, and a run whose system prompt alone does not fit fails with a message naming `AGENTS.md` and its size (or the instructions as a whole) instead of a provider error. It puts the run's `<env>` block (workspace root, terminal cwd, active file) before the last user message, for the model only; a path in it is written as it is unless it holds a control character, a line separator or a closing tag, begins with a quote or begins or ends with a space, and then as a JSON string (`pathText` in `lib/messageBlocks.ts`; the system prompt says a quoted value is JSON), so a folder or file name cannot add a line to the block or end it. Each step's usage reaches `onUsage` with the model it ran on.
 - **Reasoning effort** (`lib/reasoningEffort.ts`): a picker beside the model in the composer (`ReasoningEffortPicker`) offers off, low, medium and high for catalog models tagged `reasoning` whose provider can take an effort (OpenAI, Anthropic, Google, xAI but Grok 4.20, and DeepSeek V4, which only switches thinking off or on and offers off and high). Models whose capabilities are unknown (custom endpoints, local servers, OpenRouter) hide it. The choice is remembered per model (`reasoningEffortByModel`), and until one is made nothing is sent, so the model keeps its default. OpenAI, Anthropic, Google and xAI get the AI SDK's `reasoning` call option, which each provider maps under its own constraints: Anthropic adaptive thinking with an effort (or a budget within the max tokens) and no temperature, OpenAI `reasoningEffort`, Google `thinkingConfig`, xAI `reasoningEffort`; a model that cannot stop thinking gets its lowest setting for off. DeepSeek gets its `thinking` switch through the compatible provider. Reasoning renders as before.
 - **Sub-agents** (`agents/registry.ts`, `agents/runSubagent.ts`): named sub-agents with their own system prompts and tool subsets, invoked by the main agent via `run_subagent` tool. A sub-agent runs on the window's selected model, and each of its steps is counted in the meter of the conversation that started it, at that model (see Usage meter).
@@ -5299,3 +5299,23 @@ copy reads entries as encountered, so concurrent external edits can produce mixe
 versions. Copies are refused when a suitable private same-volume staging location
 is unavailable. Linux rename, move and delete use the same checks; metadata-safe
 copy remains unavailable there pending validation. Windows remains a later port.
+
+Review follow-up: tab and active-tab mutations update their shared refs before
+React publishes a render, so returned pane IDs and disposal do not depend on
+when React runs an updater. Suspended Vim commands have a ten-second deadline;
+retirement resets transient shared command state and stale continuations cannot
+reset the next owner. Already-applied edits are not rolled back.
+
+Theme imports save assets before a conditional selection; background kind and
+image ID publish in one preference update. Background candidates use a shared
+Web Lock and dated IDs; a later import removes old unselected candidates only
+after a preference revision barrier. A missing selected theme is resolved against
+fresh catalog and preference snapshots, reset to the built-in default and reported.
+User-visible catalog entries are retained. The store-plugin alias boundary remains
+under review as R216; the plugin still follows aliases on disk.
+
+PTY startup carries the native page generation, and write, resize, close and
+foreground checks require the owning window. Repository watches check the same
+Git metadata authorization as Git operations. Explicit workspace opens recheck
+path authorization rather than caching a spelling across later opens. Conditional
+writes compare opened file identity against the pinned entry, including hard links.
