@@ -370,8 +370,8 @@ impl Store {
     }
     fn mutate(&mut self, change: Change) -> Result<Snapshot, String> {
         let next = apply(&self.snapshot, change)?;
+        self.verify_disk()?;
         if next != self.snapshot {
-            self.verify_disk()?;
             persist(&self.path, &next, Some(&self.snapshot))?;
             self.snapshot = next;
         }
@@ -616,6 +616,22 @@ mod tests {
                 .themes,
             vec![newer]
         );
+    }
+
+    #[test]
+    fn no_op_changes_refuse_damaged_or_missing_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.mutate(upsert("theme-a")).unwrap();
+        let before = store.snapshot.clone();
+        std::fs::write(&store.path, b"damaged").unwrap();
+        assert!(store.mutate(upsert("theme-a")).is_err());
+        assert!(store.mutate(Change::Delete { id: "missing".into() }).is_err());
+        assert_eq!(store.snapshot, before);
+        assert_eq!(std::fs::read(&store.path).unwrap(), b"damaged");
+        std::fs::remove_file(&store.path).unwrap();
+        assert!(store.mutate(upsert("theme-a")).is_err());
+        assert!(!store.path.exists());
     }
     #[test]
     fn rejects_invalid_revision_duplicate_ids_and_nested_fields() {
