@@ -11,7 +11,12 @@ export function installDiscardCoordinator(): () => void {
   let alive = true;
   let unlisten: (() => void) | undefined;
   let client: DiscardCoordinator | undefined;
+  let starting = false;
   const start = async () => {
+    // Registration replaces the native page token. Do not issue overlapping
+    // attempts: their IPC replies can arrive in a different order.
+    if (!alive || starting) return;
+    starting = true;
     unlisten?.();
     client?.dispose();
     const next = new DiscardCoordinator({
@@ -70,6 +75,8 @@ export function installDiscardCoordinator(): () => void {
             },
           },
         });
+    } finally {
+      starting = false;
     }
   };
   void start();

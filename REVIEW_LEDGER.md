@@ -4112,3 +4112,7 @@ Tests cover cross-window newer choices, cancellation, durable preference snapsho
 ### R013: bounded search admission
 
 When all 16 existing supersession slots are in use, a new search now receives a clear busy error rather than an untracked ticket that cannot be superseded. Existing tracked searches remain independent and slots become reusable when work finishes. Explorer displays search failures instead of reporting “No matches.” Regression tests cover repeated overflow, preservation of existing searches, slot reuse, and visible error text. Nine focused native tests, the full native suite, strict Clippy, the full frontend suite (5,571 passed, 2 skipped), the additional focused UI test, types and lint passed. R013 is closed; Tier 3 remaining = 14, including six AI-on-hold.
+
+### R037: Discard registration retries
+
+Repeated Retry clicks now coalesce while registration is in flight. This prevents overlapping native registrations from replacing one another's page tokens or an older listener cleanup from removing the current listener. The regression holds the retry registration pending and clicks Retry twice; it verifies only one new registration and listener are created. The existing late-unmount test still verifies registration cleanup. Focused tests (13), the full frontend suite (5,573 passed, 2 skipped), types and lint passed. R037 is closed; Tier 3 remaining = 13, including six AI-on-hold.

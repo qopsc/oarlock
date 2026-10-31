@@ -103,3 +103,21 @@ it("failed registration exposes Retry and never dispatches Git", async () => {
   ).toHaveLength(2);
   expect(fake.dismiss).toHaveBeenCalledWith("discard-sync");
 });
+
+it("coalesces repeated Retry clicks while native registration is pending", async () => {
+  let finish!: (value: unknown) => void;
+  fake.invoke.mockRejectedValueOnce(new Error("unavailable"));
+  stop = installDiscardCoordinator();
+  await flush();
+  const retry = fake.error.mock.calls[0][1].action.onClick;
+  fake.invoke.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  retry();
+  retry();
+  await flush();
+  expect(fake.listen).toHaveBeenCalledTimes(2);
+  expect(fake.invoke.mock.calls.filter(([cmd]) => cmd === "git_discard_register")).toHaveLength(2);
+  finish({ token: "new", events: [] });
+  await flush();
+  expect(fake.dismiss).toHaveBeenCalledWith("discard-sync");
+  expect(fake.off).toHaveBeenCalledTimes(1);
+});
