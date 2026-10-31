@@ -4373,7 +4373,7 @@ R059 validation: the real-Git race test failed before the worktree lock and pass
 | ID | Status / tier | Current evidence |
 | --- | --- | --- |
 | R002 | Dormant, Tier 2 | The update dialog still omits the error state, but `UPDATES_ENABLED` is false. |
-| R058 | Open, Tier 2 | `git_show_text` still maps any nonzero Git exit to Missing, and branch listing still replaces failures with empty results. |
+| R058 | Partially fixed, Tier 2 remains open | `git_show_text` now verifies tree/index membership before treating an error as a missing file, and branch/worktree listing reports command failures. Real-Git regressions cover missing blob objects, genuinely absent files, unborn HEAD, and corrupt refs. Other optional line helpers still collapse some Git errors into absent values and need separate validation. |
 | R060 | Closed | `549ab52`: Source Control shows an error and Retry instead of “No repository.” |
 | R091 | Open, Tier 2 | A rejected WebGL image-layer import remains cached while the loading flag stays set; no user-visible retry is provided. |
 | R092 | Open, Tier 2 | Context restoration marks the WebGL context healthy before required resource creation can throw. |
@@ -4382,3 +4382,5 @@ R059 validation: the real-Git race test failed before the worktree lock and pass
 Counts: **1 closed; 3 Tier 2 open; 2 dormant Tier 2**. R078, an original MINOR outside these six, was fixed in `1736685`. These source checks do not claim a live GPU or updater failure reproduction.
 
 R100 publication notes: font rebuilds use the existing asset-first publication approach, with content-derived filenames and a metadata-preserving stylesheet replacement. Prior and new license notices are retained together when they differ. An interruption may leave unreferenced candidate files, but cannot remove fonts referenced by the old stylesheet. This addresses script failures; no crash-durability guarantee across an OS or power failure is claimed without filesystem synchronization.
+
+R058 checkpoint: the Git operations file reached this batch’s three-re-edit tripwire after the R059 and branch-list work. Remaining optional-line error classification is not claimed fixed. Consider splitting Git branch/ref operations into a dedicated module if this file trips again; stop this batch after verification.

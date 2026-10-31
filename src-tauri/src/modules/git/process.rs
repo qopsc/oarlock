@@ -145,7 +145,52 @@ pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> R
         return Err(GitError::TimedOut("git show"));
     }
     if output.exit_code != Some(0) {
-        return Ok(TextSource::Missing);
+        // A missing blob object and an absent path both make `git show` fail.
+        // Ask the tree or index whether the entry exists before treating the
+        // error as an ordinary addition/deletion.
+        let Some((tree, path)) = spec.split_once(':') else {
+            ensure_success(&output, "git show failed")?;
+            unreachable!();
+        };
+        // build_git_command already enables --literal-pathspecs.
+        let args = if tree.is_empty() {
+            vec!["ls-files", "--cached", "-z", "--", path]
+        } else {
+            vec!["ls-tree", "--full-tree", "-z", tree, "--", path]
+        };
+        let entries = run_git_guarded(workspace, Some(repo_root), args, DEFAULT_TIMEOUT_SECS)?;
+        if entries.timed_out {
+            return Err(GitError::TimedOut("git list entry"));
+        }
+        if entries.exit_code == Some(0) && !entries.truncated && entries.stdout.is_empty() {
+            return Ok(TextSource::Missing);
+        }
+        // An unborn branch has no HEAD tree. Distinguish that from a broken
+        // object by checking that its symbolic branch has no ref at all.
+        if tree == "HEAD" && entries.exit_code != Some(0) {
+            let head = run_git_guarded(
+                workspace,
+                Some(repo_root),
+                ["symbolic-ref", "-q", "HEAD"],
+                DEFAULT_TIMEOUT_SECS,
+            )?;
+            if head.exit_code == Some(0) && !head.timed_out && !head.truncated {
+                let name = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+                if name.starts_with("refs/heads/") {
+                    let exists = run_git_guarded(
+                        workspace,
+                        Some(repo_root),
+                        ["show-ref", "--verify", "--quiet", &name],
+                        DEFAULT_TIMEOUT_SECS,
+                    )?;
+                    if exists.exit_code == Some(1) && !exists.timed_out {
+                        return Ok(TextSource::Missing);
+                    }
+                }
+            }
+        }
+        ensure_success(&output, "git show failed")?;
+        unreachable!();
     }
     Ok(decode_text(output.stdout))
 }
@@ -699,6 +744,50 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn missing_entries_are_distinct_from_missing_git_objects() {
+        use super::git_show_text;
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@oarlock.local"]);
+        git(&["config", "user.name", "Oarlock Test"]);
+        let root = repo.to_str().unwrap();
+        assert!(matches!(
+            git_show_text(&WorkspaceEnv::Local, root, "HEAD:absent").unwrap(),
+            TextSource::Missing
+        ));
+        std::fs::write(repo.join("file.txt"), "tracked text").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-qm", "test"]);
+        assert!(matches!(
+            git_show_text(&WorkspaceEnv::Local, root, "HEAD:absent").unwrap(),
+            TextSource::Missing
+        ));
+        assert!(matches!(
+            git_show_text(&WorkspaceEnv::Local, root, ":absent").unwrap(),
+            TextSource::Missing
+        ));
+        let blob = git(&["rev-parse", "HEAD:file.txt"]);
+        std::fs::remove_file(repo.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        assert!(git_show_text(&WorkspaceEnv::Local, root, "HEAD:file.txt").is_err());
+        assert!(git_show_text(&WorkspaceEnv::Local, root, ":file.txt").is_err());
+    }
 
     #[cfg(unix)]
     #[test]

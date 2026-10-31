@@ -1203,28 +1203,39 @@ pub fn list_branches(
         .ok()
         .flatten();
     let is_detached_head = current_branch.as_deref() == Some("HEAD");
-    let worktrees = worktree::list_worktrees(registry, &repo_root).unwrap_or_default();
+    let worktrees = worktree::list_worktrees(registry, &repo_root)?;
 
     let mut branches: Vec<GitBranchEntry> = Vec::new();
-    if let Ok(lines) = repo_root.lines(["branch", "--format=%(refname:short)%00%(HEAD)"]) {
-        for line in &lines {
-            let mut parts = line.split('\0');
-            let name = parts.next().unwrap_or("").to_string();
-            let is_head = parts.next().unwrap_or("") == "*";
-            if name.is_empty() {
-                continue;
-            }
-            let worktree_path = worktrees
-                .iter()
-                .find(|wt| !wt.is_current && wt.branch.as_deref() == Some(name.as_str()))
-                .map(|wt| wt.path.clone());
-            branches.push(GitBranchEntry {
-                name,
-                worktree_path,
-                is_head,
-                is_detached: is_head && is_detached_head,
-            });
+    let listed = repo_root.run(
+        ["branch", "--format=%(refname:short)%00%(HEAD)"],
+        DEFAULT_TIMEOUT_SECS,
+    )?;
+    ensure_success(&listed, "git branch failed")?;
+    if listed.truncated {
+        return Err(GitError::command(
+            "git branch",
+            "branch list exceeds the output limit",
+        ));
+    }
+    let lines = std::str::from_utf8(&listed.stdout)
+        .map_err(|_| GitError::command("git branch", "cannot decode branch list"))?;
+    for line in lines.lines() {
+        let mut parts = line.split('\0');
+        let name = parts.next().unwrap_or("").to_string();
+        let is_head = parts.next().unwrap_or("") == "*";
+        if name.is_empty() {
+            continue;
         }
+        let worktree_path = worktrees
+            .iter()
+            .find(|wt| !wt.is_current && wt.branch.as_deref() == Some(name.as_str()))
+            .map(|wt| wt.path.clone());
+        branches.push(GitBranchEntry {
+            name,
+            worktree_path,
+            is_head,
+            is_detached: is_head && is_detached_head,
+        });
     }
     branches.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -1271,6 +1282,20 @@ mod tests {
             .current_dir(dir)
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn branch_list_reports_corrupt_refs_instead_of_an_empty_list() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(git(&root, &["init", "-q"]));
+        assert!(git(&root, &["commit", "-q", "--allow-empty", "-m", "init"]));
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let root_path = root.to_string_lossy().to_string();
+        assert!(list_branches(&registry, &root_path, &WorkspaceEnv::Local).is_ok());
+        std::fs::write(root.join(".git/packed-refs"), "not a ref\n").unwrap();
+        assert!(list_branches(&registry, &root_path, &WorkspaceEnv::Local).is_err());
     }
 
     #[test]
