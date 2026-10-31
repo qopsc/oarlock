@@ -6,7 +6,6 @@ use crate::{ChangePayload, StoreState};
 use serde_json::Value as JsonValue;
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -289,6 +288,13 @@ struct StoreInner<R: Runtime> {
 }
 
 impl<R: Runtime> StoreInner<R> {
+    fn report_save_failure(&self, error: &crate::Error) {
+        let message = format!("{}: {error}", self.path.display());
+        tracing::error!("Store save failed: {message}");
+        if let Err(error) = self.app.emit("oarlock://store-save-failed", &message) {
+            tracing::error!("Could not report store save failure: {error}");
+        }
+    }
     fn new(
         app: AppHandle<R>,
         path: PathBuf,
@@ -308,10 +314,8 @@ impl<R: Runtime> StoreInner<R> {
 
     /// Saves the store to disk at the store's `path`.
     pub fn save(&self) -> crate::Result<()> {
-        fs::create_dir_all(self.path.parent().expect("invalid store path"))?;
-
         let bytes = (self.serialize_fn)(&self.cache).map_err(crate::Error::Serialize)?;
-        crate::secure_file::write(&self.path, &bytes)?;
+        crate::secure_file::write(&self.app.path().app_data_dir()?, &self.path, &bytes)?;
 
         Ok(())
     }
@@ -320,7 +324,7 @@ impl<R: Runtime> StoreInner<R> {
     ///
     /// Note: This method loads the data and merges it with the current store
     pub fn load(&mut self) -> crate::Result<()> {
-        let bytes = crate::secure_file::read(&self.path)?;
+        let bytes = crate::secure_file::read(&self.app.path().app_data_dir()?, &self.path)?;
 
         self.cache
             .extend((self.deserialize_fn)(&bytes).map_err(crate::Error::Deserialize)?);
@@ -330,7 +334,7 @@ impl<R: Runtime> StoreInner<R> {
 
     /// Load the store from the on-disk state, ignoring defaults
     pub fn load_ignore_defaults(&mut self) -> crate::Result<()> {
-        let bytes = crate::secure_file::read(&self.path)?;
+        let bytes = crate::secure_file::read(&self.app.path().app_data_dir()?, &self.path)?;
         self.cache = (self.deserialize_fn)(&bytes).map_err(crate::Error::Deserialize)?;
         Ok(())
     }
@@ -594,7 +598,7 @@ impl<R: Runtime> Store<R> {
             return Ok(());
         };
         if auto_save_delay.is_zero() {
-            return self.save();
+            return self.save().inspect_err(|error| self.store.lock().unwrap().report_save_failure(error));
         }
         let mut auto_save_debounce_sender = self.auto_save_debounce_sender.lock().unwrap();
         if let Some(ref sender) = *auto_save_debounce_sender {
@@ -616,7 +620,8 @@ impl<R: Runtime> Store<R> {
                     }
                     _ = sleep(auto_save_delay) => {
                         auto_save_debounce_sender.lock().unwrap().take();
-                        let _ = store.lock().unwrap().save();
+                        let store = store.lock().unwrap();
+                        if let Err(error) = store.save() { store.report_save_failure(&error); }
                         return;
                     }
                 };
@@ -630,7 +635,7 @@ impl<R: Runtime> Store<R> {
         let auto_save_debounce_sender = self.auto_save_debounce_sender.lock().unwrap().take();
         if let Some(sender) = auto_save_debounce_sender {
             let _ = sender.send(AutoSaveMessage::Cancel);
-            let _ = self.save();
+            if let Err(error) = self.save() { self.store.lock().unwrap().report_save_failure(&error); }
         };
     }
 }
