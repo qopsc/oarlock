@@ -370,6 +370,7 @@ pub async fn fs_save_document(
     content: String,
     expected_version: Option<String>,
     workspace: Option<WorkspaceEnv>,
+    source: Option<String>,
 ) -> Result<DocumentSaveResult, String> {
     let emitter = app.clone();
     let event_path = path.clone();
@@ -423,7 +424,7 @@ pub async fn fs_save_document(
             "fs:file-written",
             FileWrittenEvent {
                 path: event_path,
-                source: Some("editor".into()),
+                source: Some(source.unwrap_or_else(|| "editor".into())),
             },
         );
     }

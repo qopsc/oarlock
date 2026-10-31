@@ -62,7 +62,9 @@ describe("theme file persistence", () => {
   beforeEach(() => {
     events.listeners.length = 0;
     core.invoke.mockReset();
-    core.invoke.mockResolvedValue(undefined);
+    core.invoke.mockImplementation(async (cmd: string) =>
+      cmd === "fs_save_document" ? { kind: "saved", version: "new" } : undefined,
+    );
     paths.appConfigDir.mockClear();
     // A WSL window: theme files still live in the host's app config folder.
     useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Ubuntu" } });
@@ -71,7 +73,7 @@ describe("theme file persistence", () => {
   it("writes pretty-printed JSON into the themes dir without recreating it", async () => {
     const path = await writeThemeFile(theme());
 
-    expect(path).toBe("/config/themes/my-theme.oarlock-theme");
+    expect(path).toEqual({ path: "/config/themes/my-theme.oarlock-theme", comparison: "same" });
     expect(core.invoke).toHaveBeenCalledWith("fs_stat", {
       path: "/config/themes",
       workspace: host,
@@ -80,19 +82,48 @@ describe("theme file persistence", () => {
       (c) => c[0] === "fs_create_dir",
     );
     expect(calls).toHaveLength(0);
-    expect(core.invoke).toHaveBeenLastCalledWith("fs_write_file", {
+    expect(core.invoke).toHaveBeenLastCalledWith("fs_save_document", {
       path: "/config/themes/my-theme.oarlock-theme",
       content: JSON.stringify(theme(), null, 2),
+      expectedVersion: null,
       workspace: host,
       source: "theme",
     });
+  });
+
+  it("preserves an existing theme file and reports when it differs from the catalog", async () => {
+    const existing = JSON.stringify({ ...theme(), name: "Other window's edit" });
+    core.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "fs_save_document") return { kind: "conflict", version: "existing" };
+      if (cmd === "fs_read_file") return { kind: "text", content: existing };
+      return undefined;
+    });
+    const result = await writeThemeFile(theme());
+    expect(result).toEqual({ path: "/config/themes/my-theme.oarlock-theme", comparison: "different" });
+    expect(core.invoke).toHaveBeenCalledWith("fs_save_document", {
+      path: "/config/themes/my-theme.oarlock-theme",
+      content: JSON.stringify(theme(), null, 2),
+      expectedVersion: null,
+      workspace: host,
+      source: "theme",
+    });
+    expect(core.invoke).not.toHaveBeenCalledWith("fs_write_file", expect.anything());
+  });
+
+  it("does not report a difference for equivalent JSON with reordered keys", async () => {
+    core.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "fs_save_document") return { kind: "conflict", version: "existing" };
+      if (cmd === "fs_read_file") return { kind: "text", content: JSON.stringify({ variants: {}, description: "", author: "", name: "Mine", id: "my-theme" }) };
+      return undefined;
+    });
+    await expect(writeThemeFile(theme())).resolves.toEqual({ path: "/config/themes/my-theme.oarlock-theme", comparison: "same" });
   });
 
   it("creates the themes dir first when it does not exist yet", async () => {
     core.invoke.mockImplementation((cmd: string) =>
       cmd === "fs_stat"
         ? Promise.reject(new Error("missing"))
-        : Promise.resolve(undefined),
+        : Promise.resolve(cmd === "fs_save_document" ? { kind: "saved", version: "new" } : undefined),
     );
 
     await writeThemeFile(theme("t2"));
@@ -101,6 +132,15 @@ describe("theme file persistence", () => {
       path: "/config/themes",
       workspace: host,
     });
+  });
+
+  it("preserves an existing file when it cannot be compared", async () => {
+    core.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "fs_save_document") return { kind: "conflict", version: "existing" };
+      if (cmd === "fs_read_file") throw new Error("read failed");
+      return undefined;
+    });
+    await expect(writeThemeFile(theme())).resolves.toEqual({ path: "/config/themes/my-theme.oarlock-theme", comparison: "unknown" });
   });
 
   it("deletes a theme file and swallows a missing-file failure", async () => {

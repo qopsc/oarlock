@@ -8,6 +8,7 @@ import { workspaceEnvForPath } from "@/modules/workspace";
 import { listCustomThemes, readCustomThemes, saveCustomTheme, saveThemeFileSnapshot } from "./customThemes";
 import { createThemeFileIngest } from "./themeFileIngest";
 import {
+  compareThemeFile,
   isThemeFilePath,
   onThemeEdit,
   parseThemeFile,
@@ -69,7 +70,18 @@ export function useThemeFileEditing({ tabsRef, openFileTab }: Params) {
         const open = tabsRef.current.some(
           (t) => t.kind === "editor" && t.path === path,
         );
-        if (!open) await writeThemeFile(theme);
+        const comparison = open
+          ? await compareThemeFile(path, theme)
+          : (await writeThemeFile(theme)).comparison;
+        if (comparison === "different") {
+          toast.warning("Existing theme file differs from the saved theme", {
+            description: "The existing file was preserved and opened for editing.",
+          });
+        } else if (comparison === "unknown") {
+          toast.warning("Could not compare the existing theme file", {
+            description: "The file was preserved. Check it before saving changes.",
+          });
+        }
         void persistThemeId(theme.id);
         openFileTab(path);
         void getCurrentWebviewWindow().setFocus().catch(console.error);
