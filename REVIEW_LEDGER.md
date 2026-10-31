@@ -4034,3 +4034,7 @@ R018 is fixed: pointer cancellation and lost capture abandon a drag without movi
 ## Tier 2: R047 LSP navigation ownership
 
 R047 is fixed: definition and reference requests share a per-editor ordering, and a response or results-panel selection is ignored if superseded, the document or selection changed, the editor was destroyed, or its pane became hidden and visible again. This uses the editor's existing visibility signal and LSP view lifetime; no persisted state or native interface was added. Regressions exercise overlapping definition/reference requests, edits, cursor movement, pane visibility changes and destruction. The full frontend suite passed (5,533 passed, 2 skipped), followed by the focused navigation tests after a test-only type correction; types and lint passed. Tier 2 remaining in the ownership group: 24.
+
+## Tier 2: R061 Git graph context
+
+R061 is fixed: delayed repository resolution for the Git graph is accepted only while its originating space, environment, tab and repository context remain current, and a newer request or unmount supersedes it. The guard follows the existing repository-targeting request ownership pattern. Regression tests cover out-of-order resolution and closure of the owning context. The full frontend suite passed (5,535 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 23.

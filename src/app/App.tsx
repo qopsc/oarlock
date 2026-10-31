@@ -1044,6 +1044,9 @@ export default function App() {
   const { sourceControl, toggleSourceControl, openGitGraphFromContext } =
     useSourceControlContext({
       enabled: !unavailableWorkspace,
+      spaceId: sourceControlSpaceId,
+      workspaceKey: workspaceScopeKey(workspaceEnv),
+      isContextCurrent: isRepositoryContextCurrent,
       activeTab,
       tabs,
       activeTerminalLeafCwd,
