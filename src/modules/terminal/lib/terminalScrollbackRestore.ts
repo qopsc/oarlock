@@ -1,4 +1,5 @@
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { preferencesReady } from "@/modules/settings/readiness";
 import {
   createScrollbackKey,
   encodeScrollbackFile,
@@ -244,7 +245,12 @@ export class TerminalScrollbackRegistry {
 
   private async write(targets: readonly number[]): Promise<void> {
     const { backend, settings } = this.options;
-    await settings.ready();
+    try {
+      await settings.ready();
+    } catch (error) {
+      console.warn("[oarlock] cannot save scrollback until preferences are available:", error);
+      return;
+    }
     if (!settings.enabled()) {
       if (this.purged) return;
       try {
@@ -394,15 +400,16 @@ function restoreEnabled(state: {
 }
 
 const preferenceSettings: ScrollbackSettings = {
-  ready: () =>
-    usePreferencesStore
-      .getState()
-      .init()
-      .catch(() => undefined),
+  ready: async () => {
+    await usePreferencesStore.getState().init();
+    if (!preferencesReady(usePreferencesStore.getState()))
+      throw new Error("Preferences are not synchronized");
+  },
   enabled: () => restoreEnabled(usePreferencesStore.getState()),
   subscribe: (listener) =>
     usePreferencesStore.subscribe((state, previous) => {
-      if (restoreEnabled(state) !== restoreEnabled(previous)) listener();
+      if (restoreEnabled(state) !== restoreEnabled(previous) ||
+          preferencesReady(state) !== preferencesReady(previous)) listener();
     }),
 };
 

@@ -66,6 +66,7 @@ export async function deleteBgImage(id: string): Promise<void> {
     tx.objectStore(STORE).delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error("Image deletion was aborted"));
   });
 }
 
