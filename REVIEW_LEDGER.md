@@ -4384,3 +4384,7 @@ Counts: **1 closed; 3 Tier 2 open; 2 dormant Tier 2**. R078, an original MINOR o
 R100 publication notes: font rebuilds use the existing asset-first publication approach, with content-derived filenames and a metadata-preserving stylesheet replacement. Prior and new license notices are retained together when they differ. An interruption may leave unreferenced candidate files, but cannot remove fonts referenced by the old stylesheet. This addresses script failures; no crash-durability guarantee across an OS or power failure is claimed without filesystem synchronization.
 
 R058 checkpoint: the Git operations file reached this batch’s three-re-edit tripwire after the R059 and branch-list work. Remaining optional-line error classification is not claimed fixed. Consider splitting Git branch/ref operations into a dedicated module if this file trips again; stop this batch after verification.
+
+### Branch/ref module split
+
+Moved branch listing, switching, Undo Commit and remote-containment checks, including their existing unit tests, from `git/operations.rs` to `git/branches.rs`. The original `operations` entry points re-export them, with no intended behavior change. The original 32 entry-point guard and 15 remote-scope tests pass unchanged. Further R058 work follows separately.
