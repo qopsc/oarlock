@@ -2,9 +2,77 @@ use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::operations::sha_is_safe;
 use crate::modules::git::process::{ensure_git_available, ensure_success};
 use crate::modules::git::types::{GitBranchEntry, GitBranchListResult, DEFAULT_TIMEOUT_SECS};
-use crate::modules::git::utils::{authorized_repo_root, owned_repo_root, validate_branch_name};
+use crate::modules::git::utils::{
+    authorized_repo_root, owned_repo_root, validate_branch_name, ResolvedGitDirectory,
+};
 use crate::modules::git::worktree;
 use crate::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
+
+pub(super) fn symbolic_head(repo: &ResolvedGitDirectory) -> Result<Option<String>> {
+    repo.optional_line(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])
+}
+
+pub(super) fn is_unborn_head(repo: &ResolvedGitDirectory) -> Result<bool> {
+    let Some(head) = symbolic_head(repo)? else {
+        return Ok(false);
+    };
+    if !head.starts_with("refs/heads/") {
+        return Ok(false);
+    }
+    let output = repo.run(
+        ["show-ref", "--verify", "--quiet", &head],
+        DEFAULT_TIMEOUT_SECS,
+    )?;
+    if !output.timed_out && output.exit_code == Some(1) {
+        return Ok(true);
+    }
+    ensure_success(&output, "git HEAD failed")?;
+    Ok(false)
+}
+
+pub(super) fn upstream_name(repo: &ResolvedGitDirectory) -> Result<Option<String>> {
+    let Some(head) = symbolic_head(repo)? else {
+        return Ok(None);
+    };
+    let lines = repo.lines([
+        "for-each-ref",
+        "--format=%(refname)%00%(upstream:short)",
+        &head,
+    ])?;
+    for line in lines {
+        let Some((name, upstream)) = line.split_once('\0') else {
+            return Err(GitError::command("git upstream", "malformed ref output"));
+        };
+        if name == head {
+            if upstream.is_empty() {
+                if let Some(branch) = head.strip_prefix("refs/heads/") {
+                    if repo
+                        .optional_line(["config", "--get", &format!("branch.{branch}.merge")])?
+                        .is_some()
+                    {
+                        return Err(GitError::command(
+                            "git upstream",
+                            "configured upstream cannot be resolved",
+                        ));
+                    }
+                }
+            }
+            return Ok((!upstream.is_empty()).then(|| upstream.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn first_parent(repo: &ResolvedGitDirectory, sha: &str) -> Result<Option<String>> {
+    let parents = repo.line([
+        "show",
+        "--no-show-signature",
+        "--no-patch",
+        "--format=%P",
+        sha,
+    ])?;
+    Ok(parents.and_then(|text| text.split_whitespace().next().map(str::to_owned)))
+}
 
 /// Undoes the newest commit the way `git reset --soft HEAD~1` does: the branch moves back to
 /// the commit's first parent and its changes stay staged, so nothing is lost. `expected_head`
@@ -40,9 +108,7 @@ fn undo_last_commit_with_hook(
         }
         validate_branch_name(expected_branch)?;
         let expected_ref = format!("refs/heads/{expected_branch}");
-        if repo_root
-            .line(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])?
-            .as_deref()
+        if symbolic_head(&repo_root)?.as_deref()
             != Some(expected_ref.as_str())
         {
             return Err(GitError::command(
@@ -56,13 +122,7 @@ fn undo_last_commit_with_hook(
         // update to a different branch; external races remain best effort.
         // The parent comes from the chosen commit, not from HEAD, so a racing commit cannot
         // change which commit is undone.
-        let parent = repo_root
-            .line([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{expected_head}^"),
-            ])?
+        let parent = first_parent(&repo_root, expected_head)?
             .ok_or_else(|| GitError::command("undo commit", "the first commit cannot be undone"))?;
         let output = repo_root.run(
             [
@@ -131,11 +191,7 @@ pub fn list_branches(
     let repo_root = authorized_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
 
-    let current_branch = repo_root
-        .line(["rev-parse", "--abbrev-ref", "HEAD"])
-        .ok()
-        .flatten();
-    let is_detached_head = current_branch.as_deref() == Some("HEAD");
+    let is_detached_head = symbolic_head(&repo_root)?.is_none();
     let worktrees = worktree::list_worktrees(registry, &repo_root)?;
 
     let mut branches: Vec<GitBranchEntry> = Vec::new();

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::parser::parse_porcelain_v2;
-use crate::modules::git::process::{ensure_git_available, ensure_success, git_stdout_lines};
+use crate::modules::git::process::{ensure_git_available, ensure_success, run_git_guarded};
 use crate::modules::git::types::{
     GitLinkedWorktree, GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeEntry,
     GitWorktreeRemoveResult, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
@@ -43,8 +43,25 @@ pub(crate) fn locate_work_tree(
     workspace: &WorkspaceEnv,
     cwd: &str,
 ) -> Result<Option<WorkTreeLocation>> {
-    let lines = git_stdout_lines(workspace, cwd, LOCATE_ARGS)?;
-    let mut lines = lines.iter().map(|line| line.trim());
+    let output = run_git_guarded(workspace, Some(cwd), LOCATE_ARGS, DEFAULT_TIMEOUT_SECS)?;
+    if !output.timed_out && output.exit_code != Some(0) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.starts_with("fatal: not a git repository (or any of the parent directories)")
+            || stderr.starts_with("fatal: this operation must be run in a work tree")
+        {
+            return Ok(None);
+        }
+    }
+    ensure_success(&output, "git repository discovery failed")?;
+    if output.truncated {
+        return Err(GitError::command(
+            "git repository discovery",
+            "output exceeds the limit",
+        ));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| GitError::command("git repository discovery", "cannot decode output"))?;
+    let mut lines = text.lines().map(|line| line.trim());
     let Some(toplevel) = lines.next().filter(|line| !line.is_empty()) else {
         return Ok(None);
     };
@@ -275,19 +292,16 @@ fn worktree_folder(path: &str, workspace: &WorkspaceEnv) -> Result<WorktreeFolde
 }
 
 fn local_branch_exists(repo: &ResolvedGitDirectory, name: &str) -> Result<bool> {
+    let name = format!("refs/heads/{name}");
     let output = repo.run(
-        [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{name}"),
-        ],
+        ["show-ref", "--verify", "--quiet", &name],
         DEFAULT_TIMEOUT_SECS,
     )?;
-    if output.timed_out {
-        return Err(GitError::TimedOut("git rev-parse"));
+    if !output.timed_out && output.exit_code == Some(1) {
+        return Ok(false);
     }
-    Ok(output.exit_code == Some(0))
+    ensure_success(&output, "git branch lookup failed")?;
+    Ok(true)
 }
 
 /// Fails unless `base` names a commit. Like branch names it can never be read as an option.

@@ -5,14 +5,13 @@ use std::path::{Path, PathBuf};
 use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2};
 use crate::modules::git::process::{
-    decode_text, ensure_git_available, ensure_success, git_show_text, git_stdout_line_opt,
-    git_stdout_lines, read_text_file, run_git_capped, run_git_guarded,
+    decode_text, ensure_git_available, ensure_success, git_show_text, read_text_file,
+    run_git_capped, run_git_guarded,
 };
 use crate::modules::git::types::{
-    DiscardEntry, GitCommitFileChange, GitCommitResult,
-    GitDiffContentResult, GitDiffResult, GitLogEntry, GitOutput, GitPanelSnapshot, GitPushResult,
-    GitRepoInfo, GitStatusSnapshot, TextSource, COMMIT_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS,
-    NETWORK_TIMEOUT_SECS,
+    DiscardEntry, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
+    GitLogEntry, GitOutput, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
+    TextSource, COMMIT_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS,
 };
 use crate::modules::git::utils::{
     authorized_repo_root, canonical_dir, git_entry_name, git_worktree_entry, owned_repo_root,
@@ -46,31 +45,16 @@ fn resolve_repo_in_authorized(
     };
     let canonical_root = discovered_root(registry, cwd, &location.toplevel)?;
 
-    let head = match git_stdout_lines(
-        &canonical_root.workspace,
-        &canonical_root.git_path,
-        ["rev-parse", "--abbrev-ref", "HEAD"],
-    )?
-    .into_iter()
-    .next()
-    {
-        Some(h) => h,
-        None => git_stdout_line_opt(
-            &canonical_root.workspace,
-            &canonical_root.git_path,
-            ["symbolic-ref", "--short", "HEAD"],
-        )?
-        .ok_or(GitError::CommandFailed {
-            context: "failed to resolve HEAD",
-            detail: String::new(),
-        })?,
+    let head = match canonical_root.optional_line(["symbolic-ref", "--quiet", "--short", "HEAD"])? {
+        Some(branch) => branch,
+        None => {
+            let detached =
+                canonical_root.run(["cat-file", "-e", "HEAD^{commit}"], DEFAULT_TIMEOUT_SECS)?;
+            ensure_success(&detached, "git HEAD failed")?;
+            "HEAD".to_string()
+        }
     };
-
-    let upstream = git_stdout_line_opt(
-        &canonical_root.workspace,
-        &canonical_root.git_path,
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )?;
+    let upstream = super::branches::upstream_name(&canonical_root)?;
 
     Ok(Some(GitRepoInfo {
         repo_root: canonical_root.git_path,
@@ -240,9 +224,22 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
 
     let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
     let parsed = parse_porcelain_v2(stdout);
+    let mut listing_error = None;
     let files = untracked::expand_untracked_dirs(parsed.files, |dir, budget| {
-        list_untracked_in(repo_root, dir, budget)
+        if listing_error.is_some() {
+            return None;
+        }
+        match list_untracked_in(repo_root, dir, budget) {
+            Ok(files) => files,
+            Err(error) => {
+                listing_error = Some(error);
+                None
+            }
+        }
     });
+    if let Some(error) = listing_error {
+        return Err(error);
+    }
 
     Ok(GitStatusSnapshot {
         repo_root: repo_root.git_path.clone(),
@@ -257,13 +254,13 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
 }
 
 /// Files git reports as untracked (and not ignored) under `dir`, or `None` when
-/// there are more than `budget` or the listing fails. The walk is abandoned as
+/// there are more than `budget`. The walk is abandoned as
 /// soon as the output exceeds what `budget` entries could need.
 fn list_untracked_in(
     repo_root: &ResolvedGitDirectory,
     dir: &str,
     budget: usize,
-) -> Option<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     let output = run_git_capped(
         &repo_root.workspace,
         Some(&repo_root.git_path),
@@ -278,16 +275,13 @@ fn list_untracked_in(
         ],
         DEFAULT_TIMEOUT_SECS,
         untracked::LISTING_CAP_BYTES,
-    )
-    .ok()?;
-    if output.truncated || output.timed_out {
-        return None;
+    )?;
+    // A listing cut short by the output cap reports exit failure.
+    if output.truncated {
+        return Ok(None);
     }
-    // A listing that was cut short by the cap above reports exit failure.
-    if output.exit_code != Some(0) {
-        return None;
-    }
-    untracked::parse_listing(&output.stdout, budget)
+    ensure_success(&output, "git untracked listing failed")?;
+    Ok(untracked::parse_listing(&output.stdout, budget))
 }
 
 pub fn diff(
@@ -465,8 +459,14 @@ pub fn file_base(
     if output.timed_out {
         return Err(GitError::TimedOut("git show"));
     }
-    if output.exit_code != Some(0) || output.truncated {
+    if output.truncated {
         return Ok(None);
+    }
+    if output.exit_code != Some(0) {
+        return Ok(match git_show_text(&cwd.workspace, &cwd.git_path, &spec)? {
+            TextSource::Text(text) => Some(text),
+            TextSource::Missing | TextSource::Binary => None,
+        });
     }
     Ok(match decode_text(output.stdout) {
         TextSource::Text(text) => Some(text),
@@ -684,7 +684,7 @@ pub fn push(
         super::remote_guard::RemoteAction::Push,
     )?;
 
-    let upstream = repo_root.line(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])?;
+    let upstream = super::branches::upstream_name(&repo_root)?;
     if upstream.is_none() {
         return Err(GitError::NoUpstream);
     }
@@ -749,12 +749,7 @@ pub fn log(
         return Err(GitError::TimedOut("git log"));
     }
     if output.exit_code != Some(0) {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("does not have any commits yet")
-            || stderr.contains("bad default revision")
-            || stderr.contains("unknown revision")
-            || stderr.contains("ambiguous argument 'head'")
-        {
+        if anchor.is_none() && super::branches::is_unborn_head(&repo_root)? {
             return Ok(Vec::new());
         }
         return ensure_success(&output, "git log failed").map(|_| Vec::new());
@@ -946,7 +941,7 @@ pub fn commit_file_diff(
         _ => rel.clone(),
     };
 
-    let parent = repo_root.line(["rev-parse", &format!("{sha}^")])?;
+    let parent = super::branches::first_parent(&repo_root, sha)?;
     let original = match parent.as_deref() {
         Some(p) => git_show_text(
             &repo_root.workspace,
@@ -1007,7 +1002,7 @@ pub fn remote_url(
     if name.is_empty() || name.len() > 64 || !name.chars().all(is_remote_name_char) {
         return Ok(None);
     }
-    repo_root.line(["config", "--get", &format!("remote.{name}.url")])
+    repo_root.optional_line(["config", "--get", &format!("remote.{name}.url")])
 }
 
 fn is_remote_name_char(c: char) -> bool {

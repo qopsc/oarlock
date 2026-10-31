@@ -25,19 +25,31 @@ impl ResolvedGitDirectory {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.line_with_absent_status(args, false)
+    }
+    pub(crate) fn optional_line<I, S>(&self, args: I) -> Result<Option<String>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.line_with_absent_status(args, true)
+    }
+    fn line_with_absent_status<I, S>(&self, args: I, absent_is_one: bool) -> Result<Option<String>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let output = self.run(args, super::types::DEFAULT_TIMEOUT_SECS)?;
-        if output.timed_out {
-            return Err(GitError::TimedOut("git command"));
-        }
-        if output.exit_code != Some(0) {
+        if absent_is_one && !output.timed_out && output.exit_code == Some(1) {
             return Ok(None);
         }
-        let line = std::str::from_utf8(&output.stdout)
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim();
+        super::process::ensure_success(&output, "git read failed")?;
+        if output.truncated {
+            return Err(GitError::command("git read", "output exceeds the limit"));
+        }
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| GitError::command("git read", "cannot decode output"))?;
+        let line = text.lines().next().unwrap_or("").trim();
         Ok((!line.is_empty()).then(|| line.to_string()))
     }
     pub(crate) fn lines<I, S>(&self, args: I) -> Result<Vec<String>>
@@ -46,14 +58,13 @@ impl ResolvedGitDirectory {
         S: AsRef<OsStr>,
     {
         let output = self.run(args, super::types::DEFAULT_TIMEOUT_SECS)?;
-        if output.timed_out {
-            return Err(GitError::TimedOut("git command"));
+        super::process::ensure_success(&output, "git read failed")?;
+        if output.truncated {
+            return Err(GitError::command("git read", "output exceeds the limit"));
         }
-        if output.exit_code != Some(0) {
-            return Ok(vec![]);
-        }
-        Ok(std::str::from_utf8(&output.stdout)
-            .unwrap_or("")
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| GitError::command("git read", "cannot decode output"))?;
+        Ok(text
             .lines()
             .map(|line| line.trim_end_matches('\r').to_string())
             .collect())

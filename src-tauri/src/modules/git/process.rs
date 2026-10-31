@@ -156,7 +156,7 @@ pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> R
         let args = if tree.is_empty() {
             vec!["ls-files", "--cached", "-z", "--", path]
         } else {
-            vec!["ls-tree", "--full-tree", "-z", tree, "--", path]
+            vec!["ls-tree", "-z", tree, "--", path]
         };
         let entries = run_git_guarded(workspace, Some(repo_root), args, DEFAULT_TIMEOUT_SECS)?;
         if entries.timed_out {
@@ -193,51 +193,6 @@ pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> R
         unreachable!();
     }
     Ok(decode_text(output.stdout))
-}
-
-pub fn git_stdout_line_opt<I, S>(
-    workspace: &WorkspaceEnv,
-    cwd: &str,
-    args: I,
-) -> Result<Option<String>>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = run_git_guarded(workspace, Some(cwd), args, DEFAULT_TIMEOUT_SECS)?;
-    if output.timed_out {
-        return Err(GitError::TimedOut("git command"));
-    }
-    if output.exit_code != Some(0) {
-        return Ok(None);
-    }
-    let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
-    let line = stdout.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(line.to_string()))
-    }
-}
-
-/// Run git, returning multiple stdout lines (UTF-8). Empty trailing lines stripped.
-pub fn git_stdout_lines<I, S>(workspace: &WorkspaceEnv, cwd: &str, args: I) -> Result<Vec<String>>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = run_git_guarded(workspace, Some(cwd), args, DEFAULT_TIMEOUT_SECS)?;
-    if output.timed_out {
-        return Err(GitError::TimedOut("git command"));
-    }
-    if output.exit_code != Some(0) {
-        return Ok(Vec::new());
-    }
-    let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
-    Ok(stdout
-        .lines()
-        .map(|line| line.trim_end_matches('\r').to_string())
-        .collect())
 }
 
 pub fn read_text_file(repo_root: &Path, path: &Path) -> Result<TextSource> {

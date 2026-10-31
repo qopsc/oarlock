@@ -4373,13 +4373,13 @@ R059 validation: the real-Git race test failed before the worktree lock and pass
 | ID | Status / tier | Current evidence |
 | --- | --- | --- |
 | R002 | Dormant, Tier 2 | The update dialog still omits the error state, but `UPDATES_ENABLED` is false. |
-| R058 | Partially fixed, Tier 2 remains open | `git_show_text` now verifies tree/index membership before treating an error as a missing file, and branch/worktree listing reports command failures. Real-Git regressions cover missing blob objects, genuinely absent files, unborn HEAD, and corrupt refs. Other optional line helpers still collapse some Git errors into absent values and need separate validation. |
+| R058 | Closed | Optional reads distinguish expected absence from Git failures: repository discovery, symbolic HEAD and upstream, parent lookup, remote configuration, worktree branch lookup, file base, history and untracked expansion report errors. Real-Git tests cover corrupt refs/objects, invalid upstream and gitfile, and valid unborn, detached, untracked and no-upstream cases. |
 | R060 | Closed | `549ab52`: Source Control shows an error and Retry instead of “No repository.” |
 | R091 | Open, Tier 2 | A rejected WebGL image-layer import remains cached while the loading flag stays set; no user-visible retry is provided. |
 | R092 | Open, Tier 2 | Context restoration marks the WebGL context healthy before required resource creation can throw. |
 | R114 | Dormant, Tier 2 | Updater artifacts remain disabled; the release job still treats download failures as missing assets. |
 
-Counts: **1 closed; 3 Tier 2 open; 2 dormant Tier 2**. R078, an original MINOR outside these six, was fixed in `1736685`. These source checks do not claim a live GPU or updater failure reproduction.
+Counts: **2 closed; 2 Tier 2 open; 2 dormant Tier 2**. R078, an original MINOR outside these six, was fixed in `1736685`. These source checks do not claim a live GPU or updater failure reproduction.
 
 R100 publication notes: font rebuilds use the existing asset-first publication approach, with content-derived filenames and a metadata-preserving stylesheet replacement. Prior and new license notices are retained together when they differ. An interruption may leave unreferenced candidate files, but cannot remove fonts referenced by the old stylesheet. This addresses script failures; no crash-durability guarantee across an OS or power failure is claimed without filesystem synchronization.
 
@@ -4388,3 +4388,5 @@ R058 checkpoint: the Git operations file reached this batch’s three-re-edit tr
 ### Branch/ref module split
 
 Moved branch listing, switching, Undo Commit and remote-containment checks, including their existing unit tests, from `git/operations.rs` to `git/branches.rs`. The original `operations` entry points re-export them, with no intended behavior change. The original 32 entry-point guard and 15 remote-scope tests pass unchanged. Further R058 work follows separately.
+
+R058 completion: optional Git helpers now accept only command-specific absence statuses; other failures, truncated optional output and decoding errors surface. Upstreams and commit parents use successful structured Git queries rather than treating failed revision parsing as missing. An invalid configured upstream reports an error. Repository-discovery diagnostics rely on Git’s existing `LC_ALL=C` execution setting. A capped untracked listing still stays collapsed by design; other listing failures surface.
