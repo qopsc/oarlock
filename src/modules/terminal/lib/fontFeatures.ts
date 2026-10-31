@@ -246,8 +246,14 @@ export function subscribeFontFeatures(listener: () => void): () => void {
 
 function retryMissingFonts(): void {
   const now = Date.now();
-  if (![...installed.values()].some((entry) =>
-    typeof entry === "object" && !(entry instanceof Promise) && entry.retryAt <= now)) return;
+  let removed = false;
+  for (const [key, entry] of installed) {
+    if (typeof entry === "object" && !(entry instanceof Promise) && entry.retryAt <= now) {
+      installed.delete(key);
+      removed = true;
+    }
+  }
+  if (!removed) return;
   revision += 1;
   for (const listener of listeners) listener();
 }

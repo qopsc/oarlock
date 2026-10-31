@@ -24,6 +24,8 @@ it("retries a failed installed-font lookup after returning to the window", async
   await vi.advanceTimersByTimeAsync(10_000);
   window.dispatchEvent(new Event("focus"));
   expect(changed).toHaveBeenCalledOnce();
+  window.dispatchEvent(new Event("focus"));
+  expect(changed).toHaveBeenCalledOnce();
   withFontFeatures(stack, '"ss01" 1');
   for (let i = 0; i < 5; i++) await Promise.resolve();
   expect(core.invoke).toHaveBeenCalledTimes(2);
