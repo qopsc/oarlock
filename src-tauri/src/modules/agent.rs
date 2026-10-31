@@ -258,6 +258,12 @@ fn settings_path(spec: &AgentSpec) -> Result<std::path::PathBuf, String> {
     home_path(spec.dir, spec.file)
 }
 
+pub(super) fn protected_settings_paths() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = AGENTS.iter().map(settings_path).collect::<Result<Vec<_>, _>>()?;
+    paths.push(pi_extension_path()?);
+    Ok(paths)
+}
+
 fn pi_extension_path() -> Result<std::path::PathBuf, String> {
     home_path(PI_EXTENSION_DIR, PI_EXTENSION_FILE)
 }

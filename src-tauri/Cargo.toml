@@ -65,7 +65,7 @@ nucleo-matcher = "0.3"
 shared_child = "1"
 tauri-plugin-log = "2"
 tauri-plugin-os = "2"
-tauri-plugin-store = "2"
+tauri-plugin-store = { path = "vendor/tauri-plugin-store" }
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 # One reqwest for the whole app: tauri-plugin-updater already pulls 0.13 with

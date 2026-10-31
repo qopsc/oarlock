@@ -1665,6 +1665,15 @@ language-server fields and malformed collections fail before consumers can throw
 on `.toLowerCase()`, `.length` or language-map lookup. Existing files are preserved
 and can be repaired before Retry; failed writes publish no speculative values.
 
+R216 remains in progress. Preference and theme catalog reads use a retained
+directory and check the opened file against its entry; preference commits use
+the conditional metadata-preserving writer with their own 64 MiB limit. The
+local `tauri-plugin-store` fork checks every store read and write without
+following a final symlink and refuses hard-linked entries. Workspace file saves
+and Explorer mutations check known native store and agent-settings identities.
+The inventory and remaining gaps are recorded in `REVIEW_LEDGER.md`; these
+partial changes do not yet establish the complete native-store boundary.
+
 Validation for native revisioned preferences: 4,770 frontend tests pass across
 514 files, and 1,298 Rust tests pass with three ignored. Types, Clippy, production
 build, dist graph and size checks pass; lint remains

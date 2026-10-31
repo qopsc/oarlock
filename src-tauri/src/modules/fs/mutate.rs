@@ -256,6 +256,7 @@ pub async fn fs_create_file(
         let registry = app.state::<WorkspaceRegistry>();
         let gates = registry.gates(Origin::App);
         let p = gates.authorized_new(&requested)?;
+        super::native_store::refuse_write(&app, &p)?;
         // Oarlock's own new file in a project's trusted item keeps the user's trust in it.
         let change = OwnChange::File {
             target: &p,
@@ -264,6 +265,7 @@ pub async fn fs_create_file(
         project_trust::keeping_trust(&app, change, || {
             create_checked(&p, false, |opened| {
                 let current = gates.authorized_new(&requested)?;
+                super::native_store::refuse_write(&app, &current)?;
                 if current != p || opened != p {
                     return Err("Creation destination changed during operation".into());
                 }
@@ -363,6 +365,8 @@ pub async fn fs_rename(
             let gates = registry.gates(Origin::App);
             let from_p = gates.authorized_entry(&resolve_path(&from, &workspace)?)?;
             let to_p = gates.authorized_entry(&resolve_path(&to, &workspace)?)?;
+            super::native_store::refuse_write(&app, &from_p)?;
+            super::native_store::refuse_write(&app, &to_p)?;
             rename(&from_p, &to_p)?;
             note_changed(&index, &from_p);
             note_changed(&index, &to_p);
@@ -411,6 +415,8 @@ pub async fn fs_move(
         mutation_events::transact(&app, workspace.clone(), &[from.clone(), to.clone()], || {
             let root =
                 resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
+            super::native_store::refuse_write(&app, &resolve_path(&from, &workspace)?)?;
+            super::native_store::refuse_write(&app, &resolve_path(&to, &workspace)?)?;
             let moved = fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)?;
             if moved == FsMoveResult::Moved {
                 let index = app.state::<FileIndexState>();
@@ -499,6 +505,7 @@ pub async fn fs_delete(
                 .state::<WorkspaceRegistry>()
                 .gates(Origin::App)
                 .authorized_entry(&resolve_path(&path, &workspace)?)?;
+            super::native_store::refuse_write(&app, &p)?;
             delete_path(&p)?;
             note_changed(&index, &p);
             Ok((
@@ -542,7 +549,9 @@ pub async fn fs_delete_batch(
                     None,
                 ));
             };
-            let result = fs_delete_batch_impl(paths, &root, &workspace);
+            let result = fs_delete_batch_checked(paths, &root, &workspace, |path| {
+                super::native_store::refuse_write(&app, path)
+            });
             let index = app.state::<FileIndexState>();
             for deleted in &result.deleted {
                 if let Ok(resolved) = resolve_path(deleted, &workspace) {
@@ -566,10 +575,16 @@ pub async fn fs_delete_batch(
     }))
 }
 
-fn fs_delete_batch_impl(
+#[cfg(test)]
+fn fs_delete_batch_impl(paths: Vec<String>, root: &Path, workspace: &WorkspaceEnv) -> FsDeleteBatchResult {
+    fs_delete_batch_checked(paths, root, workspace, |_| Ok(()))
+}
+
+fn fs_delete_batch_checked(
     paths: Vec<String>,
     root: &Path,
     workspace: &WorkspaceEnv,
+    guard: impl Fn(&Path) -> Result<(), String>,
 ) -> FsDeleteBatchResult {
     let mut deleted = Vec::with_capacity(paths.len());
     let mut failed = 0;
@@ -579,6 +594,7 @@ fn fs_delete_batch_impl(
             continue;
         };
         let result = authorize_mutation_entry(&resolved, root)
+            .and_then(|()| guard(&resolved))
             .and_then(|()| remove_path(&resolved).map_err(|error| error.to_string()));
         match result {
             Ok(()) => deleted.push(path),
@@ -594,6 +610,23 @@ fn fs_delete_batch_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_delete_preserves_an_entry_refused_by_the_store_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let protected = root.join("protected");
+        let ordinary = root.join("ordinary");
+        std::fs::write(&protected, b"protected").unwrap();
+        std::fs::write(&ordinary, b"ordinary").unwrap();
+        let paths = vec![protected.to_string_lossy().into_owned(), ordinary.to_string_lossy().into_owned()];
+        let result = fs_delete_batch_checked(paths, &root, &WorkspaceEnv::default(), |path| {
+            if path == protected { Err("protected".into()) } else { Ok(()) }
+        });
+        assert_eq!(result.failed, 1);
+        assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
+        assert!(!ordinary.exists());
+    }
 
     #[cfg(not(windows))]
     #[test]

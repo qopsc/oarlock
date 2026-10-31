@@ -156,6 +156,7 @@ struct DiskState {
 fn current(
     destination: &Destination,
     validate: &impl Fn(&Path) -> Result<(), String>,
+    limit: u64,
 ) -> Result<DiskState, SaveError> {
     let mut file = match destination.open_current() {
         Ok(file) => file,
@@ -178,9 +179,9 @@ fn current(
             break;
         }
         size += count as u64;
-        if size > 50 * 1024 * 1024 {
+        if size > limit {
             return Err(SaveError::Failed(
-                "The file on disk exceeds the editor's save comparison limit".into(),
+                format!("The file on disk exceeds the {limit}-byte save comparison limit"),
             ));
         }
         digest.update(&buffer[..count]);
@@ -203,14 +204,24 @@ pub fn write_checked(
     expected: Option<&str>,
     validate: impl Fn(&Path) -> Result<(), String>,
 ) -> Result<String, SaveError> {
-    if content.len() > 50 * 1024 * 1024 {
+    write_checked_with_limit(target, content, expected, validate, 50 * 1024 * 1024)
+}
+
+pub(crate) fn write_checked_with_limit(
+    target: &Path,
+    content: &[u8],
+    expected: Option<&str>,
+    validate: impl Fn(&Path) -> Result<(), String>,
+    limit: u64,
+) -> Result<String, SaveError> {
+    if content.len() as u64 > limit {
         return Err(SaveError::Failed(
-            "The document exceeds the 50 MiB editor save limit".into(),
+            format!("The document exceeds the {limit}-byte save limit"),
         ));
     }
     let destination = Destination::pin(target, false, &validate)?;
     let staged = destination.stage(content)?;
-    let actual = current(&destination, &validate)?;
+    let actual = current(&destination, &validate, limit)?;
     if actual.version.as_deref() != expected {
         return Err(SaveError::Conflict(actual.version));
     }
@@ -231,7 +242,7 @@ pub fn write_checked(
         };
         if identity_now != actual.identity || stamp_now != actual.stamp {
             return Err(SaveError::Conflict(
-                current(&destination, &validate)?.version,
+                current(&destination, &validate, limit)?.version,
             ));
         }
     }
@@ -242,7 +253,7 @@ pub fn write_checked(
         Ok(file) => file,
         Err(error) if expected.is_none() && error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(SaveError::Conflict(
-                current(&destination, &validate)?.version,
+                current(&destination, &validate, limit)?.version,
             ));
         }
         Err(error) => return Err(error.into()),

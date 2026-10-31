@@ -302,9 +302,9 @@ fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
                 && std::fs::symlink_metadata(&target).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => None,
             Err(e) => return Err(format!("Cannot safely open preferences: {e}")),
         };
-        document_save::write_checked(&target, &bytes, version.as_deref(), |actual| {
+        document_save::write_checked_with_limit(&target, &bytes, version.as_deref(), |actual| {
             if actual == target { Ok(()) } else { Err("Preferences destination changed".into()) }
-        }).map(|_| ()).map_err(|error| match error {
+        }, MAX_BYTES).map(|_| ()).map_err(|error| match error {
             SaveError::Failed(message) => message,
             SaveError::Conflict(_) => "Preferences changed during commit; files preserved".into(),
         })

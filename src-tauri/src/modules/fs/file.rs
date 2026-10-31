@@ -319,6 +319,7 @@ pub async fn fs_write_file(
         let registry = watcher.state::<WorkspaceRegistry>();
         let gates = registry.gates(origin.unwrap_or_default());
         let target = gates.authorized_write_target(&requested)?;
+        super::native_store::refuse_write(&watcher, &target)?;
         let mtime = document_save::with_lock(&target, || -> Result<u64, String> {
             // Oarlock's own write into a project's trusted item keeps the user's trust in it.
             let change = OwnChange::File {
@@ -328,6 +329,7 @@ pub async fn fs_write_file(
             let (real, existed) = project_trust::keeping_trust(&watcher, change, || {
                 write_file_checked(&target, content.as_bytes(), |opened| {
                     let current = gates.authorized_write_target(&requested)?;
+                    super::native_store::refuse_write(&watcher, &current)?;
                     if current != target || opened != target {
                         return Err("File destination changed during write".into());
                     }
@@ -377,6 +379,7 @@ pub async fn fs_save_document(
         let registry = app.state::<WorkspaceRegistry>();
         let gates = registry.gates(Origin::App);
         let target = gates.authorized_write_target(&requested)?;
+        super::native_store::refuse_write(&app, &target)?;
         document_save::with_lock(&target, || {
             let change = OwnChange::File {
                 target: &target,
@@ -389,6 +392,7 @@ pub async fn fs_save_document(
                     expected_version.as_deref(),
                     |opened| {
                         let current = gates.authorized_write_target(&requested)?;
+                        super::native_store::refuse_write(&app, &current)?;
                         if current != target || opened != target {
                             return Err("Document destination changed during save".into());
                         }
