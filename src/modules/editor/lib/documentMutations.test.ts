@@ -2,7 +2,6 @@ import { expect, it, vi } from "vitest";
 vi.mock("@/modules/settings/store", () => ({ setLastWslDistro: vi.fn() }));
 import type { EditorTab, Tab } from "@/modules/tabs";
 import { DocumentSession } from "./documentSession";
-import { noteRetarget } from "./pathRetarget";
 import {
   documentTabsInEnvironment,
   planDocumentMutation,
@@ -40,6 +39,31 @@ const move: DocumentMutation = {
 const flush = async () => {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 };
+
+it("retains a queued rename when applying an earlier mutation fails", async () => {
+  let receive!: (event: DocumentMutation) => void;
+  const applied: number[] = [];
+  const failed = vi.fn();
+  const stop = subscribeDocumentMutations(
+    async (listener) => {
+      receive = listener;
+      return () => {};
+    },
+    (event) => {
+      if (event.sequence === 1) {
+        receive({ ...move, sequence: 2, from: "/moved", to: "/final" });
+        throw new Error("first mutation failed");
+      }
+      applied.push(event.sequence);
+    },
+    failed,
+  );
+  await flush();
+  receive(move);
+  expect(applied).toEqual([2]);
+  expect(failed).toHaveBeenCalledOnce();
+  stop();
+});
 
 it("only retargets documents in the originating environment, including cold and markdown tabs", () => {
   const tabs: Tab[] = [
@@ -132,7 +156,7 @@ it("broadcasts rename chains to two windows while retaining each dirty buffer", 
       (event) => {
         const plan = planDocumentMutation(tabs, spaces, event);
         for (const change of plan.renamed) {
-          noteRetarget(change.from, change.path);
+          session.retarget(change.from, change.path);
           tabs = tabs.map((t) =>
             t.id === change.id ? { ...t, path: change.path } : t,
           );
@@ -321,7 +345,7 @@ it("renames and deletion cancel final verification before applying their complet
       expect(sealEditors("too-early")).toBe(false);
       if (event.kind === "renamed") {
         expect(event.from).toBe(path);
-        noteRetarget(event.from, event.to);
+        session.retarget(event.from, event.to);
         path = event.to;
         session.open(path);
       } else {

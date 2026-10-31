@@ -17,6 +17,7 @@ mod linux_staging;
 pub mod mutate;
 pub mod mutation_events;
 pub(crate) mod private_staging;
+pub mod reconcile;
 mod run_prompt;
 pub mod search;
 pub mod supersede;

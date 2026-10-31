@@ -158,6 +158,8 @@ export function useDocument({ path, onDirtyChange, onBindingChange }: Options) {
     doc,
     detached,
     detach: session.detach,
+    retarget: session.retarget,
+    bindingSnapshot: session.bindingSnapshot,
     isDetached: session.isDetached,
     recover: session.recover,
     canComplete: session.canComplete,

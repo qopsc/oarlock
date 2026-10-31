@@ -79,66 +79,118 @@ export function planDocumentMutation(
   return { renamed, deleted, refresh };
 }
 
-/** One listener lifetime; async setup cannot leak after disposal or Retry. */
+/** One listener lifetime. Reconciliation precedes events after a gap or failure. */
 export function subscribeDocumentMutations(
   listen: (receive: (event: DocumentMutation) => void) => Promise<() => void>,
   apply: (event: DocumentMutation) => void,
-  failed: (error: unknown) => void,
+  failed: (error: unknown, retry?: () => void) => void,
   ready: () => void = () => {},
+  reconcile?: (workspace: WorkspaceEnv | undefined, isLive: () => boolean) => Promise<void>,
 ): () => void {
+  type Work = { event: DocumentMutation } | { reconcile: WorkspaceEnv | undefined };
   let live = true;
   let last = 0;
   let unlisten: (() => void) | undefined;
-  let pending: DocumentMutation[] | null = null;
+  let busy = false;
+  let stalled = false;
   let releasePending: (() => void) | undefined;
+  const pending: Work[] = [];
   recoveryMutationCoverage(false);
+
+  const drain = () => {
+    if (!live || busy || stalled || pending.length === 0) return;
+    busy = true;
+    const mutation = beginDocumentMutation();
+    releasePending = mutation.release;
+    const finish = () => {
+      busy = false;
+      releasePending = undefined;
+      mutation.release();
+      if (live && unlisten && !stalled && pending.length === 0) {
+        recoveryMutationCoverage(true);
+        ready();
+      }
+      drain();
+    };
+    const retry = () => {
+      if (!live) return;
+      stalled = false;
+      drain();
+    };
+    const run = () => {
+      while (live && pending.length > 0) {
+        const work = pending[0];
+        if ("reconcile" in work) {
+          if (!reconcile) {
+            pending.shift();
+            continue;
+          }
+          recoveryMutationCoverage(false);
+          void Promise.resolve().then(() => reconcile(work.reconcile, () => live)).then(
+            () => {
+              const index = pending.indexOf(work);
+              if (live && index >= 0) pending.splice(index, 1);
+              finish();
+            },
+            (error) => {
+              if (live) {
+                stalled = true;
+                recoveryMutationCoverage(false);
+                failed(error, retry);
+              }
+              finish();
+            },
+          );
+          return;
+        }
+        pending.shift();
+        try {
+          apply(work.event);
+        } catch (error) {
+          recoveryMutationCoverage(false);
+          if (reconcile) pending.unshift({ reconcile: work.event.workspace });
+          else failed(error);
+        }
+      }
+      finish();
+    };
+    if (mutation.ready) void mutation.ready.then(run);
+    else run();
+  };
+
   void listen((event) => {
     if (!live || event.sequence <= last) return;
+    if (last !== 0 && event.sequence !== last + 1 && reconcile) {
+      recoveryMutationCoverage(false);
+      pending.push({ reconcile: undefined });
+    }
     last = event.sequence;
     recoveryTargetsChanged(
       workspaceScopeKey(event.workspace),
       event.kind === "deleted" ? event.paths : [event.from, event.to],
     );
-    if (pending) {
-      pending.push(event);
-      return;
-    }
-    const batch = [event];
-    pending = batch;
-    const mutation = beginDocumentMutation();
-    releasePending = mutation.release;
-    const drain = () => {
-      try {
-        // flushSync in the caller commits each binding before the next event
-        // computes its plan. Never coalesce successive renames or deletions.
-        for (const queued of batch) {
-          if (!live) break;
-          apply(queued);
-        }
-      } catch (error) {
-        if (live) {
-          recoveryMutationCoverage(false);
-          failed(error);
-        }
-      } finally {
-        pending = null;
-        releasePending = undefined;
-        mutation.release();
-      }
-    };
-    if (mutation.ready) void mutation.ready.then(drain);
-    else drain();
+    pending.push({ event });
+    drain();
   }).then(
     (stop) => {
-      if (live) {
-        unlisten = stop;
+      if (!live) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      if (reconcile) {
+        pending.unshift({ reconcile: undefined });
+        drain();
+      } else {
         recoveryMutationCoverage(true);
         ready();
-      } else stop();
+      }
     },
     (error) => {
       if (live) {
         recoveryMutationCoverage(false);
+        if (reconcile)
+          void Promise.resolve().then(() => reconcile(undefined, () => live)).catch((reconcileError) => console.error(reconcileError));
         failed(error);
       }
     },
@@ -147,7 +199,7 @@ export function subscribeDocumentMutations(
     if (!live) return;
     live = false;
     recoveryMutationCoverage(false);
-    if (pending) pending.length = 0;
+    pending.length = 0;
     releasePending?.();
     unlisten?.();
   };

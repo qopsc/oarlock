@@ -122,6 +122,8 @@ export type EditorPaneHandle = {
   closeRevision: () => string;
   prepareDiscard: () => import("./lib/documentSession").DiscardPreparation;
   detach: () => void;
+  retarget: (from: string, to: string) => boolean;
+  bindingSnapshot: () => { path: string; version?: string; epoch: number; session: number } | null;
   isDetached: () => boolean;
   /** Request an AI ghost suggestion at the cursor. */
   triggerAiComplete: () => void;
@@ -198,6 +200,8 @@ export const EditorPane = memo(
       doc,
       detached,
       detach,
+      retarget,
+      bindingSnapshot,
       isDetached,
       recover,
       canComplete,
@@ -782,6 +786,8 @@ export const EditorPane = memo(
         closeRevision,
         prepareDiscard,
         detach,
+        retarget,
+        bindingSnapshot,
         isDetached,
         triggerAiComplete: () => {
           const view = cmRef.current?.view;
@@ -803,6 +809,8 @@ export const EditorPane = memo(
         closeRevision,
         prepareDiscard,
         detach,
+        retarget,
+        bindingSnapshot,
         isDetached,
       ],
     );

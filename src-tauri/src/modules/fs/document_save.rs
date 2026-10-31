@@ -11,7 +11,7 @@ use std::{
 };
 
 #[cfg(unix)]
-fn identity(file: &fs::File) -> std::io::Result<String> {
+pub(crate) fn identity(file: &fs::File) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata()?;
     // Birth time prevents inode reuse. Older filesystems conservatively use
@@ -24,7 +24,7 @@ fn identity(file: &fs::File) -> std::io::Result<String> {
 }
 
 #[cfg(windows)]
-fn identity(file: &fs::File) -> std::io::Result<String> {
+pub(crate) fn identity(file: &fs::File) -> std::io::Result<String> {
     use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,

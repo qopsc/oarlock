@@ -6,13 +6,19 @@ import {
   subscribeDocumentMutations,
   type DocumentMutation,
 } from "./lib/documentMutations";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 
 /** Each mutation is committed before the next event reads the tab identities. */
-export function useDocumentMutations(apply: (event: DocumentMutation) => void) {
+export function useDocumentMutations(
+  apply: (event: DocumentMutation) => void,
+  reconcile: (workspace: WorkspaceEnv | undefined, isLive: () => boolean) => Promise<void>,
+) {
   const current = useRef(apply);
+  const currentReconcile = useRef(reconcile);
   useLayoutEffect(() => {
     current.current = apply;
-  }, [apply]);
+    currentReconcile.current = reconcile;
+  }, [apply, reconcile]);
   useEffect(() => {
     let live = true;
     let stop: (() => void) | undefined;
@@ -26,14 +32,15 @@ export function useDocumentMutations(apply: (event: DocumentMutation) => void) {
             (event) => receive(event.payload),
           ),
         (event) => flushSync(() => current.current(event)),
-        (error) =>
+        (error, retry) =>
           toast.error("Document updates unavailable", {
             id: "document-mutations",
             description: `Other windows' renames and deletions cannot be synchronized. ${String(error)}`,
             duration: Infinity,
-            action: { label: "Retry", onClick: start },
+            action: { label: "Retry", onClick: retry ?? start },
           }),
         () => toast.dismiss("document-mutations"),
+        (workspace, isLive) => currentReconcile.current(workspace, isLive),
       );
     };
     start();

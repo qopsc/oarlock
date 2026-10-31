@@ -5,7 +5,6 @@ import {
   type DocumentState,
   type ReadResult,
 } from "./documentSession";
-import { consumeRetarget, noteRetarget } from "./pathRetarget";
 
 type Op = "read" | "write";
 
@@ -213,7 +212,7 @@ describe("DocumentSession rename (crynta/terax-ai#1369)", () => {
     t.session.change("unsaved\n");
 
     t.rename("/p/a.ts", "/p/b.ts");
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     await flush();
 
@@ -246,12 +245,11 @@ describe("DocumentSession rename (crynta/terax-ai#1369)", () => {
     t.hold("read");
     t.session.open("/p/a.ts");
     t.rename("/p/a.ts", "/p/b.ts");
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     t.release("read");
     await flush();
     expect(t.doc()).toEqual({ status: "ready", content: "a\n", size: 2 });
-    expect(consumeRetarget("/p/a.ts", "/p/b.ts")).toBe(false);
   });
 
   it("re-arms a pending autosave onto the new path", async () => {
@@ -262,7 +260,7 @@ describe("DocumentSession rename (crynta/terax-ai#1369)", () => {
     t.session.change("edit\n");
     await vi.advanceTimersByTimeAsync(300);
     t.rename("/p/a.ts", "/p/b.ts");
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     await vi.advanceTimersByTimeAsync(600);
     expect(t.log.filter((l) => l.startsWith("write"))).toEqual([
@@ -279,7 +277,7 @@ describe("DocumentSession rename (crynta/terax-ai#1369)", () => {
     t.session.change("edit\n");
     const saving = t.session.save();
     t.rename("/p/a.ts", "/p/b.ts");
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     expect(await saving).toBe(false);
     expect(t.log.filter((l) => l.startsWith("write"))).toEqual([]);
@@ -294,7 +292,7 @@ describe("DocumentSession rename (crynta/terax-ai#1369)", () => {
     t.hold("write");
     const saving = t.session.save();
     await flush();
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     t.release("write");
     expect(await saving).toBe(false);
@@ -311,7 +309,7 @@ describe("DocumentSession rename (crynta/terax-ai#1369)", () => {
     expect(await t.session.save()).toBe(false);
     const overwrite = t.host.conflict.mock.lastCall?.[1];
     t.rename("/p/a.ts", "/p/b.ts");
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     overwrite?.();
     await flush();
@@ -370,7 +368,7 @@ describe("DocumentSession save conflicts (crynta/terax-ai#1375)", () => {
     const saving = t.session.save();
     await flush();
     t.rename("/p/a.ts", "/p/b.ts");
-    noteRetarget("/p/a.ts", "/p/b.ts");
+    t.session.retarget("/p/a.ts", "/p/b.ts");
     t.session.open("/p/b.ts");
     t.release("write");
     expect(await saving).toBe(false);
@@ -556,7 +554,7 @@ it("retains native privacy eligibility through edits, retargeting, and partial b
   t.session.change("SYNTHETIC_SECRET plus edit");
   t.session.adoptDiskText("safe baseline", "safe-version", true);
   expect(t.session.canComplete("/alias.txt")).toBe(false);
-  noteRetarget("/alias.txt", "/renamed.txt");
+  t.session.retarget("/alias.txt", "/renamed.txt");
   t.session.open("/renamed.txt");
   expect(t.session.canComplete("/renamed.txt")).toBe(false);
   t.session.open("/safe.txt");

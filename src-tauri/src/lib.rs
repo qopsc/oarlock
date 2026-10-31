@@ -457,6 +457,7 @@ pub fn run() {
             fs::tree::list_subdirs,
             fs::tree::fs_read_dir,
             fs::file::fs_read_file,
+            fs::reconcile::fs_reconcile_documents,
             fs::file::ai_validate_document,
             fs::attachment::ai_import_attachment,
             fs::attachment::ai_pick_attachment_files,

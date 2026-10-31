@@ -6,7 +6,6 @@ import {
 } from "./quitBarrier";
 import { detectEol, type Eol, normalizeToLf, restoreEol } from "./eol";
 import type { RecoveryTarget } from "./recoveryTarget";
-import { consumeRetarget } from "./pathRetarget";
 
 export type ReadResult =
   | {
@@ -115,25 +114,29 @@ export class DocumentSession {
     if (prev === path && this.active) return;
     this.active = true;
     this.path = path;
-    if (prev !== null && prev !== path) {
-      this.release(prev);
-      // The explorer renamed or moved this file: keep the buffer, dirty
-      // state, EOL and disk version instead of reloading. The note is consumed
-      // either way so it cannot match a later path change.
-      if (
-        consumeRetarget(prev, path) &&
-        !this.detached &&
-        this.loadedPath === prev
-      ) {
-        this.epoch += 1;
-        this.loadedPath = path;
-        documentRevisionChanged();
-        this.armAutoSave();
-        return;
-      }
-    }
+    if (prev !== null && prev !== path) this.release(prev);
     this.load(false);
   }
+
+  /** Retarget the actual session, never a reusable credit for a future tab. */
+  retarget = (from: string, to: string): boolean => {
+    if (!this.active || this.detached) return false;
+    if (this.path === to && this.loadedPath === to) return true;
+    if (this.path !== from || this.loadedPath !== from) return false;
+    this.release(from);
+    this.path = to;
+    this.loadedPath = to;
+    this.epoch += 1;
+    this.readGeneration += 1;
+    documentRevisionChanged();
+    this.armAutoSave();
+    return true;
+  };
+
+  bindingSnapshot = (): { path: string; version?: string; epoch: number; session: number } | null =>
+    this.active && !this.detached && this.path && this.loadedPath === this.path
+      ? { path: this.path, version: this.diskVersion, epoch: this.epoch, session: this.sessionIdentity }
+      : null;
 
   close(): void {
     if (deferEditorLifecycle(this, "binding", () => this.close())) return;

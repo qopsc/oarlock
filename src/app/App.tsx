@@ -49,7 +49,6 @@ import { useControlBridge } from "@/modules/control";
 import {
   type EditorPaneHandle,
   NewEditorDialog,
-  noteRetarget,
   useApplyEditorFontSize,
   useEditorFileSync,
 } from "@/modules/editor";
@@ -152,12 +151,15 @@ import {
 import { UpdaterDialog } from "@/modules/updater";
 import {
   authorizeFileFolder,
+  LOCAL_WORKSPACE,
+  workspaceEnvForPath,
   type WorkspaceEnv,
   useWorkspaceEnvStore,
   workspaceScopeKey,
 } from "@/modules/workspace";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { flushSync } from "react-dom";
 import {
   lazy,
   Suspense,
@@ -180,6 +182,7 @@ import { aiToggleAction } from "./hooks/aiToggle";
 import { useAppCloseGuard } from "./hooks/useAppCloseGuard";
 import { useOpenFolder } from "./hooks/useOpenFolder";
 import { useDocumentMutations } from "@/modules/editor/useDocumentMutations";
+import { applyReconciledBinding, type BindingSnapshot } from "@/modules/editor/lib/documentReconcile";
 import {
   documentTabsInEnvironment,
   planDocumentMutation,
@@ -890,7 +893,11 @@ export default function App() {
       event,
     );
     for (const change of plan.renamed) {
-      if (change.preserveBuffer) noteRetarget(change.from, change.path);
+      if (change.preserveBuffer) {
+        const editor = editorRefs.current.get(change.id);
+        if (editor?.bindingSnapshot() && !editor.retarget(change.from, change.path))
+          throw new Error("A document changed while applying its rename.");
+      }
       updateTab(change.id, { path: change.path, title: change.title });
     }
     for (const id of plan.deleted) {
@@ -901,6 +908,63 @@ export default function App() {
       editorRefs.current.get(id)?.hasUnsavedChanges(),
     );
     for (const id of plan.refresh) editorRefs.current.get(id)?.reload();
+  }, async (scope, isLive) => {
+    const spaces = useSpaces.getState().spaces;
+    const groups = new Map<string, {
+      workspace: WorkspaceEnv;
+      roots: Set<string>;
+      documents: { id: number; path: string; version?: string; snapshot: BindingSnapshot | null }[];
+    }>();
+    for (const tab of tabsRef.current) {
+      if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
+      if (tab.kind === "editor" && tab.detached) continue;
+      const space = spaces.find((item) => item.id === tab.spaceId);
+      if (!space) continue;
+      const workspace = workspaceEnvForPath(tab.path, space.env ?? LOCAL_WORKSPACE);
+      if (scope && workspaceScopeKey(scope) !== workspaceScopeKey(workspace)) continue;
+      const key = workspaceScopeKey(workspace);
+      let group = groups.get(key);
+      if (!group) {
+        group = { workspace, roots: new Set(), documents: [] };
+        groups.set(key, group);
+      }
+      const root = space.root;
+      if (root && workspaceScopeKey(workspaceEnvForPath(root, space.env ?? LOCAL_WORKSPACE)) === key &&
+          (tab.path === root || tab.path.startsWith(`${root.replace(/[\\/]$/, "")}/`))) {
+        group.roots.add(root);
+      } else {
+        const slash = Math.max(tab.path.lastIndexOf("/"), tab.path.lastIndexOf("\\"));
+        if (slash >= 0) group.roots.add(tab.path.slice(0, slash) || "/");
+      }
+      const snapshot = editorRefs.current.get(tab.id)?.bindingSnapshot() ?? null;
+      group.documents.push({ id: tab.id, path: tab.path, version: snapshot?.version, snapshot });
+    }
+    for (const group of groups.values()) {
+      const results = await invoke<{ id: number; path: string | null }[]>("fs_reconcile_documents", {
+        workspace: group.workspace, roots: [...group.roots],
+        documents: group.documents.map(({ id, path, version }) => ({ id, path, version })),
+      });
+      if (!isLive()) return;
+      flushSync(() => { for (const result of results) {
+        const original = group.documents.find((item) => item.id === result.id);
+        const tab = tabsRef.current.find((item) => item.id === result.id);
+        if (!original || !tab || (tab.kind !== "editor" && tab.kind !== "markdown")) continue;
+        if (tab.path !== original.path) throw new Error("A document moved during synchronization. Retry.");
+        const editor = editorRefs.current.get(result.id);
+        if (editor && original.snapshot) {
+          applyReconciledBinding(original.snapshot, result.path, editor, (path) =>
+            updateTab(result.id, { path, title: path.split(/[\\/]/).pop() ?? path }));
+        } else if (result.path && result.path !== original.path) {
+          updateTab(result.id, { path: result.path, title: result.path.split(/[\\/]/).pop() ?? result.path });
+        } else if (result.path === null) {
+          toast.warning("Document no longer available", {
+            id: `orphaned-document:${result.id}`,
+            description: `${original.path} could not be found in its workspace.`,
+            duration: Infinity,
+          });
+        }
+      } });
+    }
   });
 
   const canReplaceExplorerPath = useCallback(
