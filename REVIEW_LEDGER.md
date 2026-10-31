@@ -4197,3 +4197,7 @@ Repository watch planning now calls the same native Git metadata authorization u
 ### R067: terminal operation ownership
 
 PTY write, resize, close and both foreground queries now check the calling webview against the session's existing owner, as cwd and path-drop commands already did. Close checks ownership and removes the entry under one registry lock; closing an already absent session remains idempotent. A native regression uses two real shell sessions to verify cross-window lookup/removal is refused and each owner can still access and close its own terminal. This test exercises the native ownership gate, not a packaged two-window IPC exploit. The focused test, full macOS native suite (1,499 library tests, 4 ignored, plus integration suites) and strict Clippy passed. R067 is closed for the established window-ownership contract.
+
+### R120: Git fixture isolation
+
+Integration-fixture Git commands now remove inherited and explicitly supplied `GIT_*` overrides before running and disable inherited system/global Git configuration. A regression creates two disposable repositories, supplies the second as `GIT_DIR`, `GIT_WORK_TREE` and configuration overrides, and verifies Git still resolves the first. The focused test, full macOS native suite (1,499 library tests, 4 ignored, plus integration suites) and strict Clippy passed. R120 is closed.

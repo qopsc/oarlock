@@ -54,16 +54,26 @@ impl GitRepoFixture {
 }
 
 fn run_git_in(cwd: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("git on PATH");
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    isolate_git_environment(&mut command);
+    let out = command.output().expect("git on PATH");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Test fixtures must never inherit a repository or configuration override.
+pub fn isolate_git_environment(command: &mut Command) {
+    let names: Vec<_> = std::env::vars_os().map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_owned()))
+        .filter(|key| key.to_string_lossy().to_ascii_uppercase().starts_with("GIT_"))
+        .collect();
+    for name in names { command.env_remove(name); }
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" });
 }
 
 pub fn git_available() -> bool {
