@@ -14,7 +14,10 @@ import {
   type ThemePref,
 } from "@/modules/settings/store";
 import { applyTheme, clearTheme } from "./applyTheme";
-import { watchCustomThemes } from "./customThemes";
+import { readCustomThemes, watchCustomThemes } from "./customThemes";
+import { mutatePreferences, readNativePreferences } from "@/modules/settings/nativePreferences";
+import { toast } from "sonner";
+import { reconcileThemeSelection } from "./reconcileThemeSelection";
 import { SurfaceLayer } from "./SurfaceLayer";
 import { getBuiltinTheme, getDefaultTheme } from "./themes";
 import type { Theme } from "./types";
@@ -87,6 +90,7 @@ export function ThemeProvider({
     readFastMode(defaultMode),
   );
   const [themeId, setThemeIdState] = useState<string>(() => readFastThemeId());
+  const preferencesReady = usePreferencesStore((p) => p.hydrated && !p.syncing && !p.error);
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [customThemes, setCustomThemes] = useState<Theme[]>([]);
   const [customThemesError, setCustomThemesError] = useState<string | null>(
@@ -177,12 +181,27 @@ export function ThemeProvider({
     [effectiveId, customThemes],
   );
   useEffect(() => {
-    if (effectiveId === DEFAULT_THEME_ID) {
+    if (!preferencesReady || !customThemesReady || getBuiltinTheme(themeId) || customThemes.some((theme) => theme.id === themeId)) return;
+    let alive = true;
+    void reconcileThemeSelection(themeId, {
+      preferences: readNativePreferences,
+      themes: readCustomThemes,
+      isBuiltin: (id) => !!getBuiltinTheme(id),
+      persistDefault: (revision) => mutatePreferences({ kind: "themeselection", id: DEFAULT_THEME_ID }, revision),
+      current: () => alive,
+      notice: () => toast("Selected theme was deleted"),
+    }).catch((error) => {
+      if (alive) toast.error("Could not restore the default theme", { description: String(error) });
+    });
+    return () => { alive = false; };
+  }, [themeId, customThemes, customThemesReady, preferencesReady]);
+  useEffect(() => {
+    if (activeTheme.id === DEFAULT_THEME_ID) {
       clearTheme();
       return;
     }
     applyTheme(activeTheme, resolvedMode);
-  }, [effectiveId, activeTheme, resolvedMode]);
+  }, [activeTheme, resolvedMode]);
 
   const setMode = useCallback((next: ThemePref) => {
     setModeState(next);
