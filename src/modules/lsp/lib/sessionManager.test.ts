@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => {
   });
   const start = vi.fn(() => gate);
   const close = vi.fn();
+  const shutdown = vi.fn(async () => {});
   const preset = {
     id: "test",
     name: "Test",
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => {
   return {
     start,
     close,
+    shutdown,
     ready: true,
     transports: [] as {
       exitInfo: { code: null; stderrTail: string; reason: string } | null;
@@ -86,7 +88,7 @@ vi.mock("./client", () => ({
     ready = mocks.ready;
     initializePromise = Promise.resolve();
     textDocumentDidClose() {}
-    async shutdownGracefully() {}
+    shutdownGracefully = mocks.shutdown;
   },
   lspInteractions: () => [],
   languageServerWithTransport: () => [],
@@ -95,6 +97,7 @@ vi.mock("./client", () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.shutdown.mockReset().mockResolvedValue(undefined);
   mocks.reset();
   mocks.clients.length = 0;
 });
@@ -246,4 +249,90 @@ it("writer failure requires explicit Restart even after the crash window expires
   handle?.release();
   fresh?.release();
   await manager.restartPresetSessions("test");
+});
+
+it("replaces an eligible idle session when opening a fifth root", async () => {
+  const requests: ReturnType<typeof manager.acquireDocExtension>[] = [];
+  for (let index = 0; index < 4; index++) {
+    requests.push(manager.acquireDocExtension(`/idle${index}/file`, "test"));
+    await vi.waitFor(() => expect(mocks.start).toHaveBeenCalledTimes(index + 1));
+  }
+  mocks.finish();
+  const handles = await Promise.all(requests);
+  expect(handles.every(Boolean)).toBe(true);
+  for (const handle of handles) handle?.release();
+  const now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now + 11_000);
+  try {
+    const next = await manager.acquireDocExtension("/new-root/file", "test");
+    expect(next).not.toBeNull();
+    expect(mocks.start).toHaveBeenCalledTimes(5);
+    next?.release();
+  } finally {
+    clock.mockRestore();
+    await manager.restartPresetSessions("test");
+  }
+});
+
+it("keeps closing sessions counted while two roots compete for the freed slot", async () => {
+  const requests: ReturnType<typeof manager.acquireDocExtension>[] = [];
+  for (let index = 0; index < 4; index++) {
+    requests.push(manager.acquireDocExtension(`/held${index}/file`, "test"));
+    await vi.waitFor(() => expect(mocks.start).toHaveBeenCalledTimes(index + 1));
+  }
+  mocks.finish();
+  const handles = await Promise.all(requests);
+  expect(handles.every(Boolean)).toBe(true);
+  handles[0]?.release();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 11_000);
+  let finishClose: () => void = () => {};
+  mocks.shutdown.mockImplementationOnce(() => new Promise<void>((resolve) => { finishClose = resolve; }));
+  try {
+    const fifth = manager.acquireDocExtension("/fifth/file", "test");
+    await vi.waitFor(() => expect(mocks.shutdown).toHaveBeenCalledOnce());
+    const sixth = manager.acquireDocExtension("/sixth/file", "test");
+    await Promise.resolve();
+    expect(mocks.start).toHaveBeenCalledTimes(4);
+    finishClose();
+    const results = await Promise.all([fifth, sixth]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(mocks.start).toHaveBeenCalledTimes(5);
+    for (const result of results) result?.release();
+  } finally {
+    finishClose();
+    clock.mockRestore();
+    for (const handle of handles) handle?.release();
+    await manager.restartPresetSessions("test");
+  }
+});
+
+it("does not evict a session that becomes active during another shutdown", async () => {
+  const requests: ReturnType<typeof manager.acquireDocExtension>[] = [];
+  for (let index = 0; index < 4; index++) {
+    requests.push(manager.acquireDocExtension(`/reuse${index}/file`, "test"));
+    await vi.waitFor(() => expect(mocks.start).toHaveBeenCalledTimes(index + 1));
+  }
+  mocks.finish();
+  const handles = await Promise.all(requests);
+  for (const handle of handles) handle?.release();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 11_000);
+  let finishClose: () => void = () => {};
+  mocks.shutdown.mockImplementationOnce(() => new Promise<void>((resolve) => { finishClose = resolve; }));
+  let reused: Awaited<ReturnType<typeof manager.acquireDocExtension>> = null;
+  try {
+    const fifth = manager.acquireDocExtension("/new-reuse/file", "test");
+    await vi.waitFor(() => expect(mocks.shutdown).toHaveBeenCalledOnce());
+    reused = await manager.acquireDocExtension("/reuse1/file", "test");
+    expect(reused).not.toBeNull();
+    finishClose();
+    const opened = await fifth;
+    expect(opened).not.toBeNull();
+    expect(mocks.shutdown).toHaveBeenCalledTimes(3);
+    opened?.release();
+  } finally {
+    finishClose();
+    reused?.release();
+    clock.mockRestore();
+    await manager.restartPresetSessions("test");
+  }
 });

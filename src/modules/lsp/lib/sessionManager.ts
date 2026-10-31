@@ -39,6 +39,7 @@ export type LspDocHandle = {
 
 const sessions = new Map<string, Managed>();
 const creating = new Map<string, Promise<Managed | null>>();
+const closing = new Map<string, Promise<void>>();
 const generations = new Map<string, number>();
 const pendingTransports = new Map<string, Set<TauriLspTransport>>();
 function generation(presetId: string): number {
@@ -101,33 +102,53 @@ export async function acquireDocExtension(
   if (!root || !current(preset, epoch)) return null;
   const key = `${preset.id}\u0000${root}`;
   if (stopped.has(key) || crashedOut(key)) return null;
+  const previousClose = closing.get(key);
+  if (previousClose) {
+    await previousClose;
+    if (!current(preset, epoch)) return null;
+  }
+  const countSessions = () =>
+    [...new Set([...sessions.keys(), ...creating.keys(), ...closing.keys()])]
+      .filter((name) => name.startsWith(`${preset.id}\u0000`)).length;
+  if (!sessions.has(key) && !creating.has(key)) {
+    const now = Date.now();
+    const idle = [...sessions.values()].filter(
+      (m) => m.preset.id === preset.id && m.refs.size === 0 && !m.closing &&
+        now - m.bornAt > EVICTION_MIN_AGE_MS,
+    );
+    // Wait for one idle session to close before consuming its slot. Closing
+    // sessions remain counted so simultaneous opens cannot over-admit.
+    if (countSessions() >= MAX_SESSIONS_PER_PRESET) {
+      const oldest = idle.shift();
+      const pending = oldest
+        ? closeSession(oldest)
+        : [...closing.entries()].find(([name]) =>
+            name.startsWith(`${preset.id}\u0000`),
+          )?.[1];
+      if (pending) await pending;
+      if (!current(preset, epoch)) return null;
+    }
+    for (const session of idle) {
+      // Another document can acquire a previously idle session while the
+      // first shutdown is awaited.
+      if (
+        sessions.get(session.key) === session &&
+        session.refs.size === 0 &&
+        !session.closing &&
+        Date.now() - session.bornAt > EVICTION_MIN_AGE_MS
+      )
+        void closeSession(session);
+    }
+  }
   if (
     !sessions.has(key) &&
     !creating.has(key) &&
-    [...new Set([...sessions.keys(), ...creating.keys()])].filter((key) =>
-      key.startsWith(`${preset.id}\u0000`),
-    ).length >= MAX_SESSIONS_PER_PRESET
+    countSessions() >= MAX_SESSIONS_PER_PRESET
   ) {
     console.warn(
       `[lsp] session cap reached for ${preset.id}, skipping ${root}`,
     );
     return null;
-  }
-
-  // Evict idle sessions of other roots; the age guard keeps simultaneous
-  // multi-root opens from evicting each other's newborn sessions.
-  if (!sessions.has(key)) {
-    const now = Date.now();
-    for (const m of sessions.values()) {
-      if (
-        m.preset.id === preset.id &&
-        m.refs.size === 0 &&
-        !m.closing &&
-        now - m.bornAt > EVICTION_MIN_AGE_MS
-      ) {
-        void closeSession(m);
-      }
-    }
   }
 
   const managed =
@@ -377,8 +398,8 @@ function releaseRef(managed: Managed, uri: string): void {
   }
 }
 
-async function closeSession(managed: Managed): Promise<void> {
-  if (managed.closing) return;
+function closeSession(managed: Managed): Promise<void> {
+  if (managed.closing) return closing.get(managed.key) ?? Promise.resolve();
   managed.closing = true;
   if (managed.idleTimer) {
     clearTimeout(managed.idleTimer);
@@ -386,11 +407,19 @@ async function closeSession(managed: Managed): Promise<void> {
   }
   sessions.delete(managed.key);
   useLspRuntimeStore.getState().removeSession(managed.key, managed.preset.id);
-  try {
-    await managed.client.shutdownGracefully(SHUTDOWN_TIMEOUT_MS);
-  } finally {
-    managed.transport.close();
-  }
+  const pending = (async () => {
+    try {
+      await managed.client.shutdownGracefully(SHUTDOWN_TIMEOUT_MS);
+    } finally {
+      managed.transport.close();
+    }
+  })();
+  closing.set(managed.key, pending);
+  void pending.then(
+    () => { if (closing.get(managed.key) === pending) closing.delete(managed.key); },
+    () => { if (closing.get(managed.key) === pending) closing.delete(managed.key); },
+  );
+  return pending;
 }
 
 export function notifyDocumentSaved(path: string): void {
@@ -420,8 +449,11 @@ async function stopPresetSessions(presetId: string): Promise<void> {
   const targets = [...sessions.values()].filter(
     (m) => m.preset.id === presetId,
   );
-  const closing = targets.map((m) => closeSession(m));
-  await Promise.all([retireLspGeneration(presetId, epoch), ...closing]);
+  const shutdowns = targets.map((m) => closeSession(m));
+  const alreadyClosing = [...closing.entries()]
+    .filter(([key]) => key.startsWith(`${presetId}\u0000`))
+    .map(([, pending]) => pending);
+  await Promise.all([retireLspGeneration(presetId, epoch), ...shutdowns, ...alreadyClosing]);
   for (const key of crashTimes.keys()) {
     if (key.startsWith(`${presetId}\u0000`)) crashTimes.delete(key);
   }

@@ -4398,3 +4398,52 @@ R091/R092: both fixes reuse the existing per-surface renderer recovery and visib
 Window restoration now opens each state-directory component relative to the retained app-data directory without following links, verifies opened entry identity, and rejects hard-linked state files before reading. Fingerprints, metadata capture, new journal entries, recovery markers, renames and directory synchronization use those retained directories. A regression failed against the prior implementation because hard-linked registry and manifest files were accepted; tests now also preserve a hard-linked source file. The existing 15 restoration tests cover interrupted publication and link refusal. Private temporary-directory creation and cleanup still use the named app-data path; a same-user process replacing that path concurrently remains best effort under the approved threat model. No new persistent recovery state was added. R216 remains open for the packaged-app checks and any uncovered store paths; this is not a claim that the entire store inventory has been independently verified.
 
 Validation for the restoration checkpoint: the full macOS native suite passed 1,537 library tests (four ignored) and all integration tests; the frontend suite passed 5,616 tests (two skipped), strict Clippy and type checks passed, and lint stayed at 80 warnings. All 15 macOS restoration tests and all 14 applicable Linux restoration tests passed. Linux used an offline, unprivileged container and a disposable source copy; it reported the two previously recorded unrelated Linux warnings. Packaged-app restoration and autosave-notice checks remain manual.
+
+### Resource limits and process lifetime: revalidation (38 members)
+
+Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing results, Tier 3 stalled or retained work, Tier 4 cosmetic. Resource exhaustion can also crash the app; that risk is recorded with the Tier 3 entries rather than presented as a reproduced data-loss event. AI/MCP execution remains on hold; Windows and WSL are port work.
+
+| ID | Disposition | Evidence |
+| --- | --- | --- |
+| R011 | Open, Tier 3 | `fs/grep.rs::search_tree` copies complete matching lines and has a count cap but no aggregate response-byte cap. |
+| R024 | Windows/WSL port | WSL-only discovery and shell probes are outside this release. |
+| R031 | Open, Tier 3 | `watch.rs::release_window` takes the shared set lock; `resolve_changes` still calls file stamping while holding that lock. |
+| R041 | Open, Tier 3 | `editor/search/regexEvaluation.ts` builds expanded replacement text before enforcing its output budget; Vim substitution needs the same check. |
+| R045 | Open, Tier 3 | `lsp/framing.rs::FrameDecoder::push` appends unterminated headers without a header-byte limit. |
+| R046 | Open, Tier 3 | `lsp/session.rs` removes a naturally exited server after a bounded reader wait without terminating surviving descendants. |
+| R051 | Closed | Eligible idle sessions are closed before a new root is admitted. Closing sessions remain counted until shutdown finishes; regression tests cover the fifth root, simultaneous admissions and a session reacquired while another shutdown waits. |
+| R052 | Open, Tier 3 | `lsp/transport.ts` retains an unbounded incoming backlog and native channel output has no acknowledgment budget. |
+| R068 | Open, Tier 3 | `pty_write` clones an unrestricted body before waiting on the 64-entry input queue; waiting senders have no aggregate byte bound. |
+| R069 | Windows/WSL port | Windows ConPTY job assignment is a later-port concern. |
+| R070 | Open, Tier 3 | `proc/capture.rs::collect` returns after its grace period while a pipe-reader thread can remain blocked on an inherited pipe. |
+| R071 | Closed | The scrollback reader now uses nonblocking, no-follow admission; the FIFO regression is recorded in the earlier R216 checkpoint. |
+| R079 | Open, Tier 3 | Terminal clipboard snapshot requests have no shared admission cap, and image decoding occurs before the clipboard commit coordinator. |
+| R089 | Open, Tier 3 | `imageLayer.ts::ensure` expands non-RGBA pixels before checking whether the RGBA texture fits its byte budget. |
+| R096 | Open, Tier 3 | `GhosttyCoreRuntime.createModel` configures the newly constructed model before registering it, without disposing it if configuration throws. |
+| R098 | Open, Tier 3 | `fontFeatures.ts` retains derived font faces and keyed maps for the page lifetime without eviction. |
+| R099 | Open, Tier 3 | `GlyphMap.process` checks the time budget only after a glyph resolves, so an all-deferred queue is drained in one call. |
+| R103 | Open, Tier 3 | Background image import decodes a static image before resizing or checking decoded dimensions; animated files bypass resizing. |
+| R104 | Open, Tier 3 | `minimalToml.ts` recursively parses inline tables without a nesting limit, within the theme import's 1 MiB source limit. |
+| R107 | Open, Tier 3 | Shell history initialization uses whole-file reads, including a possible inherited FIFO, before checking file type or size. |
+| R117 | Open, Tier 3 | The build-script capture helper buffers output without a byte cap and waits for inherited pipes after killing only its direct child. |
+| R133 | Closed | Earlier R216 conversation-storage work bounds reads before allocation; large-file stress testing was not performed. |
+| R137 | AI/MCP on hold | OAuth callback listener work is held with the backend. |
+| R138 | Windows/WSL port | Windows MCP process ownership is deferred with both the port and MCP. |
+| R142 | AI/MCP on hold | Remote AI-image request admission is held with the backend. |
+| R143 | AI/MCP on hold | AI shell background-job reader lifetime is held with the backend. |
+| R154 | AI/MCP on hold | Chat code highlighting work is held with the backend. |
+| R159 | AI/MCP on hold | Model cache work is held with the backend. |
+| R160 | AI/MCP on hold | Chat compaction work is held with the backend. |
+| R162 | AI/MCP on hold | AI attachment image decoding is held with the backend. |
+| R173 | AI/MCP on hold | Voice recording work is held with the backend. |
+| R174 | AI/MCP on hold | AI request-body preparation is held with the backend. |
+| R179 | AI/MCP on hold | MCP stdio transport work is held with the backend. |
+| R186 | AI/MCP on hold | MCP result formatting is held with the backend. |
+| R190 | Open, Tier 3 | `asset_all_folders.rs` reads an unranged file into memory and starts blocking work without an aggregate admission limit. |
+| R192 | Open, Tier 3 | Mermaid rendering cannot interrupt an already-running render, and its 32-entry cache has no byte limit. |
+| R207 | Open, Tier 3 | Theme batch upserts clone and repeatedly scan the catalog before the serialized size check. |
+| R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
+
+Counts: **3 closed; 21 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+
+R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
