@@ -4026,3 +4026,7 @@ R201 final validation: the full native suite passed (1,487 library tests, 4 igno
 ## Tier 2: R017 commit-file diff scope
 
 R017 is fixed: a commit-file diff is reused only when its owning space also matches. The regression covers identical repository, commit and file paths in two spaces, plus same-space reuse. The full frontend suite passed (5,528 passed, 2 skipped); types and lint passed. The full native suite remained green from R201; this change has no native code. Tier 2 remaining in the ownership group: 26.
+
+## Tier 2: R018 cancelled space drags
+
+R018 is fixed: pointer cancellation and lost capture abandon a drag without moving or activating anything, and only the initiating pointer can commit. Closing or unmounting the switcher releases the captured pointer and restores the prior text-selection style; cleanup also handles a capture that the browser already revoked. Regressions cover cancellation, unrelated pointers, normal completion and cleanup after revoked capture. The full frontend suite passed (5,531 passed, 2 skipped); types and lint passed. Tier 2 remaining in the ownership group: 25.
