@@ -220,6 +220,22 @@ fn production_update_preserves_other_hardlink_contents() {
 
 #[cfg(unix)]
 #[test]
+fn production_update_preserves_a_hardlink_in_another_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("original");
+    let settings_dir = dir.path().join("settings");
+    std::fs::create_dir(&settings_dir).unwrap();
+    let path = settings_dir.join("settings.json");
+    std::fs::write(&outside, "{}").unwrap();
+    std::fs::hard_link(&outside, &path).unwrap();
+    enable_hooks_at(&path, find("claude").unwrap()).unwrap();
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "{}");
+    let updated: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(updated["hooks"]["Notification"].is_array());
+}
+
+#[cfg(unix)]
+#[test]
 fn replacing_symlink_with_another_link_to_the_same_target_is_refused() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();

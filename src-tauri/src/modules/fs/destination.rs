@@ -104,8 +104,7 @@ impl Destination {
         let file = self.dir.open_with(&self.name, &options)?.into_std();
         // cap-std confines symlink resolution to the directory, but may follow
         // a link to another entry in it. Reject that identity before any read.
-        let opened = super::attachment::handle_path(&file).map_err(io::Error::other)?;
-        if opened != self.opened {
+        if !super::file_identity::entry_matches(&self.dir, Path::new(&self.name), &file)? {
             return Err(io::Error::other(
                 "Destination entry changed during operation",
             ));

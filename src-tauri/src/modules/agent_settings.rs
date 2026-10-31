@@ -1,7 +1,7 @@
 //! Best-effort conditional updates for agent-owned settings paths.
 //! External writers do not honor the native lock: the final check and rename
 //! are not an atomic compare-and-swap, as documented by document_save.
-use crate::modules::fs::{attachment, document_save};
+use crate::modules::fs::document_save;
 use std::{fs, io::Read, path::{Path, PathBuf}};
 
 struct Binding {
@@ -54,6 +54,35 @@ impl Binding {
 }
 
 #[cfg(unix)]
+fn same_opened_target(target: &Path, file: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(a), Ok(b)) = (fs::symlink_metadata(target), file.metadata()) else { return false; };
+    a.is_file() && b.is_file() && a.dev() == b.dev() && a.ino() == b.ino()
+}
+#[cfg(not(unix))]
+fn same_opened_target(target: &Path, file: &fs::File) -> bool {
+    crate::modules::fs::attachment::handle_path(file).is_ok_and(|path| path == target)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn opened_hardlink_is_checked_by_identity_and_replacement_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        let alias = dir.path().join("original");
+        fs::write(&target, "{}").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        let file = fs::File::open(&alias).unwrap();
+        assert!(same_opened_target(&target, &file));
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, "{}").unwrap();
+        assert!(!same_opened_target(&target, &file));
+    }
+}
+
+#[cfg(unix)]
 fn same_link(a: &fs::Metadata, b: &fs::Metadata) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
     Ok(a.dev() == b.dev() && a.ino() == b.ino() && a.ctime() == b.ctime() && a.ctime_nsec() == b.ctime_nsec())
@@ -85,8 +114,10 @@ pub(super) fn edit(path: &Path, transform: impl FnOnce(Option<&str>) -> Result<O
         let snapshot = match options.open(&binding.target) {
             Ok(mut file) => {
                 if !file.metadata().map_err(|e| e.to_string())?.is_file() { return Err("Agent settings are not a regular file".into()); }
-                let opened = attachment::handle_path(&file)?;
-                binding.validate(&opened)?;
+                if !same_opened_target(&binding.target, &file) {
+                    return Err("Agent settings destination moved".into());
+                }
+                binding.validate(&binding.target)?;
                 let before = document_save::change_stamp(&file).map_err(|e| e.to_string())?;
                 let mut bytes = Vec::new();
                 file.by_ref().take(50 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;

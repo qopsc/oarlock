@@ -166,8 +166,9 @@ fn current(
     };
     let identity = identity(&file)?;
     let stamp = change_stamp(&file)?;
-    let opened = super::attachment::handle_path(&file).map_err(SaveError::Failed)?;
-    validate(&opened).map_err(SaveError::Failed)?;
+    // open_current already matched the opened file to the pinned directory
+    // entry. A file descriptor's reported name can be a different hard link.
+    destination.validate(validate)?;
     let mut digest = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     let mut size = 0u64;
