@@ -206,6 +206,19 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_repository_containing_application_data_but_allows_another() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let unrelated = root.path().join("unrelated");
+        fs::create_dir_all(repository.join("app-data")).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+        let store = repository.join("app-data/preferences.json");
+        fs::write(&store, b"keep").unwrap();
+        assert!(check(&repository, std::slice::from_ref(&store)).is_err());
+        assert!(check(&unrelated, std::slice::from_ref(&store)).is_ok());
+    }
+
+    #[test]
     fn conditional_writer_accepts_the_callers_own_size_limit() {
         use super::super::document_save::{self, SaveError};
         let root = tempfile::tempdir().unwrap();

@@ -341,12 +341,13 @@ fn worktree_add_args(branch: &GitWorktreeBranch, path: &str) -> Vec<OsString> {
 
 /// Adds a worktree for a new branch, or for a local branch no worktree has checked out, in
 /// `path` (or `<repository folder>-<branch>` beside the repository), and authorizes its folder.
-pub fn add(
+pub fn add_with_guard(
     registry: &WorkspaceRegistry,
     repo_root: &str,
     branch: &GitWorktreeBranch,
     path: Option<&str>,
     workspace: &WorkspaceEnv,
+    guard: &impl Fn(&Path) -> std::result::Result<(), String>,
 ) -> Result<GitWorktreeAddResult> {
     let repo = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo.workspace)?;
@@ -394,6 +395,7 @@ pub fn add(
         }
     };
     let folder = worktree_folder(&path, &repo.workspace)?;
+    guard(&folder.local_path).map_err(|error| GitError::command("new worktree", error))?;
     let output = repo.run(
         worktree_add_args(branch, &folder.git_path),
         WORKTREE_TIMEOUT_SECS,
@@ -409,6 +411,17 @@ pub fn add(
         path,
         branch: name.to_string(),
     })
+}
+
+#[cfg(test)]
+fn add(
+    registry: &WorkspaceRegistry,
+    repo_root: &str,
+    branch: &GitWorktreeBranch,
+    path: Option<&str>,
+    workspace: &WorkspaceEnv,
+) -> Result<GitWorktreeAddResult> {
+    add_with_guard(registry, repo_root, branch, path, workspace, &|_| Ok(()))
 }
 
 fn find_worktree<'a>(
@@ -1309,6 +1322,19 @@ mod tests {
             &|folder| if protected.starts_with(folder) { Err("contains a protected store".into()) } else { Ok(()) });
         assert!(result.unwrap_err().to_string().contains("protected store"));
         assert_eq!(std::fs::read(&protected).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn refuses_worktree_creation_inside_a_protected_store_directory() {
+        let Some(fx) = Fixture::new() else { return };
+        let protected = fx.base.join("state");
+        std::fs::create_dir(&protected).unwrap();
+        let dest = protected.join("new-worktree");
+        let error = add_with_guard(&fx.registry, &fx.root(), &new_branch("protected", None),
+            Some(dest.to_str().unwrap()), &WorkspaceEnv::Local,
+            &|folder| if folder.starts_with(&protected) { Err("protected store directory".into()) } else { Ok(()) }).unwrap_err();
+        assert!(error.to_string().contains("protected store"));
+        assert!(!dest.exists());
     }
 
     #[test]

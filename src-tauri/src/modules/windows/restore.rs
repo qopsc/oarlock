@@ -272,7 +272,24 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
     {
         return Err(fail("Invalid window recovery manifest"));
     }
-    if !journal.join("committed").try_exists()? {
+    let marker = journal.join("committed");
+    let committed = match fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+        Ok(meta) if meta.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() != 1 { return Err(fail("Window recovery commit marker has additional hard links")); }
+            }
+            let mut bytes = Vec::new();
+            crate::modules::fs::open_store_file(&marker)?.take(11).read_to_end(&mut bytes)?;
+            if bytes != b"committed\n" { return Err(fail("Invalid window recovery commit marker")); }
+            true
+        }
+        Ok(_) => return Err(fail("Window recovery commit marker is not a regular file")),
+    };
+    if !committed {
         validate_source_directories(root, &manifest.from)?;
         for (index, ((source, destination), item)) in paths(root, &journal, &manifest.from)
             .iter()
@@ -331,8 +348,6 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
             &journal.join("committed"),
             checkpoint,
         )?;
-    } else if fs::read(journal.join("committed"))? != b"committed\n" {
-        return Err(fail("Invalid window recovery commit marker"));
     }
     // Retire atomically before recursive deletion: interruption during cleanup
     // cannot leave a half-deleted live journal that replays over newer app state.

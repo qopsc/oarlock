@@ -146,6 +146,25 @@ fn committed_recovery_does_not_replay_over_later_state() {
         "later state"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn linked_commit_marker_cannot_discard_an_uncommitted_recovery() {
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(outside.path(), b"committed\n").unwrap();
+    for hard in [false, true] {
+        let dir = fixture();
+        let root = dir.path();
+        prepared(root);
+        let marker = root.join(JOURNAL).join("committed");
+        if hard { fs::hard_link(outside.path(), marker).unwrap(); }
+        else { std::os::unix::fs::symlink(outside.path(), marker).unwrap(); }
+        assert!(recover(root, &mut || Ok(())).is_err());
+        assert!(root.join(JOURNAL).exists());
+        assert_eq!(fs::read(root.join("windows/w-a/oarlock-spaces.json")).unwrap(), b"saved spaces");
+        assert_eq!(fs::read(outside.path()).unwrap(), b"committed\n");
+    }
+}
 #[cfg(unix)]
 #[test]
 fn symlink_state_is_not_followed_or_removed() {
