@@ -4355,7 +4355,7 @@ These are membership lists, not current-status counts. AI/MCP and Windows/WSL en
 | R033 | Windows port | The timestamp-only Windows watcher remains a port finding. |
 | R059 | Closed for Oarlock branch switching | Undo and Oarlock's branch switch share the existing worktree-keyed lock. A real-Git test reproduced Undo succeeding after a switch and now checks serialization, including an alias to the same worktree. Other same-user programs remain best effort. Git probes found `symref-verify` and updating its referent cannot be combined in one transaction, and holding `HEAD.lock` also blocks Git's own ref update. |
 | R077 | Closed | `5e0c020`: scrollback refuses work until preferences are current. |
-| R100 | Open, Tier 1 | Both font generators delete the current assets before generating replacements; failure can leave a broken working tree. Source revalidated; no destructive rebuild attempted. |
+| R100 | Closed | Both font generators prepare all subsets before publication, write content-addressed assets first, and atomically replace the stylesheet last. Interrupted publication leaves the old stylesheet and fonts usable; tests also cover collisions and macOS extended-attribute preservation. Previously referenced fonts are removed only after the new stylesheet is installed. |
 | R102 | Closed | `5e0c020`: aborted image deletion rejects rather than hanging. |
 | R106 | Closed | `6d26ec1`: native per-language patches merge independent formatter edits. |
 | R110 | Closed | `4b875dc` and follow-ups use the shared metadata-preserving writer. |
@@ -4364,7 +4364,7 @@ These are membership lists, not current-status counts. AI/MCP and Windows/WSL en
 | R204 | Open, Tier 2 | Theme selection updates the live state and fast-path shadow before fire-and-forget persistence; failure is not handled locally. Source revalidated. |
 | R209 | Closed | `691b691`: no-op theme mutations verify disk and refuse damaged or missing storage. |
 
-Counts: **10 closed; 1 Tier 1 and 1 Tier 2 open; 8 AI/MCP held; 1 Windows-port item**. R235 is a separate later MAJOR for a future non-atomic-save choice, not one of these original 21.
+Counts: **11 closed; 1 Tier 2 open; 8 AI/MCP held; 1 Windows-port item**. R235 is a separate later MAJOR for a future non-atomic-save choice, not one of these original 21.
 
 R059 validation: the real-Git race test failed before the worktree lock and passed afterward, including when branch switching used a directory alias. The full macOS native suite passed 1,533 library tests (four ignored) and all integration suites; the full frontend suite passed 5,608 tests with two skipped. Strict Clippy, type checking and lint passed; lint remained at 80 warnings. A terminal or another program changing HEAD is not serialized by this in-process lock.
 
@@ -4380,3 +4380,5 @@ R059 validation: the real-Git race test failed before the worktree lock and pass
 | R114 | Dormant, Tier 2 | Updater artifacts remain disabled; the release job still treats download failures as missing assets. |
 
 Counts: **1 closed; 3 Tier 2 open; 2 dormant Tier 2**. R078, an original MINOR outside these six, was fixed in `1736685`. These source checks do not claim a live GPU or updater failure reproduction.
+
+R100 publication notes: font rebuilds use the existing asset-first publication approach, with content-derived filenames and a metadata-preserving stylesheet replacement. Prior and new license notices are retained together when they differ. An interruption may leave unreferenced candidate files, but cannot remove fonts referenced by the old stylesheet. This addresses script failures; no crash-durability guarantee across an OS or power failure is claimed without filesystem synchronization.
