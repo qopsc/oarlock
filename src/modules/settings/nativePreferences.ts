@@ -31,6 +31,10 @@ let reading: Promise<PreferenceSnapshot> | undefined;
 let connecting: Promise<void> | undefined;
 let unlisten: UnlistenFn | undefined;
 const observers = new Set<Observer>();
+/** Capture the synchronized revision before beginning an asynchronous choice. */
+export function currentNativePreferences(): PreferenceSnapshot | undefined {
+  return current && current.revision >= wanted ? current : undefined;
+}
 function accept(snapshot: PreferenceSnapshot) {
   if (current && snapshot.revision <= current.revision) return;
   current = snapshot;
@@ -116,7 +120,9 @@ export async function watchNativePreferences(
 export async function mutatePreferences(
   change:
     | { kind: "set"; key: string; value: unknown }
-    | { kind: "patch"; key: string; values: Record<string, unknown> },
+    | { kind: "patch"; key: string; values: Record<string, unknown> }
+    | { kind: "background"; imageId: string | null }
+    | { kind: "themeselection"; id: string },
   expectedRevision?: number,
 ): Promise<void> {
   try {
@@ -124,6 +130,7 @@ export async function mutatePreferences(
     if (observers.size) update(result);
   } catch (error) {
     if (expectedRevision !== undefined && String(error).includes("PREFERENCES_REVISION_CHANGED")) throw error;
+    if (change.kind === "background") throw error;
     const { toast } = await import("sonner");
     toast.error("Could not save preference", { description: String(error) });
     throw error;

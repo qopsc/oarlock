@@ -6,9 +6,10 @@ type Props = {
   /** Resolves true once the text was imported, which closes the panel. */
   onImport: (text: string) => Promise<boolean>;
   onClose: () => void;
+  saving?: boolean;
 };
 
-export function ThemePastePanel({ onImport, onClose }: Props) {
+export function ThemePastePanel({ onImport, onClose, saving = false }: Props) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const empty = text.trim() === "";
@@ -34,7 +35,7 @@ export function ThemePastePanel({ onImport, onClose }: Props) {
         className="field-sizing-fixed h-32 rounded-md px-2.5 py-2 font-mono text-[11px] md:text-[11px]"
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") {
+          if (e.key === "Escape" && !saving) {
             e.preventDefault();
             onClose();
           } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -48,6 +49,7 @@ export function ThemePastePanel({ onImport, onClose }: Props) {
           variant="ghost"
           size="sm"
           className="h-7 px-2 text-[11px]"
+          disabled={saving}
           onClick={onClose}
         >
           Cancel
@@ -58,7 +60,7 @@ export function ThemePastePanel({ onImport, onClose }: Props) {
           disabled={empty || busy}
           onClick={() => void submit()}
         >
-          Import
+          {saving ? "Saving…" : "Import"}
         </Button>
       </div>
     </div>

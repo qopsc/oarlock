@@ -25,6 +25,8 @@ pub struct Snapshot {
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Change {
     Upsert { themes: Vec<Value> },
+    /// Imports create new entries; they must not replace an existing theme.
+    Create { themes: Vec<Value> },
     Delete { id: String },
 }
 #[derive(Deserialize)]
@@ -209,6 +211,16 @@ fn validate(snapshot: &Snapshot) -> Result<(), String> {
 fn apply(current: &Snapshot, change: Change) -> Result<Snapshot, String> {
     let mut next = current.clone();
     match change {
+        Change::Create { themes } => {
+            let mut ids = std::collections::HashSet::new();
+            for theme in &themes {
+                let id = validate_theme(theme)?;
+                if !ids.insert(id) || current.themes.iter().any(|existing| existing["id"] == id) {
+                    return Err("A theme with this ID already exists; retry the import".into());
+                }
+            }
+            next.themes.extend(themes);
+        }
         Change::Upsert { themes } => {
             // Validate the entire batch before changing anything. Last duplicate wins.
             for theme in &themes {
@@ -461,6 +473,20 @@ mod tests {
         Change::Upsert {
             themes: vec![theme(id)],
         }
+    }
+    #[test]
+    fn interrupted_import_cannot_overwrite_an_existing_selected_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.mutate(upsert("selected-theme")).unwrap();
+        let before = store.snapshot.clone();
+        let mut replacement = theme("selected-theme");
+        replacement["name"] = json!("replacement");
+        assert!(store.mutate(Change::Create {
+            themes: vec![theme("new-theme"), replacement],
+        }).unwrap_err().contains("already exists"));
+        assert_eq!(store.snapshot, before);
+        assert_eq!(Store::open(dir.path()).unwrap().snapshot, before);
     }
     #[test]
     fn concurrent_independent_imports_and_deletion_do_not_lose_or_resurrect_themes() {

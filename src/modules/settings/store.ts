@@ -859,7 +859,7 @@ export async function setTheme(value: ThemePref): Promise<void> {
 }
 
 export async function setThemeId(value: string): Promise<void> {
-  await writePref(KEY_THEME_ID, value);
+  await mutatePreferences({ kind: "themeselection", id: value });
 }
 
 /** Slider stores 0..1. Actual rendered opacity is halved in SurfaceLayer

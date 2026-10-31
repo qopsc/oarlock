@@ -49,6 +49,13 @@ export async function saveCustomThemes(
     }),
   );
 }
+/** Importing must never overwrite an existing, possibly selected, theme. */
+export async function createImportedThemes(themes: readonly Theme[]): Promise<void> {
+  if (themes.length === 0) return;
+  accept(await invoke<ThemeSnapshot>("themes_mutate", {
+    change: { kind: "create", themes },
+  }));
+}
 export async function deleteCustomTheme(id: string): Promise<void> {
   accept(
     await invoke<ThemeSnapshot>("themes_mutate", {

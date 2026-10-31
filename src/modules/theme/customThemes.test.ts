@@ -46,6 +46,14 @@ it("does not invoke for an empty import", async () => {
   await mod.saveCustomThemes([]);
   expect(native.invoke).not.toHaveBeenCalled();
 });
+it("creates imports without using the overwrite operation", async () => {
+  const mod = await import("./customThemes");
+  native.invoke.mockResolvedValue({ revision: 1, themes: [theme("new-theme")] });
+  await mod.createImportedThemes([theme("new-theme")]);
+  expect(native.invoke).toHaveBeenCalledWith("themes_mutate", {
+    change: { kind: "create", themes: [theme("new-theme")] },
+  });
+});
 it("subscribes before its initial read and rejects a stale startup snapshot", async () => {
   const mod = await import("./customThemes");
   let done: (value: unknown) => void = () => {};

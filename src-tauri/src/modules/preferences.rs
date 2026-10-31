@@ -37,6 +37,13 @@ pub enum Change {
         key: String,
         values: Map<String, Value>,
     },
+    /// Publish a background in one revision; a missing image clears it.
+    Background {
+        #[serde(rename = "imageId")]
+        image_id: Option<String>,
+    },
+    /// A selection is an intent even when it names the current theme.
+    ThemeSelection { id: String },
 }
 
 fn strings(value: &Value) -> bool {
@@ -192,8 +199,8 @@ fn validate(key: &str, value: &Value, allow_unknown: bool) -> Result<(), String>
     Ok(())
 }
 fn apply(current: &Snapshot, change: Change) -> Result<(Snapshot, Update), String> {
-    let (key, value) = match change {
-        Change::Set { key, value } => (key, value),
+    let (values, force) = match change {
+        Change::Set { key, value } => (Map::from_iter([(key, value)]), false),
         Change::Patch { key, values } => {
             if !matches!(key.as_str(), "terminalBehavior" | "lspActivation") {
                 return Err("Preference does not accept field patches".into());
@@ -211,20 +218,35 @@ fn apply(current: &Snapshot, change: Change) -> Result<(Snapshot, Update), Strin
                     merged.insert(field, value);
                 }
             }
-            (key, Value::Object(merged))
+            (Map::from_iter([(key, Value::Object(merged))]), false)
         }
+        Change::Background { image_id } => {
+            if image_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 128) {
+                return Err("Invalid background image id".into());
+            }
+            let kind = if image_id.is_some() { "image" } else { "none" };
+            (Map::from_iter([
+                ("backgroundKind".into(), Value::String(kind.into())),
+                ("backgroundImageId".into(), image_id.map_or(Value::Null, Value::String)),
+            ]), true)
+        }
+        Change::ThemeSelection { id } => (Map::from_iter([("themeId".into(), Value::String(id))]), true),
     };
-    validate(&key, &value, false)?;
+    for (key, value) in &values { validate(key, value, false)?; }
     let mut next = current.clone();
     let mut changes = Map::new();
-    if current.values.get(&key) != Some(&value) {
+    for (key, value) in values {
+        if force || current.values.get(&key) != Some(&value) {
+            next.values.insert(key.clone(), value.clone());
+            changes.insert(key, value);
+        }
+    }
+    if !changes.is_empty() {
         next.revision = current
             .revision
             .checked_add(1)
             .filter(|r| *r <= MAX_REVISION)
             .ok_or("Preference revision exhausted")?;
-        next.values.insert(key.clone(), value.clone());
-        changes.insert(key, value);
     }
     let update = Update {
         revision: next.revision,
@@ -377,7 +399,10 @@ pub async fn preferences_snapshot(app: tauri::AppHandle) -> Result<Snapshot, Str
 pub async fn preferences_mutate(app: tauri::AppHandle, change: Change, expected_revision: Option<u64>) -> Result<Update, String> {
     super::fs::blocking(move || {
         with_store(&app, |store| {
-            let update = store.mutate_at_revision(change, expected_revision)?;
+            let background = matches!(&change, Change::Background { .. });
+            let update = store.mutate_at_revision(change, expected_revision).map_err(|error| {
+                if background { format!("BACKGROUND_NOT_COMMITTED: {error}") } else { error }
+            })?;
             if !update.changes.is_empty() {
                 apply_access(
                     &store.snapshot,
@@ -410,6 +435,36 @@ mod tests {
         assert!(store.mutate_at_revision(set("showHidden", json!(false)), Some(revision))
             .unwrap_err().contains("PREFERENCES_REVISION_CHANGED"));
         assert_eq!(store.snapshot.values["showHidden"], json!(true));
+    }
+    #[test]
+    fn background_selection_is_atomic_and_explicit_theme_selection_advances_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let initial = store.snapshot.revision;
+        let saved = store.mutate_at_revision(Change::Background { image_id: Some("candidate".into()) }, Some(initial)).unwrap();
+        assert_eq!(saved.revision, initial + 1);
+        assert_eq!(saved.changes["backgroundKind"], json!("image"));
+        assert_eq!(saved.changes["backgroundImageId"], json!("candidate"));
+        let before = store.snapshot.clone();
+        assert!(store.mutate_at_revision(Change::Background { image_id: None }, Some(initial)).is_err());
+        assert_eq!(store.snapshot, before);
+        let first = store.mutate(Change::ThemeSelection { id: "selected".into() }).unwrap();
+        let repeated = store.mutate(Change::ThemeSelection { id: "selected".into() }).unwrap();
+        assert_eq!(repeated.revision, first.revision + 1);
+        assert_eq!(repeated.changes["themeId"], json!("selected"));
+    }
+    #[test]
+    fn interrupted_background_import_retains_a_complete_durable_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.mutate(Change::Background { image_id: Some("old".into()) }).unwrap();
+        let old = store.snapshot.clone();
+        // The asset is prepared before preferences change. A restart here sees old.
+        assert_eq!(Store::open(dir.path()).unwrap().snapshot, old);
+        store.mutate_at_revision(Change::Background { image_id: Some("new".into()) }, Some(old.revision)).unwrap();
+        let after = Store::open(dir.path()).unwrap().snapshot;
+        assert_eq!(after.values["backgroundKind"], json!("image"));
+        assert_eq!(after.values["backgroundImageId"], json!("new"));
     }
     #[test]
     fn migration_preserves_legacy_and_never_reimports_it() {
