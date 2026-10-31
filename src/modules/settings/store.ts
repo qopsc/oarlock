@@ -1223,6 +1223,16 @@ export async function setTerminalCustomShader(
   );
 }
 
+export async function setTerminalCustomShaderAtRevision(
+  value: TerminalCustomShader | null,
+  revision: number,
+): Promise<void> {
+  await mutatePreferences({
+    kind: "set", key: KEY_TERMINAL_CUSTOM_SHADER,
+    value: normalizeTerminalCustomShader(value),
+  }, revision);
+}
+
 export async function setTerminalMinimumContrast(value: number): Promise<void> {
   await writePref(KEY_TERMINAL_MINIMUM_CONTRAST, clampMinimumContrast(value));
 }

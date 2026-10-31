@@ -317,6 +317,12 @@ impl Store {
         }
         Ok(update)
     }
+    fn mutate_at_revision(&mut self, change: Change, expected: Option<u64>) -> Result<Update, String> {
+        if expected.is_some_and(|revision| revision != self.snapshot.revision) {
+            return Err("PREFERENCES_REVISION_CHANGED".into());
+        }
+        self.mutate(change)
+    }
 }
 fn apply_access(snapshot: &Snapshot, registry: &super::workspace::WorkspaceRegistry) {
     for (key, origin) in [
@@ -368,10 +374,10 @@ pub async fn preferences_snapshot(app: tauri::AppHandle) -> Result<Snapshot, Str
     super::fs::blocking(move || with_store(&app, |store| Ok(store.snapshot.clone()))).await
 }
 #[tauri::command]
-pub async fn preferences_mutate(app: tauri::AppHandle, change: Change) -> Result<Update, String> {
+pub async fn preferences_mutate(app: tauri::AppHandle, change: Change, expected_revision: Option<u64>) -> Result<Update, String> {
     super::fs::blocking(move || {
         with_store(&app, |store| {
-            let update = store.mutate(change)?;
+            let update = store.mutate_at_revision(change, expected_revision)?;
             if !update.changes.is_empty() {
                 apply_access(
                     &store.snapshot,
@@ -394,6 +400,16 @@ mod tests {
             key: key.into(),
             value,
         }
+    }
+    #[test]
+    fn conditional_update_rejects_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let revision = store.snapshot.revision;
+        store.mutate(set("showHidden", json!(true))).unwrap();
+        assert!(store.mutate_at_revision(set("showHidden", json!(false)), Some(revision))
+            .unwrap_err().contains("PREFERENCES_REVISION_CHANGED"));
+        assert_eq!(store.snapshot.values["showHidden"], json!(true));
     }
     #[test]
     fn migration_preserves_legacy_and_never_reimports_it() {

@@ -117,11 +117,13 @@ export async function mutatePreferences(
   change:
     | { kind: "set"; key: string; value: unknown }
     | { kind: "patch"; key: string; values: Record<string, unknown> },
+  expectedRevision?: number,
 ): Promise<void> {
   try {
-    const result = await invoke<Update>("preferences_mutate", { change });
+    const result = await invoke<Update>("preferences_mutate", expectedRevision === undefined ? { change } : { change, expectedRevision });
     if (observers.size) update(result);
   } catch (error) {
+    if (expectedRevision !== undefined && String(error).includes("PREFERENCES_REVISION_CHANGED")) throw error;
     const { toast } = await import("sonner");
     toast.error("Could not save preference", { description: String(error) });
     throw error;
