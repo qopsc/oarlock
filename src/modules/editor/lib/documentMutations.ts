@@ -85,9 +85,9 @@ export function subscribeDocumentMutations(
   apply: (event: DocumentMutation) => void,
   failed: (error: unknown, retry?: () => void) => void,
   ready: () => void = () => {},
-  reconcile?: (workspace: WorkspaceEnv | undefined, isLive: () => boolean) => Promise<void>,
+  reconcile?: (workspace: WorkspaceEnv | undefined, isLive: () => boolean, failedEvent?: DocumentMutation) => Promise<void>,
 ): () => void {
-  type Work = { event: DocumentMutation } | { reconcile: WorkspaceEnv | undefined };
+  type Work = { event: DocumentMutation } | { reconcile: WorkspaceEnv | undefined; failedEvent?: DocumentMutation };
   let live = true;
   let last = 0;
   let unlisten: (() => void) | undefined;
@@ -126,7 +126,7 @@ export function subscribeDocumentMutations(
             continue;
           }
           recoveryMutationCoverage(false);
-          void Promise.resolve().then(() => reconcile(work.reconcile, () => live)).then(
+          void Promise.resolve().then(() => reconcile(work.reconcile, () => live, work.failedEvent)).then(
             () => {
               const index = pending.indexOf(work);
               if (live && index >= 0) pending.splice(index, 1);
@@ -148,7 +148,7 @@ export function subscribeDocumentMutations(
           apply(work.event);
         } catch (error) {
           recoveryMutationCoverage(false);
-          if (reconcile) pending.unshift({ reconcile: work.event.workspace });
+          if (reconcile) pending.unshift({ reconcile: work.event.workspace, failedEvent: work.event });
           else failed(error);
         }
       }

@@ -11,7 +11,7 @@ import type { WorkspaceEnv } from "@/modules/workspace/env";
 /** Each mutation is committed before the next event reads the tab identities. */
 export function useDocumentMutations(
   apply: (event: DocumentMutation) => void,
-  reconcile: (workspace: WorkspaceEnv | undefined, isLive: () => boolean) => Promise<void>,
+  reconcile: (workspace: WorkspaceEnv | undefined, isLive: () => boolean, failedEvent?: DocumentMutation) => Promise<void>,
 ) {
   const current = useRef(apply);
   const currentReconcile = useRef(reconcile);
@@ -40,7 +40,7 @@ export function useDocumentMutations(
             action: { label: "Retry", onClick: retry ?? start },
           }),
         () => toast.dismiss("document-mutations"),
-        (workspace, isLive) => currentReconcile.current(workspace, isLive),
+        (workspace, isLive, failedEvent) => currentReconcile.current(workspace, isLive, failedEvent),
       );
     };
     start();

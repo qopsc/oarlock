@@ -17,10 +17,12 @@ use crate::modules::{
 };
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Document {
     id: u64,
     path: String,
     version: Option<String>,
+    alternate_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -85,6 +87,15 @@ fn reconcile(
             if expected.is_none_or(|identity| identity == actual) {
                 bindings[i].path = Some(doc.path.clone());
                 continue;
+            }
+        }
+        if expected.is_none() {
+            if let Some(alternate) = doc.alternate_path.as_deref() {
+                let candidate = resolve_path(alternate, workspace)?;
+                if opened_identity(&candidate, &authorize).is_ok() {
+                    bindings[i].path = Some(alternate.to_owned());
+                    continue;
+                }
             }
         }
         if let Some(identity) = expected {
@@ -182,6 +193,96 @@ pub async fn fs_reconcile_documents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_rename_without_identity_checks_source_before_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+        let docs = vec![Document {
+            id: 1,
+            path: source.to_string_lossy().into(),
+            version: None,
+            alternate_path: Some(destination.to_string_lossy().into()),
+        }];
+        let roots = vec![Root {
+            path: temp.path().into(),
+            display: temp.path().to_string_lossy().into(),
+        }];
+        let find = || reconcile(&docs, &roots, &WorkspaceEnv::default(), |_| Ok(())).unwrap();
+        assert_eq!(find()[0].path.as_deref(), source.to_str());
+        fs::remove_file(&source).unwrap();
+        assert_eq!(find()[0].path.as_deref(), destination.to_str());
+        let destination_real = fs::canonicalize(&destination).unwrap();
+        let refused = reconcile(&docs, &roots, &WorkspaceEnv::default(), |path| {
+            if path == destination_real {
+                Err("outside authorized workspace".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(refused[0].path, None);
+        fs::remove_file(&destination).unwrap();
+        assert_eq!(find()[0].path, None);
+    }
+
+    #[test]
+    fn missed_rename_without_identity_or_destination_cannot_be_inferred() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::write(&destination, "saved document").unwrap();
+        let docs = vec![Document {
+            id: 1,
+            path: source.to_string_lossy().into(),
+            version: None,
+            alternate_path: None,
+        }];
+        let roots = vec![Root {
+            path: temp.path().into(),
+            display: temp.path().to_string_lossy().into(),
+        }];
+        let bindings = reconcile(&docs, &roots, &WorkspaceEnv::default(), |_| Ok(())).unwrap();
+        assert_eq!(bindings[0].path, None);
+    }
+
+    #[test]
+    fn partial_rename_uses_identity_when_source_and_destination_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::write(&source, "original").unwrap();
+        let file = fs::File::open(&source).unwrap();
+        let version = document_save::version(&file, b"original").unwrap();
+        let docs = vec![Document {
+            id: 1,
+            path: source.to_string_lossy().into(),
+            version: Some(version),
+            alternate_path: None,
+        }];
+        let roots = vec![Root {
+            path: temp.path().into(),
+            display: temp.path().to_string_lossy().into(),
+        }];
+        let find = || reconcile(&docs, &roots, &WorkspaceEnv::default(), |_| Ok(())).unwrap();
+
+        // The attempted rename left both entries in place: retain the source.
+        fs::write(&destination, "unrelated destination").unwrap();
+        assert_eq!(find()[0].path.as_deref(), source.to_str());
+        assert_eq!(find(), find());
+
+        // The rename succeeded, but another file was created at the old name.
+        fs::remove_file(&destination).unwrap();
+        fs::rename(&source, &destination).unwrap();
+        assert_eq!(find()[0].path.as_deref(), destination.to_str());
+        fs::write(&source, "replacement").unwrap();
+        assert_eq!(find()[0].path.as_deref(), destination.to_str());
+        assert_eq!(find(), find());
+    }
+
     #[test]
     fn finds_a_missed_rename_and_does_not_choose_ambiguous_hardlinks() {
         let temp = tempfile::tempdir().unwrap();
@@ -195,6 +296,7 @@ mod tests {
             id: 1,
             path: a.to_string_lossy().into(),
             version: Some(version),
+            alternate_path: None,
         }];
         let roots = vec![Root {
             path: temp.path().into(),

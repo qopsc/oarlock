@@ -9,6 +9,7 @@ const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve()
 it("reconciles a failed mutation before applying the next queued rename", async () => {
   let receive!: (event: DocumentMutation) => void;
   const actions: string[] = [];
+  const failedEvents: (DocumentMutation | undefined)[] = [];
   const stop = subscribeDocumentMutations(
     async (listener) => { receive = listener; return () => {}; },
     (item) => {
@@ -20,13 +21,15 @@ it("reconciles a failed mutation before applying the next queued rename", async 
     },
     vi.fn(),
     vi.fn(),
-    async () => { actions.push("reconcile"); },
+    async (_scope, _isLive, failedEvent) => { actions.push("reconcile"); failedEvents.push(failedEvent); },
   );
   await flush();
   actions.length = 0;
+  failedEvents.length = 0;
   receive(event(1, "/a", "/b"));
   await flush();
   expect(actions).toEqual(["apply 1", "reconcile", "apply 2"]);
+  expect(failedEvents).toEqual([event(1, "/a", "/b")]);
   stop();
 });
 
