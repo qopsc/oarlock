@@ -17,7 +17,8 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { recheckLspInstall } from "./lspInstallRecheck";
 
 type Props = {
   server: LspPreset | null;
@@ -28,6 +29,17 @@ export function LspInstallDialog({ server, onClose }: Props) {
   const [copied, setCopied] = useState(false);
   const [checking, setChecking] = useState(false);
   const [notFound, setNotFound] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const attempt = useRef(0);
+  const savingRef = useRef(false);
+  const serverId = useRef(server?.id);
+  if (serverId.current !== server?.id) {
+    serverId.current = server?.id;
+    attempt.current++;
+  }
+
+  useEffect(() => () => { attempt.current++; }, []);
 
   useEffect(() => {
     if (!copied) return;
@@ -48,21 +60,32 @@ export function LspInstallDialog({ server, onClose }: Props) {
   };
 
   const checkAgain = async () => {
+    const owner = ++attempt.current;
+    const current = () => attempt.current === owner && serverId.current === server.id;
     setChecking(true);
     setNotFound(false);
-    const path = await redetectBinary(server.command);
-    if (path) {
-      await setLspActivation(server.id, "enabled");
-      onClose();
-      return;
+    setError(null);
+    try {
+      const result = await recheckLspInstall(current, () => redetectBinary(server.command), () => {
+        savingRef.current = true;
+        setSaving(true);
+      }, () => setLspActivation(server.id, "enabled"));
+      if (result === "saved") onClose();
+      else if (result === "missing") setNotFound(true);
+    } catch (error) {
+      if (current()) setError(`Could not enable the language server: ${String(error)}`);
+    } finally {
+      if (current()) {
+        savingRef.current = false;
+        setSaving(false);
+        setChecking(false);
+      }
     }
-    setChecking(false);
-    setNotFound(true);
   };
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-md">
+    <Dialog open onOpenChange={(open) => { if (!open && !savingRef.current) { attempt.current++; onClose(); } }}>
+      <DialogContent className="max-w-md" showCloseButton={!saving}>
         <DialogHeader>
           <DialogTitle>Install {server.name} language server</DialogTitle>
           <DialogDescription>
@@ -104,6 +127,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
             is available on PATH.
           </p>
         ) : null}
+        {error ? <p role="alert" className="text-xs text-destructive">{error}</p> : null}
 
         <DialogFooter className="items-center sm:justify-between">
           {server.install ? (
@@ -131,7 +155,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
               strokeWidth={1.9}
               className={checking ? "animate-spin" : undefined}
             />
-            {checking ? "Checking..." : "Check again"}
+            {saving ? "Saving…" : checking ? "Checking..." : "Check again"}
           </Button>
         </DialogFooter>
       </DialogContent>

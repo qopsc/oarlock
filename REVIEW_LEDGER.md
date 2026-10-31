@@ -4128,3 +4128,7 @@ An exited quick-terminal shell is disposed and its pane is removed while the nat
 ### R065: concurrent remote actions
 
 Each Source Control hook now synchronously reserves an action for its workspace and repository before dispatch. Another action for that repository returns busy until the first completes, while a different workspace remains independent. A regression holds a fetch pending, verifies a second request is refused and then verifies a later request can run. Focused tests (3), the full frontend suite (5,578 passed, 2 skipped), types and lint passed. This covers manual actions in one hook; it does not claim cross-window Git serialization. R065 is closed; Tier 3 remaining = 10, including six AI-on-hold.
+
+### R050: language-server installation recheck
+
+An installation recheck now belongs to the dialog and its selected server. Dismissal or replacement invalidates a pending binary lookup, and an obsolete completion cannot close a new dialog. Once the preference save starts, the dialog shows Saving and prevents an ordinary close until the save returns; a failed save is shown and the Check Again button becomes available. A parent that forcibly unmounts the dialog after native save dispatch cannot undo that already-started save. Focused regressions cover a dismissed lookup, missing binaries, a failed save and retry, and a replacement dialog while a save completes. Full frontend tests passed (5,581 passed, 2 skipped); types and lint passed. R050 is closed; Tier 3 remaining = 9, including six AI-on-hold.
