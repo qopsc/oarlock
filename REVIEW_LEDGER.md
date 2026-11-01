@@ -4412,10 +4412,10 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R045 | Closed | LSP framing limits headers to 16 KiB before buffering arbitrary input; regressions cover oversized headers, the exact limit, and pipelined messages. |
 | R046 | Open, Tier 3 | `lsp/session.rs` removes a naturally exited server after a bounded reader wait without terminating surviving descendants. |
 | R051 | Closed | Eligible idle sessions are closed before a new root is admitted. Closing sessions remain counted until shutdown finishes; regression tests cover the fifth root, simultaneous admissions and a session reacquired while another shutdown waits. |
-| R052 | Partially mitigated, Tier 3 | Native output now enforces the user-selected rate budget and restarts excessive senders. This limits bursts but does not bound outstanding channel or frontend backlog when a page remains stalled; that residual remains open. |
+| R052 | Closed; residual accepted | Native rate limits restart excessive senders. The user accepted as best effort the possibility that a stalled window accumulates messages below the rate threshold. |
 | R068 | Open, Tier 3 | `pty_write` clones an unrestricted body before waiting on the 64-entry input queue; waiting senders have no aggregate byte bound. |
 | R069 | Windows/WSL port | Windows ConPTY job assignment is a later-port concern. |
-| R070 | Open, Tier 3 | `proc/capture.rs::collect` returns after its grace period while a pipe-reader thread can remain blocked on an inherited pipe. |
+| R070 | Closed for Unix | Pipe readers wait on both the child pipe and a cancellation socket; collection wakes the reader after its drain deadline. A held-open-pipe regression failed before the change and passes afterward. Windows process capture remains port work. |
 | R071 | Closed | The scrollback reader now uses nonblocking, no-follow admission; the FIFO regression is recorded in the earlier R216 checkpoint. |
 | R079 | Open, Tier 3 | Terminal clipboard snapshot requests have no shared admission cap, and image decoding occurs before the clipboard commit coordinator. |
 | R089 | Closed | Images exceeding the texture budget are rejected before pixel expansion; a regression verifies their pixels are never read. |
@@ -4444,7 +4444,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **13 closed; 11 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **15 closed (including one accepted residual); 9 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4474,10 +4474,16 @@ R117 validation note: two default-concurrency full frontend runs timed out in un
 
 Each LSP session now admits at most 512 MiB and 50,000 messages in a conservatively bucketed 10-second sliding window. On breach, native stops forwarding and kills the server; the existing crash cooldown schedules a restart, shows an excessive-output notice, and stops retrying after repeated failures. A successful replacement shows a restart notice. Tests cover byte/count limits, bucket expiration, restart, cancellation and crash-loop behavior. No new acknowledgment or other IPC message was added.
 
-This rate limit bounds bursts, not the total data queued while the receiving webview is stalled: a server sending continuously below the threshold, including across restarts, can still accumulate unconsumed data. R052 remains open for that residual rather than claiming a hard memory bound. These generous thresholds were not validated against a large rust-analyzer or TypeScript language-server workspace because neither server is available here; a signed-release manual workload check is required. No evidence was found that a well-behaved server exceeds a reasonable limit.
+This rate limit bounds bursts, not the total data queued while the receiving webview is stalled: a server sending continuously below the threshold, including across restarts, can still accumulate unconsumed data. The user accepted that residual as best effort; no hard memory bound is claimed. These generous thresholds were not validated against a large rust-analyzer or TypeScript language-server workspace because neither server is available here; a signed-release manual workload check is required. No evidence was found that a well-behaved server exceeds a reasonable limit.
 
 The three real editor, terminal and Vim regex-worker tests now permit 15 seconds for the subprocess and 20 seconds for the test, preserving the actual worker timeout assertions while accommodating loaded CI hosts.
 
 R052 checkpoint: the full macOS native suite passed 1,548 library tests (four ignored) and integration suites; the full frontend suite passed 6,054 tests with two skipped at default concurrency after the worker timeout changes. Strict Clippy, types and lint passed; lint remained at 80 warnings. The native tests exercise the budget calculation; frontend tests exercise restart, cancellation, notices and crash-loop handling. A packaged end-to-end flood test and large real-server workload test have not been run.
 
 The batch stopped at the three-re-edit tripwire for `src/modules/lsp/lib/sessionManager.test.ts`: additional lifecycle regressions, formatting those new tests, and a TypeScript-target compatibility correction were three edits after the first passing version. Remaining resource findings and Compatibility triage are not complete; the review PR remains a draft.
+
+R052 decision: the user accepted the stalled-window residual as documented best effort on this release; it is not an open finding. The large-workspace manual check remains.
+
+R070: macOS/Linux pipe reads are interrupted when the collection grace expires, even if a descendant retains its write end. Existing bounded drain behavior and incomplete-output reporting remain. Windows process capture remains port work; an observer callback already executing cannot be forcibly interrupted by the pipe wake-up.
+
+R070 checkpoint: the full macOS native suite passed 1,549 library tests (four ignored) and integration suites; the full frontend suite passed 6,054 tests with two skipped. Strict Clippy and type checks passed; lint remained at 80 warnings. The 15 focused process-capture tests also passed on Linux in an offline, unprivileged container using a disposable earlier source snapshot with the current capture module; that build reported the two previously recorded unrelated Linux warnings.

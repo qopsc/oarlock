@@ -219,6 +219,61 @@ struct Drained {
 struct Reader {
     shared: Arc<Mutex<Drained>>,
     done: mpsc::Receiver<()>,
+    #[cfg(unix)]
+    wake: Option<std::os::unix::net::UnixStream>,
+}
+
+#[cfg(unix)]
+trait CaptureInput: Read + Send + std::os::fd::AsRawFd + 'static {}
+#[cfg(unix)]
+impl<T: Read + Send + std::os::fd::AsRawFd + 'static> CaptureInput for T {}
+#[cfg(not(unix))]
+trait CaptureInput: Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: Read + Send + 'static> CaptureInput for T {}
+
+#[cfg(unix)]
+struct InterruptibleReader<R> {
+    input: R,
+    wake: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+impl<R: Read + std::os::fd::AsRawFd> Read for InterruptibleReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.input.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if fds[1].revents != 0 {
+                return Ok(0);
+            }
+            if fds[0].revents != 0 {
+                return self.input.read(output);
+            }
+        }
+    }
 }
 
 /// Keeps reading past the cap so the child never blocks on a full pipe, unless
@@ -261,13 +316,24 @@ fn drain<R: Read>(
     }
 }
 
-fn spawn_reader<R: Read + Send + 'static>(
+fn spawn_reader<R: CaptureInput>(
     name: &'static str,
     reader: R,
     cap: usize,
     on_cap: Option<Arc<SharedChild>>,
     observer: Option<OutputObserver>,
 ) -> io::Result<Reader> {
+    #[cfg(unix)]
+    let (reader, wake) = {
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        (
+            InterruptibleReader {
+                input: reader,
+                wake: read,
+            },
+            Some(write),
+        )
+    };
     let shared = Arc::new(Mutex::new(Drained::default()));
     let (tx, done) = mpsc::channel();
     let writer = shared.clone();
@@ -289,13 +355,23 @@ fn spawn_reader<R: Read + Send + 'static>(
             );
             let _ = tx.send(());
         })?;
-    Ok(Reader { shared, done })
+    Ok(Reader {
+        shared,
+        done,
+        #[cfg(unix)]
+        wake,
+    })
 }
 
-/// Waits for EOF up to `grace`, then returns whatever has arrived. The reader
-/// stays bounded by `cap` and exits on its own when the pipe finally closes.
+/// Waits for EOF up to `grace`, then interrupts a Unix reader still waiting on a pipe.
 fn collect(reader: &Reader, grace: Duration) -> Drained {
     let complete = reader.done.recv_timeout(grace).is_ok();
+    #[cfg(unix)]
+    if !complete {
+        if let Some(wake) = &reader.wake {
+            let _ = wake.shutdown(std::net::Shutdown::Write);
+        }
+    }
     let mut out = std::mem::take(&mut *reader.shared.lock().unwrap_or_else(|e| e.into_inner()));
     out.incomplete |= !complete;
     out
@@ -668,6 +744,17 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_blocked_by_an_inherited_pipe_exits_after_the_drain_deadline() {
+        let (read, _held_open) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader = spawn_reader("capture-deadline-test", read, 1024, None, None).unwrap();
+        assert!(collect(&reader, Duration::from_millis(20)).incomplete);
+        assert!(
+            reader.done.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "reader thread survived its drain deadline while the pipe remained open"
+        );
+    }
+
+    #[test]
     fn spawn_failure_is_an_error() {
         let mut cmd = Command::new("/definitely/not/a/binary");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -693,6 +780,8 @@ mod completeness_tests {
         let reader = Reader {
             shared: Arc::new(Mutex::new(Drained::default())),
             done,
+            #[cfg(unix)]
+            wake: None,
         };
         assert!(collect(&reader, Duration::ZERO).incomplete);
     }
