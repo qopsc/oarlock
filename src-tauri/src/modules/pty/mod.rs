@@ -323,7 +323,7 @@ pub async fn pty_write(
     let session = state.owned(id, webview.label())?;
     // One ordered queue per session feeds a dedicated writer thread: no task
     // spawn or lock per keystroke, and the result is the real pipe write's.
-    session.write(bytes.clone()).await.map_err(|e| {
+    session.write(bytes).await.map_err(|e| {
         log::debug!("pty_write id={id} failed: {e}");
         e
     })

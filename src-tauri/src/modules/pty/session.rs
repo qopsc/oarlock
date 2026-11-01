@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +23,9 @@ const EXIT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Writes queued ahead of the writer thread; a full queue applies async
 /// backpressure to `pty_write` instead of growing without bound.
 const INPUT_QUEUE: usize = 64;
+const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_INPUT_BYTES: usize = MAX_INPUT_BYTES + 256 * 1024;
+const MAX_PENDING_INPUT_REQUESTS: usize = INPUT_QUEUE + 1;
 // Three small threads per PTY: keep their stacks small. The reader calls
 // Tauri's event emit, so it keeps a little more than the others.
 const READER_STACK: usize = 256 * 1024;
@@ -31,8 +34,59 @@ const WAITER_STACK: usize = 256 * 1024;
 
 struct InputMessage {
     bytes: Vec<u8>,
+    permit: Option<InputPermit>,
     /// Receives the write result; absent for fire-and-forget terminal replies.
     done: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Default)]
+struct InputBudget {
+    bytes: AtomicUsize,
+    requests: AtomicUsize,
+}
+
+struct InputPermit {
+    budget: Arc<InputBudget>,
+    bytes: usize,
+}
+
+fn try_add(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+impl InputBudget {
+    fn admit(self: &Arc<Self>, bytes: usize) -> Result<InputPermit, String> {
+        if bytes > MAX_INPUT_BYTES {
+            return Err("Terminal input exceeds 64 MiB".into());
+        }
+        if !try_add(&self.requests, 1, MAX_PENDING_INPUT_REQUESTS) {
+            return Err("Terminal input queue is full".into());
+        }
+        if !try_add(&self.bytes, bytes, MAX_PENDING_INPUT_BYTES) {
+            self.requests.fetch_sub(1, Ordering::AcqRel);
+            return Err("Terminal input queue is full".into());
+        }
+        Ok(InputPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for InputPermit {
+    fn drop(&mut self) {
+        self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.requests.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -60,6 +114,7 @@ pub struct Session {
     /// Feeds the per-session writer thread, which keeps input ordered and off
     /// every async worker.
     input: mpsc::Sender<InputMessage>,
+    input_budget: Arc<InputBudget>,
     pub master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     output: Arc<OutputQueue>,
     // Set only after output drains, so registration cannot reap a live queue.
@@ -114,11 +169,13 @@ impl Session {
 
     /// Queues `bytes` for the writer thread and resolves with the result of
     /// the actual pipe write, so callers still see real I/O errors in order.
-    pub(super) async fn write(&self, bytes: Vec<u8>) -> Result<(), String> {
+    pub(super) async fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        let permit = self.input_budget.admit(bytes.len())?;
         let (done, result) = oneshot::channel();
         self.input
             .send(InputMessage {
-                bytes,
+                bytes: bytes.to_vec(),
+                permit: Some(permit),
                 done: Some(done),
             })
             .await
@@ -328,6 +385,7 @@ pub(super) fn spawn_with(
         drop_pending: AtomicBool::new(false),
         killer: Mutex::new(killer),
         input: input.clone(),
+        input_budget: Arc::new(InputBudget::default()),
         master: Arc::new(Mutex::new(Some(pair.master))),
         output: output.clone(),
         finished: finished.clone(),
@@ -342,11 +400,18 @@ pub(super) fn spawn_with(
         .stack_size(WRITER_STACK)
         .spawn(move || {
             while let Some(message) = input_rx.blocking_recv() {
-                let result = writer.write_all(&message.bytes).map_err(|e| {
+                let InputMessage {
+                    bytes,
+                    permit,
+                    done,
+                } = message;
+                let result = writer.write_all(&bytes).map_err(|e| {
                     log::debug!("pty write failed: {e}");
                     e.to_string()
                 });
-                if let Some(done) = message.done {
+                drop(bytes);
+                drop(permit);
+                if let Some(done) = done {
                     let _ = done.send(result);
                 }
             }
@@ -395,6 +460,7 @@ pub(super) fn spawn_with(
                                 if input
                                     .try_send(InputMessage {
                                         bytes: reply.to_vec(),
+                                        permit: None,
                                         done: None,
                                     })
                                     .is_err()
@@ -761,7 +827,7 @@ mod tests {
         // thread applies them in submission order.
         runtime.block_on(async {
             for chunk in [&b"one "[..], b"two ", b"three"] {
-                session.write(chunk.to_vec()).await.unwrap();
+                session.write(chunk).await.unwrap();
             }
         });
         while frontend.received.len() < "readyone two three".len() && Instant::now() < deadline {
@@ -774,6 +840,52 @@ mod tests {
         session.close_output();
         let _ = session.killer.lock().unwrap().kill();
         reaped.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn oversized_terminal_input_is_refused_before_a_stalled_writer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (_hub, session, _frontend, reaped) = start("sleep 30");
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                session.write(&vec![0; 64 * 1024 * 1024 + 1]),
+            )
+            .await
+        });
+        session.close_output();
+        let _ = session.killer.lock().unwrap().kill();
+        drop(session);
+        reaped.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(result, Ok(Err(message)) if message.contains("input exceeds")));
+    }
+
+    #[test]
+    fn terminal_input_budget_bounds_bytes_and_releases_permits() {
+        let budget = Arc::new(InputBudget::default());
+        assert!(budget.admit(MAX_INPUT_BYTES + 1).is_err());
+        let large = budget.admit(MAX_INPUT_BYTES).unwrap();
+        let small = budget.admit(256 * 1024).unwrap();
+        assert!(budget.admit(1).is_err());
+        drop(large);
+        assert!(budget.admit(MAX_INPUT_BYTES).is_ok());
+        drop(small);
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(budget.requests.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn terminal_input_budget_bounds_even_empty_pending_requests() {
+        let budget = Arc::new(InputBudget::default());
+        let permits: Vec<_> = (0..MAX_PENDING_INPUT_REQUESTS)
+            .map(|_| budget.admit(0).unwrap())
+            .collect();
+        assert!(budget.admit(0).is_err());
+        drop(permits);
+        assert!(budget.admit(0).is_ok());
     }
 
     #[test]

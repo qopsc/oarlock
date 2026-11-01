@@ -4413,7 +4413,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R046 | Open, Tier 3 | `lsp/session.rs` removes a naturally exited server after a bounded reader wait without terminating surviving descendants. |
 | R051 | Closed | Eligible idle sessions are closed before a new root is admitted. Closing sessions remain counted until shutdown finishes; regression tests cover the fifth root, simultaneous admissions and a session reacquired while another shutdown waits. |
 | R052 | Closed; residual accepted | Native rate limits restart excessive senders. The user accepted as best effort the possibility that a stalled window accumulates messages below the rate threshold. |
-| R068 | Open, Tier 3 | `pty_write` clones an unrestricted body before waiting on the 64-entry input queue; waiting senders have no aggregate byte bound. |
+| R068 | Closed | Per-session admission now refuses writes above 64 MiB and bounds queued/in-flight input bytes and callers before cloning; permits remain held through the writer. Tests cover a stalled terminal, byte and request limits, and permit release. Tauri materializes request bodies before this boundary (R239). |
 | R069 | Windows/WSL port | Windows ConPTY job assignment is a later-port concern. |
 | R070 | Closed for Unix | Pipe readers wait on both the child pipe and a cancellation socket; collection wakes the reader after its drain deadline. A held-open-pipe regression failed before the change and passes afterward. Windows process capture remains port work. |
 | R071 | Closed | The scrollback reader now uses nonblocking, no-follow admission; the FIFO regression is recorded in the earlier R216 checkpoint. |
@@ -4444,7 +4444,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **15 closed (including one accepted residual); 9 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **16 closed (including one accepted residual); 8 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4487,3 +4487,13 @@ R052 decision: the user accepted the stalled-window residual as documented best 
 R070: macOS/Linux pipe reads are interrupted when the collection grace expires, even if a descendant retains its write end. Existing bounded drain behavior and incomplete-output reporting remain. Windows process capture remains port work; an observer callback already executing cannot be forcibly interrupted by the pipe wake-up.
 
 R070 checkpoint: the full macOS native suite passed 1,549 library tests (four ignored) and integration suites; the full frontend suite passed 6,054 tests with two skipped. Strict Clippy and type checks passed; lint remained at 80 warnings. The 15 focused process-capture tests also passed on Linux in an offline, unprivileged container using a disposable earlier source snapshot with the current capture module; that build reported the two previously recorded unrelated Linux warnings.
+
+### R068: terminal input admission
+
+The native session admits at most 65 queued/in-flight requests, with a 64 MiB per-write limit and a total of 64 MiB plus 256 KiB retained until the writer releases each request. Admission happens before Oarlock clones the request body. Fixed-size native terminal replies remain on the same existing queue. An oversized write to a stalled real PTY failed the regression before the fix; the session suite also covers input order and budget release.
+
+R239 — **MAJOR, untriaged:** Tauri has already materialized an incoming raw IPC body before `pty_write` sees it, so R068 does not limit allocation at that earlier boundary. The source shows the ordering, but a multi-request ingress exhaustion has not been reproduced or bounded. Enforcing admission before body creation may require a change to the IPC transport; assess that separately before proposing any contract change. This is not one of the original 38 resource-group IDs.
+
+The current batch reached the three-re-edit tripwire in `src-tauri/src/modules/pty/session.rs` after its first passing version: replacing deprecated atomic operations, formatting the new code, and releasing a completed write's buffer before its budget. Stop after this checkpoint.
+
+R068 checkpoint: the full macOS native suite passed 1,552 library tests (four ignored) and all integration suites; the frontend suite passed 6,054 tests with two skipped. Strict Clippy and type checking passed; lint remained at 80 warnings. All three focused input-budget tests also passed on Linux in an offline, unprivileged container using a disposable earlier source snapshot with the current PTY modules; the two previously recorded unrelated Linux warnings remained.
