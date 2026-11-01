@@ -3,7 +3,13 @@ import { expect, it, vi } from "vitest";
 const invoke = vi.hoisted(() =>
   vi.fn(async () => ({ content: "result", size: 6 })),
 );
-vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke,
+  Channel: class {
+    onmessage() {}
+  },
+}));
+vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "page" }));
 
 import { runExternalFormatter } from "./externalFormat";
 
@@ -20,6 +26,9 @@ it("retains the owning environment and passes filenames as data", async () => {
       content: "draft",
       customCommand: "",
       workspace,
+      pageGeneration: "page",
+      requestId: expect.any(String),
+      onAdmitted: expect.any(Object),
     });
   }
 });
@@ -40,5 +49,8 @@ it("sends a selected language separately from the authorized document path", asy
     customCommand: "",
     workspace,
     language: "ts",
+    pageGeneration: "page",
+    requestId: expect.any(String),
+    onAdmitted: expect.any(Object),
   });
 });

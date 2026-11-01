@@ -98,6 +98,7 @@ export class DocumentSession {
   private discardReadSuppressed = false;
   private recoveryTarget: RecoveryTarget | undefined;
   private saveTail: Promise<unknown> = Promise.resolve();
+  private formatter: AbortController | undefined;
   // "Open anyway" was chosen: reads of this file lift the size limit.
   private force = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -171,6 +172,7 @@ export class DocumentSession {
       });
       return;
     }
+    this.cancelFormatter();
     this.buffer = text;
     this.revision += 1;
     this.setDirty(
@@ -182,6 +184,7 @@ export class DocumentSession {
 
   // Never rejects: a failed write is reported through the host.
   save = async (): Promise<boolean> => {
+    this.cancelFormatter();
     this.clearTimer();
     if (this.detached) {
       this.host.saveFailed(
@@ -201,6 +204,7 @@ export class DocumentSession {
     format: (
       path: string,
       content: string,
+      signal: AbortSignal,
     ) => Promise<{ content: string; size: number }>,
   ): Promise<boolean> => {
     const path = this.path;
@@ -214,14 +218,22 @@ export class DocumentSession {
     const suspendedAutoSave = this.timer !== null;
     this.clearTimer();
     const timerGeneration = this.timerGeneration;
+    this.cancelFormatter();
+    const formatter = new AbortController();
+    this.formatter = formatter;
     const epoch = this.epoch,
       revision = this.revision,
       generation = this.readGeneration;
     let adopted = false;
     try {
-      const candidate = await format(path, restoreEol(this.buffer, this.eol));
+      const candidate = await format(
+        path,
+        restoreEol(this.buffer, this.eol),
+        formatter.signal,
+      );
       if (
         editorQuitSealed() ||
+        formatter.signal.aborted ||
         !this.active ||
         epoch !== this.epoch ||
         revision !== this.revision ||
@@ -229,12 +241,18 @@ export class DocumentSession {
       )
         return false;
       adopted = true;
+      if (this.formatter === formatter) this.formatter = undefined;
       const content = normalizeToLf(candidate.content);
       this.eol = detectEol(candidate.content);
       this.change(content);
       this.host.state({ status: "ready", content, size: candidate.size });
       return this.save();
+    } catch (error) {
+      if (formatter.signal.aborted && error === formatter.signal.reason)
+        return false;
+      throw error;
     } finally {
+      if (this.formatter === formatter) this.formatter = undefined;
       // Preparation suspended autosave. Failed or superseded candidates must
       // restore it, without restarting a timer paused by a save conflict.
       if (
@@ -267,6 +285,7 @@ export class DocumentSession {
     )
       return;
     this.detached = true;
+    this.cancelFormatter();
     this.epoch += 1;
     this.readGeneration += 1;
     this.aiAllowed = false;
@@ -412,6 +431,7 @@ export class DocumentSession {
           }
           return empty;
         }
+        this.cancelFormatter();
         this.clearTimer();
         if (this.loadedPath === this.path) {
           epoch = ++this.epoch;
@@ -490,6 +510,7 @@ export class DocumentSession {
       return false;
     }
     // A pending autosave would write the discarded text back.
+    this.cancelFormatter();
     this.discardReadSuppressed = false;
     if (force) this.clearTimer();
     const epoch = this.epoch;
@@ -542,6 +563,7 @@ export class DocumentSession {
     version: string | undefined,
     aiContextAllowed = false,
   ): string => {
+    this.cancelFormatter();
     this.readGeneration += 1;
     this.aiAllowed = this.aiAllowed && aiContextAllowed;
     this.eol = detectEol(diskText);
@@ -554,6 +576,7 @@ export class DocumentSession {
   };
 
   private load(force: boolean): void {
+    this.cancelFormatter();
     const path = this.path;
     if (path === null) return;
     const epoch = ++this.epoch;
@@ -686,6 +709,7 @@ export class DocumentSession {
       });
       return false;
     }
+    this.cancelFormatter();
     this.readGeneration += 1;
     this.diskVersion = result.version;
     this.saved = content;
@@ -715,6 +739,7 @@ export class DocumentSession {
   }
 
   private release(path: string): void {
+    this.cancelFormatter();
     this.pendingDiscards = undefined;
     this.discardReadSuppressed = false;
     this.recoveryTarget?.dispose();
@@ -727,5 +752,10 @@ export class DocumentSession {
     this.isDirty = dirty;
     this.host.dirty(this.hasUnsavedChanges());
     documentRevisionChanged();
+  }
+
+  private cancelFormatter(): void {
+    this.formatter?.abort();
+    this.formatter = undefined;
   }
 }

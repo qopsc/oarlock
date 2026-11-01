@@ -67,6 +67,9 @@ pub fn cancel_requests(app: &tauri::AppHandle, window: &str) {
     if let Some(state) = app.try_state::<crate::modules::fs::interactive::SearchRequests>() {
         state.cancel_window(window);
     }
+    if let Some(state) = app.try_state::<crate::modules::fs::formatter::FormatterRequests>() {
+        state.cancel_window(window);
+    }
     if let Some(state) = app.try_state::<crate::modules::clipboard_write::ClipboardWrites>() {
         state.release_window(window);
     }

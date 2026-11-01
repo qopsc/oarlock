@@ -2,6 +2,7 @@
 //! editor adopts candidate text only while its snapshot is current, then saves
 //! through the native conditional transaction.
 use crate::modules::{
+    net::{page::NetworkPages, AiStreamState},
     proc::capture::{self, Cancellation, Limits, OnTimeout},
     workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry},
 };
@@ -13,11 +14,19 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tauri::Manager;
+use tauri::{ipc::Channel, Manager, State, Window};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_BYTES: usize = 50 * 1024 * 1024;
 const MAX_FORMATTERS: usize = 4;
+
+#[derive(Default)]
+pub struct FormatterRequests(AiStreamState);
+impl FormatterRequests {
+    pub fn cancel_window(&self, window: &str) {
+        self.0.cancel_window(window);
+    }
+}
 
 fn admit_formatter(budget: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, String> {
     budget
@@ -29,6 +38,15 @@ fn admit_formatter(budget: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Stri
 fn formatter_budget() -> &'static Arc<Semaphore> {
     static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
     BUDGET.get_or_init(|| Arc::new(Semaphore::new(MAX_FORMATTERS)))
+}
+
+async fn cancel_on_abort(
+    registration: futures_util::future::AbortRegistration,
+    cancellation: Arc<Cancellation>,
+) {
+    let _ = futures_util::future::Abortable::new(std::future::pending::<()>(), registration).await;
+    cancellation.request();
+    let _ = tauri::async_runtime::spawn_blocking(move || cancellation.cancel()).await;
 }
 
 #[derive(Serialize)]
@@ -133,7 +151,11 @@ fn run(
     content: &str,
     workspace: &WorkspaceEnv,
     timeout: Duration,
+    cancellation: &Cancellation,
 ) -> Result<Candidate, String> {
+    if cancellation.is_requested() {
+        return Err("Formatter cancelled".into());
+    }
     if content.len() > MAX_BYTES {
         return Err("Document exceeds the 50 MiB formatter limit".into());
     }
@@ -169,7 +191,6 @@ fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::modules::proc::hide_console(&mut command);
-    let cancellation = Cancellation::default();
     let result = capture::run_cancellable(
         &mut command,
         timeout,
@@ -179,7 +200,7 @@ fn run(
             stop_on_stdout_cap: true,
         },
         OnTimeout::TerminateGroup,
-        Some(&cancellation),
+        Some(cancellation),
         control,
     )
     .map_err(|e| e.to_string())?;
@@ -243,8 +264,15 @@ fn local_command(args: &[String], cwd: &str) -> Result<Command, String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn fs_format_document(
     app: tauri::AppHandle,
+    window: Window,
+    requests: State<'_, FormatterRequests>,
+    pages: State<'_, NetworkPages>,
+    page_generation: String,
+    request_id: String,
+    on_admitted: Channel<()>,
     formatter: String,
     path: String,
     content: String,
@@ -253,36 +281,163 @@ pub async fn fs_format_document(
     workspace: Option<WorkspaceEnv>,
 ) -> Result<Candidate, String> {
     let permit = admit_formatter(formatter_budget())?;
-    super::blocking(move || {
-        // Cancellation or loss of the IPC waiter cannot free admission while
-        // its blocking worker and formatter process are still running.
-        let _permit = permit;
-        let workspace = WorkspaceEnv::from_option(workspace);
-        let requested = resolve_path(&path, &workspace)?;
-        app.state::<WorkspaceRegistry>()
-            .gates(Origin::App)
-            .authorized_write_target(&requested)?;
-        let cwd = Path::new(&path)
-            .parent()
-            .and_then(Path::to_str)
-            .ok_or("Document has no parent directory")?;
-        app.state::<WorkspaceRegistry>()
-            .gates(Origin::App)
-            .spawn_cwd(Some(cwd), &workspace)?;
-        let hint = language_hint(&path, language.as_deref())?;
-        let args = arguments(
-            &formatter,
-            &hint,
-            custom_command.as_deref().unwrap_or_default(),
-        )?;
-        run(&args, cwd, &content, &workspace, Duration::from_secs(20))
+    let (lease, registration) = pages.with_page(window.label(), &page_generation, || {
+        requests
+            .0
+            .start_bounded(window.label(), &request_id, MAX_FORMATTERS)
+    })?;
+    on_admitted.send(()).map_err(|error| error.to_string())?;
+    let task = tauri::async_runtime::spawn(async move {
+        let cancel = Arc::new(Cancellation::default());
+        let watcher = tauri::async_runtime::spawn(cancel_on_abort(registration, cancel.clone()));
+        let result = super::blocking(move || {
+            // Cancellation or loss of the IPC waiter cannot free admission while
+            // its blocking worker and formatter process are still running.
+            let _permit = permit;
+            let _lease = lease;
+            if cancel.is_requested() {
+                return Err("Formatter cancelled".into());
+            }
+            let workspace = WorkspaceEnv::from_option(workspace);
+            let requested = resolve_path(&path, &workspace)?;
+            app.state::<WorkspaceRegistry>()
+                .gates(Origin::App)
+                .authorized_write_target(&requested)?;
+            if cancel.is_requested() {
+                return Err("Formatter cancelled".into());
+            }
+            let cwd = Path::new(&path)
+                .parent()
+                .and_then(Path::to_str)
+                .ok_or("Document has no parent directory")?;
+            app.state::<WorkspaceRegistry>()
+                .gates(Origin::App)
+                .spawn_cwd(Some(cwd), &workspace)?;
+            let hint = language_hint(&path, language.as_deref())?;
+            let args = arguments(
+                &formatter,
+                &hint,
+                custom_command.as_deref().unwrap_or_default(),
+            )?;
+            run(
+                &args,
+                cwd,
+                &content,
+                &workspace,
+                Duration::from_secs(20),
+                &cancel,
+            )
+        })
+        .await;
+        watcher.abort();
+        result
+    });
+    task.await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn fs_format_cancel(
+    window: Window,
+    requests: State<'_, FormatterRequests>,
+    pages: State<'_, NetworkPages>,
+    page_generation: String,
+    request_id: String,
+) -> Result<(), String> {
+    pages.with_page(window.label(), &page_generation, || {
+        requests.0.cancel(window.label(), &request_id);
+        Ok(())
     })
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retiring_a_page_cancels_its_formatters_only() {
+        let requests = FormatterRequests::default();
+        let pages = NetworkPages::default();
+        pages.begin("a", || {}).unwrap();
+        pages.begin("b", || {}).unwrap();
+        let a = pages.finish("a").unwrap();
+        let b = pages.finish("b").unwrap();
+        let (_a, ar) = pages
+            .with_page("a", &a, || requests.0.start("a", "one"))
+            .unwrap();
+        let (_b, br) = pages
+            .with_page("b", &b, || requests.0.start("b", "one"))
+            .unwrap();
+        pages.close("a", || requests.cancel_window("a"));
+        assert!(ar.handle().is_aborted());
+        assert!(!br.handle().is_aborted());
+        assert!(pages
+            .with_page("a", &a, || requests.0.start("a", "late"))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_running_formatter_stops_its_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let ready = root.join("ready");
+        let late = root.join("late");
+        let requests = FormatterRequests::default();
+        let (_lease, registration) = requests.0.start("window", "format").unwrap();
+        let cancellation = Arc::new(Cancellation::default());
+        let watcher = tokio::spawn(cancel_on_abort(registration, cancellation.clone()));
+        let worker = tokio::task::spawn_blocking(move || {
+            run(
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "touch ready; sleep 1; touch late; cat".into(),
+                ],
+                root.to_str().unwrap(),
+                "draft",
+                &WorkspaceEnv::Local,
+                Duration::from_secs(10),
+                &cancellation,
+            )
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "formatter did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        requests.0.cancel("window", "format");
+        tokio::time::timeout(Duration::from_secs(3), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(!late.exists(), "a cancelled child must not write later");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_before_preparation_never_starts_a_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancellation = Cancellation::default();
+        cancellation.request();
+        let result = run(
+            &["/bin/sh".into(), "-c".into(), "touch started".into()],
+            dir.path().to_str().unwrap(),
+            "draft",
+            &WorkspaceEnv::Local,
+            Duration::from_secs(2),
+            &cancellation,
+        );
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+        assert!(!dir.path().join("started").exists());
+    }
+
     #[test]
     fn formatter_budget_is_shared_and_reports_overload() {
         let permits: Vec<_> = (0..MAX_FORMATTERS)
@@ -401,6 +556,7 @@ mod tests {
             content,
             &WorkspaceEnv::Local,
             timeout,
+            &Cancellation::default(),
         )
     }
 
@@ -457,7 +613,7 @@ mod tests {
             document_save::version(&std::fs::File::open(&file).unwrap(), b"base").unwrap();
         let root = temp.path().to_path_buf();
         let worker = std::thread::spawn(move || {
-            run(&["/bin/sh".into(), "-c".into(), "input=$(cat); touch ready; while [ ! -f proceed ]; do sleep 0.01; done; printf 'formatted:%s' \"$input\"".into()], root.to_str().unwrap(), "base", &WorkspaceEnv::Local, Duration::from_secs(5))
+            run(&["/bin/sh".into(), "-c".into(), "input=$(cat); touch ready; while [ ! -f proceed ]; do sleep 0.01; done; printf 'formatted:%s' \"$input\"".into()], root.to_str().unwrap(), "base", &WorkspaceEnv::Local, Duration::from_secs(5), &Cancellation::default())
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         while !ready.exists() {

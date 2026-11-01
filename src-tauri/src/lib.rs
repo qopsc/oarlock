@@ -401,6 +401,7 @@ pub fn run() {
         .manage(net::probe::ProbeRequests::default())
         .manage(net::page::NetworkPages::default())
         .manage(fs::interactive::SearchRequests::default())
+        .manage(fs::formatter::FormatterRequests::default())
         .manage(modules::ai_sessions::SessionFilesState::default())
         .manage(modules::ai_metadata::MetadataState::default())
         .manage(modules::ai_subagents::SubagentState::default())
@@ -467,6 +468,7 @@ pub fn run() {
             fs::mutation_events::fs_recovery_changed,
             fs::mutation_events::fs_recovery_end,
             fs::formatter::fs_format_document,
+            fs::formatter::fs_format_cancel,
             fs::file::fs_stat,
             fs::file::fs_host_path,
             fs::file::fs_canonicalize,

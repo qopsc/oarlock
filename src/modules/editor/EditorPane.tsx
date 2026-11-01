@@ -247,10 +247,12 @@ export const EditorPane = memo(
     const formatAndSaveRef = useRef(formatAndSave);
     formatAndSaveRef.current = formatAndSave;
     const saveLifetime = useRef(0);
+    const activeFormats = useRef(new Set<AbortController>());
     // biome-ignore lint/correctness/useExhaustiveDependencies: changing document identity invalidates pending saves even when the view is reused.
     useLayoutEffect(() => {
       saveLifetime.current++;
       return () => {
+        for (const owner of activeFormats.current) owner.abort();
         saveLifetime.current++;
       };
     }, [path, workspace, detached, language.id]);
@@ -396,6 +398,7 @@ export const EditorPane = memo(
       languageRef.current = documentLanguage(path, next).id;
       languageOverrideRef.current = next;
       saveLifetime.current++;
+      for (const owner of activeFormats.current) owner.abort();
       lspActiveRef.current = false;
       languageChangeRef.current(next);
     };
@@ -416,20 +419,31 @@ export const EditorPane = memo(
             ? (languageRef.current ?? "txt")
             : null;
           const saved = await formatAndSaveRef.current(
-            async (file, content) => {
-              const result = await runExternalFormatter(
-                formatter,
-                file,
-                content,
-                prefs.editorCustomFormatCommand,
-                workspace,
-                languageHint,
-              );
-              if (!current())
-                throw Error(
-                  "Document language changed during formatting. Save again.",
+            async (file, content, signal) => {
+              const owner = new AbortController();
+              activeFormats.current.add(owner);
+              const cancelDocument = () => owner.abort(signal.reason);
+              signal.addEventListener("abort", cancelDocument, { once: true });
+              if (signal.aborted) cancelDocument();
+              try {
+                const result = await runExternalFormatter(
+                  formatter,
+                  file,
+                  content,
+                  prefs.editorCustomFormatCommand,
+                  workspace,
+                  languageHint,
+                  owner.signal,
                 );
-              return result;
+                if (!current())
+                  throw Error(
+                    "Document language changed during formatting. Save again.",
+                  );
+                return result;
+              } finally {
+                signal.removeEventListener("abort", cancelDocument);
+                activeFormats.current.delete(owner);
+              }
             },
           );
           if (saved && current()) onSavedRef.current?.();

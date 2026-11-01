@@ -704,7 +704,7 @@ it("formats candidate content without a disk write before formatting finishes", 
       }),
   );
   const saving = t.session.formatAndSave(format);
-  expect(format).toHaveBeenCalledWith("/a", "draft");
+  expect(format).toHaveBeenCalledWith("/a", "draft", expect.any(AbortSignal));
   expect(t.disk.get("/a")?.content).toBe("base");
   t.touch("/a", "other window");
   finish({ content: "formatted draft", size: 15 });

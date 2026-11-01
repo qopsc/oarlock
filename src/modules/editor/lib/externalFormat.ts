@@ -1,6 +1,7 @@
 import type { EditorFormatter } from "@/modules/settings/store";
+import { networkPage } from "@/lib/networkPage";
 import { currentWorkspaceEnv, type WorkspaceEnv } from "@/modules/workspace";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 export type ExternalFormatter = Exclude<EditorFormatter, "lsp">;
 
@@ -84,13 +85,50 @@ export async function runExternalFormatter(
   customCommand = "",
   workspace: WorkspaceEnv = currentWorkspaceEnv(),
   language: string | null = null,
+  signal: AbortSignal = new AbortController().signal,
 ): Promise<{ content: string; size: number }> {
-  return invoke("fs_format_document", {
-    formatter,
-    path,
-    content,
-    customCommand,
-    workspace,
-    ...(language ? { language } : {}),
+  signal.throwIfAborted();
+  const pageGeneration = await networkPage(signal);
+  signal.throwIfAborted();
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const onAdmitted = new Channel<void>();
+    let closed = false;
+    let cancelled = false;
+    const cancel = () =>
+      invoke("fs_format_cancel", { pageGeneration, requestId }).catch(() => {});
+    const finish = (action: () => void) => {
+      if (closed) return;
+      closed = true;
+      signal.removeEventListener("abort", abort);
+      action();
+    };
+    const abort = () => {
+      cancelled = true;
+      finish(() => reject(signal.reason));
+      void cancel();
+    };
+    onAdmitted.onmessage = () => {
+      if (cancelled) void cancel();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    void invoke<{ content: string; size: number }>("fs_format_document", {
+      formatter,
+      path,
+      content,
+      customCommand,
+      workspace,
+      pageGeneration,
+      requestId,
+      onAdmitted,
+      ...(language ? { language } : {}),
+    }).then(
+      (result) => finish(() => resolve(result)),
+      (error) => finish(() => reject(error)),
+    );
   });
 }
