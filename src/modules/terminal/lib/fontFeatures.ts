@@ -1,5 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { useSyncExternalStore } from "react";
+import { useLayoutEffect, useState, useSyncExternalStore } from "react";
 import { IS_MAC } from "@/lib/platform";
 
 /**
@@ -192,12 +192,100 @@ const derived = new Map<string, string>();
 /** Whether `@font-face` rules declare a family, by lowercase name. */
 const declaredFamilies = new Map<string, boolean>();
 /** Negative results may retry after the native font scanner's rescan window. */
-const installed = new Map<string, string | { retryAt: number } | Promise<void>>();
+const installed = new Map<
+  string,
+  string | { retryAt: number } | Promise<void>
+>();
 const FONT_RETRY_MS = 10_000;
 /** Every derived family name, for `loadFeatureFamilies`. */
 const derivedNames = new Set<string>();
+const MAX_UNUSED_FAMILIES = 32;
+const MAX_MISSING_FAMILIES = 128;
+const MAX_FONT_LOOKUPS = 16;
+let nextDerivedName = 0;
+let pendingLookups = 0;
+let waitingForLookup = false;
+type FaceGroup = { faces: FontFace[]; fonts: FontFaceSet; evict: () => void };
+const faceGroups = new Map<string, FaceGroup>();
+const retained = new Map<string, number>();
+let sweepTimer: ReturnType<typeof setTimeout> | undefined;
 let revision = 0;
 const listeners = new Set<() => void>();
+
+function changed(): void {
+  revision += 1;
+  for (const listener of listeners) listener();
+}
+
+function scheduleSweep(): void {
+  if (sweepTimer !== undefined) return;
+  sweepTimer = setTimeout(() => {
+    sweepTimer = undefined;
+    let unused = [...faceGroups.keys()].filter(
+      (name) => !retained.has(name),
+    ).length;
+    for (const [name, group] of faceGroups) {
+      if (unused <= MAX_UNUSED_FAMILIES) break;
+      if (retained.has(name) || typeof group.fonts.delete !== "function")
+        continue;
+      for (const face of group.faces) group.fonts.delete(face);
+      group.evict();
+      faceGroups.delete(name);
+      derivedNames.delete(name);
+      unused -= 1;
+    }
+  }, 0);
+}
+
+function touchFamily(name: string): void {
+  const group = faceGroups.get(name);
+  if (!group) return;
+  faceGroups.delete(name);
+  faceGroups.set(name, group);
+}
+
+function trackFamily(name: string, faces: FontFace[], evict: () => void): void {
+  derivedNames.add(name);
+  faceGroups.set(name, { faces, fonts: document.fonts, evict });
+  scheduleSweep();
+}
+
+function retainFamilies(stack: string): {
+  release: () => void;
+  missing: boolean;
+} {
+  const names = fontStackFamilies(stack).filter((name) =>
+    derivedNames.has(name),
+  );
+  for (const name of names) retained.set(name, (retained.get(name) ?? 0) + 1);
+  const missing = fontStackFamilies(stack).some(
+    (name) =>
+      / \(Oarlock features \d+\)$/.test(name) && !derivedNames.has(name),
+  );
+  const release = () => {
+    for (const name of names) {
+      const count = retained.get(name) ?? 0;
+      if (count <= 1) retained.delete(name);
+      else retained.set(name, count - 1);
+    }
+    scheduleSweep();
+  };
+  return { release, missing };
+}
+
+function trimMissing<T>(
+  map: Map<string, T>,
+  missing: (value: T) => boolean,
+): void {
+  let count = [...map.values()].filter(missing).length;
+  for (const [key, value] of map) {
+    if (count <= MAX_MISSING_FAMILIES) break;
+    if (missing(value)) {
+      map.delete(key);
+      count -= 1;
+    }
+  }
+}
 
 /** CSS generic families: never fonts of their own. */
 const GENERIC = new Set([
@@ -264,10 +352,18 @@ function retryMissingFonts(): void {
  */
 export function useFontFeatureStack(stack: string, features: string): string {
   useSyncExternalStore(subscribeFontFeatures, fontFeaturesRevision);
-  return withFontFeatures(
+  const [, refresh] = useState(0);
+  const result = withFontFeatures(
     stack,
     parseFontFeatures(features).settings ?? "normal",
   );
+  useLayoutEffect(() => {
+    const ownership = retainFamilies(result);
+    // A concurrent render may have outlived an eviction before it committed.
+    if (ownership.missing) refresh((value) => value + 1);
+    return ownership.release;
+  }, [result]);
+  return result;
 }
 
 /**
@@ -317,6 +413,10 @@ function isDeclared(family: string): boolean {
   if (known === undefined) {
     known = declaredFaces(family).length > 0;
     declaredFamilies.set(key, known);
+    if (declaredFamilies.size > MAX_MISSING_FAMILIES) {
+      const oldest = declaredFamilies.keys().next().value;
+      if (oldest !== undefined) declaredFamilies.delete(oldest);
+    }
   }
   return known;
 }
@@ -330,15 +430,32 @@ function isSystemFace(path: string): boolean {
 }
 
 function derivedFamilyName(family: string): string {
-  return `${family} (Oarlock features ${derivedNames.size + 1})`;
+  nextDerivedName += 1;
+  return `${family} (Oarlock features ${nextDerivedName})`;
 }
 
 function installedFamily(family: string, settings: string): string | null {
   const key = `${family.toLowerCase()}\u0000${settings}`;
   const known = installed.get(key);
-  if (typeof known === "string") return known;
-  if (known === undefined || (typeof known === "object" && !(known instanceof Promise) && known.retryAt <= Date.now())) {
-    installed.set(key, declareInstalled(family, settings, key));
+  if (typeof known === "string") {
+    touchFamily(known);
+    return known;
+  }
+  if (
+    known === undefined ||
+    (typeof known === "object" &&
+      !(known instanceof Promise) &&
+      known.retryAt <= Date.now())
+  ) {
+    if (pendingLookups >= MAX_FONT_LOOKUPS) {
+      waitingForLookup = true;
+      return null;
+    }
+    pendingLookups += 1;
+    installed.set(
+      key,
+      Promise.resolve().then(() => declareInstalled(family, settings, key)),
+    );
   }
   return null;
 }
@@ -348,58 +465,99 @@ async function declareInstalled(
   settings: string,
   key: string,
 ): Promise<void> {
-  let faces: InstalledFace[] = [];
+  const declared: FontFace[] = [];
   try {
-    faces = await invoke<InstalledFace[]>("system_font_faces", { family });
+    let faces: InstalledFace[] = [];
+    try {
+      faces = await invoke<InstalledFace[]>("system_font_faces", { family });
+    } catch {
+      /* not in the app, or the lookup failed: draw without features */
+    }
+    if (
+      settings === "normal" &&
+      faces.every((face) => isSystemFace(face.path))
+    ) {
+      faces = [];
+    }
+    if (faces.length === 0) {
+      installed.set(key, { retryAt: Date.now() + FONT_RETRY_MS });
+      trimMissing(
+        installed,
+        (value) => typeof value === "object" && !(value instanceof Promise),
+      );
+      return;
+    }
+    const name = derivedFamilyName(family);
+    for (const face of faces) {
+      // Each face loads from its file the first time it is drawn.
+      const derivedFace = new FontFace(
+        name,
+        `url("${convertFileSrc(face.path)}")`,
+        {
+          weight: String(face.weight),
+          style: face.style,
+          stretch: `${face.stretch}%`,
+          featureSettings: settings,
+        },
+      );
+      document.fonts.add(derivedFace);
+      declared.push(derivedFace);
+    }
+    installed.set(key, name);
+    trackFamily(name, declared, () => {
+      if (installed.get(key) === name) installed.delete(key);
+    });
+    changed();
   } catch {
-    /* not in the app, or the lookup failed: draw without features */
-  }
-  if (settings === "normal" && faces.every((face) => isSystemFace(face.path))) {
-    faces = [];
-  }
-  if (faces.length === 0) {
+    if (typeof document !== "undefined")
+      for (const face of declared) document.fonts.delete?.(face);
     installed.set(key, { retryAt: Date.now() + FONT_RETRY_MS });
-    return;
-  }
-  const name = derivedFamilyName(family);
-  for (const face of faces) {
-    // Each face loads from its file the first time it is drawn.
-    document.fonts.add(
-      new FontFace(name, `url("${convertFileSrc(face.path)}")`, {
-        weight: String(face.weight),
-        style: face.style,
-        stretch: `${face.stretch}%`,
-        featureSettings: settings,
-      }),
+    trimMissing(
+      installed,
+      (value) => typeof value === "object" && !(value instanceof Promise),
     );
+  } finally {
+    pendingLookups -= 1;
+    if (waitingForLookup) {
+      waitingForLookup = false;
+      changed();
+    }
   }
-  derivedNames.add(name);
-  installed.set(key, name);
-  revision += 1;
-  for (const listener of listeners) listener();
 }
 
 function deriveFamily(family: string, settings: string): string | null {
   const key = `${family.toLowerCase()}\u0000${settings}`;
   const known = derived.get(key);
-  if (known !== undefined) return known || null;
+  if (known !== undefined) {
+    if (known) touchFamily(known);
+    return known || null;
+  }
   const faces = declaredFaces(family);
   if (faces.length === 0) {
     derived.set(key, "");
+    trimMissing(derived, (value) => value === "");
     return null;
   }
   const name = derivedFamilyName(family);
-  for (const face of faces) {
-    // Loads on first use like the rule it copies (unicode-range segments).
-    document.fonts.add(
-      new FontFace(name, face.source, {
+  const declared: FontFace[] = [];
+  try {
+    for (const face of faces) {
+      // Loads on first use like the rule it copies (unicode-range segments).
+      const derivedFace = new FontFace(name, face.source, {
         ...face.descriptors,
         featureSettings: settings,
-      }),
-    );
+      });
+      document.fonts.add(derivedFace);
+      declared.push(derivedFace);
+    }
+  } catch (error) {
+    for (const face of declared) document.fonts.delete?.(face);
+    throw error;
   }
   derived.set(key, name);
-  derivedNames.add(name);
+  trackFamily(name, declared, () => {
+    if (derived.get(key) === name) derived.delete(key);
+  });
   return name;
 }
 
