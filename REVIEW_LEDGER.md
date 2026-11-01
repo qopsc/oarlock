@@ -4412,7 +4412,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R045 | Closed | LSP framing limits headers to 16 KiB before buffering arbitrary input; regressions cover oversized headers, the exact limit, and pipelined messages. |
 | R046 | Open, Tier 3 | `lsp/session.rs` removes a naturally exited server after a bounded reader wait without terminating surviving descendants. |
 | R051 | Closed | Eligible idle sessions are closed before a new root is admitted. Closing sessions remain counted until shutdown finishes; regression tests cover the fifth root, simultaneous admissions and a session reacquired while another shutdown waits. |
-| R052 | Open, Tier 3 | `lsp/transport.ts` retains an unbounded incoming backlog and native channel output has no acknowledgment budget. |
+| R052 | Partially mitigated, Tier 3 | Native output now enforces the user-selected rate budget and restarts excessive senders. This limits bursts but does not bound outstanding channel or frontend backlog when a page remains stalled; that residual remains open. |
 | R068 | Open, Tier 3 | `pty_write` clones an unrestricted body before waiting on the 64-entry input queue; waiting senders have no aggregate byte bound. |
 | R069 | Windows/WSL port | Windows ConPTY job assignment is a later-port concern. |
 | R070 | Open, Tier 3 | `proc/capture.rs::collect` returns after its grace period while a pipe-reader thread can remain blocked on an inherited pipe. |
@@ -4462,10 +4462,22 @@ R117 policy: capture rejects combined output over 32 MiB and pipes remaining ope
 
 ### AP017 proposed — bounded incoming LSP delivery (R052)
 
-Status: awaiting decision; no transport change implemented. The native reader sends decoded messages into a Tauri channel without knowing when the webview consumes them. The frontend additionally queues messages before startup and before a listener attaches. A JavaScript-only queue limit cannot bound messages already waiting in the native/webview channel if the page is stalled.
+Status: superseded by the user-selected rate policy; no acknowledgment protocol implemented. The native reader sends decoded messages into a Tauri channel without knowing when the webview consumes them. The frontend additionally queues messages before startup and before a listener attaches. A JavaScript-only queue limit cannot bound messages already waiting in the native/webview channel if the page is stalled.
 
 Options: (1) cap only the frontend queue, improving startup behavior but leaving channel memory unbounded; (2) terminate sessions after a fixed lifetime traffic allowance, which breaks otherwise healthy long-running servers; or (3) add acknowledged, per-session delivery credits, reusing the ownership and cumulative-ack principles of the PTY transport. Recommend option 3: allow at most 64 MiB and 256 unacknowledged messages per session (one existing maximum-sized LSP frame fits), pause native reads at the limit, and fail the session visibly with Restart if delivery makes no progress for 30 seconds. Acknowledgments must identify the page and session, reject invalid boundaries, and release credits only after delivery to the consumer; close/reload releases waiting readers. This adds native/frontend IPC and changes the LSP delivery contract, so it requires approval.
 
 Proposed tests: flood while startup or listener registration is delayed; stall the page and verify the byte/message bound; resume in order; reject duplicate, forged or stale-page acknowledgments; close or restart while blocked; exercise the maximum permitted frame and visible failure on a persistent stall.
 
 R117 validation note: two default-concurrency full frontend runs timed out in unrelated real regex-worker tests (editor, Vim and terminal across the runs); the editor worker passed alone, and the complete suite passed with four workers. No test timeout was changed. This is a test-reliability observation, not a claim that a product failure was reproduced.
+
+### R052: user-selected native output-rate policy
+
+Each LSP session now admits at most 512 MiB and 50,000 messages in a conservatively bucketed 10-second sliding window. On breach, native stops forwarding and kills the server; the existing crash cooldown schedules a restart, shows an excessive-output notice, and stops retrying after repeated failures. A successful replacement shows a restart notice. Tests cover byte/count limits, bucket expiration, restart, cancellation and crash-loop behavior. No new acknowledgment or other IPC message was added.
+
+This rate limit bounds bursts, not the total data queued while the receiving webview is stalled: a server sending continuously below the threshold, including across restarts, can still accumulate unconsumed data. R052 remains open for that residual rather than claiming a hard memory bound. These generous thresholds were not validated against a large rust-analyzer or TypeScript language-server workspace because neither server is available here; a signed-release manual workload check is required. No evidence was found that a well-behaved server exceeds a reasonable limit.
+
+The three real editor, terminal and Vim regex-worker tests now permit 15 seconds for the subprocess and 20 seconds for the test, preserving the actual worker timeout assertions while accommodating loaded CI hosts.
+
+R052 checkpoint: the full macOS native suite passed 1,548 library tests (four ignored) and integration suites; the full frontend suite passed 6,054 tests with two skipped at default concurrency after the worker timeout changes. Strict Clippy, types and lint passed; lint remained at 80 warnings. The native tests exercise the budget calculation; frontend tests exercise restart, cancellation, notices and crash-loop handling. A packaged end-to-end flood test and large real-server workload test have not been run.
+
+The batch stopped at the three-re-edit tripwire for `src/modules/lsp/lib/sessionManager.test.ts`: additional lifecycle regressions, formatting those new tests, and a TypeScript-target compatibility correction were three edits after the first passing version. Remaining resource findings and Compatibility triage are not complete; the review PR remains a draft.

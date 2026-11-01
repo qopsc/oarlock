@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,10 @@ use super::framing::{encode_frame, FrameDecoder};
 
 pub(super) const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTPUT_WINDOW: Duration = Duration::from_secs(10);
+const OUTPUT_MAX_BYTES: usize = 512 * 1024 * 1024;
+const OUTPUT_MAX_MESSAGES: usize = 50_000;
+const EXCESSIVE_OUTPUT: &str = "excessive output";
 
 const READ_BUF: usize = 32 * 1024;
 const STDERR_LINE_CAP: usize = 512;
@@ -24,6 +29,69 @@ const MEM_STARTUP_GRACE: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_RSS_MB: u64 = 4096;
 // Pipe pumps and the waiter only shuffle bytes, so they need very little stack.
 const THREAD_STACK: usize = 256 * 1024;
+
+struct OutputBucket {
+    second: u64,
+    last: Instant,
+    bytes: usize,
+    messages: usize,
+}
+
+struct OutputBudget {
+    start: Instant,
+    buckets: VecDeque<OutputBucket>,
+    bytes: usize,
+    messages: usize,
+}
+
+impl OutputBudget {
+    fn new(start: Instant) -> Self {
+        Self {
+            start,
+            buckets: VecDeque::new(),
+            bytes: 0,
+            messages: 0,
+        }
+    }
+
+    fn admit(&mut self, now: Instant, bytes: usize) -> bool {
+        // Retain a partially expired bucket until its last message expires.
+        while self
+            .buckets
+            .front()
+            .is_some_and(|bucket| now.saturating_duration_since(bucket.last) >= OUTPUT_WINDOW)
+        {
+            let old = self.buckets.pop_front().expect("front exists");
+            self.bytes -= old.bytes;
+            self.messages -= old.messages;
+        }
+        if bytes > OUTPUT_MAX_BYTES.saturating_sub(self.bytes)
+            || self.messages >= OUTPUT_MAX_MESSAGES
+        {
+            return false;
+        }
+        let second = now.saturating_duration_since(self.start).as_secs();
+        if self
+            .buckets
+            .back()
+            .is_none_or(|bucket| bucket.second != second)
+        {
+            self.buckets.push_back(OutputBucket {
+                second,
+                last: now,
+                bytes: 0,
+                messages: 0,
+            });
+        }
+        let bucket = self.buckets.back_mut().expect("bucket inserted");
+        bucket.last = now;
+        bucket.bytes += bytes;
+        bucket.messages += 1;
+        self.bytes += bytes;
+        self.messages += 1;
+        true
+    }
+}
 
 fn spawn_thread(
     name: String,
@@ -79,7 +147,7 @@ impl Drop for WritePermit {
 }
 
 impl LspSession {
-    fn stop_for_write(&self, reason: String) -> String {
+    fn stop_with_reason(&self, reason: String) -> String {
         let mut saved = self.kill_reason.lock().unwrap();
         if saved.is_none() {
             *saved = Some(reason.clone());
@@ -99,7 +167,7 @@ impl LspSession {
         timeout: Duration,
     ) -> Result<(), String> {
         if message.len() > MAX_WRITE_BYTES {
-            return Err(self.stop_for_write(
+            return Err(self.stop_with_reason(
                 "Language server write exceeds 16 MiB. Restart the language server.".into(),
             ));
         }
@@ -111,7 +179,7 @@ impl LspSession {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(self.stop_for_write(
+            return Err(self.stop_with_reason(
                 "Concurrent language server writes refused. Restart the language server.".into(),
             ));
         }
@@ -123,11 +191,11 @@ impl LspSession {
         });
         match tokio::time::timeout(timeout, writing).await {
             Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(error))) => Err(self.stop_for_write(error)),
+            Ok(Ok(Err(error))) => Err(self.stop_with_reason(error)),
             Ok(Err(error)) => {
-                Err(self.stop_for_write(format!("Language server writer failed: {error}")))
+                Err(self.stop_with_reason(format!("Language server writer failed: {error}")))
             }
-            Err(_) => Err(self.stop_for_write(
+            Err(_) => Err(self.stop_with_reason(
                 "Language server write stalled for 30 seconds. Restart the language server.".into(),
             )),
         }
@@ -261,6 +329,7 @@ pub fn spawn(
     let session_reader = session.clone();
     let reader_thread = spawn_thread(format!("oarlock-lsp-reader-{id}"), move || {
         let mut decoder = FrameDecoder::default();
+        let mut budget = OutputBudget::new(Instant::now());
         let mut buf = [0u8; READ_BUF];
         loop {
             match stdout.read(&mut buf) {
@@ -268,6 +337,11 @@ pub fn spawn(
                 Ok(n) => match decoder.push(&buf[..n]) {
                     Ok(messages) => {
                         for msg in messages {
+                            if !budget.admit(Instant::now(), msg.len()) {
+                                log::warn!("lsp id={id} exceeded its output budget; killing server");
+                                session_reader.stop_with_reason(EXCESSIVE_OUTPUT.into());
+                                return;
+                            }
                             if on_message.send(Response::new(msg.into_bytes())).is_err() {
                                 log::info!("lsp id={id}: channel closed; killing server");
                                 session_reader.kill();
@@ -410,6 +484,38 @@ mod tests {
         assert_eq!(over_budget(4096 * mb, 4096), None);
         assert_eq!(over_budget(4096 * mb + mb - 1, 4096), None);
         assert_eq!(over_budget(4097 * mb, 4096), Some(4097));
+    }
+
+    #[test]
+    fn output_budget_enforces_bytes_and_expires_old_buckets() {
+        let start = Instant::now();
+        let mut budget = OutputBudget::new(start);
+        assert!(budget.admit(start, OUTPUT_MAX_BYTES));
+        assert!(!budget.admit(start + Duration::from_millis(999), 1));
+        assert!(budget.admit(start + OUTPUT_WINDOW, 1));
+    }
+
+    #[test]
+    fn output_budget_enforces_message_count_across_bucket_boundaries() {
+        let start = Instant::now();
+        let mut budget = OutputBudget::new(start);
+        for i in 0..OUTPUT_MAX_MESSAGES {
+            let now =
+                start + Duration::from_millis(if i < OUTPUT_MAX_MESSAGES / 2 { 0 } else { 999 });
+            assert!(budget.admit(now, 0));
+        }
+        assert!(!budget.admit(start + Duration::from_millis(999), 0));
+        assert!(budget.admit(start + OUTPUT_WINDOW + Duration::from_secs(1), 0));
+    }
+
+    #[test]
+    fn output_budget_keeps_a_partial_second_until_all_its_messages_expire() {
+        let start = Instant::now();
+        let mut budget = OutputBudget::new(start);
+        assert!(budget.admit(start, OUTPUT_MAX_BYTES - 1));
+        assert!(budget.admit(start + Duration::from_millis(999), 1));
+        assert!(!budget.admit(start + OUTPUT_WINDOW, 1));
+        assert!(budget.admit(start + OUTPUT_WINDOW + Duration::from_millis(999), 1));
     }
 
     #[test]

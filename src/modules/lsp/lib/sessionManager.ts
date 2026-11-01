@@ -54,6 +54,8 @@ function current(preset: LspPreset, epoch: number): boolean {
 }
 const stopped = new Set<string>();
 const crashTimes = new Map<string, number[]>();
+const excessiveOutputRestarts = new Set<string>();
+const EXCESSIVE_OUTPUT = "excessive output";
 
 function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
@@ -253,6 +255,7 @@ async function createSession(
     });
   } catch (e) {
     if (!current(preset, epoch)) return null;
+    excessiveOutputRestarts.delete(key);
     recordCrash(key);
     store.removeSession(key, preset.id);
     toast.error(`${preset.name} language server failed to start`, {
@@ -305,6 +308,7 @@ async function createSession(
       // The library reports initialize errors via onError and resolves this
       // promise anyway. Resolution alone does not mean initialization succeeded.
       if (!client.ready) {
+        excessiveOutputRestarts.delete(key);
         toast.error(`${preset.name} language server failed to initialize`);
         handleServerExit(key, transport);
         return;
@@ -318,6 +322,11 @@ async function createSession(
         root,
         status: "running",
       });
+      if (excessiveOutputRestarts.delete(key)) {
+        toast.success(`${preset.name} language server restarted`, {
+          description: "The previous server produced excessive output.",
+        });
+      }
     }
   });
 
@@ -334,9 +343,9 @@ function handleServerExit(key: string, transport: TauriLspTransport): void {
   managed.client.close();
   useLspRuntimeStore.getState().removeSessionQuiet(key);
   const info = managed.transport.exitInfo;
-  // Budget kills don't respawn: reloading would repay the startup peak
-  // that got the server killed. Restart from the pill is explicit.
-  if (info?.reason) {
+  // Memory and write failures need an explicit restart; excessive output
+  // uses the ordinary crash cooldown and crash-loop limit below.
+  if (info?.reason && info.reason !== EXCESSIVE_OUTPUT) {
     stopped.add(key);
     useLspRuntimeStore.getState().setFailed(managed.preset.id, info.reason);
     toast.error(`${managed.preset.name} language server stopped`, {
@@ -346,18 +355,26 @@ function handleServerExit(key: string, transport: TauriLspTransport): void {
   }
   const tail = info?.stderrTail;
   if (crashedOut(key)) {
-    useLspRuntimeStore
-      .getState()
-      .setFailed(
-        managed.preset.id,
-        tail ? tail.slice(-300) : "The server kept crashing.",
-      );
+    excessiveOutputRestarts.delete(key);
+    const failure =
+      info?.reason === EXCESSIVE_OUTPUT
+        ? "The server repeatedly produced excessive output."
+        : tail
+          ? tail.slice(-300)
+          : "The server kept crashing.";
+    useLspRuntimeStore.getState().setFailed(managed.preset.id, failure);
     toast.error(`${managed.preset.name} language server keeps crashing`, {
-      description: tail ? tail.slice(-300) : "Giving up for this workspace.",
+      description: failure,
     });
     return;
   }
-  if (tail) {
+  if (info?.reason === EXCESSIVE_OUTPUT) {
+    excessiveOutputRestarts.add(key);
+    toast.warning(`${managed.preset.name} language server restarting`, {
+      description: "The server produced excessive output.",
+    });
+  }
+  if (tail && info?.reason !== EXCESSIVE_OUTPUT) {
     toast.error(`${managed.preset.name} language server exited`, {
       description: tail.slice(-300),
     });
@@ -432,6 +449,9 @@ export function notifyDocumentSaved(path: string): void {
 }
 
 async function stopPresetSessions(presetId: string): Promise<void> {
+  for (const key of excessiveOutputRestarts) {
+    if (key.startsWith(`${presetId}\u0000`)) excessiveOutputRestarts.delete(key);
+  }
   for (const key of stopped) {
     if (key.startsWith(`${presetId}\u0000`)) stopped.delete(key);
   }

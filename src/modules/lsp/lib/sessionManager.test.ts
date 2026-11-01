@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => {
   const start = vi.fn(() => gate);
   const close = vi.fn();
   const shutdown = vi.fn(async () => {});
+  const toast = { error: vi.fn(), warning: vi.fn(), success: vi.fn() };
   const preset = {
     id: "test",
     name: "Test",
@@ -24,6 +25,7 @@ const mocks = vi.hoisted(() => {
     start,
     close,
     shutdown,
+    toast,
     ready: true,
     transports: [] as {
       exitInfo: { code: null; stderrTail: string; reason: string } | null;
@@ -44,6 +46,7 @@ const mocks = vi.hoisted(() => {
     preferences,
   };
 });
+vi.mock("sonner", () => ({ toast: mocks.toast }));
 vi.mock("@/modules/settings/preferences", () => ({
   usePreferencesStore: {
     getState: () => mocks.preferences,
@@ -249,6 +252,113 @@ it("writer failure requires explicit Restart even after the crash window expires
   handle?.release();
   fresh?.release();
   await manager.restartPresetSessions("test");
+});
+
+it("restarts after excessive output and reports the successful restart", async () => {
+  const { useLspRuntimeStore } = await import("./runtimeStore");
+  const first = manager.acquireDocExtension("/excess-output/file", "test");
+  mocks.finish();
+  const handle = await first;
+  const generation = useLspRuntimeStore.getState().generations.test ?? 0;
+  vi.useFakeTimers();
+  try {
+    mocks.transports[mocks.transports.length - 1].exitInfo = {
+      code: null,
+      stderrTail: "",
+      reason: "excessive output",
+    };
+    mocks.clients[mocks.clients.length - 1].onClose();
+    expect(mocks.toast.warning).toHaveBeenCalledWith(
+      "Test language server restarting",
+      expect.objectContaining({
+        description: expect.stringContaining("excessive output"),
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(useLspRuntimeStore.getState().generations.test).toBe(generation + 1);
+    const restarted = await manager.acquireDocExtension(
+      "/excess-output/file",
+      "test",
+    );
+    expect(restarted).not.toBeNull();
+    await Promise.resolve();
+    expect(mocks.toast.success).toHaveBeenCalledWith(
+      "Test language server restarted",
+      expect.objectContaining({
+        description: expect.stringContaining("excessive output"),
+      }),
+    );
+    restarted?.release();
+  } finally {
+    vi.useRealTimers();
+    handle?.release();
+    await manager.restartPresetSessions("test");
+  }
+});
+
+it("stops retrying a server that repeatedly exceeds the output budget", async () => {
+  const { useLspRuntimeStore } = await import("./runtimeStore");
+  const first = manager.acquireDocExtension("/output-loop/file", "test");
+  mocks.finish();
+  const handles = [await first];
+  vi.useFakeTimers();
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      mocks.transports[mocks.transports.length - 1].exitInfo = {
+        code: null,
+        stderrTail: "",
+        reason: "excessive output",
+      };
+      mocks.clients[mocks.clients.length - 1].onClose();
+      if (attempt < 2) {
+        await vi.advanceTimersByTimeAsync(attempt === 0 ? 2_000 : 10_000);
+        handles.push(
+          await manager.acquireDocExtension("/output-loop/file", "test"),
+        );
+        expect(handles[handles.length - 1]).not.toBeNull();
+      }
+    }
+    expect(useLspRuntimeStore.getState().failed.test).toContain(
+      "excessive output",
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(
+      await manager.acquireDocExtension("/output-loop/file", "test"),
+    ).toBeNull();
+  } finally {
+    vi.useRealTimers();
+    for (const handle of handles) handle?.release();
+    await manager.restartPresetSessions("test");
+  }
+});
+
+it("cancels a pending output restart when the preset is explicitly restarted", async () => {
+  const first = manager.acquireDocExtension("/cancel-output/file", "test");
+  mocks.finish();
+  const handle = await first;
+  vi.useFakeTimers();
+  try {
+    mocks.transports[mocks.transports.length - 1].exitInfo = {
+      code: null,
+      stderrTail: "",
+      reason: "excessive output",
+    };
+    mocks.clients[mocks.clients.length - 1].onClose();
+    await manager.restartPresetSessions("test");
+    await vi.advanceTimersByTimeAsync(2_000);
+    const next = await manager.acquireDocExtension(
+      "/cancel-output/file",
+      "test",
+    );
+    expect(next).not.toBeNull();
+    await Promise.resolve();
+    expect(mocks.toast.success).not.toHaveBeenCalled();
+    next?.release();
+  } finally {
+    vi.useRealTimers();
+    handle?.release();
+    await manager.restartPresetSessions("test");
+  }
 });
 
 it("replaces an eligible idle session when opening a fifth root", async () => {

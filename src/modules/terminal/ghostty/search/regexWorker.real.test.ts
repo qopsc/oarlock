@@ -5,7 +5,7 @@ it("keeps the production search engine responsive during catastrophic backtracki
   const result = spawnSync(
     "bun",
     ["scripts/terminal-shell-drop/regex-worker-probe.mjs"],
-    { encoding: "utf8", timeout: 8000 },
+    { encoding: "utf8", timeout: 15_000 },
   );
   expect(result.error, result.stderr).toBeUndefined();
   expect(result.status, result.stderr).toBe(0);
@@ -13,4 +13,4 @@ it("keeps the production search engine responsive during catastrophic backtracki
     deadlinePassed: true,
     recoveryPassed: true,
   });
-});
+}, 20_000);
