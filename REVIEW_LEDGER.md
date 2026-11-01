@@ -4407,7 +4407,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | --- | --- | --- |
 | R011 | Closed | Search retains at most 8 MiB of hit text and paths, then uses the existing truncated-result signal. A real-filesystem regression with three multi-megabyte matching lines failed before the fix and passes after it. |
 | R024 | Windows/WSL port | WSL-only discovery and shell probes are outside this release. |
-| R031 | Open, Tier 3 | `watch.rs::release_window` takes the shared set lock; `resolve_changes` still calls file stamping while holding that lock. |
+| R031 | Closed for window cleanup | Closing invalidates watch ownership immediately and moves backend synchronization to blocking work. Registrations no longer hold the owner lock over backend work and are rolled back if their page closes while they are being installed. Tests cover a stalled registration and preservation of a replacement page’s watch. Individual watcher operations can still wait for a slow filesystem on worker threads. |
 | R041 | Closed | Editor and Vim worker substitutions check output size while expanding captures, before joining results. Vim replacement tests compare hundreds of regex, Unicode, named-capture and dollar-token cases against native JavaScript behavior. |
 | R045 | Closed | LSP framing limits headers to 16 KiB before buffering arbitrary input; regressions cover oversized headers, the exact limit, and pipelined messages. |
 | R046 | Closed for Unix process groups | The server leader remains unreaped while its process group is stopped; stdout/stderr reads are interruptible and incomplete startup cleans up. A real-process regression failed before the fix and passes afterward. Windows ownership is port work. |
@@ -4444,7 +4444,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **18 closed (including one accepted residual); 6 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **19 closed (including one accepted residual); 5 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4534,3 +4534,10 @@ Native clipboard captures share four slots; image capture and native image writi
 R241 — **MAJOR, Tier 3:** non-PNG terminal clipboard writes use the webview's `createImageBitmap` before their decoded dimensions are checked; multiple windows can begin conversions independently. A compressed image may therefore allocate substantially before the size check. This is a source-level resource risk; no out-of-memory test was run. It is separate from R079's native capture and PNG-work admission, and needs its own review.
 
 R079 validation: the native macOS suite passed 1,561 library tests (four ignored) and all integration tests. The frontend suite passed 6,058 tests (two skipped); type checking passed and lint remained at 80 warnings. The final Linux clipboard suite passed 21 tests with three ignored in an offline unprivileged container. An additional headless GTK test passed with the ignored timeout-ownership test enabled. The initial frontend run could not bind its local servers in the restricted environment; the full rerun with local-server access passed.
+
+
+### R031 checkpoint — window watcher cleanup
+
+Window close and reload now retire their watch incarnation before scheduling backend cleanup off the lifecycle callback. A registration that finishes after retirement is undone, and the existing reference-counted registrations protect watches subsequently acquired by another page. The owner lock is no longer held during watcher backend synchronization or explicit release. Regression tests exercise a deliberately stalled registration and rollback alongside a new page’s watch. Filesystem stamps and backend synchronization may still take time on their workers; this change does not make slow filesystems themselves cancellable.
+
+R031 validation: the full macOS native suite passed 1,563 library tests (four ignored) and all integration suites; strict Clippy passed. The frontend suite passed 6,058 tests (two skipped), types passed, and lint remained at 80 warnings. All 62 focused watcher tests passed on Linux in the offline unprivileged container; the two previously recorded unrelated Linux warnings remained.

@@ -531,11 +531,48 @@ impl FsWatchState {
 
     /// Gives back every watch `owner` (a window) still holds.
     pub fn release_window(&self, app: &AppHandle, owner: &str) {
-        let mut owners = self.owners();
-        let held = owners.take(owner);
-        let _ = self.with_running(app, false, |running| {
-            running.apply(|set| Held::release_all(held, set));
+        let held = self.owners().take(owner);
+        if held.is_empty() {
+            return;
+        }
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<FsWatchState>();
+            let _ = state.with_running(&app, false, |running| {
+                running.apply(|set| Held::release_all(held, set));
+            });
         });
+    }
+
+    // Native watcher synchronization can touch slow filesystems. Never hold the
+    // owner lock during it: closing a window must invalidate its incarnation
+    // immediately. If it closes during registration, undo that registration.
+    fn register<T>(
+        &self,
+        owner: &str,
+        incarnation: &Arc<()>,
+        count: usize,
+        apply: impl FnOnce(Vec<String>) -> Result<(T, Vec<(String, Held)>), String>,
+        rollback: impl FnOnce(Vec<Held>),
+    ) -> Result<T, String> {
+        let ids = {
+            let mut owners = self.owners();
+            owners.current(owner, incarnation)?;
+            owners.reserve(count)?
+        };
+        let (result, held) = apply(ids)?;
+        let mut owners = self.owners();
+        if let Err(error) = owners.current(owner, incarnation) {
+            drop(owners);
+            rollback(
+                held.into_iter()
+                    .map(|(_, registration)| registration)
+                    .collect(),
+            );
+            return Err(error);
+        }
+        owners.keep(owner, held);
+        Ok(result)
     }
 
     fn with_running<T>(
@@ -702,52 +739,60 @@ pub async fn fs_watch_add(
             .map(|(_, dir)| plan::listing_signature(dir))
             .collect();
         let state = app.state::<FsWatchState>();
-        // Same lock order for acquire, explicit release and window cleanup.
-        let mut owners = state.owners();
-        owners.current(&owner, &incarnation)?;
-        let mut ids = owners.reserve(dirs.len() + files.len())?.into_iter();
-        let mut handles = FsWatchHandles::default();
-        let mut held = Vec::new();
-        if dirs.is_empty() && files.is_empty() {
-            return Ok(handles);
-        }
-        state.with_running(&app, true, |running| {
-            running.apply(|set| {
-                let mut moved = false;
-                for ((spelling, dir), signature) in dirs.into_iter().zip(baselines) {
-                    let key = to_canon(&dir);
-                    let handle = ids.next().expect("reserved handle");
-                    held.push((
-                        handle.clone(),
-                        Held::Directory((key.clone(), spelling.clone())),
-                    ));
-                    handles.directories.push(WatchPath {
-                        path: spelling.clone(),
-                        handle,
-                    });
-                    let poll = plan::is_wsl_share(&key);
-                    if set.add_dir(key.clone(), spelling, dir, poll) {
-                        set.record_listing(&key, signature);
-                        moved = true;
-                    }
+        state.register(
+            &owner,
+            &incarnation,
+            dirs.len() + files.len(),
+            |ids| {
+                let mut ids = ids.into_iter();
+                let mut handles = FsWatchHandles::default();
+                let mut held = Vec::new();
+                if dirs.is_empty() && files.is_empty() {
+                    return Ok((handles, held));
                 }
-                for (dir, key, spelling, stamp) in files {
-                    let handle = ids.next().expect("reserved handle");
-                    held.push((
-                        handle.clone(),
-                        Held::File((dir.clone(), key.clone(), spelling.clone())),
-                    ));
-                    handles.files.push(WatchPath {
-                        path: spelling.clone(),
-                        handle,
-                    });
-                    moved |= set.add_file(dir, key, spelling, stamp);
-                }
-                moved
-            })
-        })?;
-        owners.keep(&owner, held);
-        Ok(handles)
+                state.with_running(&app, true, |running| {
+                    running.apply(|set| {
+                        let mut moved = false;
+                        for ((spelling, dir), signature) in dirs.into_iter().zip(baselines) {
+                            let key = to_canon(&dir);
+                            let handle = ids.next().expect("reserved handle");
+                            held.push((
+                                handle.clone(),
+                                Held::Directory((key.clone(), spelling.clone())),
+                            ));
+                            handles.directories.push(WatchPath {
+                                path: spelling.clone(),
+                                handle,
+                            });
+                            let poll = plan::is_wsl_share(&key);
+                            if set.add_dir(key.clone(), spelling, dir, poll) {
+                                set.record_listing(&key, signature);
+                                moved = true;
+                            }
+                        }
+                        for (dir, key, spelling, stamp) in files {
+                            let handle = ids.next().expect("reserved handle");
+                            held.push((
+                                handle.clone(),
+                                Held::File((dir.clone(), key.clone(), spelling.clone())),
+                            ));
+                            handles.files.push(WatchPath {
+                                path: spelling.clone(),
+                                handle,
+                            });
+                            moved |= set.add_file(dir, key, spelling, stamp);
+                        }
+                        moved
+                    })
+                })?;
+                Ok((handles, held))
+            },
+            |held| {
+                let _ = state.with_running(&app, false, |running| {
+                    running.apply(|set| Held::release_all(held, set));
+                });
+            },
+        )
     })
     .await
 }
@@ -763,8 +808,7 @@ pub async fn watch_release(
     let owner = webview.label().to_owned();
     blocking(move || {
         let state = app.state::<FsWatchState>();
-        let mut owners = state.owners();
-        let held = owners.release(&owner, &handles);
+        let held = state.owners().release(&owner, &handles);
         state.with_running(&app, false, |running| {
             running.apply(|set| Held::release_all(held, set))
         })?;
@@ -904,14 +948,23 @@ pub async fn git_watch_add(
             plan.git_dir_key.clone(),
         ));
         let state = app.state::<FsWatchState>();
-        let mut owners = state.owners();
-        owners.current(&owner, &incarnation)?;
-        let handle = owners.reserve(1)?.pop().expect("reserved handle");
-        state.with_running(&app, true, |running| {
-            running.apply(|set| register_repo(set, plan))
-        })?;
-        owners.keep(&owner, [(handle.clone(), held)]);
-        Ok(handle)
+        state.register(
+            &owner,
+            &incarnation,
+            1,
+            |mut ids| {
+                let handle = ids.pop().expect("reserved handle");
+                state.with_running(&app, true, |running| {
+                    running.apply(|set| register_repo(set, plan))
+                })?;
+                Ok((handle.clone(), vec![(handle, held)]))
+            },
+            |held| {
+                let _ = state.with_running(&app, false, |running| {
+                    running.apply(|set| Held::release_all(held, set));
+                });
+            },
+        )
     })
     .await
 }
@@ -942,6 +995,73 @@ pub fn note_written(app: &AppHandle, path: &Path) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn closing_during_a_slow_registration_invalidates_it_without_waiting() {
+        let state = Arc::new(FsWatchState::default());
+        let old = state.owners().begin("main");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (rollback_tx, rollback_rx) = mpsc::channel();
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            worker_state.register(
+                "main",
+                &old,
+                1,
+                |ids| {
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    Ok((
+                        (),
+                        vec![(ids[0].clone(), Held::Directory(("/a".into(), "/a".into())))],
+                    ))
+                },
+                |held| rollback_tx.send(held).unwrap(),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Closing and opening the next page must not wait for the old work.
+        let closer_state = state.clone();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let held = closer_state.owners().take("main");
+            let new = closer_state.owners().begin("main");
+            closed_tx.send((held, new)).unwrap();
+        });
+        let closed = closed_rx.recv_timeout(Duration::from_secs(2));
+        resume_tx.send(()).unwrap();
+        let (held, new) = closed.expect("closing must not wait for the watcher");
+        assert!(held.is_empty());
+        closer.join().unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(rollback_rx.recv().unwrap().len(), 1);
+        assert!(state.owners().current("main", &new).is_ok());
+        assert!(state.owners().take("main").is_empty());
+    }
+
+    #[test]
+    fn late_registration_rollback_keeps_a_new_pages_watch() {
+        let state = FsWatchState::default();
+        let old = state.owners().begin("main");
+        let mut set = WatchSet::default();
+        let path = "/workspace";
+        set.add_dir(path.into(), path.into(), PathBuf::from(path), false);
+        state.owners().take("main");
+        let new = state.owners().begin("main");
+        set.add_dir(path.into(), path.into(), PathBuf::from(path), false);
+        let handle = state.owners().reserve(1).unwrap().pop().unwrap();
+        state.owners().keep(
+            "main",
+            [(handle, Held::Directory((path.into(), path.into())))],
+        );
+        assert!(state.owners().current("main", &old).is_err());
+        Held::Directory((path.into(), path.into())).release(&mut set);
+        assert!(set.contains_dir(path));
+        assert!(state.owners().current("main", &new).is_ok());
+        Held::release_all(state.owners().take("main"), &mut set);
+        assert!(set.is_empty());
+    }
 
     #[test]
     fn handles_are_owned_idempotent_and_cannot_cross_window_incarnations() {
