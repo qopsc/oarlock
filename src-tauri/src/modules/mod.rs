@@ -5,6 +5,7 @@ pub mod ai_sessions;
 pub mod app_menu;
 pub mod asset_all_folders;
 pub mod asset_scope;
+pub mod background_image;
 #[cfg(feature = "bench")]
 pub mod bench;
 pub mod clipboard_image;

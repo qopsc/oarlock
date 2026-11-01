@@ -1,3 +1,5 @@
+import { inspectBackgroundImage } from "./inspectBackgroundImage";
+
 const DB_NAME = "oarlock-bg-images";
 const STORE = "images";
 const VERSION = 1;
@@ -51,12 +53,13 @@ async function putBgImage(id: string, blob: Blob): Promise<void> {
 
 export async function getBgImage(id: string): Promise<Blob | null> {
   const db = await openDb();
-  return new Promise<Blob | null>((resolve, reject) => {
+  const blob = await new Promise<Blob | null>((resolve, reject) => {
     const tx = db.transaction(STORE, "readonly");
     const req = tx.objectStore(STORE).get(id);
     req.onsuccess = () => resolve((req.result as Blob | undefined) ?? null);
     req.onerror = () => reject(req.error);
   });
+  return blob ? inspectBackgroundImage(blob) : null;
 }
 
 export async function deleteBgImage(id: string): Promise<void> {
@@ -99,9 +102,25 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-async function isAnimated(file: File): Promise<boolean> {
+export async function isAnimated(file: Blob): Promise<boolean> {
   const t = file.type.toLowerCase();
   if (t === "image/gif" || t === "image/apng") return true;
+  if (t === "image/png") {
+    const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    if (signature.length !== 8 || ![137, 80, 78, 71, 13, 10, 26, 10].every((value, index) => signature[index] === value)) return false;
+    let offset = 8;
+    for (let chunks = 0; chunks < 1024 && offset + 12 <= file.size; chunks++) {
+      const header = new Uint8Array(await file.slice(offset, offset + 8).arrayBuffer());
+      if (header.length !== 8) return false;
+      const length = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(0);
+      if (length > file.size - offset - 12) return false;
+      const tag = String.fromCharCode(...header.subarray(4, 8));
+      if (tag === "acTL") return true;
+      if (tag === "IDAT") return false;
+      offset += length + 12;
+    }
+    throw new Error("PNG image metadata is too complex or incomplete.");
+  }
   if (t !== "image/webp") return false;
   const head = new Uint8Array(
     await file.slice(0, WEBP_SNIFF_BYTES).arrayBuffer(),
@@ -119,12 +138,21 @@ async function isAnimated(file: File): Promise<boolean> {
   return false;
 }
 
-export async function importBgImageFromFile(file: File): Promise<{ id: string; blob: Blob }> {
+export async function importBgImageFromFile(
+  file: File,
+): Promise<{ id: string; blob: Blob }> {
   if (!file.type.startsWith("image/")) {
     throw new Error("This file isn't an image.");
   }
   const id = `oarlock-stage-v1-${Date.now()}-${crypto.randomUUID()}`;
-  const animated = await isAnimated(file);
+  if (file.size > MAX_STATIC_BYTES) {
+    throw new Error(
+      `Images are limited to 30 MB. This one is ${formatBytes(file.size)}.`,
+    );
+  }
+  // Keep the exact bytes inspected by native code for both classification and decoding.
+  const snapshot = await inspectBackgroundImage(file);
+  const animated = await isAnimated(snapshot);
   const limit = animated ? MAX_ANIMATED_BYTES : MAX_STATIC_BYTES;
   if (file.size > limit) {
     const limitMb = Math.round(limit / 1024 / 1024);
@@ -135,13 +163,14 @@ export async function importBgImageFromFile(file: File): Promise<{ id: string; b
     );
   }
   if (animated) {
-    const blob = file.slice(0, file.size, file.type);
+    const type = snapshot.type.toLowerCase() === "image/png" ? "image/apng" : snapshot.type;
+    const blob = snapshot.slice(0, snapshot.size, type);
     await putBgImage(id, blob);
     return { id, blob };
   }
   let bitmap: ImageBitmap;
   try {
-    bitmap = await createImageBitmap(file);
+    bitmap = await createImageBitmap(snapshot);
   } catch {
     throw new Error("This image couldn't be decoded. Try a different file.");
   }

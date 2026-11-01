@@ -5,6 +5,7 @@ import {
 import { BG_OPACITY_RENDER_FACTOR } from "@/modules/settings/store";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { toast } from "sonner";
 import {
   renderStillFrame,
   surfaceFrame,
@@ -54,7 +55,13 @@ function BackgroundImage({ fastImageId }: { fastImageId: string | null }) {
     setVisible(false);
     void (async () => {
       const { getBgImage } = await import("./bgImageStore");
-      const blob = await getBgImage(imageId).catch(() => null);
+      const blob = await getBgImage(imageId).catch((error: unknown) => {
+        if (alive)
+          toast.error("Background image could not be loaded", {
+            description: String(error),
+          });
+        return null;
+      });
       if (!alive || !blob) return;
       const url = URL.createObjectURL(blob);
       if (lastUrlRef.current) URL.revokeObjectURL(lastUrlRef.current);

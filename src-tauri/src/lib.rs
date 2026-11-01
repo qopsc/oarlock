@@ -469,6 +469,7 @@ pub fn run() {
             fs::mutation_events::fs_recovery_end,
             fs::formatter::fs_format_document,
             fs::formatter::fs_format_cancel,
+            modules::background_image::background_image_inspect,
             fs::file::fs_stat,
             fs::file::fs_host_path,
             fs::file::fs_canonicalize,
