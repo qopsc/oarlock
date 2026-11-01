@@ -100,6 +100,33 @@ export function serialized<A extends unknown[], R>(
   };
 }
 
+/** Eligibility follows both the viewport and the window's visibility. */
+export function observeDiagramVisibility(
+  element: HTMLElement,
+  update: (eligible: boolean) => void,
+): () => void {
+  let intersecting = typeof IntersectionObserver === "undefined";
+  let active = true;
+  const report = () => {
+    if (active) update(intersecting && !document.hidden);
+  };
+  const observer = typeof IntersectionObserver === "undefined"
+    ? null
+    : new IntersectionObserver((entries) => {
+        const entry = entries[entries.length - 1];
+        if (entry) intersecting = entry.isIntersecting;
+        report();
+      }, { rootMargin: "400px 0px" });
+  document.addEventListener("visibilitychange", report);
+  observer?.observe(element);
+  report();
+  return () => {
+    active = false;
+    document.removeEventListener("visibilitychange", report);
+    observer?.disconnect();
+  };
+}
+
 /**
  * Rendered diagrams by theme and source, so a diagram shown again (a chat
  * reopened, a file re-read after a save) is not laid out again. Least
@@ -107,8 +134,12 @@ export function serialized<A extends unknown[], R>(
  */
 export class DiagramCache {
   private readonly entries = new Map<string, string>();
+  private bytes = 0;
 
-  constructor(private readonly limit: number) {}
+  constructor(
+    private readonly limit: number,
+    private readonly byteLimit = 16 * 1024 * 1024,
+  ) {}
 
   static key(mode: "light" | "dark", source: string): string {
     return `${mode}\n${source}`;
@@ -124,10 +155,19 @@ export class DiagramCache {
   }
 
   set(key: string, svg: string): void {
-    this.entries.delete(key);
+    const previous = this.entries.get(key);
+    if (previous !== undefined) {
+      this.entries.delete(key);
+      this.bytes -= 2 * (key.length + previous.length);
+    }
+    const bytes = 2 * (key.length + svg.length);
+    if (bytes > this.byteLimit) return;
     this.entries.set(key, svg);
+    this.bytes += bytes;
     for (const oldest of this.entries.keys()) {
-      if (this.entries.size <= this.limit) break;
+      if (this.entries.size <= this.limit && this.bytes <= this.byteLimit) break;
+      const evicted = this.entries.get(oldest);
+      if (evicted !== undefined) this.bytes -= 2 * (oldest.length + evicted.length);
       this.entries.delete(oldest);
     }
   }

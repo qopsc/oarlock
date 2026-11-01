@@ -4440,7 +4440,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R179 | AI/MCP on hold | MCP stdio transport work is held with the backend. |
 | R186 | AI/MCP on hold | MCP result formatting is held with the backend. |
 | R190 | Open, Tier 3 | `asset_all_folders.rs` reads an unranged file into memory and starts blocking work without an aggregate admission limit. |
-| R192 | Open, Tier 3 | Mermaid rendering cannot interrupt an already-running render, and its 32-entry cache has no byte limit. |
+| R192 | Open, Tier 3; partly mitigated | The cache now has a 16 MiB estimated UTF-16 byte budget, visibility changes cancel queued work, and cancelled renders do not populate it. Tests cover byte eviction and viewport/page visibility. Mermaid still runs on the page and an already-running render cannot be interrupted; an unresolved render can stall later queued diagrams. |
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
@@ -4541,3 +4541,10 @@ R079 validation: the native macOS suite passed 1,561 library tests (four ignored
 Window close and reload now retire their watch incarnation before scheduling backend cleanup off the lifecycle callback. A registration that finishes after retirement is undone, and the existing reference-counted registrations protect watches subsequently acquired by another page. The owner lock is no longer held during watcher backend synchronization or explicit release. Regression tests exercise a deliberately stalled registration and rollback alongside a new page’s watch. Filesystem stamps and backend synchronization may still take time on their workers; this change does not make slow filesystems themselves cancellable.
 
 R031 validation: the full macOS native suite passed 1,563 library tests (four ignored) and all integration suites; strict Clippy passed. The frontend suite passed 6,058 tests (two skipped), types passed, and lint remained at 80 warnings. All 62 focused watcher tests passed on Linux in the offline unprivileged container; the two previously recorded unrelated Linux warnings remained.
+
+
+### R192 partial mitigation — diagram retention and visibility
+
+The existing 32-entry Mermaid cache now also bounds the estimated UTF-16 size of source keys and SVG output to 16 MiB, evicting least-recently-used entries and not caching a single oversized drawing. Viewport and page visibility control whether work remains eligible, and a render that completes after cancellation does not populate the cache. Regression tests reproduce the previously unbounded cache and check viewport, page visibility, and observer fallback. **Still open:** Mermaid executes in the page and a started render cannot be stopped; the serialized queue can wait behind one that never finishes. A byte budget is not a bound on allocations inside the renderer.
+
+R192 partial validation: the full macOS native suite passed 1,563 library tests (four ignored) and all integration suites; strict Clippy passed. The frontend suite passed 6,061 tests (two skipped), types passed, and lint remained at 80 warnings. The cache and visibility regressions failed before their changes and passed afterward.

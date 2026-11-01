@@ -12,6 +12,7 @@ import {
 import {
   DiagramCache,
   mermaidConfig,
+  observeDiagramVisibility,
   serialized,
   stripSvgLinks,
 } from "./mermaidRender";
@@ -36,25 +37,14 @@ const renderDiagram = serialized(
   },
 );
 
-/** True once `ref` comes near the viewport; stays true. */
+/** Only diagrams near a visible viewport may start rendering. */
 function useNearViewport(ref: RefObject<HTMLElement | null>): boolean {
   const [near, setNear] = useState(false);
   useEffect(() => {
     const element = ref.current;
-    if (near || !element) return;
-    if (typeof IntersectionObserver === "undefined") {
-      setNear(true);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) setNear(true);
-      },
-      { rootMargin: "400px 0px" },
-    );
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [near, ref]);
+    if (!element) return;
+    return observeDiagramVisibility(element, setNear);
+  }, [ref]);
   return near;
 }
 
@@ -97,8 +87,10 @@ export function MermaidDiagram({ code, pending, failed }: Props) {
     const render = new AbortController();
     renderDiagram(code, mode, render.signal).then(
       (svg) => {
-        cache.set(key, svg);
-        if (!render.signal.aborted) setDrawn({ key, svg });
+        if (!render.signal.aborted) {
+          cache.set(key, svg);
+          setDrawn({ key, svg });
+        }
       },
       (error: unknown) => {
         if (!render.signal.aborted) setDrawn({ key, error });

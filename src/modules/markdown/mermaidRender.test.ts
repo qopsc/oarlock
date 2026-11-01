@@ -3,10 +3,12 @@ import {
   DiagramCache,
   MERMAID_SECURE_KEYS,
   mermaidConfig,
+  observeDiagramVisibility,
   serialized,
   stripSvgLinks,
 } from "./mermaidRender";
 import { diagramError } from "./MermaidViews";
+import { vi } from "vitest";
 
 describe("mermaidConfig", () => {
   it("renders untrusted diagrams strictly, as SVG text, without drawing errors", () => {
@@ -122,6 +124,78 @@ describe("DiagramCache", () => {
     expect(cache.get("c")).toBeUndefined();
     expect(cache.get("a")).toBe("A2");
   });
+
+  it("bounds retained key and drawing bytes, including replacements", () => {
+    const cache = new DiagramCache(32, 16);
+    cache.set("a", "111"); // 8 UTF-16 bytes including its key
+    cache.set("b", "222");
+    expect(cache.get("a")).toBe("111");
+    cache.set("c", "333");
+    expect(cache.get("b")).toBeUndefined();
+    expect(cache.get("a")).toBe("111");
+    cache.set("a", "12345678");
+    expect(cache.get("a")).toBeUndefined();
+    expect(cache.get("c")).toBe("333");
+    cache.set("d", "4");
+    cache.set("d", "55");
+    expect(cache.get("d")).toBe("55");
+    expect(cache.get("c")).toBe("333");
+  });
+});
+
+it("pauses diagram eligibility when it leaves view or the page is hidden", () => {
+  let intersect!: (entries: IntersectionObserverEntry[]) => void;
+  let visibility!: () => void;
+  let hidden = false;
+  const disconnect = vi.fn();
+  vi.stubGlobal("document", {
+    get hidden() { return hidden; },
+    addEventListener: (_: string, callback: () => void) => { visibility = callback; },
+    removeEventListener: vi.fn(),
+  });
+  vi.stubGlobal("IntersectionObserver", class {
+    constructor(callback: (entries: IntersectionObserverEntry[]) => void) { intersect = callback; }
+    observe() {}
+    disconnect = disconnect;
+  });
+  try {
+    const update = vi.fn();
+    const stop = observeDiagramVisibility({} as HTMLElement, update);
+    intersect([{ isIntersecting: true } as IntersectionObserverEntry]);
+    expect(update).toHaveBeenLastCalledWith(true);
+    hidden = true;
+    visibility();
+    expect(update).toHaveBeenLastCalledWith(false);
+    hidden = false;
+    visibility();
+    expect(update).toHaveBeenLastCalledWith(true);
+    intersect([{ isIntersecting: false } as IntersectionObserverEntry]);
+    expect(update).toHaveBeenLastCalledWith(false);
+    stop();
+    expect(disconnect).toHaveBeenCalledOnce();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it("treats the visible page as eligible without IntersectionObserver", () => {
+  let visibility!: () => void;
+  vi.stubGlobal("IntersectionObserver", undefined);
+  vi.stubGlobal("document", {
+    hidden: false,
+    addEventListener: (_: string, callback: () => void) => { visibility = callback; },
+    removeEventListener: vi.fn(),
+  });
+  try {
+    const update = vi.fn();
+    const stop = observeDiagramVisibility({} as HTMLElement, update);
+    expect(update).toHaveBeenCalledWith(true);
+    stop();
+    visibility();
+    expect(update).toHaveBeenCalledOnce();
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 describe("serialized", () => {
