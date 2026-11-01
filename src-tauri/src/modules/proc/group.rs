@@ -25,6 +25,40 @@ impl ProcessTree {
             changed: Condvar::new(),
         }
     }
+
+    /// Kill a foreground tree immediately without reaping its leader. The
+    /// leader reserves the process-group ID until `finish_foreground` reaps it.
+    pub(crate) fn kill_now(&self) {
+        let mut phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+        while phase.stopping {
+            phase = self.changed.wait(phase).unwrap_or_else(|e| e.into_inner());
+        }
+        if phase.reaped || phase.stopped {
+            return;
+        }
+        phase.stopping = true;
+        drop(phase);
+        unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL) };
+        // Also terminate the leader if it moved itself out of its group.
+        let _ = self.child.kill();
+        let mut phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+        phase.stopping = false;
+        phase.stopped = true;
+        self.changed.notify_all();
+    }
+
+    /// Observe exit without releasing the leader's PID or process group.
+    pub(crate) fn wait_until(&self, deadline: Instant) -> io::Result<bool> {
+        wait_root(
+            self.child.id(),
+            Some(deadline.saturating_duration_since(Instant::now())),
+        )
+    }
+
+    pub(crate) fn finish_foreground(&self) -> io::Result<ExitStatus> {
+        self.kill_now();
+        self.reap()
+    }
     pub fn stop(&self) {
         let mut phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
         while phase.stopping {

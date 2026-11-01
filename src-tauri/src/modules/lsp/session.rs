@@ -120,6 +120,24 @@ fn next_memory_check(now: Instant, first: bool) -> Instant {
     }
 }
 
+fn wait_lsp_exit(
+    session: &LspSession,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(unix)]
+    {
+        if session.tree.wait_until(deadline)? {
+            session.tree.finish_foreground().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        session.child.wait_deadline(deadline)
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LspExit {
@@ -129,8 +147,11 @@ pub struct LspExit {
 }
 
 pub struct LspSession {
+    #[cfg(unix)]
+    tree: Arc<crate::modules::proc::group::ProcessTree>,
     #[cfg(windows)]
     _job: Option<crate::modules::proc::job::ProcessJob>,
+    #[cfg(not(unix))]
     child: Arc<SharedChild>,
     stdin: Mutex<Option<ChildStdin>>,
     stopping: AtomicBool,
@@ -229,15 +250,14 @@ impl LspSession {
             return;
         }
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
-        }
+        self.tree.kill_now();
         #[cfg(windows)]
         if let Some(job) = &self._job {
             if let Err(error) = job.terminate() {
                 log::warn!("lsp process-tree termination failed: {error}");
             }
         }
+        #[cfg(not(unix))]
         let _ = self.child.kill();
         // A full pipe holds this mutex. Stop must not wait on server input;
         // the active writer closes its handle when termination releases it.
@@ -250,6 +270,23 @@ impl LspSession {
 impl Drop for LspSession {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+struct StartGuard {
+    session: Arc<LspSession>,
+    armed: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.kill();
+            #[cfg(unix)]
+            let _ = self.session.tree.finish_foreground();
+            #[cfg(not(unix))]
+            let _ = self.session.child.wait();
+        }
     }
 }
 
@@ -288,18 +325,26 @@ pub fn spawn(
         SharedChild::spawn(&mut cmd)
             .map_err(|e| format!("lsp spawn failed for {}: {e}", binary.display()))?,
     );
+    #[cfg(unix)]
+    let tree = Arc::new(crate::modules::proc::group::ProcessTree::new(child.clone()));
     let kill_on_fail = || {
-        let _ = child.kill();
+        #[cfg(unix)]
+        let _ = tree.finish_foreground();
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     };
     let stdin = child.take_stdin().ok_or_else(|| {
         kill_on_fail();
         "lsp: no stdin pipe".to_string()
     })?;
-    let mut stdout = child.take_stdout().ok_or_else(|| {
+    let stdout = child.take_stdout().ok_or_else(|| {
         kill_on_fail();
         "lsp: no stdout pipe".to_string()
     })?;
-    let mut stderr = child.take_stderr().ok_or_else(|| {
+    let stderr = child.take_stderr().ok_or_else(|| {
         kill_on_fail();
         "lsp: no stderr pipe".to_string()
     })?;
@@ -316,8 +361,11 @@ pub fn spawn(
     let kill_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let exited = Arc::new(AtomicBool::new(false));
     let session = Arc::new(LspSession {
+        #[cfg(unix)]
+        tree,
         #[cfg(windows)]
         _job: job,
+        #[cfg(not(unix))]
         child: child.clone(),
         stdin: Mutex::new(Some(stdin)),
         stopping: AtomicBool::new(false),
@@ -325,6 +373,19 @@ pub fn spawn(
         kill_reason: kill_reason.clone(),
         exited: exited.clone(),
     });
+    let mut start_guard = StartGuard {
+        session: session.clone(),
+        armed: true,
+    };
+
+    #[cfg(unix)]
+    let (mut stdout, stdout_wake) = crate::modules::proc::capture::InterruptibleReader::new(stdout)
+        .map_err(|error| format!("lsp stdout wake setup failed: {error}"))?;
+    #[cfg(unix)]
+    let (mut stderr, stderr_wake) = crate::modules::proc::capture::InterruptibleReader::new(stderr)
+        .map_err(|error| format!("lsp stderr wake setup failed: {error}"))?;
+    #[cfg(not(unix))]
+    let (mut stdout, mut stderr) = (stdout, stderr);
 
     let session_reader = session.clone();
     let reader_thread = spawn_thread(format!("oarlock-lsp-reader-{id}"), move || {
@@ -366,7 +427,7 @@ pub fn spawn(
     let stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>> =
         Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let stderr_tail_w = stderr_tail.clone();
-    spawn_thread(format!("oarlock-lsp-stderr-{id}"), move || {
+    let stderr_thread = spawn_thread(format!("oarlock-lsp-stderr-{id}"), move || {
         let mut buf = [0u8; 4096];
         let mut line: Vec<u8> = Vec::new();
         let push_line = |line: &mut Vec<u8>| {
@@ -400,7 +461,6 @@ pub fn spawn(
     let cap_mb = max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
     let pid = child.id();
     let session_w = session.clone();
-    let child_waiter = child;
     let exited_w = exited;
     // One thread both reaps the server and polices its memory: the wait is a
     // timed condvar sleep, so an idle server costs two wakeups per minute and
@@ -408,7 +468,7 @@ pub fn spawn(
     spawn_thread(format!("oarlock-lsp-waiter-{id}"), move || {
         let mut check_at = next_memory_check(Instant::now(), true);
         let code = loop {
-            match child_waiter.wait_deadline(check_at) {
+            match wait_lsp_exit(&session_w, check_at) {
                 Ok(Some(status)) => break status.code(),
                 Ok(None) => {
                     if let Some(rss) = crate::modules::proc::rss::rss_bytes(pid) {
@@ -426,6 +486,11 @@ pub fn spawn(
                 }
                 Err(e) => {
                     log::warn!("lsp id={id} wait failed: {e}");
+                    session_w.kill();
+                    #[cfg(unix)]
+                    let _ = session_w.tree.finish_foreground();
+                    #[cfg(not(unix))]
+                    let _ = session_w.child.wait();
                     break None;
                 }
             }
@@ -434,8 +499,19 @@ pub fn spawn(
         // Bounded, not join: a grandchild inheriting stdout keeps the
         // pipe open past child exit and would hang us.
         let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline && !reader_thread.is_finished() {
+        while Instant::now() < deadline
+            && (!reader_thread.is_finished() || !stderr_thread.is_finished())
+        {
             thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(unix)]
+        {
+            if !reader_thread.is_finished() {
+                let _ = stdout_wake.shutdown(std::net::Shutdown::Write);
+            }
+            if !stderr_thread.is_finished() {
+                let _ = stderr_wake.shutdown(std::net::Shutdown::Write);
+            }
         }
         if let Some(state) = app.try_state::<super::LspState>() {
             state.take(id);
@@ -452,6 +528,8 @@ pub fn spawn(
         }
     })?;
 
+    start_guard.armed = false;
+
     Ok(session)
 }
 
@@ -461,7 +539,7 @@ mod tests {
 
     fn dummy_session(child: Arc<SharedChild>, stdin: Option<ChildStdin>) -> LspSession {
         LspSession {
-            child,
+            tree: Arc::new(crate::modules::proc::group::ProcessTree::new(child.clone())),
             stdin: Mutex::new(stdin),
             stopping: AtomicBool::new(false),
             writing: AtomicBool::new(false),
@@ -484,6 +562,49 @@ mod tests {
         assert_eq!(over_budget(4096 * mb, 4096), None);
         assert_eq!(over_budget(4096 * mb + mb - 1, 4096), None);
         assert_eq!(over_budget(4097 * mb, 4096), Some(4097));
+    }
+
+    #[test]
+    fn natural_server_exit_terminates_its_remaining_process_group() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let trigger = dir.path().join("trigger");
+        let script = format!(
+            "(while [ ! -e '{}' ]; do sleep 0.02; done; touch '{}') & exit 0",
+            trigger.display(), marker.display()
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &script])
+            .stdin(Stdio::piped())
+            .process_group(0);
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = dummy_session(child.clone(), child.take_stdin());
+        let status = wait_lsp_exit(&session, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .expect("server should exit");
+        assert!(status.success());
+        std::fs::write(trigger, b"go").unwrap();
+        thread::sleep(Duration::from_millis(700));
+        assert!(!marker.exists(), "server descendant survived natural exit");
+    }
+
+    #[test]
+    fn failed_start_cleans_up_even_if_a_reader_keeps_the_session_alive() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::piped());
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+        let reader_owner = session.clone();
+        drop(StartGuard {
+            session,
+            armed: true,
+        });
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+        drop(reader_owner);
     }
 
     #[test]

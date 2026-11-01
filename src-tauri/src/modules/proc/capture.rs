@@ -233,9 +233,17 @@ trait CaptureInput: Read + Send + 'static {}
 impl<T: Read + Send + 'static> CaptureInput for T {}
 
 #[cfg(unix)]
-struct InterruptibleReader<R> {
+pub(crate) struct InterruptibleReader<R> {
     input: R,
     wake: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+impl<R> InterruptibleReader<R> {
+    pub(crate) fn new(input: R) -> io::Result<(Self, std::os::unix::net::UnixStream)> {
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        Ok((Self { input, wake: read }, write))
+    }
 }
 
 #[cfg(unix)]
@@ -325,14 +333,8 @@ fn spawn_reader<R: CaptureInput>(
 ) -> io::Result<Reader> {
     #[cfg(unix)]
     let (reader, wake) = {
-        let (read, write) = std::os::unix::net::UnixStream::pair()?;
-        (
-            InterruptibleReader {
-                input: reader,
-                wake: read,
-            },
-            Some(write),
-        )
+        let (reader, write) = InterruptibleReader::new(reader)?;
+        (reader, Some(write))
     };
     let shared = Arc::new(Mutex::new(Drained::default()));
     let (tx, done) = mpsc::channel();
