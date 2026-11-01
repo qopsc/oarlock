@@ -4442,7 +4442,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R190 | Open, Tier 3 | `asset_all_folders.rs` reads an unranged file into memory and starts blocking work without an aggregate admission limit. |
 | R192 | Open, Tier 3; partly mitigated | The cache now has a 16 MiB estimated UTF-16 byte budget, visibility changes cancel queued work, and cancelled renders do not populate it. Tests cover byte eviction and viewport/page visibility. Mermaid still runs on the page and an already-running render cannot be interrupted; an unresolved render can stall later queued diagrams. |
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
-| R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
+| R210 | Open, Tier 3; partly mitigated | Native admission now permits four formatter workers across the app, retaining their slots until blocking work ends and reporting overload. Formatter cancellation still is not connected to document/window lifetime; an obsolete formatter can continue until its existing 20-second timeout. |
 
 Counts: **19 closed (including one accepted residual); 5 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
@@ -4548,3 +4548,10 @@ R031 validation: the full macOS native suite passed 1,563 library tests (four ig
 The existing 32-entry Mermaid cache now also bounds the estimated UTF-16 size of source keys and SVG output to 16 MiB, evicting least-recently-used entries and not caching a single oversized drawing. Viewport and page visibility control whether work remains eligible, and a render that completes after cancellation does not populate the cache. Regression tests reproduce the previously unbounded cache and check viewport, page visibility, and observer fallback. **Still open:** Mermaid executes in the page and a started render cannot be stopped; the serialized queue can wait behind one that never finishes. A byte budget is not a bound on allocations inside the renderer.
 
 R192 partial validation: the full macOS native suite passed 1,563 library tests (four ignored) and all integration suites; strict Clippy passed. The frontend suite passed 6,061 tests (two skipped), types passed, and lint remained at 80 warnings. The cache and visibility regressions failed before their changes and passed afterward.
+
+
+### R210 partial mitigation — formatter admission
+
+Native formatting now admits at most four formatter workers across the app and reports a busy error when full. A worker retains its slot even if the IPC waiter disappears. The existing 50 MiB input/output and 20-second timeout remain in effect; IPC payload materialization before native admission is the separately accepted R239 limitation. Tests check the shared cap, clear refusal, release and a worker whose waiter times out. **Still open:** document close, edits, navigation and window retirement do not signal the formatter process; it can continue until its existing timeout.
+
+R210 partial validation: the full macOS native suite passed 1,565 library tests (four ignored) and all integration suites; strict Clippy passed. The frontend suite passed 6,061 tests (two skipped), types passed, and lint remained at 80 warnings. All seven focused formatter tests passed on Linux in the offline unprivileged container, with the two previously recorded unrelated Linux warnings.

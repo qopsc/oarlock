@@ -10,11 +10,27 @@ use std::{
     io::{Seek, SeekFrom, Write},
     path::Path,
     process::{Command, Stdio},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tauri::Manager;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_BYTES: usize = 50 * 1024 * 1024;
+const MAX_FORMATTERS: usize = 4;
+
+fn admit_formatter(budget: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, String> {
+    budget
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "Too many formatters are running. Try saving again shortly.".into())
+}
+
+fn formatter_budget() -> &'static Arc<Semaphore> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    BUDGET.get_or_init(|| Arc::new(Semaphore::new(MAX_FORMATTERS)))
+}
+
 #[derive(Serialize)]
 pub struct Candidate {
     content: String,
@@ -236,7 +252,11 @@ pub async fn fs_format_document(
     language: Option<String>,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<Candidate, String> {
+    let permit = admit_formatter(formatter_budget())?;
     super::blocking(move || {
+        // Cancellation or loss of the IPC waiter cannot free admission while
+        // its blocking worker and formatter process are still running.
+        let _permit = permit;
         let workspace = WorkspaceEnv::from_option(workspace);
         let requested = resolve_path(&path, &workspace)?;
         app.state::<WorkspaceRegistry>()
@@ -263,6 +283,39 @@ pub async fn fs_format_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn formatter_budget_is_shared_and_reports_overload() {
+        let permits: Vec<_> = (0..MAX_FORMATTERS)
+            .map(|_| admit_formatter(formatter_budget()).unwrap())
+            .collect();
+        assert!(admit_formatter(formatter_budget())
+            .unwrap_err()
+            .contains("Too many formatters"));
+        drop(permits);
+        assert!(admit_formatter(formatter_budget()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn formatter_work_stays_counted_when_its_waiter_is_dropped() {
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admit_formatter(&budget).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            wait.recv().unwrap();
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(20), worker)
+            .await
+            .is_err());
+        assert!(admit_formatter(&budget).is_err());
+        release.send(()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while admit_formatter(&budget).is_err() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[test]
     fn syntax_hint_changes_only_the_extension_and_rejects_path_injection() {
         assert_eq!(
