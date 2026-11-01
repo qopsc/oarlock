@@ -2,9 +2,20 @@
 //! after the OS version has been checked around this capture's text read.
 use super::net::page::NetworkPages;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tauri::{ipc::Response, Manager};
 
 const CHANGED: &str = "Clipboard changed while reading. Paste again to use its new contents.";
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
+fn check_text_size(size: usize) -> Result<(), String> {
+    if size > MAX_TEXT_BYTES {
+        Err("Clipboard text exceeds 8 MiB. Copy less text and try again.".into())
+    } else {
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImageRequest {
@@ -71,6 +82,7 @@ fn capture(
 ) -> Result<Snapshot, String> {
     unchanged(&start, revision()?)?;
     let text = text()?;
+    check_text_size(text.len())?;
     unchanged(&start, revision()?)?;
     let (status, png) = if !image.wanted(&text, false) {
         (ImageStatus::Omitted, Vec::new())
@@ -141,6 +153,16 @@ fn revision() -> Result<String, String> {
         .changeCount()
         .to_string())
 }
+
+async fn await_capture<T>(
+    task: tauri::async_runtime::JoinHandle<Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(CAPTURE_TIMEOUT, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("Clipboard capture timed out. Try pasting again.".into()),
+    }
+}
 #[cfg(windows)]
 fn revision() -> Result<String, String> {
     let value = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
@@ -176,10 +198,12 @@ pub async fn terminal_clipboard_snapshot(
             }
             .wire();
         }
-        let start = revision()?;
-        tauri::async_runtime::spawn_blocking(move || {
+        let permit = super::clipboard_work::budget().snapshot(false)?;
+        let task = tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
             app.state::<NetworkPages>()
                 .with_page(&label, &page_generation, || Ok(()))?;
+            let start = revision()?;
             // Use the already-bundled arboard API directly so absence stays
             // distinct from an OS error (the plugin erases that distinction).
             let clipboard =
@@ -194,41 +218,48 @@ pub async fn terminal_clipboard_snapshot(
                     Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
                     Err(e) => Err(e.to_string()),
                 },
-                || match clipboard.borrow_mut().get_image() {
-                    Ok(image) => encode_image(
-                        &image.bytes,
-                        image.width.try_into().map_err(|_| "Invalid image width")?,
-                        image
-                            .height
-                            .try_into()
-                            .map_err(|_| "Invalid image height")?,
-                    )
-                    .map(Some),
-                    Err(arboard::Error::ContentNotAvailable) => Ok(None),
-                    Err(e) => Err(e.to_string()),
+                || {
+                    let _image = super::clipboard_work::budget().image()?;
+                    match clipboard.borrow_mut().get_image() {
+                        Ok(image) => encode_image(
+                            &image.bytes,
+                            image.width.try_into().map_err(|_| "Invalid image width")?,
+                            image
+                                .height
+                                .try_into()
+                                .map_err(|_| "Invalid image height")?,
+                        )
+                        .map(Some),
+                        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                        Err(e) => Err(e.to_string()),
+                    }
                 },
             )?;
             app.state::<NetworkPages>()
                 .with_page(&label, &page_generation, || Ok(()))?;
             snapshot.wire()
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        });
+        await_capture(task).await
     }
     #[cfg(target_os = "linux")]
     {
-        let snapshot = linux::capture(
-            &app,
-            &label,
-            &page_generation,
-            primary,
-            image,
-            known_image_revision,
-        )
-        .await?;
-        app.state::<NetworkPages>()
-            .with_page(&label, &page_generation, || Ok(()))?;
-        snapshot.wire()
+        let permit = super::clipboard_work::budget().snapshot(false)?;
+        let task = tauri::async_runtime::spawn(async move {
+            let snapshot = linux::capture(
+                &app,
+                &label,
+                &page_generation,
+                primary,
+                image,
+                known_image_revision,
+                permit,
+            )
+            .await?;
+            app.state::<NetworkPages>()
+                .with_page(&label, &page_generation, || Ok(()))?;
+            snapshot.wire()
+        });
+        await_capture(task).await
     }
 }
 
@@ -241,6 +272,18 @@ mod linux;
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn oversized_text_is_refused_before_reading_image_pixels() {
+        let result = capture(
+            "1".into(),
+            || Ok("1".into()),
+            None,
+            ImageRequest::Always,
+            || Ok("x".repeat(MAX_TEXT_BYTES + 1)),
+            || panic!("pixels must not be read after oversized text"),
+        );
+        assert!(matches!(result, Err(error) if error.contains("exceeds 8 MiB")));
+    }
     #[test]
     fn pixels_preserve_alpha_and_strip_row_padding_with_checked_bounds() {
         assert_eq!(

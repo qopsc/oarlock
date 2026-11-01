@@ -16,6 +16,36 @@ fn pump_until(check: impl Fn() -> bool) {
 
 #[test]
 #[ignore = "Requires a disposable GTK display; run under xvfb-run"]
+fn timed_out_capture_keeps_its_permit_until_the_gtk_callback_releases_it() {
+    gtk::init().unwrap();
+    let budget = crate::modules::clipboard_work::budget();
+    let held: Vec<_> = (0..3).map(|_| budget.snapshot(false).unwrap()).collect();
+    let tracker = tracker(false).unwrap();
+    let start = revision(&tracker, None).unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let pending = Rc::new(RefCell::new(Pending {
+        tracker,
+        start,
+        focus: None,
+        focus_signal: None,
+        destroy_signal: None,
+        signal: None,
+        timer: None,
+        sender: Some(tx),
+        permit: Some(budget.snapshot(false).unwrap()),
+    }));
+    let callback_owner = pending.clone();
+    finish(&pending, Err("timeout".into()));
+    assert!(rx.try_recv().unwrap().is_err());
+    drop(pending);
+    assert!(budget.snapshot(false).is_err(), "callback must retain its permit");
+    drop(callback_owner);
+    assert!(budget.snapshot(false).is_ok());
+    drop(held);
+}
+
+#[test]
+#[ignore = "Requires a disposable GTK display; run under xvfb-run"]
 fn gtk_focus_loss_cancels_pending_capture_and_invalidates_reuse() {
     gtk::init().unwrap();
     let first = gtk::Window::new(gtk::WindowType::Toplevel);
@@ -38,6 +68,7 @@ fn gtk_focus_loss_cancels_pending_capture_and_invalidates_reuse() {
         signal: None,
         timer: None,
         sender: Some(tx),
+        permit: Some(crate::modules::clipboard_work::budget().snapshot(false).unwrap()),
     }));
     observe(&pending);
     second.window().unwrap().focus(0);

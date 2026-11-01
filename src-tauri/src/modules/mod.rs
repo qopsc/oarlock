@@ -10,6 +10,7 @@ pub mod bench;
 pub mod clipboard_image;
 pub mod clipboard_read;
 pub mod clipboard_snapshot;
+mod clipboard_work;
 pub mod clipboard_write;
 #[cfg(target_os = "linux")]
 pub mod color_scheme;

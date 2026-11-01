@@ -120,6 +120,7 @@ struct Pending {
     signal: Option<glib::SignalHandlerId>,
     timer: Option<glib::SourceId>,
     sender: Option<tokio::sync::oneshot::Sender<Result<Raw, String>>>,
+    permit: Option<super::super::clipboard_work::SnapshotPermit>,
 }
 struct Pixels {
     bytes: glib::Bytes,
@@ -134,6 +135,7 @@ struct Raw {
     image: ImageStatus,
     pixels: Option<Pixels>,
     focus_required: bool,
+    permit: Option<super::super::clipboard_work::SnapshotPermit>,
 }
 fn finish(pending: &Rc<RefCell<Pending>>, result: Result<Raw, String>) {
     let mut state = pending.borrow_mut();
@@ -155,6 +157,10 @@ fn finish(pending: &Rc<RefCell<Pending>>, result: Result<Raw, String>) {
         timer.remove();
     }
     if let Some(sender) = state.sender.take() {
+        let result = result.map(|mut raw| {
+            raw.permit = state.permit.take();
+            raw
+        });
         let _ = sender.send(result);
     }
 }
@@ -165,6 +171,7 @@ pub async fn capture(
     primary: bool,
     image: ImageRequest,
     known: Option<String>,
+    permit: super::super::clipboard_work::SnapshotPermit,
 ) -> Result<Snapshot, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let owner = (app.clone(), label.to_owned(), page.to_owned());
@@ -177,13 +184,13 @@ pub async fn capture(
             let _ = tx.send(Err(error));
             return;
         }
-        start(&owner.0, &owner.1, primary, image, known, tx);
+        start(&owner.0, &owner.1, primary, image, known, permit, tx);
     })
     .map_err(|e| e.to_string())?;
     let raw = rx.await.map_err(|_| "Clipboard capture cancelled")??;
     app.state::<NetworkPages>()
         .with_page(label, page, || Ok(()))?;
-    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+    let (snapshot, permit) = tauri::async_runtime::spawn_blocking(move || {
         let png = match raw.pixels {
             Some(pixels) => {
                 let rgba = packed_rgba(
@@ -197,15 +204,18 @@ pub async fn capture(
             }
             None => Vec::new(),
         };
-        Ok::<_, String>(Snapshot {
-            header: Header {
-                revision: raw.revision,
-                text: Some(raw.text),
-                image: raw.image,
-                focus_required: raw.focus_required,
+        Ok::<_, String>((
+            Snapshot {
+                header: Header {
+                    revision: raw.revision,
+                    text: Some(raw.text),
+                    image: raw.image,
+                    focus_required: raw.focus_required,
+                },
+                png,
             },
-            png,
-        })
+            raw.permit,
+        ))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -228,6 +238,7 @@ pub async fn capture(
         rx.await
             .map_err(|_| "Clipboard version check cancelled")??,
     )?;
+    drop(permit);
     Ok(snapshot)
 }
 fn start(
@@ -236,6 +247,7 @@ fn start(
     primary: bool,
     image: ImageRequest,
     known: Option<String>,
+    permit: super::super::clipboard_work::SnapshotPermit,
     sender: tokio::sync::oneshot::Sender<Result<Raw, String>>,
 ) {
     let tracker = match tracker(primary) {
@@ -274,10 +286,15 @@ fn start(
         signal: None,
         timer: None,
         sender: Some(sender),
+        permit: Some(permit),
     }));
     observe(&pending);
     clipboard.request_text(move |clipboard, text| {
         if pending.borrow().sender.is_none() {
+            return;
+        }
+        if let Err(error) = check_text_size(text.as_ref().map_or(0, |text| text.len())) {
+            finish(&pending, Err(error));
             return;
         }
         let text = text.map(ToString::to_string).unwrap_or_default();
@@ -302,8 +319,18 @@ fn start(
                     image: status,
                     pixels: None,
                     focus_required,
+                    permit: None,
                 }),
             );
+            return;
+        }
+        let image_admission = {
+            let mut state = pending.borrow_mut();
+            state.permit.as_mut().ok_or_else(|| "Clipboard capture cancelled".to_string())
+                .and_then(|permit| permit.require_image())
+        };
+        if let Err(error) = image_admission {
+            finish(&pending, Err(error));
             return;
         }
         clipboard.request_image(move |_, image| {
@@ -352,6 +379,7 @@ fn start(
                     },
                     pixels,
                     focus_required,
+                    permit: None,
                 })
             })();
             finish(&pending, captured);

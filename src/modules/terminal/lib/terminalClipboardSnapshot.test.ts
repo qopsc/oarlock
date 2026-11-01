@@ -77,6 +77,53 @@ it("keeps one image capture in flight and verifies its version for queued reads"
     expect.objectContaining({ knownImageRevision: "old" }),
   );
 });
+it("cancels a queued capture promptly without letting later reads overtake", async () => {
+  let finish!: (buffer: ArrayBuffer) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise<ArrayBuffer>((resolve) => { finish = resolve; }));
+  const first = readTerminalClipboardSnapshot("always");
+  await vi.waitFor(() => expect(ipc.invoke).toHaveBeenCalledOnce());
+  const owner = new AbortController();
+  const cancelled = readTerminalClipboardSnapshot("always", false, owner.signal);
+  const observed = cancelled.then(() => "resolved", () => "cancelled");
+  const later = readTerminalClipboardSnapshot("always");
+  ipc.invoke.mockResolvedValueOnce(wire("new", "empty"));
+  owner.abort();
+  try {
+    const outcome = await Promise.race([
+      observed,
+      new Promise<string>((resolve) => setTimeout(() => resolve("stalled"), 100)),
+    ]);
+    expect(outcome).toBe("cancelled");
+    expect(ipc.invoke).toHaveBeenCalledOnce();
+  } finally {
+    finish(wire("old", "empty"));
+    await Promise.allSettled([first, cancelled, later]);
+  }
+  expect(ipc.invoke).toHaveBeenCalledTimes(2);
+});
+
+it("bounds queued image captures while a clipboard read is stalled", async () => {
+  let finish!: (buffer: ArrayBuffer) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise<ArrayBuffer>((resolve) => { finish = resolve; }));
+  const first = readTerminalClipboardSnapshot("always");
+  await vi.waitFor(() => expect(ipc.invoke).toHaveBeenCalledOnce());
+  const owners = Array.from({ length: 15 }, () => new AbortController());
+  const pending = owners.map((owner) => readTerminalClipboardSnapshot("always", false, owner.signal));
+  // Attach rejection handlers before aborting the pending reads.
+  const settled = Promise.allSettled(pending);
+  const overflow = readTerminalClipboardSnapshot("always").then(() => "accepted", () => "refused");
+  try {
+    expect(await Promise.race([
+      overflow,
+      new Promise<string>((resolve) => setTimeout(() => resolve("stalled"), 100)),
+    ])).toBe("refused");
+  } finally {
+    for (const owner of owners) owner.abort();
+    ipc.invoke.mockResolvedValue(wire("after", "empty"));
+    finish(wire("first", "empty"));
+    await Promise.allSettled([first, settled, overflow]);
+  }
+});
 it("rejects changed captures rather than returning cached bytes", async () => {
   ipc.invoke.mockResolvedValueOnce(wire("a", "png", [1]));
   await readTerminalClipboardSnapshot("always");
@@ -101,6 +148,30 @@ it("drops an aborted capture and does not cache its image", async () => {
   finish(wire("a", "png", [1]));
   await rejected;
   ipc.invoke.mockResolvedValueOnce(wire("b", "empty"));
+  await readTerminalClipboardSnapshot("always");
+  expect(ipc.invoke).toHaveBeenLastCalledWith(
+    "terminal_clipboard_snapshot",
+    expect.objectContaining({ knownImageRevision: null }),
+  );
+});
+it("returns promptly when an active native capture is cancelled", async () => {
+  let finish!: (buffer: ArrayBuffer) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise<ArrayBuffer>((resolve) => { finish = resolve; }));
+  const owner = new AbortController();
+  const read = readTerminalClipboardSnapshot("always", false, owner.signal);
+  const result = read.then(() => "resolved", () => "cancelled");
+  await vi.waitFor(() => expect(ipc.invoke).toHaveBeenCalledOnce());
+  owner.abort();
+  try {
+    expect(await Promise.race([
+      result,
+      new Promise<string>((resolve) => setTimeout(() => resolve("stalled"), 100)),
+    ])).toBe("cancelled");
+  } finally {
+    finish(wire("old", "png", [1]));
+  }
+  await Promise.resolve();
+  ipc.invoke.mockResolvedValueOnce(wire("new", "empty"));
   await readTerminalClipboardSnapshot("always");
   expect(ipc.invoke).toHaveBeenLastCalledWith(
     "terminal_clipboard_snapshot",

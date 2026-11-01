@@ -10,7 +10,14 @@ export type TerminalClipboardSnapshot = {
 type CachedImage = { revision: string; at: number; image: Uint8Array | null };
 let cached: CachedImage | null = null;
 let expiry: ReturnType<typeof setTimeout> | null = null;
-let imageTail: Promise<void> | null = null;
+const MAX_IMAGE_WAITERS = 15;
+type ImageWaiter = {
+  signal: AbortSignal;
+  resolve: (release: () => void) => void;
+  abort: () => void;
+};
+const imageWaiters: ImageWaiter[] = [];
+let imageBusy = false;
 const unowned = new AbortController().signal;
 const REUSE_MS = 1000;
 
@@ -99,20 +106,65 @@ async function queuedCapture(
   checkFocus: () => void,
 ): Promise<TerminalClipboardSnapshot> {
   if (primary || image === "never")
-    return capture(image, primary, signal, checkFocus);
-  const previous = imageTail;
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  imageTail = current;
+    return abortable(capture(image, primary, signal, checkFocus), signal);
+  const release = await acquireImageCapture(signal);
   try {
-    await previous;
-    return await capture(image, primary, signal, checkFocus);
+    return await abortable(capture(image, primary, signal, checkFocus), signal);
   } finally {
     release();
-    if (imageTail === current) imageTail = null;
   }
+}
+
+function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = () => finish(() => reject(signal.reason));
+    const finish = (settle: () => void) => {
+      signal.removeEventListener("abort", abort);
+      settle();
+    };
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
+async function acquireImageCapture(signal: AbortSignal): Promise<() => void> {
+  signal.throwIfAborted();
+  if (!imageBusy) {
+    imageBusy = true;
+    return releaseImageCapture;
+  }
+  if (imageWaiters.length >= MAX_IMAGE_WAITERS)
+    throw new Error("Clipboard image queue is full. Try again.");
+  return new Promise((resolve, reject) => {
+    const waiter: ImageWaiter = {
+      signal,
+      resolve,
+      abort: () => {
+        const index = imageWaiters.indexOf(waiter);
+        if (index < 0) return;
+        imageWaiters.splice(index, 1);
+        signal.removeEventListener("abort", waiter.abort);
+        reject(signal.reason);
+      },
+    };
+    imageWaiters.push(waiter);
+    signal.addEventListener("abort", waiter.abort, { once: true });
+    if (signal.aborted) waiter.abort();
+  });
+}
+
+function releaseImageCapture(): void {
+  const waiter = imageWaiters.shift();
+  if (!waiter) {
+    imageBusy = false;
+    return;
+  }
+  waiter.signal.removeEventListener("abort", waiter.abort);
+  waiter.resolve(releaseImageCapture);
 }
 
 async function capture(

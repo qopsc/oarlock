@@ -2,7 +2,7 @@
 //! as PNG writes through the clipboard plugin's long-lived clipboard, so
 //! images stay served on X11. Version-checked reads live in clipboard_read.
 
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 
 use super::{clipboard_write::ClipboardWrites, net::page::NetworkPages};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
@@ -25,14 +25,29 @@ const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 /// RGBA pixels as PNG, compressed for speed: the program receiving it
 /// recompresses if it cares.
 pub(super) fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+    let mut out = BoundedPng::new(MAX_PNG_BYTES);
     PngEncoder::new_with_quality(&mut out, CompressionType::Fast, FilterType::Adaptive)
         .write_image(rgba, width, height, ExtendedColorType::Rgba8)
         .map_err(|error| error.to_string())?;
-    if out.len() > MAX_PNG_BYTES {
-        return Err("the clipboard image is too large".into());
+    Ok(out.bytes)
+}
+
+struct BoundedPng {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl BoundedPng {
+    fn new(limit: usize) -> Self { Self { bytes: Vec::new(), limit } }
+}
+impl Write for BoundedPng {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other("the clipboard image is too large"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
     }
-    Ok(out)
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 /// A PNG as RGBA pixels, refusing images too large to hold.
@@ -104,10 +119,20 @@ pub async fn clipboard_image_write(
                 .check(&label, &page, &ticket, false)
         })
         .map_err(ClipboardImageWriteError::write)?;
+    let permit = super::clipboard_work::budget()
+        .image()
+        .map_err(ClipboardImageWriteError::write)?;
     let png = ipc_body::bytes_of(request.body(), MAX_PNG_BYTES, 0)
         .map_err(ClipboardImageWriteError::decode)?
         .into_owned();
     tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        app.state::<NetworkPages>()
+            .with_page(&label, &page, || {
+                app.state::<ClipboardWrites>()
+                    .check(&label, &page, &ticket, false)
+            })
+            .map_err(ClipboardImageWriteError::write)?;
         let (rgba, width, height) = decode_png(&png).map_err(ClipboardImageWriteError::decode)?;
         let image = tauri::image::Image::new_owned(rgba, width, height);
         app.state::<ClipboardWrites>()
@@ -132,6 +157,14 @@ pub async fn clipboard_image_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_output_never_grows_past_its_budget() {
+        let mut output = BoundedPng::new(4);
+        output.write_all(b"1234").unwrap();
+        assert!(output.write_all(b"5").is_err());
+        assert_eq!(output.bytes, b"1234");
+    }
 
     #[test]
     fn decode_failures_are_distinct_from_native_commit_failures() {

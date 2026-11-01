@@ -4417,7 +4417,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R069 | Windows/WSL port | Windows ConPTY job assignment is a later-port concern. |
 | R070 | Closed for Unix | Pipe readers wait on both the child pipe and a cancellation socket; collection wakes the reader after its drain deadline. A held-open-pipe regression failed before the change and passes afterward. Windows process capture remains port work. |
 | R071 | Closed | The scrollback reader now uses nonblocking, no-follow admission; the FIFO regression is recorded in the earlier R216 checkpoint. |
-| R079 | Open, Tier 3 | Terminal clipboard snapshot requests have no shared admission cap, and image decoding occurs before the clipboard commit coordinator. |
+| R079 | Closed for the native capture and image-work paths | A shared budget limits native captures and image work, retains permits until blocking or GTK work actually finishes, and reports overload or timeout. Image-reading waiters are bounded and cancellation settles promptly. Regression tests cover admission, timeout ownership, queue ordering, cancellation, and output limits. The OS may allocate clipboard data before returning it; frontend non-PNG conversion is tracked separately as R241. |
 | R089 | Closed | Images exceeding the texture budget are rejected before pixel expansion; a regression verifies their pixels are never read. |
 | R096 | Closed | Model setup failures dispose the constructed terminal before propagating the error; a real-WASM regression injects a configuration failure. |
 | R098 | Open, Tier 3 | `fontFeatures.ts` retains derived font faces and keyed maps for the page lifetime without eviction. |
@@ -4444,7 +4444,7 @@ Tiers follow user impact: Tier 1 data loss/corruption, Tier 2 wrong or missing r
 | R207 | Closed | Incoming theme batches and persisted snapshots are bounded while serializing; bulk upserts deduplicate in one pass while retaining last-update ordering. Regressions reject oversized input and verify duplicate ordering. |
 | R210 | Open, Tier 3 | Formatter requests have private, unsignalled cancellation and no app-wide admission cap. |
 
-Counts: **17 closed (including one accepted residual); 7 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
+Counts: **18 closed (including one accepted residual); 6 Tier 3 open; 11 AI/MCP held; 3 Windows/WSL port**. No Tier 1 or Tier 4 findings were confirmed by this source revalidation. No memory-exhaustion or process-leak stress test is claimed here.
 
 R051: the cap continues to count session startup and shutdown while an idle root is retired. The first focused regression failed before the fix and passed afterward. Native process teardown is asynchronous after transport close and remains covered by the separate R046 lifetime finding; no claim is made that OS processes can never briefly overlap.
 
@@ -4519,3 +4519,18 @@ R240 WebKit checks: the macOS probe reproduced script in the original asset-orig
 R240 checkpoint: the full macOS native suite passed 1,557 library tests (four ignored) and all integration suites; the full frontend suite passed 6,055 tests with two skipped. Strict Clippy and type checking passed, and lint remained at 80 warnings. All 17 focused guarded-asset tests passed on Linux in an offline, unprivileged container using a disposable earlier source snapshot with the current handler and tests; its two previously recorded unrelated Linux warnings remained. Local macOS and Linux WebKit probes are described above.
 
 Signed-release manual check for R240: with app-wide folder access both off and on, open a valid PDF and confirm it renders; open a crafted `.pdf` containing HTML plus a NUL byte and confirm it shows a refusal and runs no script; repeat via a `.pdf` symlink to that file. The packaged application has not yet been tested for this fix.
+
+### AP018 proposed — large guarded asset responses (R190)
+
+A real macOS WKWebView rendered a disposable 65 MiB PDF through the guarded scheme after requesting the whole resource without a Range header. The native handler currently buffers that whole response, and Wry/Tauri's existing `UriSchemeResponder` accepts one complete byte buffer rather than a stream. A 64 MiB hard limit would therefore refuse this valid PDF; a sparse-file regression confirmed the current handler instead returns the whole file.
+
+Options: (1) enforce a 64 MiB whole-response limit and bounded request concurrency, showing an explicit message and retaining ranged requests; users would need another app for larger PDFs that WebKit requests whole; (2) design a bounded streaming transport, likely requiring a maintained Wry/Tauri change or a separately authenticated local streaming boundary on macOS and Linux, preserving large previews but changing the native transport contract; or (3) defer R190. No option has been implemented. The user requested approval before broad IPC/contract changes; a decision is needed before changing this behavior. The R190 reproduction was removed from the working tree while the policy is undecided, and its output is in `/private/tmp/oarlock-r190-red.log`.
+
+
+### R079 checkpoint — bounded clipboard work
+
+Native clipboard captures share four slots; image capture and native image writing share one image-work slot. Captures report a 15-second timeout, but a slot remains occupied until underlying blocking or GTK work finishes. Text larger than 8 MiB and encoded PNG output larger than 64 MiB are refused visibly. Text-only work is not blocked merely because the image slot is busy. The per-page image-read queue allows one active request and 15 waiters, removes cancelled waiters promptly, and refuses further work rather than retaining an unbounded chain. Image-write overload is reported as a write failure, not a decoding failure that could trigger a text fallback. These limits do not prevent an OS clipboard API from materializing data before returning it.
+
+R241 — **MAJOR, Tier 3:** non-PNG terminal clipboard writes use the webview's `createImageBitmap` before their decoded dimensions are checked; multiple windows can begin conversions independently. A compressed image may therefore allocate substantially before the size check. This is a source-level resource risk; no out-of-memory test was run. It is separate from R079's native capture and PNG-work admission, and needs its own review.
+
+R079 validation: the native macOS suite passed 1,561 library tests (four ignored) and all integration tests. The frontend suite passed 6,058 tests (two skipped); type checking passed and lint remained at 80 warnings. The final Linux clipboard suite passed 21 tests with three ignored in an offline unprivileged container. An additional headless GTK test passed with the ignored timeout-ownership test enabled. The initial frontend run could not bind its local servers in the restricted environment; the full rerun with local-server access passed.
