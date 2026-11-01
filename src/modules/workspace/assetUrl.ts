@@ -9,16 +9,17 @@ import {
 } from "./env";
 
 /**
- * The backend's scheme for previews while the app may access all folders:
- * the asset protocol serves only the authorized folders and its grants
- * cannot be taken back, while this one asks the setting on every request
- * (and still serves no dot folders).
+ * The backend's guarded scheme for PDF previews and previews while the app
+ * may access all folders. It checks the setting on every request, preserves
+ * the asset scope's dot-folder rule, and validates PDF content.
  */
 const ALL_FOLDERS_SCHEME = "oarlock-asset";
 
 /** A host path as a URL the webview loads it from. */
 function assetSrc(hostPath: string, allFolders: boolean): string {
-  return allFolders
+  // PDF previews use an iframe. The guarded scheme verifies PDF content
+  // before serving it so a renamed HTML file cannot run script in that frame.
+  return allFolders || /\.pdf$/i.test(hostPath)
     ? convertFileSrc(hostPath, ALL_FOLDERS_SCHEME)
     : convertFileSrc(hostPath);
 }

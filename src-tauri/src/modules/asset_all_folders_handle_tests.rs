@@ -186,3 +186,74 @@ fn changed_setting_is_used_for_each_new_request_and_foreign_origins_are_rejected
         "tauri://localhost"
     );
 }
+
+#[test]
+fn pdf_preview_refuses_html_and_keeps_valid_pdf_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("document.PDF");
+    let fake = b"<!DOCTYPE HTML><script>window.evidence = true</script>\0";
+    std::fs::write(&path, fake).unwrap();
+    let denied = respond(&request(&path, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(denied.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(denied.headers()[header::CONTENT_TYPE], "text/plain");
+    assert!(!denied.body().windows(7).any(|chunk| chunk == b"<script"));
+    assert!(denied.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+    let head = respond(&request(&path, Method::HEAD), "tauri://localhost", |_| true);
+    assert_eq!(head.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(head.body().is_empty());
+    let mut ranged = request(&path, Method::GET);
+    ranged
+        .headers_mut()
+        .insert(header::RANGE, HeaderValue::from_static("bytes=0-8"));
+    assert_eq!(
+        respond(&ranged, "tauri://localhost", |_| true).status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+
+    let pdf = b"%PDF-1.4\n% valid PDF header\n";
+    std::fs::write(&path, pdf).unwrap();
+    let allowed = respond(&request(&path, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(allowed.headers()[header::CONTENT_TYPE], "application/pdf");
+    assert_eq!(allowed.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert_eq!(allowed.body(), pdf);
+}
+
+#[test]
+fn pdf_html_polyglot_is_never_served_as_executable_html() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("polyglot.pdf");
+    std::fs::write(
+        &path,
+        b"<!DOCTYPE HTML><script>evil()</script><!--%PDF-1.4-->\0",
+    )
+    .unwrap();
+    let response = respond(&request(&path, Method::GET), "tauri://localhost", |_| true);
+    assert!(
+        response.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE
+            || (response.status() == StatusCode::OK
+                && response.headers()[header::CONTENT_TYPE] == "application/pdf"
+                && response.headers()[header::X_CONTENT_TYPE_OPTIONS] == "nosniff")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pdf_alias_cannot_open_html_through_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    // The target name must not override its actual PDF contents.
+    let html = tmp.path().join("payload.svg");
+    let alias = tmp.path().join("document.pdf");
+    std::fs::write(&html, b"<!DOCTYPE HTML><script>evil()</script>\0").unwrap();
+    symlink(&html, &alias).unwrap();
+    let response = respond(&request(&alias, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    std::fs::write(&html, b"%PDF-1.4\n% valid PDF header\n").unwrap();
+    let response = respond(&request(&alias, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+}

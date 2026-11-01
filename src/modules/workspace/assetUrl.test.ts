@@ -44,4 +44,15 @@ describe("workspaceAssetUrl", () => {
       `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\srv\\a.png")}`,
     );
   });
+
+  it("uses the guarded scheme for PDF previews in every workspace", async () => {
+    expect(await workspaceAssetUrl("/repo/unsafe.PDF", { kind: "local" })).toBe(
+      `http://oarlock-asset.localhost/${encodeURIComponent("/repo/unsafe.PDF")}`,
+    );
+    invoke.mockResolvedValue("\\\\wsl.localhost\\Ubuntu\\repo\\file.pdf");
+    const workspace = { kind: "wsl", distro: "Ubuntu" } as const;
+    expect(await workspaceAssetUrl("/repo/file.pdf", workspace)).toBe(
+      `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\repo\\file.pdf")}`,
+    );
+  });
 });

@@ -222,8 +222,21 @@ fn respond(
         .headers()
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match read(file, &real, range, head) {
-        Ok(file) => file.response(origin),
+    let pdf_preview = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+    match read(file, &real, range, head, pdf_preview) {
+        Ok(file) => {
+            let mut response = file.response(origin);
+            if pdf_preview {
+                response.headers_mut().insert(
+                    header::X_CONTENT_TYPE_OPTIONS,
+                    HeaderValue::from_static("nosniff"),
+                );
+            }
+            response
+        }
         Err(error) => {
             log::debug!("{SCHEME}: cannot read {}: {error}", real.display());
             status_only(StatusCode::NOT_FOUND, Some(origin))
@@ -253,7 +266,13 @@ struct Served {
     body: Vec<u8>,
 }
 
-fn read(mut file: File, real: &Path, range: Option<&str>, head: bool) -> std::io::Result<Served> {
+fn read(
+    mut file: File,
+    real: &Path,
+    range: Option<&str>,
+    head: bool,
+    pdf_preview: bool,
+) -> std::io::Result<Served> {
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::other("not a file"));
@@ -263,7 +282,23 @@ fn read(mut file: File, real: &Path, range: Option<&str>, head: bool) -> std::io
     (&mut file)
         .take(size.min(SNIFF_BYTES))
         .read_to_end(&mut magic)?;
-    let mime = MimeType::parse(&magic, &real.to_string_lossy());
+    // The opened target may have another extension (notably `.svg`, for
+    // which Tauri skips sniffing). The requested PDF must be judged by bytes.
+    let mime = if pdf_preview {
+        MimeType::parse(&magic, "preview.pdf")
+    } else {
+        MimeType::parse(&magic, &real.to_string_lossy())
+    };
+    if pdf_preview && mime != "application/pdf" {
+        const MESSAGE: &[u8] = b"This file is not a valid PDF and cannot be previewed.";
+        return Ok(Served {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            mime: "text/plain".into(),
+            content_range: None,
+            len: MESSAGE.len() as u64,
+            body: if head { Vec::new() } else { MESSAGE.to_vec() },
+        });
+    }
     let (status, start, len, content_range) = match parse_range(range, size) {
         Range::Whole => (StatusCode::OK, 0, size, None),
         Range::Part { start, end } => (
@@ -311,6 +346,12 @@ impl Served {
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, "content-range")
             .header(header::CONTENT_LENGTH, self.len);
+        if self.status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            builder = builder.header(
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox",
+            );
+        }
         if let Some(range) = self.content_range {
             builder = builder.header(header::CONTENT_RANGE, range);
         }
