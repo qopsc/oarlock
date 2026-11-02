@@ -31,8 +31,22 @@ D-14 and D-09 are one commit because both rewrite the same read and save path (`
 - S-24 part 2 is mitigated (retries), not made structural: a final update that fails all three attempts still leaves the record running until the Retry toast is used.
 - Em-dashes the PR added outside this batch's ownership, left alone: `src/modules/shortcuts/shortcuts.ts` (comment), `src/settings/sections/AboutSection.tsx` ("Check failed ..."), `src/settings/sections/ModelsSection.tsx` ("Optional ...").
 - Ownership exception: `scripts/ipc-profile/smoke.ts` lost its `createProxyFetch({ allowPrivateNetwork: true })` call (one import and one line) because S-21 removed that option; without it `check-types` fails.
-- `ProjectTrustPrompt.test.tsx` was not extended: the prompt renders the backend's `detail` string, so the env display and the loader-variable refusal are tested in `mcp/project.rs`.
 - Not run: Windows and Linux (the Windows-only `command.lock().unwrap()` in `background.rs` was changed by the same substitution but not compiled here). `cargo nextest` is not installed on this machine; `cargo test --locked` was used.
+
+## Rework after review (E-1 to E-6 and two Lows)
+
+| Item | Fix | Test | Commit |
+| --- | --- | --- | --- |
+| E-1 (S-18) | `describe` puts one `sets NAME=value` line per env entry before the command line; `ItemEntries` renders those lines unclamped and only clamps the command; the refused set gains `NPM_CONFIG_*`, `UV_*`, `PIP_*`, `GIT_*`, `HOME`, `XDG_CONFIG_HOME`, `ZDOTDIR`, `DOTNET_STARTUP_HOOKS`, `CLASSPATH`, `PERLLIB` (case-insensitive) | `ProjectTrustPrompt.test.tsx` "shows a server's environment even when its command line is long"; `mcp::project::tests` (prompt text, the new names) | c211743d |
+| E-2 (D-14/D-09) | Plan mode always reads the file for `originalContent` and keeps the cached version as `baseVersion` | `fs.test.ts` "shows the plan review the file as it is, keeping the version the model read" | ef303bfd |
+| E-3 | `native.writeFile` sends `source: "ai"`. Consumers: `useEditorFileSync` reloads on any source but `"editor"`, so clean editors reload at once as for the old `fs_write_file` (no source); `useThemeFileEditing` ingests only `"editor"`, so AI edits to theme files are not taken as user saves, as before | `native.test.ts` (exact `fs_save_document` arguments) | 7682315a |
+| E-4 | `statusWhenAuthorized` waits for `authorizationSettled(root, env)` before `project_trust_status`; `SkillsWatcher` uses it | `statusWhenAuthorized.test.ts` | aeb7e329 |
+| E-5 | `fs_grep` and `fs_glob` with origin AI skip paths that fail `secret_paths::readable` (hidden names were already skipped by the walker, so the test uses `server.pem` and `credentials`); `tests/fs_search.rs` got thin shims for the new `protect_secrets` argument | `fs::grep::tests::the_ais_searches_skip_secret_files_and_the_apps_do_not` | cb688aa6, 9d180660 |
+| E-6 | A non-stale failure after another edit to the same file landed says the edit has to be rejected and asked for again | `planStore.test.ts` (the "no longer applies" case) | c0b5170d |
+| S-15 Low | `project_trust::tests::the_file_commands_pass_their_callers_origin_to_keeping_trust` reads the command sources (no mock app runtime is available without a `Cargo.toml` change) and asserts `fs_write_file`, `fs_save_document` and `fs_create_dir` pass `origin` and only `fs_create_file`, which takes none, names `Origin::App`. It catches a wrong or dropped argument, not behaviour. | same | dca166e6 |
+| Nit | The two terminal tests import `@/modules/terminal/lib/quoteShellPath` | existing tests | 07c17639 |
+
+`fs/grep.rs` and `tests/fs_search.rs` are outside the stated ownership; E-5 asks for the grep and glob walkers, so they were edited minimally.
 
 ## 3. AGENTS.md edits
 
@@ -46,7 +60,7 @@ D-14 and D-09 are one commit because both rewrite the same read and save path (`
 
 3. Anchor: `### AI subsystem`, bullet "**Tools** (`tools/tools.ts`)", "`lib/security.ts` is a deny-list refusing obvious secret paths". Append:
 
-   > The same list is enforced natively for the AI's file calls (see `fs::*`). The AI saves through `fs_save_document` with the version it read (`readFile` with `versioned`; `write_file` uses the version in its read cache, else the one on disk now, and `null` means create only), so a file changed meanwhile is refused with a stale-version error and never overwritten. Plan mode queues edit operations with the version they were derived from, and Apply runs them in order onto one running buffer per file, reporting a stale version per edit. `bash_kill` and `bash_logs` carry the chat id and refuse a job another chat started (`BackgroundProc::reachable_by`).
+   > The same list is enforced natively for the AI's file calls (see `fs::*`), and the AI's `fs_grep` and `fs_glob` skip secret files under an authorized root. The AI's saves carry `source: "ai"`, so open editors reload them at once and a theme file the AI wrote is not taken in as the user's save. The AI saves through `fs_save_document` with the version it read (`readFile` with `versioned`; `write_file` uses the version in its read cache, else the one on disk now, and `null` means create only), so a file changed meanwhile is refused with a stale-version error and never overwritten. Plan mode queues edit operations with the version they were derived from, and Apply runs them in order onto one running buffer per file, reporting a stale version per edit. `bash_kill` and `bash_logs` carry the chat id and refuse a job another chat started (`BackgroundProc::reachable_by`).
 
 4. Anchor: `### Two-process model`, bullet `shell::shell_run_command` ... `shell::shell_session_*`. Append to the persistent-agent-shell sentence:
 
@@ -58,7 +72,7 @@ D-14 and D-09 are one commit because both rewrite the same read and save path (`
 
 6. Anchor: bullet `mcp::*`, "A project's `.mcp.json` (`mcp/project.rs`, Claude Code's format) is a project trust item". Append:
 
-   > The trust prompt lists a stdio server's environment (names and values). A project server may not set a variable that changes what the program loads or runs (`DYLD_*`, `LD_*`, `PYTHON*`, `PATH`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, `BASH_ENV`, `ENV`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`); such an entry reads as "Cannot be used" and is never started. A Settings save waits at most 3 s for a server's token refresh before it gives way with an error, so a refresh stuck on the network cannot hold the settings lock for every spawn and save.
+   > The trust prompt lists a stdio server's environment (names and values), one `sets NAME=value` line each, before the command line and never clipped, so a long command cannot push it out of view. A project server may not set a variable that changes what the program loads or runs (case-insensitive; prefixes `DYLD_`, `LD_`, `PYTHON`, `NPM_CONFIG_`, `UV_`, `PIP_`, `GIT_`; names `PATH`, `HOME`, `XDG_CONFIG_HOME`, `ZDOTDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`, `BASH_ENV`, `ENV`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `CLASSPATH`, `DOTNET_STARTUP_HOOKS`); such an entry reads as "Cannot be used" and is never started. A Settings save waits at most 3 s for a server's token refresh before it gives way with an error, so a refresh stuck on the network cannot hold the settings lock for every spawn and save.
 
 7. Anchor: bullet `skills::*` ... `project_trust::*`, "`project_trust_status`". Add: "The root a page names for `project_trust_status`, `project_trust_decide` and the skills commands must be a folder the workspace registry authorizes (`resolve_authorized_project`); otherwise there is no open project for that window. A staged skill install can be committed or cancelled only by the window that started it."
 
@@ -90,13 +104,13 @@ Run from the batch worktree. The machine has no global git-lfs or signing config
 - `bun run check-types` printed `$ tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json` and no errors.
 - `bun run test`:
   ```
-   Test Files  645 passed (645)
-        Tests  6150 passed | 2 skipped (6152)
+   Test Files  646 passed (646)
+        Tests  6153 passed | 2 skipped (6155)
   ```
 - `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings` ended `Finished \`dev\` profile [unoptimized + debuginfo] target(s)` with no warnings.
 - `cd src-tauri && cargo nextest run --locked`: `error: no such command: \`nextest\``. Fallback `cargo test --locked --no-fail-fast`:
   ```
-  test result: ok. 1603 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out   (lib)
+  test result: ok. 1605 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out   (lib)
   test result: ok. 25 passed (fs_search), 2 passed (ghostty_artifacts), 8 passed (git_ai_diff), 1 passed (git_candidate_object),
   32 passed (git_entrypoint_guard), 8 passed (git_executable_refusal), 1 passed (git_fixture_isolation), 2 passed (git_literal_names),
   61 passed (git_operations), 5 passed (git_optional_reads), 15 passed (git_remote_scope), 2 passed (git_status_limits),
