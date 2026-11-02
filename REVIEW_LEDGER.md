@@ -4629,12 +4629,12 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R171 | AI/MCP on hold | The affected text-window tool belongs to the held AI backend. |
 | R177 | AI/MCP on hold | The affected environment parsing belongs to MCP configuration. |
 | R187 | AI/MCP on hold | The affected tool-policy map belongs to MCP configuration. |
-| R191 | Open, Tier 2 | A failed Markdown refresh still returns the previous ready state without a stale/error indicator; an existing test asserts that behavior. |
+| R191 | Closed; mounted check manual | A failed Markdown refresh keeps the previous content with a stale notice and Retry. A successful read clears the notice; state-transition regressions pass. |
 | R200 | Open, Tier 2 | The built-in Vim `:set` implementation still processes only `setArgs[0]`; a mounted-editor reproduction remains outstanding. |
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **10 closed; 15 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **11 closed; 14 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4684,4 +4684,10 @@ Validation: focused editor tests and the full frontend suite passed (6,089 passe
 
 **MAJOR, test reliability; diagnostics added:** During the R191 checkpoint, the full macOS native suite failed `nodeletebusy_does_not_bind_the_named_entry_to_the_open_file`: the second `unlinkat` returned `-1` where the test expected success. The assertion did not capture errno. The same test passed alone, and a separate 1,000-iteration, 16-worker temporary-file probe of the replacement/unlink sequence had no failures. These checks do not establish the failure's cause or prove a product defect. The test already used a unique `tempfile::tempdir`; neighboring probes also use independent temporary directories. It now uses a recognizable unique prefix and records the immediate errno, selected path and directory entries if either unlink assertion fails. The user directed that this intermittent test-reliability finding is not a release blocker.
 
-R191 work is currently uncommitted: refresh failures preserve the previous preview, expose a stale notice and Retry, and a successful read clears the notice. Its state-transition regression and frontend suite passed; the visible Retry has not yet had a mounted UI test. The first lint run added one hook-dependency warning; reading the retry value in the effect removed it and the warning count returned to 80. A subsequent full native run with the diagnostic assertion passed; strict Clippy also passed.
+The R191 checkpoint: refresh failures preserve the previous preview, expose a stale notice and Retry, and a successful read clears the notice. Its state-transition regression and frontend suite passed; the visible Retry has not yet had a mounted UI test. The first lint run added one hook-dependency warning; reading the retry value in the effect removed it and the warning count returned to 80. A subsequent full native run with the diagnostic assertion passed; strict Clippy also passed.
+
+### R191 checkpoint — Markdown refresh recovery
+
+A failed refresh leaves the prior rendering visible with a stale warning, the error or privacy notice, and a Retry action. A successful read clears the warning even when the text is unchanged. State-transition regressions cover repeated failures and recovery. The full macOS native suite passed 1,580 library tests (four ignored) and all integration suites; strict Clippy passed. The frontend suite passed 6,089 tests (two skipped), types passed, and lint remained at 80 warnings.
+
+Manual signed-release check: open a Markdown preview, make its file temporarily unavailable or unreadable, and confirm the previous content remains with a stale notice; restore access, choose Retry, and confirm the notice clears and the current content appears. A mounted Retry interaction was not run in this environment.

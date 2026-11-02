@@ -24,9 +24,14 @@ describe("previewAfterRead", () => {
     expect(previewAfterRead(ready, text("# A"))).toBe(ready);
   });
 
-  it("keeps the rendered file when a refresh read fails", () => {
+  it("keeps the rendered file but marks failed refreshes until a successful read", () => {
     const ready: PreviewStatus = { kind: "ready", content: "# A" };
-    expect(previewAfterRead(ready, { ok: false, error: "ENOENT" })).toBe(ready);
+    const stale = previewAfterRead(ready, { ok: false, error: "ENOENT" });
+    expect(stale).toEqual({ kind: "ready", content: "# A", refreshError: "ENOENT" });
+    expect(previewAfterRead(stale, { ok: false, error: "EACCES" })).toEqual({
+      kind: "ready", content: "# A", refreshError: "EACCES",
+    });
+    expect(previewAfterRead(stale, text("# A"))).toEqual(ready);
     expect(
       previewAfterRead({ kind: "loading" }, { ok: false, error: "ENOENT" }),
     ).toEqual({ kind: "error", message: "ENOENT" });

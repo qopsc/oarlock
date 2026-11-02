@@ -75,6 +75,7 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
   const workspace = workspaceEnvForPath(path, useOwnedWorkspace());
   const [status, setStatus] = useState<PreviewStatus>({ kind: "loading" });
   const [shownPath, setShownPath] = useState(path);
+  const [retry, setRetry] = useState(0);
   const revision = useFileRevision(path, workspace);
   const { activeTheme, resolvedMode } = useTheme();
 
@@ -84,12 +85,15 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
   }
   const refusal = usePrivacyRefusal(
     path,
-    status.kind === "error" ? status.message : null,
+    status.kind === "error"
+      ? status.message
+      : status.kind === "ready" ? status.refreshError ?? null : null,
   );
 
   useEffect(() => {
     // Each reported change of the file reads it again.
     void revision;
+    void retry;
     let cancelled = false;
     authorizationSettled(path, workspace)
       .then(() =>
@@ -111,7 +115,7 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [path, revision, workspace]);
+  }, [path, revision, retry, workspace]);
 
   return (
     <div
@@ -121,6 +125,22 @@ export function MarkdownPreviewPane({ path, visible, onSetView }: Props) {
       )}
     >
       <MarkdownViewToggle mode="rendered" onChange={onSetView} />
+      {status.kind === "ready" && status.refreshError !== undefined && (
+        <div role="alert" className="px-8 py-3 text-[12px] text-destructive">
+          {refusal ? (
+            <PrivacyRefusalNotice
+              refusal={refusal}
+              title="Could not refresh this file"
+              className="items-start text-left"
+            />
+          ) : (
+            <p>Could not refresh this file; the preview may be out of date: {status.refreshError}</p>
+          )}
+          <button type="button" className="underline" onClick={() => setRetry((n) => n + 1)}>
+            Retry
+          </button>
+        </div>
+      )}
       <div className="flex-1 overflow-auto">
         {status.kind === "ready" ? (
           // The document alone sits in .markdown-body, so the GitHub-style
