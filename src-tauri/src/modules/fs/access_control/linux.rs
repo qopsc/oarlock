@@ -4,6 +4,12 @@ use std::{fs::File, io, os::fd::AsRawFd};
 pub struct Acl(Option<Vec<u8>>);
 const NAME: &std::ffi::CStr = c"system.posix_acl_access";
 
+impl Acl {
+    pub fn has_rules(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 pub fn read(file: &File) -> io::Result<Acl> {
     // A non-POSIX ACL can grant access to a private staging directory even
     // after chmod; do not treat an unsupported POSIX ACL query as its absence.

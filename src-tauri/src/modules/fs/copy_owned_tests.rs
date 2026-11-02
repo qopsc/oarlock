@@ -17,7 +17,7 @@ fn fixture() -> (
     (tmp, src, dest, registry)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn batch_copies_regular_files_without_replacing_conflicts() {
     let (_tmp, src, dest, registry) = fixture();
@@ -39,7 +39,7 @@ fn batch_copies_regular_files_without_replacing_conflicts() {
     assert_eq!(fs::read_to_string(dest.join("a copy.txt")).unwrap(), "new");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn copy_checks_the_actual_chosen_destination_before_publication() {
     let (_tmp, src, dest, registry) = fixture();
@@ -142,7 +142,7 @@ fn replacing_destination_parent_does_not_write_to_new_target() {
     assert!(!outside.path().join("a").exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn final_destination_symlink_is_not_overwritten_or_followed() {
     use std::os::unix::fs::symlink;
@@ -171,30 +171,7 @@ fn final_destination_symlink_is_not_overwritten_or_followed() {
     assert_eq!(fs::read_to_string(victim).unwrap(), "untouched");
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-#[test]
-fn directories_and_links_are_refused_without_partial_copies() {
-    use std::os::unix::fs::symlink;
-    let (_tmp, src, dest, registry) = fixture();
-    fs::create_dir(src.join("folder")).unwrap();
-    symlink("folder", src.join("link")).unwrap();
-    let path = |p: &Path| p.to_string_lossy().into_owned();
-    let result = copy_batch_impl(
-        vec![path(&src.join("folder")), path(&src.join("link"))],
-        &path(&dest),
-        &path(&dest),
-        &WorkspaceEnv::Local,
-        &registry,
-        &FileIndexState::default(),
-        false,
-    )
-    .unwrap();
-    assert!(result.created.is_empty());
-    assert_eq!(result.failed.len(), 2);
-    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn copies_links_as_entries_without_following_targets() {
     use std::os::unix::fs::symlink;
@@ -237,7 +214,7 @@ fn copies_links_as_entries_without_following_targets() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_replaced_source_link_is_never_copied_from_its_new_entry() {
     use std::os::unix::fs::symlink;
@@ -272,7 +249,7 @@ fn a_replaced_source_link_is_never_copied_from_its_new_entry() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn folders_are_copied_without_partial_publication() {
     let (_tmp, src, dest, registry) = fixture();
@@ -296,7 +273,7 @@ fn folders_are_copied_without_partial_publication() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn folder_replaced_after_open_cannot_copy_its_new_target() {
     use std::os::unix::fs::symlink;
@@ -332,7 +309,7 @@ fn folder_replaced_after_open_cannot_copy_its_new_target() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn folder_with_nested_outside_link_leaves_no_partial_copy() {
     use std::os::unix::fs::symlink;
@@ -362,7 +339,7 @@ fn folder_with_nested_outside_link_leaves_no_partial_copy() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn simultaneous_copies_choose_distinct_names() {
     let (_tmp, src, dest, registry) = fixture();
@@ -420,7 +397,7 @@ fn unauthorized_source_fails_without_publishing_anything() {
     assert_eq!(fs::read_dir(dest).unwrap().count(), 0);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[test]
 fn unsupported_platform_does_not_publish_a_file() {
     let (_tmp, src, dest, registry) = fixture();
@@ -442,7 +419,7 @@ fn unsupported_platform_does_not_publish_a_file() {
     assert!(!dest.join("a").exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn guarded_batch_copies_to_authorized_destination() {
     let (_tmp, src, dest, registry) = fixture();
@@ -544,7 +521,7 @@ fn copies_acl_and_extended_attributes() {
     assert_eq!(&read[..size as usize], value);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn refuses_a_copy_whose_privileged_mode_cannot_be_preserved() {
     use std::os::unix::fs::PermissionsExt;
@@ -566,4 +543,60 @@ fn refuses_a_copy_whose_privileged_mode_cannot_be_preserved() {
     assert_eq!(result.failed.len(), 1);
     assert!(result.failed[0].message.contains("setuid"));
     assert!(!dest.join("privileged").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn lexical_resolution_pops_parents_and_drops_dots() {
+    assert_eq!(lexical_normalize(Path::new("/a/b/../c/./d")), Path::new("/a/c/d"));
+    assert_eq!(lexical_normalize(Path::new("/a/../../x")), Path::new("/x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_link_is_judged_where_the_copy_will_put_it() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let deep = src.join("a/b/c/dir");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(src.join("a/x"), "inside").unwrap();
+    // Three levels up from `a/b/c/dir` is `a/x`; the same text from
+    // `destination/dir` leaves the authorized folder.
+    symlink("../../../x", deep.join("link")).unwrap();
+    let item_dest = dest.join("dir");
+    assert!(nested_link_allowed(&deep.join("link"), &item_dest, &item_dest, &registry).is_err());
+    // Staying inside the copied item is fine wherever it goes.
+    fs::write(deep.join("sibling"), "s").unwrap();
+    symlink("sibling", deep.join("near")).unwrap();
+    assert!(nested_link_allowed(&deep.join("near"), &item_dest, &item_dest, &registry).is_ok());
+    // A copy beside the original resolves the same text to the same authorized place.
+    let beside = deep.parent().unwrap().join("dir2");
+    assert!(nested_link_allowed(&deep.join("link"), &beside, &beside, &registry).is_ok());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_nested_relative_link_that_escapes_only_at_the_destination_refuses_the_folder() {
+    use std::os::unix::fs::symlink;
+    let (tmp, src, dest, registry) = fixture();
+    let deep = src.join("a/b/c/dir");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(src.join("a/x"), "inside").unwrap();
+    symlink("../../../x", deep.join("link")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&deep)],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty(), "{result:?}");
+    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed[0].message.contains("escapes"), "{result:?}");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    drop(tmp);
 }

@@ -574,9 +574,6 @@ pub(super) struct CopyArea {
     index: usize,
 }
 impl CopyArea {
-    pub fn create(destination: &Dir, from: usize) -> io::Result<Self> {
-        Self::create_with_cache(destination, dirs::cache_dir(), from)
-    }
     pub fn create_with_cache(
         destination: &Dir,
         cache: Option<PathBuf>,
@@ -670,22 +667,25 @@ pub(super) fn rename_noreplace_at(
     {
         return Ok(());
     }
-    let error = io::Error::last_os_error();
+    Err(noreplace_error(io::Error::last_os_error()))
+}
+/// EINVAL means the filesystem cannot publish without replacing: a refusal.
+pub(super) fn noreplace_error(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::EINVAL) {
-        return Err(io::Error::new(
+        return io::Error::new(
             io::ErrorKind::Unsupported,
             "This filesystem cannot publish without replacing (RENAME_NOREPLACE); nothing was copied",
-        ));
+        );
     }
-    Err(error)
+    error
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{io::Write, process::Command};
 
-    pub(super) fn test_dir() -> tempfile::TempDir {
+    pub(crate) fn test_dir() -> tempfile::TempDir {
         match std::env::var_os("OARLOCK_TEST_PRIMARY_VOLUME") {
             Some(path) => tempfile::tempdir_in(path).unwrap(),
             None => tempfile::tempdir().unwrap(),
@@ -877,7 +877,7 @@ mod tests {
         let work = root.path().join("work");
         fs::create_dir(&work).unwrap();
         let dir = open_dir(&work);
-        let mut candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
+        let candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
         candidate.file().write_all(b"secret draft").unwrap();
         candidate
             .file()
