@@ -192,6 +192,11 @@ pub fn parse_doc(
             doc.tombstones.pop_front();
         }
     }
+    // The page saves this store too, so a save between our two sets can leave a gate that is
+    // newer than the list; a tombstoned chat never reappears from that.
+    let deleted: Vec<String> = doc.tombstones.iter().map(|(id, _)| id.clone()).collect();
+    doc.sessions
+        .retain(|s| !s["id"].as_str().is_some_and(|id| deleted.iter().any(|d| d == id)));
     Ok(doc)
 }
 
@@ -491,6 +496,16 @@ mod tests {
         assert_eq!(clamped.revision, 7);
     }
 
+    #[test]
+    fn a_gate_newer_than_the_list_cannot_show_a_deleted_chat() {
+        let doc = parse_doc(
+            Some(json!([{"id":"gone","title":"g","createdAt":1,"updatedAt":1},{"id":"kept","title":"k","createdAt":1,"updatedAt":1}])),
+            Some(json!({"revision":3,"evictedThrough":null,"tombstones":[{"id":"gone","revision":3}]})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ids(&doc), ["kept"]);
+    }
     #[test]
     fn the_plugin_doc_store_saves_before_returning() {
         let source = include_str!("ai_metadata.rs");

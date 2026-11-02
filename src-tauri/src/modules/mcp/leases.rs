@@ -1,4 +1,5 @@
-//! Per-page run leases. Navigation preserves them; reload revokes pending opens.
+//! Per-window run records, one per agent turn (`runs.rs` holds the commands). Navigation
+//! preserves them; reload, Stop of the chat and `ai_run_end` remove them.
 use crate::modules::project_trust::OpenProject;
 use std::collections::HashMap;
 use std::sync::Arc;

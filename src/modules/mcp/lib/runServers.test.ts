@@ -5,6 +5,7 @@ const fake = vi.hoisted(() => ({
   records: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: fake.invoke }));
+vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "page" }));
 vi.mock("./configStore", () => ({
   loadServers: fake.globals,
   loadProjectRecords: fake.records,
@@ -51,6 +52,7 @@ it("keeps the submitted project while excluding another space's tools", async ()
     runId: scope.runId,
     root: "/a",
     workspace: { kind: "local" },
+    pageGeneration: "page",
   });
   expect(run.offeredIds).toEqual(new Set(["global", a]));
   expect(run.servers.find((s) => s.id === a)?.retainedOnly).toBe(true);
@@ -83,5 +85,6 @@ it("clears the run's project when it ends up with no MCP tools", async () => {
     runId: scope.runId,
     root: null,
     workspace: { kind: "local" },
+    pageGeneration: "page",
   });
 });

@@ -207,6 +207,26 @@ it("an admission that is refused still closes the owner's native record", async 
   expect(ended()).toEqual([owner.runId]);
 });
 
+it("a release failure on a normal completion does not turn the finished reply into an error", async () => {
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  const turn = beginRun("c14", { kind: "turn", admit: async () => {} });
+  invokeMock.mockRejectedValueOnce(new Error("IPC failed"));
+  turn.setupDone();
+  const stream = turn.wrapStream(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue("answer");
+        controller.close();
+      },
+    }),
+  );
+  const reader = stream.getReader();
+  expect((await reader.read()).value).toBe("answer");
+  expect((await reader.read()).done).toBe(true);
+  expect(chatHasRuns("c14")).toBe(true);
+  await closeChatRuns("c14", "stop");
+  expect(chatHasRuns("c14")).toBe(false);
+});
 it("an abandoned accepted owner does not block a retry of the same message", async () => {
   const owner = beginRun("c13", { kind: "prepare" });
   owner.accept("u1");

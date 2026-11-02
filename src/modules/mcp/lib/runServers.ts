@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { networkPage } from "@/lib/networkPage";
 import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { loadServers, loadProjectRecords } from "./configStore";
 import { projectConfigs, type ProjectServers } from "./projectServers";
@@ -16,9 +17,10 @@ async function openProject(
   workspace: WorkspaceEnv,
 ) {
   await scope.ready;
+  const pageGeneration = await networkPage(new AbortController().signal);
   return invoke<{ projectKey: string | null; projects: ProjectServers[] }>(
     "ai_run_mcp_open",
-    { runId: scope.runId, root, workspace },
+    { runId: scope.runId, root, workspace, pageGeneration },
   );
 }
 

@@ -686,7 +686,9 @@ the `F_FULLFSYNC` of the message files, so power loss is not covered. At most 25
 deletion tombstones are kept. Every queued delta carries the `base` revision of
 the snapshot it was built from, fixed when it is enqueued; a creation whose base
 is older than an evicted tombstone is dropped, because it cannot prove it did not
-revive a deleted chat. Failed local metadata transactions retry in order.
+revive a deleted chat (so is one enqueued before the first snapshot arrived, whose base is 0);
+chats listed in a tombstone are filtered out when the list is read, since the page saves the
+same store and can write a newer gate beside an older list. Failed local metadata transactions retry in order.
 A deletion received from another window stops and releases every matching local
 chat, including background chats, and cancels pending message persistence.
 
@@ -810,7 +812,8 @@ cancellation after asynchronous project-memory and skill preparation. Existing s
 MCP servers are not stopped by a rejected run.
 
 Active AI turns retain their submitted project's MCP servers through one native
-run record per turn (`mcp/runs.rs` over `mcp/leases.rs`): `ai_run_begin` admits the
+run record per turn (`mcp/runs.rs` over `mcp/leases.rs`): `ai_run_begin` (which, like `ai_run_mcp_open`, takes the native page
+generation, so a queued call from a reloaded page is refused) admits the
 run past the Stop barrier and inserts its record under the barrier's lock,
 `ai_run_mcp_open` attaches the project (and fails once the run has ended or the page
 reloaded), `ai_run_end` removes it. The page holds one object per turn
@@ -874,10 +877,13 @@ terminal and WASM budgets remain unchanged.
 
 Composer submissions have cancellable preparation (`ai/lib/runOwner.ts`; `composerWork.ts`
 is the facade voice and imports use). The submit-time owner registers with native
-(`ai_run_begin`), is accepted with the id of the user message handed to the chat
-(`accept`, which drops the preparation-scoped watchers once) and is claimed by the
-transport's run for that message id (`claimRun`); a continuation or regenerate never
-takes it, a stopped one is not replaced, and one nothing claims is closed. Stop
+(`ai_run_begin`), is accepted under the id of the user message before `chat.sendMessage`
+(`sendUserMessage` generates the id first, because the SDK runs the transport
+synchronously inside `sendMessage`; `accept` drops the preparation-scoped watchers once)
+and is claimed by the transport's run for that message id (`claimRun`); a continuation or
+regenerate never takes it, a message whose owner Stop closed is not run again under a fresh
+one (only Stop records that; an abandoned owner does not), one nothing claims is closed, and
+a paused approval taken by a continuation that fails before using it is put back. Stop
 cancels preparation synchronously in every owning window; chat, space or environment changes
 cancel it through subscriptions present only while preparation is pending. Returning
 to the old space cannot revive a cancelled submission. Native skill reads may finish,

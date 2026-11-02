@@ -11,7 +11,6 @@ export type CloseReason =
   | "abort"
   | "cancel"
   | "stop"
-  | "deleted"
   | "navigated"
   | "abandoned"
   | "continued";
@@ -181,7 +180,10 @@ class Owner implements RunOwner {
         options.signal?.removeEventListener("abort", aborted);
         this.controller.signal.removeEventListener("abort", aborted);
         this.pause();
-      } else await finish("complete");
+      } else
+        await finish("complete").catch((error) =>
+          console.warn("Run cleanup failed; Stop retries it", error),
+        );
     };
     return new ReadableStream<T>({
       pull: async (controller) => {
@@ -227,13 +229,16 @@ class Owner implements RunOwner {
     if (this.closing) return this.closing;
     if (
       this.phase === "accepted" &&
-      (reason === "stop" || reason === "deleted") &&
+      reason === "stop" &&
       this.chatId &&
       this.userMessageId
     ) {
       const stopped = stoppedMessages.get(this.chatId) ?? [];
       stopped.push(this.userMessageId);
+      stoppedMessages.delete(this.chatId);
       stoppedMessages.set(this.chatId, stopped.slice(-8));
+      if (stoppedMessages.size > 64)
+        stoppedMessages.delete(stoppedMessages.keys().next().value as string);
     }
     this.phase = "closing";
     this.runPrepared();
@@ -306,6 +311,13 @@ export function claimRun(
     }
   }
   return undefined;
+}
+
+/** Puts a paused owner back after the continuation that took it failed before using it. */
+export function restorePaused(owner: RunOwner) {
+  const impl = owner as Owner;
+  if (impl.chatId && impl.phase === "paused" && !paused.has(impl.chatId))
+    paused.set(impl.chatId, impl);
 }
 
 export function takePaused(chatId: string | null): RunOwner | undefined {
