@@ -200,6 +200,21 @@ fn resolve_existing_prefix(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// A `..` after a named component is not a lexical step on disk: when that name is
+/// a link, `..` follows the link's target. Such targets are refused outright.
+fn parent_after_name(written: &Path) -> bool {
+    use std::path::Component;
+    let mut named = false;
+    for component in written.components() {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether a relative target, walked from the link's folder, never rises above the
 /// copied item's root. Judged by depth, never by comparing names: the item may be
 /// published under a conflict name that differs from the one assumed here.
@@ -242,6 +257,9 @@ pub(super) fn nested_link_allowed(
     let written = fs::read_link(source_link)?;
     if written.is_absolute() {
         return Ok(());
+    }
+    if parent_after_name(&written) {
+        return Err(escapes());
     }
     if stays_inside_item(&written, link_dest_dir, item_dest) {
         return Ok(());

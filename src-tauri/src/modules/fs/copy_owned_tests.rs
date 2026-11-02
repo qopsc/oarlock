@@ -635,3 +635,37 @@ fn a_relative_link_cannot_reach_through_an_entry_that_forces_a_conflict_name() {
     assert!(result.failed[0].message.contains("escapes"), "{result:?}");
     assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_relative_link_with_dot_dot_after_a_name_is_refused_because_it_may_follow_a_link() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let (a, b) = (root.join("A"), root.join("B"));
+    fs::create_dir_all(a.join("proj/tree")).unwrap();
+    fs::create_dir(&b).unwrap();
+    let registry = WorkspaceRegistry::default();
+    registry.authorize(&a).unwrap();
+    registry.authorize(&b).unwrap();
+    fs::write(a.join("x"), "inside A").unwrap();
+    fs::write(root.join("x"), "OUTSIDE").unwrap();
+    let tree = a.join("proj/tree");
+    symlink(".", tree.join("sub")).unwrap();
+    symlink("sub/../../x", tree.join("link")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&tree)],
+        &path(&b),
+        &path(&b),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty(), "{result:?}");
+    assert_eq!(result.failed.len(), 1, "{result:?}");
+    assert!(result.failed[0].message.contains("escapes"), "{result:?}");
+    assert_eq!(fs::read_dir(&b).unwrap().count(), 0);
+}
