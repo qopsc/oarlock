@@ -1013,38 +1013,11 @@ mod windows {
             shell_kind,
             integration,
         );
-        let mut entropy = [0u8; 16];
-        getrandom::fill(&mut entropy)
-            .map_err(|e| format!("Cannot create WSL terminal identity: {e}"))?;
-        let token = entropy
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
         let mut cmd = CommandBuilder::new("wsl.exe");
-        // Preserve the exact launch arguments, with a PID-bound environment
-        // marker in the exec'd Linux shell. Descendants cannot be mistaken for
-        // the original shell when preparing a later path drop.
-        let exec = spec
-            .args
-            .iter()
-            .position(|arg| arg == "--exec")
-            .ok_or("Invalid WSL launch")?;
-        for arg in &spec.args[..=exec] {
+        for arg in &spec.args {
             cmd.arg(arg);
         }
-        cmd.args([
-            "/bin/sh",
-            "-c",
-            "OARLOCK_DROP_OWNER=\"$1:$$\"; export OARLOCK_DROP_OWNER; shift; exec \"$@\"",
-            "oarlock-shell",
-            &token,
-        ]);
-        for arg in &spec.args[exec + 1..] {
-            cmd.arg(arg);
-        }
-        cmd.env("OARLOCK_DROP_DISTRO", &distro);
-        cmd.env("OARLOCK_DROP_SHELL", &shell_path);
-        cmd.env("OARLOCK_DROP_TOKEN", &token);
+        cmd.env(super::shell_dialect::WSL_SHELL_VAR, &shell_path);
         super::apply_terminal_identity(&mut cmd);
         // A distro receives only the Windows variables WSLENV names.
         let identity = super::terminal_env::IDENTITY.map(|(key, _)| key);
