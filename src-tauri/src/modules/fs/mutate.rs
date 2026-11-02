@@ -1,6 +1,10 @@
 use super::blocking;
 use super::index::FileIndexState;
-use crate::modules::workspace::{resolve_path, WorkspaceEnv, WorkspaceRegistry};
+use super::mutation_events::{self, Change};
+use crate::modules::project_trust::{self, OwnChange};
+use crate::modules::workspace::{
+    is_plain_name, resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry,
+};
 use serde::Serialize;
 use std::io;
 use std::path::Path;
@@ -50,16 +54,18 @@ fn is_conflict(error: &io::Error) -> bool {
     )
 }
 
+/// The explorer's root a move or batch delete stays under: authorized, or anywhere while the app
+/// may access all folders.
 fn resolve_authorized_root(
     root: &str,
     workspace: &WorkspaceEnv,
     registry: &WorkspaceRegistry,
 ) -> Result<std::path::PathBuf, String> {
-    let resolved = resolve_path(root, workspace);
+    let resolved = resolve_path(root, workspace)?;
     let canonical = registry
         .canonicalize_cached(resolved)
         .map_err(|error| format!("workspace root is not accessible: {error}"))?;
-    if registry.is_authorized(&canonical) {
+    if registry.gates(Origin::App).reaches(&canonical) {
         Ok(canonical)
     } else {
         Err(format!(
@@ -69,10 +75,14 @@ fn resolve_authorized_root(
     }
 }
 
+/// The entry itself (never `..`, never a root) must sit in a folder under `root`.
 fn authorize_mutation_entry(path: &Path, root: &Path) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("not a file or folder: {}", path.display()));
+    };
+    if !is_plain_name(name) {
+        return Err(format!("not a file or folder: {}", path.display()));
+    }
     let canonical = std::fs::canonicalize(parent)
         .map_err(|error| format!("path parent is not accessible: {error}"))?;
     if canonical.starts_with(root) {
@@ -234,6 +244,7 @@ fn remove_path(path: &Path) -> io::Result<()> {
 /// Creates a new empty file. Fails if the file already exists.
 #[tauri::command]
 pub async fn fs_create_file(
+    app: AppHandle,
     index: State<'_, FileIndexState>,
     path: String,
     workspace: Option<WorkspaceEnv>,
@@ -241,22 +252,59 @@ pub async fn fs_create_file(
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = resolve_path(&path, &workspace);
-        create_file(&p)?;
+        let requested = resolve_path(&path, &workspace)?;
+        let registry = app.state::<WorkspaceRegistry>();
+        let gates = registry.gates(Origin::App);
+        let p = gates.authorized_new(&requested)?;
+        super::native_store::refuse_write(&app, &p)?;
+        // Oarlock's own new file in a project's trusted item keeps the user's trust in it.
+        let change = OwnChange::File {
+            target: &p,
+            content: &[],
+        };
+        project_trust::keeping_trust(&app, Origin::App, change, || {
+            create_checked(&p, false, |opened| {
+                let current = gates.authorized_new(&requested)?;
+                super::native_store::refuse_write(&app, &current)?;
+                if current != p || opened != p {
+                    return Err("Creation destination changed during operation".into());
+                }
+                Ok(())
+            })
+        })?;
         note_changed(&index, &p);
         Ok(())
     })
     .await
 }
 
+fn create_checked(
+    p: &Path,
+    directory: bool,
+    validate: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let destination = super::destination::Destination::pin(p, directory, &validate)
+        .map_err(|error| creation_error(p, error))?;
+    let result = if directory {
+        destination.create_dir()
+    } else {
+        destination.create_file()
+    };
+    result.map_err(|error| creation_error(p, error))
+}
+
+#[cfg(test)]
 fn create_file(p: &Path) -> Result<(), String> {
-    if p.exists() {
-        return Err(format!("already exists: {}", p.display()));
+    create_checked(p, false, |_| Ok(()))
+}
+
+fn creation_error(path: &Path, error: io::Error) -> String {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        format!("already exists: {}", path.display())
+    } else {
+        log::debug!("create({}) failed: {error}", path.display());
+        error.to_string()
     }
-    std::fs::write(p, "").map_err(|e| {
-        log::debug!("fs_create_file({}) failed: {e}", p.display());
-        e.to_string()
-    })
 }
 
 /// Creates a new directory. Fails if the directory already exists.
@@ -264,60 +312,104 @@ fn create_file(p: &Path) -> Result<(), String> {
 /// where typing "a/b/c" creates the full chain.
 #[tauri::command]
 pub async fn fs_create_dir(
+    app: AppHandle,
     index: State<'_, FileIndexState>,
     path: String,
     workspace: Option<WorkspaceEnv>,
+    origin: Option<Origin>,
 ) -> Result<(), String> {
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = resolve_path(&path, &workspace);
-        create_dir(&p)?;
+        let requested = resolve_path(&path, &workspace)?;
+        let registry = app.state::<WorkspaceRegistry>();
+        let origin = origin.unwrap_or_default();
+        let gates = registry.gates(origin);
+        let p = gates.authorized_new(&requested)?;
+        super::native_store::refuse_write(&app, &p)?;
+        // Oarlock's own new folder in a project's trusted item keeps the user's trust in it.
+        let change = OwnChange::Folder { target: &p };
+        project_trust::keeping_trust(&app, origin, change, || {
+            create_checked(&p, true, |opened| {
+                let current = gates.authorized_new(&requested)?;
+                super::native_store::refuse_write(&app, &current)?;
+                if current != p || opened != p {
+                    return Err("Creation destination changed during operation".into());
+                }
+                Ok(())
+            })
+        })?;
         note_changed(&index, &p);
         Ok(())
     })
     .await
 }
 
+#[cfg(test)]
 fn create_dir(p: &Path) -> Result<(), String> {
-    if p.exists() {
-        return Err(format!("already exists: {}", p.display()));
-    }
-    std::fs::create_dir_all(p).map_err(|e| {
-        log::debug!("fs_create_dir({}) failed: {e}", p.display());
-        e.to_string()
-    })
+    create_checked(p, true, |_| Ok(()))
 }
 
 /// Renames (or moves) a path. Refuses to overwrite an existing target.
 #[tauri::command]
 pub async fn fs_rename(
+    app: AppHandle,
     index: State<'_, FileIndexState>,
     from: String,
     to: String,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
+    super::require_owned_entry_operation()?;
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let from_p = resolve_path(&from, &workspace);
-        let to_p = resolve_path(&to, &workspace);
-        rename(&from_p, &to_p)?;
-        note_changed(&index, &from_p);
-        note_changed(&index, &to_p);
-        Ok(())
+        mutation_events::transact(&app, workspace.clone(), &[from.clone(), to.clone()], || {
+            let registry = app.state::<WorkspaceRegistry>();
+            let gates = registry.gates(Origin::App);
+            let from_p = gates.authorized_entry(&resolve_path(&from, &workspace)?)?;
+            let to_p = gates.authorized_entry(&resolve_path(&to, &workspace)?)?;
+            super::native_store::refuse_write(&app, &from_p)?;
+            super::native_store::refuse_write(&app, &to_p)?;
+            rename_guarded(&from_p, &to_p, |path| super::native_store::refuse_write(&app, path))?;
+            note_changed(&index, &from_p);
+            note_changed(&index, &to_p);
+            Ok(((), Some(Change::Renamed { from, to })))
+        })
     })
     .await
 }
 
+#[cfg(test)]
 fn rename(from_p: &Path, to_p: &Path) -> Result<(), String> {
-    if !from_p.exists() {
+    rename_guarded(from_p, to_p, |_| Ok(()))
+}
+
+#[cfg(test)]
+fn delete_path(p: &Path) -> Result<(), String> {
+    delete_path_guarded(p, |_| Ok(()))
+}
+
+fn rename_guarded(
+    from_p: &Path,
+    to_p: &Path,
+    guard: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    if metadata_if_exists(from_p)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
         return Err(format!("not found: {}", from_p.display()));
     }
-    if to_p.exists() {
+    if metadata_if_exists(to_p)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
         return Err(format!("already exists: {}", to_p.display()));
     }
-    std::fs::rename(from_p, to_p).map_err(|e| {
+    // The first look ran before these inspections; look again right before acting.
+    guard(from_p)?;
+    guard(to_p)?;
+    rename_no_replace(from_p, to_p).map_err(|e| {
         log::debug!(
             "fs_rename({} -> {}) failed: {e}",
             from_p.display(),
@@ -337,20 +429,34 @@ pub async fn fs_move(
     expected_conflict: Option<String>,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<FsMoveResult, String> {
+    super::require_owned_entry_operation()?;
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let root = resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
-        let moved = fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)?;
-        if moved == FsMoveResult::Moved {
-            let index = app.state::<FileIndexState>();
-            note_changed(&index, &resolve_path(&from, &workspace));
-            note_changed(&index, &resolve_path(&to, &workspace));
-        }
-        Ok(moved)
+        mutation_events::transact(&app, workspace.clone(), &[from.clone(), to.clone()], || {
+            let root =
+                resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
+            let moved = fs_move_checked(
+                &from,
+                &to,
+                &root,
+                expected_conflict.as_deref(),
+                &workspace,
+                |path| super::native_store::refuse_write(&app, path),
+            )?;
+            if moved == FsMoveResult::Moved {
+                let index = app.state::<FileIndexState>();
+                note_changed(&index, &resolve_path(&from, &workspace)?);
+                note_changed(&index, &resolve_path(&to, &workspace)?);
+            }
+            let event = (moved == FsMoveResult::Moved && from != to)
+                .then_some(Change::Renamed { from, to });
+            Ok((moved, event))
+        })
     })
     .await
 }
 
+#[cfg(test)]
 fn fs_move_impl(
     from: &str,
     to: &str,
@@ -358,10 +464,33 @@ fn fs_move_impl(
     expected_conflict: Option<&str>,
     workspace: &WorkspaceEnv,
 ) -> Result<FsMoveResult, String> {
-    let from_p = resolve_path(from, workspace);
-    let to_p = resolve_path(to, workspace);
-    authorize_mutation_entry(&from_p, root)?;
-    authorize_mutation_entry(&to_p, root)?;
+    fs_move_checked(from, to, root, expected_conflict, workspace, |_| Ok(()))
+}
+
+/// The entry named by `path`: its parent resolved and checked against `root`,
+/// its own name left alone (a link is the entry, never followed).
+fn authorized_entry_path(path: &Path, root: &Path) -> Result<std::path::PathBuf, String> {
+    authorize_mutation_entry(path, root)?;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("not a file or folder: {}", path.display()));
+    };
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("path parent is not accessible: {error}"))?;
+    Ok(parent.join(name))
+}
+
+fn fs_move_checked(
+    from: &str,
+    to: &str,
+    root: &Path,
+    expected_conflict: Option<&str>,
+    workspace: &WorkspaceEnv,
+    guard: impl Fn(&Path) -> Result<(), String>,
+) -> Result<FsMoveResult, String> {
+    let from_p = authorized_entry_path(&resolve_path(from, workspace)?, root)?;
+    let to_p = authorized_entry_path(&resolve_path(to, workspace)?, root)?;
+    guard(&from_p)?;
+    guard(&to_p)?;
     if from_p == to_p {
         return Ok(FsMoveResult::Moved);
     }
@@ -376,6 +505,8 @@ fn fs_move_impl(
         if !replaceable || expected_conflict != Some(token.as_str()) {
             return Ok(FsMoveResult::Conflict { replaceable, token });
         }
+        guard(&from_p)?;
+        guard(&to_p)?;
         replace_file(&from_p, &to_p).map_err(|error| {
             log::warn!(
                 "fs_move replace({} -> {}) failed: {error}",
@@ -387,6 +518,8 @@ fn fs_move_impl(
         return Ok(FsMoveResult::Moved);
     }
 
+    guard(&from_p)?;
+    guard(&to_p)?;
     match rename_no_replace(&from_p, &to_p) {
         Ok(()) => Ok(FsMoveResult::Moved),
         Err(error) if is_conflict(&error) => {
@@ -411,22 +544,37 @@ fn fs_move_impl(
 /// responsible for confirming destructive operations with the user.
 #[tauri::command]
 pub async fn fs_delete(
+    app: AppHandle,
     index: State<'_, FileIndexState>,
     path: String,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
+    super::require_owned_entry_operation()?;
     let index = index.inner().clone();
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let p = resolve_path(&path, &workspace);
-        delete_path(&p)?;
-        note_changed(&index, &p);
-        Ok(())
+        mutation_events::transact(&app, workspace.clone(), std::slice::from_ref(&path), || {
+            let p = app
+                .state::<WorkspaceRegistry>()
+                .gates(Origin::App)
+                .authorized_entry(&resolve_path(&path, &workspace)?)?;
+            super::native_store::refuse_write(&app, &p)?;
+            delete_path_guarded(&p, |path| super::native_store::refuse_write(&app, path))?;
+            note_changed(&index, &p);
+            Ok((
+                (),
+                Some(Change::Deleted {
+                    paths: vec![path.clone()],
+                }),
+            ))
+        })
     })
     .await
 }
 
-fn delete_path(p: &Path) -> Result<(), String> {
+fn delete_path_guarded(p: &Path, guard: impl Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+    // The first look ran before the removal was dispatched; look again right before acting.
+    guard(p)?;
     remove_path(p).map_err(|e| {
         log::warn!("fs_delete({}) failed: {e}", p.display());
         e.to_string()
@@ -439,43 +587,70 @@ pub async fn fs_delete_batch(
     paths: Vec<String>,
     root: String,
     workspace: Option<WorkspaceEnv>,
-) -> FsDeleteBatchResult {
+) -> Result<FsDeleteBatchResult, String> {
+    super::require_owned_entry_operation()?;
     let count = paths.len();
-    tauri::async_runtime::spawn_blocking(move || {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
-        let Ok(root) =
-            resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())
-        else {
-            return FsDeleteBatchResult {
-                deleted: Vec::new(),
-                failed: paths.len(),
+        mutation_events::transact(&app, workspace.clone(), &paths.clone(), || {
+            let Ok(root) =
+                resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())
+            else {
+                return Ok((
+                    FsDeleteBatchResult {
+                        deleted: Vec::new(),
+                        failed: paths.len(),
+                    },
+                    None,
+                ));
             };
-        };
-        let result = fs_delete_batch_impl(paths, &root, &workspace);
-        let index = app.state::<FileIndexState>();
-        for deleted in &result.deleted {
-            note_changed(&index, &resolve_path(deleted, &workspace));
-        }
-        result
+            let result = fs_delete_batch_checked(paths, &root, &workspace, |path| {
+                super::native_store::refuse_write(&app, path)
+            });
+            let index = app.state::<FileIndexState>();
+            for deleted in &result.deleted {
+                if let Ok(resolved) = resolve_path(deleted, &workspace) {
+                    note_changed(&index, &resolved);
+                }
+            }
+            let event = (!result.deleted.is_empty()).then(|| Change::Deleted {
+                paths: result.deleted.clone(),
+            });
+            Ok((result, event))
+        })
+        .unwrap_or(FsDeleteBatchResult {
+            deleted: Vec::new(),
+            failed: count,
+        })
     })
     .await
     .unwrap_or(FsDeleteBatchResult {
         deleted: Vec::new(),
         failed: count,
-    })
+    }))
 }
 
-fn fs_delete_batch_impl(
+#[cfg(test)]
+fn fs_delete_batch_impl(paths: Vec<String>, root: &Path, workspace: &WorkspaceEnv) -> FsDeleteBatchResult {
+    fs_delete_batch_checked(paths, root, workspace, |_| Ok(()))
+}
+
+fn fs_delete_batch_checked(
     paths: Vec<String>,
     root: &Path,
     workspace: &WorkspaceEnv,
+    guard: impl Fn(&Path) -> Result<(), String>,
 ) -> FsDeleteBatchResult {
     let mut deleted = Vec::with_capacity(paths.len());
     let mut failed = 0;
     for path in paths {
-        let resolved = resolve_path(&path, workspace);
-        let result = authorize_mutation_entry(&resolved, root)
-            .and_then(|()| remove_path(&resolved).map_err(|error| error.to_string()));
+        let Ok(resolved) = resolve_path(&path, workspace) else {
+            failed += 1;
+            continue;
+        };
+        let result = authorized_entry_path(&resolved, root)
+            .and_then(|entry| guard(&entry).map(|()| entry))
+            .and_then(|entry| remove_path(&entry).map_err(|error| error.to_string()));
         match result {
             Ok(()) => deleted.push(path),
             Err(error) => {
@@ -491,8 +666,103 @@ fn fs_delete_batch_impl(
 mod tests {
     use super::*;
 
+    #[test]
+    fn batch_delete_preserves_an_entry_refused_by_the_store_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let protected = root.join("protected");
+        let ordinary = root.join("ordinary");
+        std::fs::write(&protected, b"protected").unwrap();
+        std::fs::write(&ordinary, b"ordinary").unwrap();
+        let paths = vec![protected.to_string_lossy().into_owned(), ordinary.to_string_lossy().into_owned()];
+        let result = fs_delete_batch_checked(paths, &root, &WorkspaceEnv::default(), |path| {
+            if path == protected { Err("protected".into()) } else { Ok(()) }
+        });
+        assert_eq!(result.failed, 1);
+        assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
+        assert!(!ordinary.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unsupported_environment_batch_delete_never_touches_host_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("keep");
+        std::fs::write(&file, "keep").unwrap();
+        let result = fs_delete_batch_impl(
+            vec![file.to_string_lossy().into()],
+            dir.path(),
+            &WorkspaceEnv::Wsl {
+                distro: "Ubuntu".into(),
+            },
+        );
+        assert_eq!(result.failed, 1);
+        assert!(result.deleted.is_empty());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "keep");
+    }
+
     fn s(p: std::path::PathBuf) -> String {
         p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn rename_and_delete_stop_when_the_guard_refuses_at_the_moment_of_acting() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a");
+        let to = dir.path().join("b");
+        std::fs::write(&from, b"keep").unwrap();
+        let refuse = |_: &Path| Err::<(), String>("protected".into());
+        assert_eq!(rename_guarded(&from, &to, refuse).unwrap_err(), "protected");
+        assert_eq!(delete_path_guarded(&from, refuse).unwrap_err(), "protected");
+        assert_eq!(std::fs::read(&from).unwrap(), b"keep");
+        assert!(!to.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_guards_the_authorized_entries_and_checks_again_before_acting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+        std::fs::write(real.join("file"), b"keep").unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let result = fs_move_checked(
+            &s(root.join("alias/file")),
+            &s(root.join("moved")),
+            &root,
+            None,
+            &WorkspaceEnv::Local,
+            |path| {
+                seen.borrow_mut().push(path.to_path_buf());
+                if path.starts_with(&real) {
+                    Err("protected".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err(), "protected");
+        assert!(seen.borrow().contains(&real.join("file")), "{:?}", seen.borrow());
+        assert_eq!(std::fs::read(real.join("file")).unwrap(), b"keep");
+        assert!(!root.join("moved").exists());
+
+        // A guard that changes its mind after the first look still stops the move.
+        let calls = std::cell::Cell::new(0);
+        let result = fs_move_checked(
+            &s(real.join("file")),
+            &s(root.join("moved")),
+            &root,
+            None,
+            &WorkspaceEnv::Local,
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() > 2 { Err("changed".into()) } else { Ok(()) }
+            },
+        );
+        assert_eq!(result.unwrap_err(), "changed");
+        assert_eq!(std::fs::read(real.join("file")).unwrap(), b"keep");
     }
 
     fn move_path(
@@ -518,6 +788,36 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn swapped_parent_cannot_redirect_new_files_or_nested_folders() {
+        for directory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("workspace");
+            let parent = root.join("folder");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let registry = WorkspaceRegistry::default();
+            registry.authorize(&root).unwrap();
+            let requested = parent.join(if directory { "nested/new" } else { "new" });
+            let gates = registry.gates(Origin::App);
+            let target = gates.authorized_new(&requested).unwrap();
+            std::fs::rename(&parent, root.join("previous")).unwrap();
+            std::os::unix::fs::symlink(&outside, &parent).unwrap();
+            let result = create_checked(&target, directory, |opened| {
+                let current = gates.authorized_new(&requested)?;
+                if current != target || opened != target {
+                    return Err("destination changed".into());
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(root.join("previous")).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn create_file_makes_empty_and_refuses_to_clobber() {
         let dir = tempfile::tempdir().unwrap();
@@ -531,6 +831,51 @@ mod tests {
         let err = create_file(&f).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(std::fs::read(&f).unwrap(), b"data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_refuses_dangling_links_even_when_the_entry_is_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        let link = root.join("new.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let target = registry.gates(Origin::App).authorized_new(&link).unwrap();
+        assert!(create_file(&target).is_err());
+        assert!(!outside.exists());
+        assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+    }
+
+    #[test]
+    fn concurrent_creates_have_only_one_owner() {
+        for folder in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("parent/new");
+            std::fs::create_dir(path.parent().unwrap()).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    let (path, start) = (path.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        if folder {
+                            create_dir(&path)
+                        } else {
+                            create_file(&path)
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        }
     }
 
     #[test]
@@ -565,6 +910,57 @@ mod tests {
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(std::fs::read(&occupied).unwrap(), b"keep");
         assert!(to.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_preserves_dangling_destination_links_and_can_move_dangling_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let missing = dir.path().join("missing");
+        std::fs::write(&from, b"keep source").unwrap();
+        std::os::unix::fs::symlink(&missing, &to).unwrap();
+        assert!(
+            rename(&from, &to).is_err(),
+            "rename replaced a dangling link"
+        );
+        assert_eq!(std::fs::read_link(&to).unwrap(), missing);
+        assert_eq!(std::fs::read(&from).unwrap(), b"keep source");
+        let moved = dir.path().join("moved-link");
+        rename(&to, &moved).unwrap();
+        assert_eq!(std::fs::read_link(&moved).unwrap(), missing);
+    }
+
+    #[test]
+    fn concurrent_renames_never_replace_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("destination");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for id in 0..4 {
+            let source = dir.path().join(format!("source-{id}"));
+            std::fs::write(&source, id.to_string()).unwrap();
+            let (to, start) = (destination.clone(), barrier.clone());
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                (id, source.clone(), rename(&source, &to))
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, _, r)| r.is_ok()).count(), 1);
+        for (id, source, result) in results {
+            if result.is_ok() {
+                assert!(!source.exists());
+                assert_eq!(
+                    std::fs::read_to_string(&destination).unwrap(),
+                    id.to_string()
+                );
+            } else {
+                assert_eq!(std::fs::read_to_string(source).unwrap(), id.to_string());
+            }
+        }
     }
 
     #[test]
@@ -724,6 +1120,21 @@ mod tests {
         assert!(!second.exists());
     }
 
+    #[test]
+    fn batch_delete_never_takes_a_folder_through_dot_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+        let sneaky = vec![s(root.join("sub").join("..")), s(root.clone())];
+
+        let result = fs_delete_batch_impl(sneaky, &root, &WorkspaceEnv::Local);
+
+        assert!(result.deleted.is_empty());
+        assert_eq!(result.failed, 2);
+        assert!(root.join("keep.txt").exists());
+    }
+
     // Deleting a symlink that points at a directory must remove only the link,
     // never recurse through it and wipe the target's contents.
     #[cfg(unix)]
@@ -741,5 +1152,32 @@ mod tests {
         assert!(!link.exists(), "symlink itself should be gone");
         assert!(real.is_dir(), "target dir must survive");
         assert_eq!(std::fs::read(real.join("keep.txt")).unwrap(), b"keep");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn static_symlink_parent_cannot_escape_move_rename_or_batch_delete() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let escaped = root.join("link");
+        symlink(outside.path(), &escaped).unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let local = root.join("local");
+        std::fs::write(&local, "local").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        assert!(registry
+            .gates(Origin::App)
+            .authorized_entry(&escaped.join("victim"))
+            .is_err());
+        assert!(move_path(&root, &escaped.join("victim"), &root.join("moved"), None).is_err());
+        assert!(move_path(&root, &local, &escaped.join("new"), None).is_err());
+        let result =
+            fs_delete_batch_impl(vec![s(escaped.join("victim"))], &root, &WorkspaceEnv::Local);
+        assert_eq!(result.failed, 1);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), "local");
     }
 }

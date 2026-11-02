@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -8,17 +8,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use serde_json::{json, Value};
-use tauri::{Emitter, Manager};
-use terax_control_protocol::{
+use oarlock_control_protocol::{
     ControlDescriptor, ControlRequest, ControlResponse, FrontendRequest, FrontendResponse,
     OpenParams, MAX_MESSAGE_BYTES, METHODS, METHOD_CAPABILITIES, METHOD_IDENTIFY, METHOD_OPEN,
     METHOD_PING, PROTOCOL_VERSION, SERVER_RESPONSE_ID,
 };
+use serde_json::{json, Value};
+use tauri::{Emitter, Manager};
 
-use crate::modules::{fs, workspace};
+use crate::modules::{fs, windows, workspace};
 
-const CONTROL_EVENT: &str = "terax:control-request";
+const CONTROL_EVENT: &str = "oarlock:control-request";
 const FRONTEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(7);
 const MAX_PENDING_REQUESTS: usize = 32;
@@ -26,6 +26,8 @@ const MAX_CONNECTIONS: usize = 32;
 const LISTENER_STACK_BYTES: usize = 256 * 1024;
 const REQUEST_STACK_BYTES: usize = 512 * 1024;
 const STALE_LAUNCHER_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Pane ids handed out at once; the oldest is dropped beyond this.
+const MAX_PANE_IDS: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct RuntimeInfo {
@@ -36,12 +38,113 @@ struct RuntimeInfo {
     launcher_dir: Option<PathBuf>,
 }
 
+/// The pane ids shells see (`OARLOCK_PANE_ID`) are app-wide: every window
+/// numbers its panes from 1, so each id maps back to a window and its pane.
+#[derive(Default)]
+struct PaneIds {
+    last: u32,
+    panes: BTreeMap<u32, (String, u32)>,
+}
+
+impl PaneIds {
+    fn assign(&mut self, window: &str, pane: u32) -> u32 {
+        // A pane whose shell restarts keeps its id.
+        if let Some((&id, _)) = self
+            .panes
+            .iter()
+            .find(|(_, (owner, known))| owner == window && *known == pane)
+        {
+            return id;
+        }
+        loop {
+            self.last = self.last.wrapping_add(1).max(1);
+            if !self.panes.contains_key(&self.last) {
+                break;
+            }
+        }
+        if self.panes.len() >= MAX_PANE_IDS {
+            self.panes.pop_first();
+        }
+        self.panes.insert(self.last, (window.to_owned(), pane));
+        self.last
+    }
+
+    fn resolve(&self, id: u32) -> Option<(&str, u32)> {
+        self.panes
+            .get(&id)
+            .map(|(window, pane)| (window.as_str(), *pane))
+    }
+
+    fn resolve_caller(&self, id: Option<u32>) -> Result<Option<(String, u32)>, &'static str> {
+        match id {
+            None => Ok(None),
+            Some(id) => self.resolve(id).map(|(window, pane)| Some((window.to_owned(), pane)))
+                .ok_or("The calling terminal pane is no longer available"),
+        }
+    }
+
+    fn forget_window(&mut self, window: &str) {
+        self.panes.retain(|_, (owner, _)| owner != window);
+    }
+}
+
+#[derive(Default)]
+struct PendingRequests {
+    last_id: u64,
+    requests: HashMap<String, PendingResponse>,
+}
+struct PendingResponse {
+    window: String,
+    sender: SyncSender<FrontendResponse>,
+}
+impl PendingRequests {
+    fn insert(
+        &mut self,
+        window: &str,
+        sender: SyncSender<FrontendResponse>,
+    ) -> Result<String, &'static str> {
+        if self.requests.len() >= MAX_PENDING_REQUESTS {
+            return Err("too many pending frontend requests");
+        }
+        self.last_id = self
+            .last_id
+            .checked_add(1)
+            .ok_or("control request identifiers exhausted")?;
+        let id = format!("ui-{:016x}", self.last_id);
+        self.requests.insert(
+            id.clone(),
+            PendingResponse {
+                window: window.to_owned(),
+                sender,
+            },
+        );
+        Ok(id)
+    }
+    fn remove(&mut self, id: &str) {
+        self.requests.remove(id);
+    }
+    fn respond(&mut self, id: &str, window: &str, response: FrontendResponse) -> bool {
+        if !self
+            .requests
+            .get(id)
+            .is_some_and(|pending| pending.window == window)
+        {
+            return false;
+        }
+        self.requests
+            .remove(id)
+            .is_some_and(|pending| pending.sender.send(response).is_ok())
+    }
+}
+
 struct ControlCore {
     runtime: OnceLock<RuntimeInfo>,
-    frontend_ready: AtomicBool,
+    /// Windows whose page handles control requests.
+    ready: Mutex<HashSet<String>>,
+    panes: Mutex<PaneIds>,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
-    pending: Mutex<HashMap<String, SyncSender<FrontendResponse>>>,
+    pending: Mutex<PendingRequests>,
 }
 
 #[derive(Clone)]
@@ -51,10 +154,11 @@ impl Default for ControlState {
     fn default() -> Self {
         Self(Arc::new(ControlCore {
             runtime: OnceLock::new(),
-            frontend_ready: AtomicBool::new(false),
+            ready: Mutex::new(HashSet::new()),
+            panes: Mutex::new(PaneIds::default()),
             shutting_down: AtomicBool::new(false),
             active_connections: AtomicUsize::new(0),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingRequests::default()),
         }))
     }
 }
@@ -69,7 +173,9 @@ pub struct ShellControlEnv {
 }
 
 impl ControlState {
-    pub fn shell_env(&self, pane_id: u32) -> Option<ShellControlEnv> {
+    /// The credentials for the shell of `window`'s pane `pane`, under an
+    /// app-wide pane id.
+    pub fn shell_env(&self, window: &str, pane: u32) -> Option<ShellControlEnv> {
         if self.0.shutting_down.load(Ordering::Acquire) {
             return None;
         }
@@ -77,6 +183,12 @@ impl ControlState {
         if self.0.shutting_down.load(Ordering::Acquire) {
             return None;
         }
+        let pane_id = self
+            .0
+            .panes
+            .lock()
+            .expect("control panes poisoned")
+            .assign(window, pane);
         Some(ShellControlEnv {
             address: runtime.address.clone(),
             token: runtime.token.clone(),
@@ -86,9 +198,23 @@ impl ControlState {
         })
     }
 
+    /// A closed window's panes and readiness go.
+    pub fn forget_window(&self, window: &str) {
+        self.0
+            .ready
+            .lock()
+            .expect("control ready poisoned")
+            .remove(window);
+        self.0
+            .panes
+            .lock()
+            .expect("control panes poisoned")
+            .forget_window(window);
+    }
+
     pub fn shutdown(&self) {
         self.0.shutting_down.store(true, Ordering::Release);
-        self.0.frontend_ready.store(false, Ordering::Release);
+        self.0.ready.lock().expect("control ready poisoned").clear();
         if let Some(runtime) = self.0.runtime.get() {
             remove_own_descriptor(&runtime.descriptor_path, &runtime.token);
             if let Some(dir) = &runtime.launcher_dir {
@@ -113,14 +239,14 @@ pub fn start(app: tauri::AppHandle, state: ControlState) -> Result<(), String> {
         .map_err(|error| format!("read local control address: {error}"))?
         .to_string();
     let token = generate_token()?;
-    let descriptor_path = descriptor_path()?;
+    let descriptor_path = descriptor_path(&app.config().identifier)?;
     sweep_stale_launcher_dirs(&descriptor_path);
     let cli_path = find_bundled_cli();
     let launcher_dir = cli_path.as_deref().and_then(|cli_path| {
         match prepare_cli_launcher(&descriptor_path, cli_path) {
             Ok(dir) => Some(dir),
             Err(error) => {
-                log::warn!("could not prepare terax CLI launcher: {error}");
+                log::warn!("could not prepare oarlock CLI launcher: {error}");
                 None
             }
         }
@@ -155,12 +281,12 @@ pub fn start(app: tauri::AppHandle, state: ControlState) -> Result<(), String> {
     }
 
     if cli_path.is_none() {
-        log::warn!("bundled terax-cli executable not found; shell alias disabled");
+        log::warn!("bundled oarlock-cli executable not found; shell alias disabled");
     }
 
     let listener_state = state.clone();
     if let Err(error) = thread::Builder::new()
-        .name("terax-control-listener".into())
+        .name("oarlock-control-listener".into())
         .stack_size(LISTENER_STACK_BYTES)
         .spawn(move || accept_loop(listener, app, listener_state))
     {
@@ -200,7 +326,7 @@ fn accept_loop(listener: TcpListener, app: tauri::AppHandle, state: ControlState
         let app = app.clone();
         let request_state = state.clone();
         if let Err(error) = thread::Builder::new()
-            .name("terax-control-request".into())
+            .name("oarlock-control-request".into())
             .stack_size(REQUEST_STACK_BYTES)
             .spawn(move || {
                 let _guard = ConnectionGuard(request_state.clone());
@@ -436,48 +562,74 @@ fn forward_to_frontend(
     app: &tauri::AppHandle,
     state: &ControlState,
 ) -> ControlResponse {
-    if !state.0.frontend_ready.load(Ordering::Acquire) {
+    // A shell's request goes to its own window, with its pane as that window
+    // knows it; anything else to the window in front.
+    let mut caller = request.caller;
+    let resolved = match state
+            .0
+            .panes
+            .lock()
+            .expect("control panes poisoned")
+            .resolve_caller(caller.pane_id) {
+        Ok(resolved) => resolved,
+        Err(message) => return ControlResponse::failure(request.id, "caller_unavailable", message),
+    };
+    let target = match resolved {
+        Some((window, pane)) => {
+            caller.pane_id = Some(pane);
+            Some(window)
+        }
+        None => {
+            caller.pane_id = None;
+            windows::target_window(app).map(|window| window.label().to_owned())
+        }
+    };
+    let ready = target.filter(|label| {
+        state
+            .0
+            .ready
+            .lock()
+            .expect("control ready poisoned")
+            .contains(label)
+    });
+    let Some(target) = ready else {
         return ControlResponse::failure(
             request.id,
             "frontend_not_ready",
-            "Terax is still restoring its workspace; try again shortly",
+            "Oarlock is still restoring its workspace; try again shortly",
         );
-    }
+    };
 
     let id = request.id.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
+    let frontend_id = match state
+        .0
+        .pending
+        .lock()
+        .expect("control pending poisoned")
+        .insert(&target, sender)
     {
-        let mut pending = state.0.pending.lock().expect("control pending poisoned");
-        if pending.len() >= MAX_PENDING_REQUESTS {
-            return ControlResponse::failure(
-                id,
-                "server_busy",
-                "too many pending frontend requests",
-            );
-        }
-        if pending.contains_key(&id) {
-            return ControlResponse::failure(id, "duplicate_id", "request id is already pending");
-        }
-        pending.insert(id.clone(), sender);
-    }
+        Ok(id) => id,
+        Err(message) => return ControlResponse::failure(id, "server_busy", message),
+    };
 
     let frontend_request = FrontendRequest {
-        id: id.clone(),
+        id: frontend_id.clone(),
         method: request.method,
         params: request.params,
-        caller: request.caller,
+        caller,
     };
-    if let Err(error) = app.emit_to("main", CONTROL_EVENT, frontend_request) {
+    if let Err(error) = app.emit_to(target.as_str(), CONTROL_EVENT, frontend_request) {
         state
             .0
             .pending
             .lock()
             .expect("control pending poisoned")
-            .remove(&id);
+            .remove(&frontend_id);
         return ControlResponse::failure(
             id,
             "frontend_unavailable",
-            format!("could not reach Terax UI: {error}"),
+            format!("could not reach Oarlock UI: {error}"),
         );
     }
 
@@ -487,7 +639,7 @@ fn forward_to_frontend(
         }
         Ok(response) => {
             let error = response.error.unwrap_or_else(|| {
-                terax_control_protocol::ControlError::new(
+                oarlock_control_protocol::ControlError::new(
                     "frontend_error",
                     "frontend request failed",
                 )
@@ -500,35 +652,48 @@ fn forward_to_frontend(
                 .pending
                 .lock()
                 .expect("control pending poisoned")
-                .remove(&id);
-            ControlResponse::failure(id, "frontend_timeout", "Terax UI did not respond in time")
+                .remove(&frontend_id);
+            ControlResponse::failure(id, "frontend_timeout", "Oarlock UI did not respond in time")
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => ControlResponse::failure(
             id,
             "frontend_unavailable",
-            "Terax UI response channel closed",
+            "Oarlock UI response channel closed",
         ),
     }
 }
 
 #[tauri::command]
-pub fn control_frontend_ready(state: tauri::State<'_, ControlState>, ready: bool) {
-    state.0.frontend_ready.store(ready, Ordering::Release);
+pub fn control_frontend_ready(
+    window: tauri::Window,
+    state: tauri::State<'_, ControlState>,
+    ready: bool,
+) {
+    let mut windows = state.0.ready.lock().expect("control ready poisoned");
+    if ready && windows::is_app_window(window.label()) {
+        windows.insert(window.label().to_owned());
+    } else {
+        windows.remove(window.label());
+    }
 }
 
 #[tauri::command]
 pub fn control_respond(
+    window: tauri::Window,
     state: tauri::State<'_, ControlState>,
     request_id: String,
     response: FrontendResponse,
 ) -> bool {
-    let sender = state
+    let delivered = state
         .0
         .pending
         .lock()
         .expect("control pending poisoned")
-        .remove(&request_id);
-    sender.is_some_and(|sender| sender.send(response).is_ok())
+        .respond(&request_id, window.label(), response);
+    if !delivered {
+        log::warn!("Dropped expired, duplicate, unknown or wrong-window control response");
+    }
+    delivered
 }
 
 fn write_response(stream: &mut TcpStream, response: &ControlResponse) -> std::io::Result<()> {
@@ -566,10 +731,10 @@ fn generate_token() -> Result<String, String> {
     Ok(token)
 }
 
-fn descriptor_path() -> Result<PathBuf, String> {
+fn descriptor_path(identifier: &str) -> Result<PathBuf, String> {
     let cache =
         dirs::cache_dir().ok_or_else(|| "could not resolve user cache directory".to_string())?;
-    let dir = cache.join("terax");
+    let dir = cache.join(super::profile::control_directory(identifier));
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("create control directory {}: {error}", dir.display()))?;
     #[cfg(unix)]
@@ -618,9 +783,9 @@ fn remove_own_descriptor(path: &Path, token: &str) {
 
 fn find_bundled_cli() -> Option<PathBuf> {
     let filename = if cfg!(windows) {
-        "terax-cli.exe"
+        "oarlock-cli.exe"
     } else {
-        "terax-cli"
+        "oarlock-cli"
     };
     if let Some(path) = std::env::current_exe()
         .ok()
@@ -634,7 +799,7 @@ fn find_bundled_cli() -> Option<PathBuf> {
         let binaries = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
         let target = option_env!("TAURI_ENV_TARGET_TRIPLE")?;
         let candidate = binaries.join(format!(
-            "terax-cli-{target}{}",
+            "oarlock-cli-{target}{}",
             std::env::consts::EXE_SUFFIX
         ));
         return is_cli_candidate(&candidate).then_some(candidate);
@@ -738,7 +903,11 @@ fn prepare_cli_launcher(descriptor: &Path, cli_path: &Path) -> Result<PathBuf, S
             .map_err(|error| format!("secure CLI bin directory: {error}"))?;
     }
 
-    let launcher = bin_dir.join(if cfg!(windows) { "terax.exe" } else { "terax" });
+    let launcher = bin_dir.join(if cfg!(windows) {
+        "oarlock.exe"
+    } else {
+        "oarlock"
+    });
     if std::fs::symlink_metadata(&launcher).is_ok() {
         std::fs::remove_file(&launcher)
             .map_err(|error| format!("replace stale CLI launcher: {error}"))?;
@@ -757,7 +926,11 @@ fn prepare_cli_launcher(descriptor: &Path, cli_path: &Path) -> Result<PathBuf, S
 }
 
 fn remove_launcher_dir(bin_dir: &Path) {
-    let launcher = bin_dir.join(if cfg!(windows) { "terax.exe" } else { "terax" });
+    let launcher = bin_dir.join(if cfg!(windows) {
+        "oarlock.exe"
+    } else {
+        "oarlock"
+    });
     let _ = std::fs::remove_file(launcher);
     let _ = std::fs::remove_dir(bin_dir);
     if let Some(run_dir) = bin_dir.parent() {
@@ -880,9 +1053,40 @@ mod tests {
                 launcher_dir: None,
             })
             .is_ok());
-        assert!(state.shell_env(7).is_some());
+        assert!(state.shell_env("main", 7).is_some());
         state.shutdown();
-        assert!(state.shell_env(7).is_none());
+        assert!(state.shell_env("main", 7).is_none());
+    }
+
+    #[test]
+    fn shell_pane_ids_are_app_wide_and_map_back_to_their_window() {
+        let mut ids = PaneIds::default();
+        let main = ids.assign("main", 1);
+        let other = ids.assign("w-a", 1);
+        assert_ne!(main, other);
+        assert_eq!(ids.resolve(main), Some(("main", 1)));
+        assert_eq!(ids.resolve(other), Some(("w-a", 1)));
+        assert_eq!(ids.resolve_caller(None), Ok(None));
+        assert_eq!(ids.resolve_caller(Some(main)), Ok(Some(("main".to_string(), 1))));
+        // A restarted shell keeps its pane's id.
+        assert_eq!(ids.assign("w-a", 1), other);
+        ids.forget_window("w-a");
+        assert_eq!(ids.resolve(other), None);
+        assert!(ids.resolve_caller(Some(other)).is_err());
+        assert_eq!(ids.resolve(main), Some(("main", 1)));
+        assert_eq!(ids.resolve(0), None);
+    }
+
+    #[test]
+    fn pane_ids_stay_bounded() {
+        let mut ids = PaneIds::default();
+        for pane in 0..(MAX_PANE_IDS as u32 + 10) {
+            ids.assign("main", pane);
+        }
+        assert_eq!(ids.panes.len(), MAX_PANE_IDS);
+        // The oldest went.
+        assert!(ids.resolve(1).is_none());
+        assert!(ids.resolve(MAX_PANE_IDS as u32 + 10).is_some());
     }
 
     #[test]
@@ -920,15 +1124,19 @@ mod tests {
     fn launcher_exposes_the_public_command() {
         let temp = tempfile::tempdir().expect("temp directory");
         let cli = temp.path().join(if cfg!(windows) {
-            "terax-cli.exe"
+            "oarlock-cli.exe"
         } else {
-            "terax-cli"
+            "oarlock-cli"
         });
         std::fs::write(&cli, b"cli").expect("write fake CLI");
         let descriptor = temp.path().join("control.json");
 
         let bin_dir = prepare_cli_launcher(&descriptor, &cli).expect("prepare launcher");
-        let launcher = bin_dir.join(if cfg!(windows) { "terax.exe" } else { "terax" });
+        let launcher = bin_dir.join(if cfg!(windows) {
+            "oarlock.exe"
+        } else {
+            "oarlock"
+        });
         assert_eq!(std::fs::read(&launcher).expect("read launcher"), b"cli");
 
         remove_launcher_dir(&bin_dir);
@@ -977,5 +1185,64 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+    fn frontend_response(value: &str) -> FrontendResponse {
+        FrontendResponse {
+            ok: true,
+            result: Some(json!(value)),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn late_response_after_timeout_is_dropped() {
+        let mut pending = PendingRequests::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = pending.insert("main", sender).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        pending.remove(&id);
+        assert!(!pending.respond(&id, "main", frontend_response("late")));
+    }
+
+    #[test]
+    fn reused_caller_id_cannot_reuse_a_frontend_reply_slot() {
+        let mut pending = PendingRequests::default();
+        let (first, _) = mpsc::sync_channel(1);
+        let first_id = pending.insert("main", first).unwrap();
+        pending.remove(&first_id);
+        let (second, receiver) = mpsc::sync_channel(1);
+        let second_id = pending.insert("main", second).unwrap();
+        assert_ne!(first_id, second_id);
+        assert!(!pending.respond(&first_id, "main", frontend_response("stale")));
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.respond(&second_id, "main", frontend_response("current")));
+        assert_eq!(receiver.recv().unwrap().result, Some(json!("current")));
+    }
+
+    #[test]
+    fn duplicate_and_wrong_window_replies_are_dropped() {
+        let mut pending = PendingRequests::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = pending.insert("main", sender).unwrap();
+        assert!(!pending.respond(&id, "other", frontend_response("wrong")));
+        assert!(pending.respond(&id, "main", frontend_response("first")));
+        assert!(!pending.respond(&id, "main", frontend_response("duplicate")));
+        assert_eq!(receiver.recv().unwrap().result, Some(json!("first")));
+    }
+
+    #[test]
+    fn request_id_exhaustion_never_wraps() {
+        let mut pending = PendingRequests {
+            last_id: u64::MAX,
+            ..Default::default()
+        };
+        let (sender, _) = mpsc::sync_channel(1);
+        assert_eq!(
+            pending.insert("main", sender).unwrap_err(),
+            "control request identifiers exhausted"
+        );
     }
 }

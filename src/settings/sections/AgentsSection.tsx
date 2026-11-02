@@ -7,9 +7,21 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { AGENT_ICONS } from "@/modules/ai/components/AgentSwitcher";
+import {
+  APPROVAL_MODE_OPTIONS,
+  normalizeApprovalMode,
+} from "@/modules/ai/lib/approvalMode";
 import {
   type Agent,
   type AgentIconId,
@@ -26,7 +38,14 @@ import {
   useSnippetsStore,
 } from "@/modules/ai/store/snippetsStore";
 import { usePreferencesStore } from "@/modules/settings/preferences";
-import { setCustomInstructions } from "@/modules/settings/store";
+import {
+  setAiApprovalMode,
+  setAiStopBackgroundJobs,
+  setAiStopSubagents,
+  setAiAllowUnmanagedJobs,
+  setCustomInstructions,
+  setSelectionAskAi,
+} from "@/modules/settings/store";
 import {
   Add01Icon,
   CheckmarkCircle02Icon,
@@ -37,6 +56,7 @@ import {
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useEffect, useRef, useState } from "react";
 import { SectionHeader } from "../components/SectionHeader";
+import { SettingRow } from "../components/SettingRow";
 
 const ICON_OPTIONS: AgentIconId[] = [
   "coder",
@@ -49,6 +69,11 @@ const ICON_OPTIONS: AgentIconId[] = [
 
 export function AgentsSection() {
   const customInstructions = usePreferencesStore((s) => s.customInstructions);
+  const approvalMode = usePreferencesStore((s) => s.aiApprovalMode);
+  const allowUnmanaged = usePreferencesStore((s) => s.aiAllowUnmanagedJobs);
+  const stopSubagents = usePreferencesStore((s) => s.aiStopSubagents);
+  const stopBackgroundJobs = usePreferencesStore((s) => s.aiStopBackgroundJobs);
+  const selectionAskAi = usePreferencesStore((s) => s.selectionAskAi);
   const customAgents = useAgentsStore((s) => s.customAgents);
   const activeAgentId = useAgentsStore((s) => s.activeId);
   const setActiveAgentId = useAgentsStore((s) => s.setActiveId);
@@ -77,6 +102,78 @@ export function AgentsSection() {
       />
 
       <CustomInstructionsBlock value={customInstructions} />
+
+      <SettingRow
+        title="Allow unmanaged detached commands"
+        description="Off by default: managed jobs require foreground-mode programs. Enable a separate unmanaged launch tool for daemons. Unmanaged commands have no captured logs, Stop control, or job limit, and may outlive Oarlock. Turning this off does not stop existing commands."
+      >
+        <Switch
+          checked={allowUnmanaged}
+          onCheckedChange={(value) => void setAiAllowUnmanagedJobs(value)}
+          aria-label="Allow unmanaged detached commands"
+        />
+      </SettingRow>
+
+      <SettingRow
+        title="Stop background jobs with chat"
+        description="Stop and chat deletion also terminate background jobs launched by that chat. Foreground commands always stop. Off by default so dev servers can keep running."
+      >
+        <Switch
+          checked={stopBackgroundJobs}
+          onCheckedChange={(value) => void setAiStopBackgroundJobs(value)}
+          aria-label="Stop background jobs with chat"
+        />
+      </SettingRow>
+
+      <SettingRow
+        title="Stop subagents with chat"
+        description="Stop and chat deletion also cancel that chat’s subagents. Turn off to let them finish independently. Status and results remain available in Tasks, including after chat deletion. Closing their window interrupts them."
+      >
+        <Switch
+          checked={stopSubagents}
+          onCheckedChange={(value) => void setAiStopSubagents(value)}
+          aria-label="Stop subagents with chat"
+        />
+      </SettingRow>
+
+      <section className="flex flex-col gap-2">
+        <Label>Tool approval</Label>
+        <SettingRow
+          title="New chats start in"
+          description="Change a chat's mode from the composer. Auto-approve runs edits and shell commands without asking; launching or messaging a coding agent always asks, and blocked paths and commands stay blocked."
+        >
+          <Select
+            value={approvalMode}
+            onValueChange={(value) =>
+              void setAiApprovalMode(normalizeApprovalMode(value))
+            }
+          >
+            <SelectTrigger className="h-8 w-44 text-[12px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {APPROVAL_MODE_OPTIONS.map((option) => (
+                <SelectItem key={option.mode} value={option.mode}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingRow>
+      </section>
+
+      <section className="flex flex-col gap-2">
+        <Label>Selections</Label>
+        <SettingRow
+          title="Ask Oarlock on selected text"
+          description="Show an Ask Oarlock button when you select text in a terminal or the editor. The Ask AI about selection shortcut works either way."
+        >
+          <Switch
+            checked={selectionAskAi}
+            onCheckedChange={(v) => void setSelectionAskAi(v)}
+          />
+        </SettingRow>
+      </section>
 
       <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
@@ -395,7 +492,7 @@ function AgentEditorDialog({
               onChange={(e) =>
                 setDraft({ ...draft, instructions: e.target.value })
               }
-              placeholder="Persona & rules. Appended to Terax's core system prompt."
+              placeholder="Persona & rules. Appended to Oarlock's core system prompt."
               className="min-h-40 resize-y text-[12px] leading-relaxed"
             />
           </div>

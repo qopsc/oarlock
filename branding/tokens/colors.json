@@ -1,0 +1,20 @@
+{
+  "brand": {
+    "name": "Oarlock",
+    "version": "1.0"
+  },
+  "colors": {
+    "navy": "#15222F",
+    "silver": "#E9EEF3",
+    "steel": "#C9D6E2",
+    "night": "#0B141D",
+    "white": "#FFFFFF",
+    "black": "#000000"
+  },
+  "typography": {
+    "wordmark": "Satoshi Black (outlined master)",
+    "headings": "Satoshi",
+    "interface": "Inter",
+    "code": "JetBrains Mono"
+  }
+}

@@ -1,3 +1,5 @@
+import { readyKey } from "@/modules/ai/lib/credentialState";
+import { SubagentTasksButton } from "./SubagentTasksButton";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -7,9 +9,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
-import { fmtShortcut, MOD_KEY } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 import { openSettingsWindow } from "@/modules/settings/openSettingsWindow";
+import { useShortcutText } from "@/modules/shortcuts";
 import {
   Add01Icon,
   AiBookIcon,
@@ -56,10 +58,11 @@ import {
   type ModelInfo,
   type ProviderId,
 } from "../config";
-import { ACCEPTED_FILES, useComposer } from "../lib/composer";
+import { useComposer } from "../lib/composer";
 import { toggleFavoriteModel } from "../lib/modelPrefs";
 import { useChatStore } from "../store/chatStore";
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { ReasoningEffortPicker } from "./ReasoningEffortPicker";
 
 const PROVIDER_ICON = {
   openai: ChatGptIcon,
@@ -78,6 +81,7 @@ const PROVIDER_ICON = {
 } as const satisfies Record<ProviderId, typeof ChatGptIcon>;
 
 export function AiOpenButton({ onOpen }: { onOpen: () => void }) {
+  const toggleAi = useShortcutText("ai.toggle");
   return (
     <button
       type="button"
@@ -90,35 +94,24 @@ export function AiOpenButton({ onOpen }: { onOpen: () => void }) {
       title="Open AI agent"
     >
       <span>Open AI agent</span>
-      <Kbd className="h-4 min-w-4 px-1">{fmtShortcut(MOD_KEY, "I")}</Kbd>
+      <Kbd className="h-4 min-w-4 px-1">{toggleAi}</Kbd>
     </button>
   );
 }
 
 export function AiStatusBarControls() {
   const c = useComposer();
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const toggleMini = useChatStore((s) => s.toggleMini);
   const miniOpen = useChatStore((s) => s.mini.open);
   const closePanel = useChatStore((s) => s.closePanel);
+  const toggleAi = useShortcutText("ai.toggle");
+  const miniShortcut = useShortcutText("ai.toggleMini");
 
   return (
     <div className="flex items-center gap-0.5">
-      <input
-        ref={fileInputRef}
-        type="file"
-        multiple
-        accept={ACCEPTED_FILES}
-        className="hidden"
-        onChange={(e) => {
-          void c.addFiles(e.target.files);
-          e.target.value = "";
-        }}
-      />
-
       <IconBtn
         title="Attach file or image"
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => void c.pickFiles()}
         disabled={c.isBusy}
       >
         <HugeiconsIcon icon={Add01Icon} size={13} strokeWidth={2} />
@@ -131,22 +124,28 @@ export function AiStatusBarControls() {
               ? `Voice needs a ${STT_PROVIDER_LABELS[c.voice.sttProvider]} key`
               : c.voice.recording
                 ? "Stop & transcribe"
-                : c.voice.transcribing
-                  ? "Transcribing…"
+                : c.voice.acquiring || c.voice.transcribing
+                  ? "Cancel voice input"
                   : "Voice input"
           }
-          onClick={() =>
-            c.voice.recording ? c.voice.stop() : void c.voice.start()
+          onClick={() => {
+            if (c.voice.recording) c.voice.stop();
+            else if (c.voice.acquiring || c.voice.transcribing)
+              c.voice.cancel();
+            else void c.voice.start();
+          }}
+          disabled={
+            !c.voice.visible ||
+            ((c.isBusy || !c.voice.hasKey) && c.voice.state === "idle")
           }
-          disabled={c.isBusy || c.voice.transcribing || !c.voice.hasKey}
           className={cn(
             c.voice.recording &&
-            "bg-destructive/10 text-destructive hover:bg-destructive/15",
+              "bg-destructive/10 text-destructive hover:bg-destructive/15",
           )}
         >
           {c.voice.recording ? (
-            <span className="size-2 terax-blink rounded-full bg-destructive" />
-          ) : c.voice.transcribing ? (
+            <span className="size-2 oarlock-blink rounded-full bg-destructive" />
+          ) : c.voice.transcribing || c.voice.acquiring ? (
             <Spinner className="size-3" />
           ) : (
             <HugeiconsIcon icon={Mic01Icon} size={13} strokeWidth={1.75} />
@@ -154,7 +153,9 @@ export function AiStatusBarControls() {
         </IconBtn>
       )}
 
+      <SubagentTasksButton />
       <ModelDropdown />
+      <SelectedModelReasoning />
 
       <span className="mx-1 h-8 w-px bg-border" aria-hidden />
       <Button
@@ -165,12 +166,10 @@ export function AiStatusBarControls() {
         aria-label="Close AI panel"
         className="text-[11px] text-foreground/85 px-1"
       >
-        <Kbd className="h-4 gap-px px-2 font-mono text-[11px]">
-          {fmtShortcut(MOD_KEY, "I")}
-        </Kbd>
+        <Kbd className="h-4 gap-px px-2 font-mono text-[11px]">{toggleAi}</Kbd>
       </Button>
       <IconBtn
-        title={`${miniOpen ? "Close" : "Open"} AI chat window (${fmtShortcut("⇧", MOD_KEY, "I")})`}
+        title={`${miniOpen ? "Close" : "Open"} AI chat window (${miniShortcut})`}
         onClick={toggleMini}
       >
         <HugeiconsIcon icon={Message01Icon} size={13} strokeWidth={1.75} />
@@ -205,6 +204,15 @@ export function AiStatusBarControls() {
   );
 }
 
+function SelectedModelReasoning() {
+  const selected = useChatStore((s) => s.selectedModelId);
+  const customEndpoints = usePreferencesStore((s) => s.customEndpoints);
+  const model = isCompatModelId(selected)
+    ? getCompatModelInfo(selected, customEndpoints)
+    : getModel(selected as ModelId);
+  return <ReasoningEffortPicker model={model} />;
+}
+
 type Tab = "all" | "favorites" | "recent";
 
 function ModelDropdown() {
@@ -224,11 +232,11 @@ function ModelDropdown() {
   const currentProviderHasKey = isCompatModelId(selected)
     ? true
     : providerNeedsKey(current.provider)
-      ? !!apiKeys[current.provider]
+      ? !!readyKey(apiKeys[current.provider])
       : true;
 
   const hasKeyFor = (id: ProviderId) =>
-    providerNeedsKey(id) ? !!apiKeys[id] : true;
+    providerNeedsKey(id) ? !!readyKey(apiKeys[id]) : true;
 
   const epModelInfos = useMemo(() => {
     return customEndpoints.map((ep) =>
@@ -247,10 +255,7 @@ function ModelDropdown() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiKeys]);
 
-  const allModels = useMemo(
-    () => [...MODELS, ...epModelInfos],
-    [epModelInfos],
-  );
+  const allModels = useMemo(() => [...MODELS, ...epModelInfos], [epModelInfos]);
 
   const COMPAT_PROVIDER_ID = "__compat__";
 
@@ -371,22 +376,21 @@ function ModelDropdown() {
               active={activeProvider === null}
               onClick={() => setActiveProvider(null)}
             />
-            {[...sortedProviders.configured, ...sortedProviders.unconfigured].map(
-              (p) => (
-                <ProviderPill
-                  key={p.id}
-                  icon={PROVIDER_ICON[p.id]}
-                  title={
-                    hasKeyFor(p.id)
-                      ? p.label
-                      : `${p.label} — not configured`
-                  }
-                  active={activeProvider === p.id}
-                  muted={!hasKeyFor(p.id)}
-                  onClick={() => setActiveProvider(p.id)}
-                />
-              ),
-            )}
+            {[
+              ...sortedProviders.configured,
+              ...sortedProviders.unconfigured,
+            ].map((p) => (
+              <ProviderPill
+                key={p.id}
+                icon={PROVIDER_ICON[p.id]}
+                title={
+                  hasKeyFor(p.id) ? p.label : `${p.label} (not configured)`
+                }
+                active={activeProvider === p.id}
+                muted={!hasKeyFor(p.id)}
+                onClick={() => setActiveProvider(p.id)}
+              />
+            ))}
             {customEndpoints.length > 0 && (
               <ProviderPill
                 icon={PlugIcon}
@@ -428,10 +432,7 @@ function ModelDropdown() {
                   key={m.id}
                   model={m}
                   selected={m.id === selected}
-                  hasKey={
-                    isCompatModelId(m.id) ||
-                    hasKeyFor(m.provider)
-                  }
+                  hasKey={isCompatModelId(m.id) || hasKeyFor(m.provider)}
                   favorite={favoriteIds.includes(m.id)}
                   showProviderIcon={activeProvider === null}
                   onPick={() => {
@@ -524,11 +525,7 @@ function ProviderHeader({ providerId }: { providerId: ProviderId }) {
   if (!p) return null;
   return (
     <div className="flex items-center gap-1.5 px-3 pt-1 pb-1.5 text-[11px] font-medium tracking-tight text-muted-foreground/90">
-      <HugeiconsIcon
-        icon={PROVIDER_ICON[p.id]}
-        size={13}
-        strokeWidth={1.75}
-      />
+      <HugeiconsIcon icon={PROVIDER_ICON[p.id]} size={13} strokeWidth={1.75} />
       <span>{p.label}</span>
     </div>
   );
@@ -643,11 +640,7 @@ function CapabilityBars({ caps }: { caps: ModelCapabilities }) {
     <div className="ml-auto flex items-center gap-1.5">
       <CapBar icon={BrainIcon} value={caps.intelligence} label="Intelligence" />
       <CapBar icon={FlashIcon} value={caps.speed} label="Speed" />
-      <CapBar
-        icon={CoinsDollarIcon}
-        value={caps.cost}
-        label="Affordability"
-      />
+      <CapBar icon={CoinsDollarIcon} value={caps.cost} label="Affordability" />
     </div>
   );
 }
@@ -662,10 +655,7 @@ function CapBar({
   label: string;
 }) {
   return (
-    <span
-      className="flex items-center gap-0.5"
-      title={`${label}: ${value}/5`}
-    >
+    <span className="flex items-center gap-0.5" title={`${label}: ${value}/5`}>
       <HugeiconsIcon
         icon={icon}
         size={10}

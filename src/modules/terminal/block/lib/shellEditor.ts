@@ -1,5 +1,7 @@
 import "@/modules/terminal/block/block.css";
 
+import { IS_MAC } from "@/lib/platform";
+import { toast } from "sonner";
 import { buildTerminalTheme } from "@/styles/terminalTheme";
 import {
   acceptCompletion,
@@ -7,9 +9,7 @@ import {
   type Completion,
   type CompletionContext,
   type CompletionResult,
-  closeCompletion,
   completionStatus,
-  moveCompletionSelection,
   startCompletion,
 } from "@codemirror/autocomplete";
 import {
@@ -36,9 +36,14 @@ import {
 } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
 import { completionIcon } from "./completionIcons";
+import { completionListClaims, completionListKeys } from "./completionKeys";
 import { historyOpen, historyPopover } from "./historyPopover";
 import { inlineSuggestion } from "./inlineSuggest";
-import { pathCompletions } from "./pathComplete";
+import { completionWord } from "./pathComplete";
+import type { CompletionOwner } from "./safePathCompletion";
+import { ownedPathCompletion } from "./ownedPathCompletion";
+import { replaceShellDraft } from "./shellDraftHistory";
+import { shellInputGate, type ShellInputGateOwner } from "./shellInputGate";
 
 const shellLanguage = StreamLanguage.define(shell);
 
@@ -60,8 +65,10 @@ export type ShellEditorOptions = {
   historyList?: (query: string, limit: number) => Promise<string[]>;
   /** Live cwd of the terminal, for path completion in argument position. */
   getCwd?: () => string | null;
+  completionOwner?: () => CompletionOwner | null;
   /** Fires on every edit with the current text (used to gate empty-state UI). */
   onChange?: (text: string) => void;
+  inputGate?: ShellInputGateOwner;
 };
 
 export type ShellEditorHandle = {
@@ -199,8 +206,6 @@ const SHELL_COMMANDS = [
   "open",
 ];
 
-const WORD_RE = /[\w./+-]*/;
-const DOC_WORD_RE = /[A-Za-z_][\w./-]+/g;
 const VALID_FOR = /^[\w./+-]*$/;
 // Command position = start of a command segment: line start, or right after a
 // separator (; & | newline ( { ), so the 2nd command in `a; b` completes too.
@@ -225,54 +230,37 @@ function commandOptions(
   return out;
 }
 
-function docWordOptions(ctx: CompletionContext, current: string): Completion[] {
-  const seen = new Set<string>([current]);
-  const out: Completion[] = [];
-  for (const m of ctx.state.doc.toString().matchAll(DOC_WORD_RE)) {
-    const w = m[0];
-    if (seen.has(w)) continue;
-    seen.add(w);
-    out.push({ label: w, type: "text" });
-    if (out.length >= 50) break;
-  }
-  return out;
-}
-
-const PATH_VALID_FOR = /^[^/]*$/;
-
 function makeCompletionSource(
   getCommands: () => string[],
-  getCwd: () => string | null,
+  getOwner: () => CompletionOwner | null,
 ) {
   return async (ctx: CompletionContext): Promise<CompletionResult | null> => {
     if (historyOpen(ctx.state)) return null;
-    const word = ctx.matchBefore(WORD_RE);
-    if (!word || (word.from === word.to && !ctx.explicit)) return null;
+    const word = ctx.matchBefore(completionWord("posix"));
+    if (!word) return null;
     const line = ctx.state.doc.lineAt(word.from);
     const before = ctx.state.doc.sliceString(line.from, word.from);
     if (SEGMENT_START.test(before)) {
+      if (word.from === word.to && !ctx.explicit) return null;
       return {
         from: word.from,
         options: commandOptions(word.text, getCommands),
         validFor: VALID_FOR,
       };
     }
-    const cwd = getCwd();
-    if (cwd) {
-      const res = await pathCompletions(word.text, cwd);
-      if (res?.options.length) {
-        return {
-          from: word.from + res.fromOffset,
-          options: res.options,
-          validFor: PATH_VALID_FOR,
-        };
-      }
+    const owner = getOwner();
+    if (!owner) {
+      if (ctx.explicit) toast("Path completion is unavailable for this terminal.");
+      return null;
     }
-    return {
-      from: word.from,
-      options: docWordOptions(ctx, word.text),
-      validFor: VALID_FOR,
-    };
+    const result = await ownedPathCompletion(ctx, owner);
+    if (!result && ctx.explicit && !ctx.aborted && owner.active() &&
+        ctx.view?.state.doc === ctx.state.doc && ctx.view.state.selection === ctx.state.selection) {
+      toast("No safe path completion available", {
+        description: "Check the path and use a complete, unambiguous shell argument.",
+      });
+    }
+    return result;
   };
 }
 
@@ -343,21 +331,12 @@ function baseTheme(fontFamily: string, fontSize: number, fontWeight: string) {
   });
 }
 
-// Arrow keys drive the completion popup when it is open; each command returns
-// false when no completion is active, so the keys fall through (e.g. to the
-// history popover / cursor movement).
-const completionNav = Prec.highest(
-  keymap.of([
-    { key: "ArrowDown", run: moveCompletionSelection(true) },
-    { key: "ArrowUp", run: moveCompletionSelection(false) },
-    { key: "Escape", run: closeCompletion },
-  ]),
-);
-
 export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
   const themeComp = new Compartment();
   const highlightComp = new Compartment();
   const editableComp = new Compartment();
+  const historyComp = new Compartment();
+  const inputGate = opts.inputGate ? shellInputGate(opts.inputGate) : null;
 
   const clear = (view: EditorView) =>
     view.dispatch({
@@ -401,7 +380,7 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
   const state = EditorState.create({
     doc: "",
     extensions: [
-      history(),
+      historyComp.of(history()),
       drawSelection({ cursorBlinkRate: 1100 }),
       rectangularSelection(),
       crosshairCursor(),
@@ -414,14 +393,16 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
         override: [
           makeCompletionSource(
             opts.commandNames ?? (() => []),
-            opts.getCwd ?? (() => null),
+            opts.completionOwner ?? (() => null),
           ),
         ],
         icons: false,
         defaultKeymap: false,
         addToOptions: [{ render: (c) => completionIcon(c.type), position: 20 }],
       }),
-      completionNav,
+      completionListKeys,
+      completionListClaims(IS_MAC),
+      ...(inputGate?.extensions ?? []),
       ...(opts.suggest ? inlineSuggestion(opts.suggest) : []),
       ...(opts.historyList ? historyPopover(opts.historyList) : []),
       placeholder(opts.placeholderText ?? "Run a command"),
@@ -457,11 +438,10 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
     view,
     focus: () => view.focus(),
     getValue: () => view.state.doc.toString(),
-    setValue: (text) =>
-      view.dispatch({
-        changes: { from: 0, to: view.state.doc.length, insert: text },
-        selection: { anchor: text.length },
-      }),
+    setValue: (text) => {
+      inputGate?.cancel();
+      replaceShellDraft(view, historyComp, text);
+    },
     clear: () => clear(view),
     setEditable: (editable) =>
       view.dispatch({
@@ -477,6 +457,9 @@ export function createShellEditor(opts: ShellEditorOptions): ShellEditorHandle {
           highlightComp.reconfigure(syntaxHighlighting(highlightStyle())),
         ],
       }),
-    destroy: () => view.destroy(),
+    destroy: () => {
+      inputGate?.cancel();
+      view.destroy();
+    },
   };
 }

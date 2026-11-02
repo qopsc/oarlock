@@ -12,8 +12,14 @@ export type LspPreset = {
   env?: Record<string, string>;
   maxMemoryMb?: number;
   /** Absent for user-defined servers. */
-  install?: { command: string; docsUrl: string };
+  install?: { command: string; docsUrl: string; macOnly?: boolean };
 };
+
+/** Keep platform-specific commands off platforms where they may not work. */
+export function installCommandForPlatform(preset: LspPreset, isMac: boolean): string | null {
+  const install = preset.install;
+  return install && (!install.macOnly || isMac) ? install.command : null;
+}
 
 export const LSP_PRESETS: LspPreset[] = [
   {
@@ -117,6 +123,7 @@ export const LSP_PRESETS: LspPreset[] = [
     ],
     install: {
       command: "brew install llvm",
+      macOnly: true,
       docsUrl: "https://clangd.llvm.org/installation",
     },
   },
@@ -129,6 +136,7 @@ export const LSP_PRESETS: LspPreset[] = [
     rootMarkers: ["build.zig"],
     install: {
       command: "brew install zls",
+      macOnly: true,
       docsUrl: "https://zigtools.org/zls/install/",
     },
   },
@@ -141,6 +149,7 @@ export const LSP_PRESETS: LspPreset[] = [
     rootMarkers: [".luarc.json", ".luarc.jsonc"],
     install: {
       command: "brew install lua-language-server",
+      macOnly: true,
       docsUrl: "https://luals.github.io/#install",
     },
   },
@@ -261,6 +270,7 @@ export const LSP_PRESETS: LspPreset[] = [
     rootMarkers: ["Package.swift"],
     install: {
       command: "xcode-select --install",
+      macOnly: true,
       docsUrl: "https://github.com/swiftlang/sourcekit-lsp",
     },
   },
@@ -275,6 +285,11 @@ function fromCustom(server: LspCustomServer): LspPreset {
     languages: server.languages,
     rootMarkers: server.rootMarkers,
   };
+}
+
+/** Files that mark a project root for this server; a git repository by default. */
+export function rootMarkersOf(preset: LspPreset): string[] {
+  return preset.rootMarkers.length > 0 ? preset.rootMarkers : [".git"];
 }
 
 export function allServers(custom: LspCustomServer[]): LspPreset[] {

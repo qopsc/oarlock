@@ -1,3 +1,4 @@
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -11,6 +12,7 @@ import {
   FileAddIcon,
   Folder01Icon,
   FolderAddIcon,
+  FolderOpenIcon,
   Refresh01Icon,
   Search01Icon,
 } from "@hugeicons/core-free-icons";
@@ -40,9 +42,11 @@ import {
 import { InlineInput } from "./InlineInput";
 import {
   copyToClipboard,
+  REVEAL_LABEL,
   relativePath,
   revealInFinder,
 } from "./lib/contextActions";
+import { openInDefaultApp } from "./lib/openDefault";
 import { FileIcon, FolderIcon } from "./FileIcon";
 import {
   isPasteShortcut,
@@ -51,8 +55,12 @@ import {
   parentDir as parentOf,
 } from "./lib/clipboardPaste";
 import { useWorkspaceEnvStore } from "@/modules/workspace";
+import { PrivacyRefusalNotice, usePrivacyRefusal } from "@/modules/mac-privacy";
 import { COMPACT_CONTENT, COMPACT_ITEM } from "./lib/menuItemClass";
-import { useExplorerDnd } from "./lib/useExplorerDnd";
+import {
+  type ExplorerPathDropTarget,
+  useExplorerDnd,
+} from "./lib/useExplorerDnd";
 import { useExplorerFileDrop } from "./lib/useExplorerFileDrop";
 import { useFileTree } from "./lib/useFileTree";
 import { useGitStatus } from "./lib/useGitStatus";
@@ -60,7 +68,8 @@ import type { GitStatusCode } from "./lib/gitStatusUtils";
 import { useGlobalShortcuts } from "@/modules/shortcuts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { GitStatusSnapshot } from "@/modules/ai/lib/native";
-import type { TerminalPathDropTarget } from "@/modules/terminal";
+import { toast } from "sonner";
+import { confirmedDeletePaths, type DeleteConfirmation } from "./lib/deleteConfirmation";
 
 export type FileExplorerHandle = {
   focus: () => void;
@@ -72,14 +81,14 @@ type Props = {
   rootPath: string | null;
   activeFilePath?: string | null;
   onOpenFile: (path: string, pin?: boolean) => void;
-  onPathRenamed?: (from: string, to: string) => void;
-  onPathsDeleted?: (paths: string[]) => void;
-  canReplacePath?: (path: string) => boolean;
+  canReplacePath?: (path: string, workspace: WorkspaceEnv) => boolean;
   onRevealInTerminal?: (path: string) => void;
   onOpenInSourceControl?: (path: string) => void;
   onOpenGitHistory?: (path: string) => void;
   onAttachToAgent?: (path: string) => void;
-  pathDropTarget?: TerminalPathDropTarget;
+  /** Open Folder: the OS folder picker. */
+  onOpenFolder?: () => void;
+  pathDropTarget?: ExplorerPathDropTarget;
   gitStatus?: GitStatusSnapshot | null;
   /**
    * The explorer is on screen (default true). It stays mounted when the sidebar
@@ -118,6 +127,7 @@ type Row =
       depth: number;
       tone: "muted" | "error";
       message: string;
+      path?: string;
     };
 
 const ROW_HEIGHT = 24;
@@ -197,6 +207,7 @@ function buildRows(
             depth: depth + 1,
             tone: "error",
             message: child.message,
+            path,
           });
         } else if (child?.status === "loaded") {
           walk(path, depth + 1, gitignored);
@@ -215,13 +226,12 @@ export const FileExplorer = memo(
       rootPath,
       activeFilePath,
       onOpenFile,
-      onPathRenamed,
-      onPathsDeleted,
       canReplacePath,
       onRevealInTerminal,
       onOpenInSourceControl,
       onOpenGitHistory,
       onAttachToAgent,
+      onOpenFolder,
       pathDropTarget,
       gitStatus,
       visible = true,
@@ -229,11 +239,14 @@ export const FileExplorer = memo(
     ref,
   ) {
     const tree = useFileTree(rootPath, {
-      onPathRenamed,
-      onPathsDeleted,
       canReplacePath,
       active: visible,
     });
+    const rootNode = rootPath ? tree.nodes[rootPath] : undefined;
+    const rootRefusal = usePrivacyRefusal(
+      rootPath,
+      rootNode?.status === "error" ? rootNode.message : null,
+    );
     const gitDecorations = usePreferencesStore((s) => s.explorerGitDecorations);
     const { lookup: lookupGitStatus } = useGitStatus(
       rootPath,
@@ -253,6 +266,8 @@ export const FileExplorer = memo(
     } | null>(null);
     useLayoutEffect(() => {
       pasteScopeRef.current = { rootPath, workspace };
+      setSelectedPaths(new Set());
+      setAnchorPath(null);
       return () => {
         pasteScopeRef.current = { rootPath: null, workspace };
       };
@@ -293,11 +308,10 @@ export const FileExplorer = memo(
     const rowActions = useMemo<RowActions>(
       () => ({
         toggle: tree.toggle,
-        beginRename: tree.beginRename,
         commitRename: tree.commitRename,
         cancelRename: tree.cancelRename,
       }),
-      [tree.toggle, tree.beginRename, tree.commitRename, tree.cancelRename],
+      [tree.toggle, tree.commitRename, tree.cancelRename],
     );
     const renameInProgress =
       tree.renaming !== null || tree.pendingCreate !== null;
@@ -307,8 +321,30 @@ export const FileExplorer = memo(
       name: string;
       isDir: boolean;
     } | null>(null);
-    const [deleteConfirm, setDeleteConfirm] = useState(false);
+    const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmation | null>(null);
     const [menuIsBatch, setMenuIsBatch] = useState(false);
+    const menuScopeRef = useRef<typeof pasteScopeRef.current | null>(null);
+    const confirmDelete = (
+      event: Event,
+      paths: string[],
+      remove: (paths: string[]) => void,
+    ) => {
+      const scope = pasteScopeRef.current;
+      if (menuScopeRef.current !== scope) {
+        setDeleteConfirm(null);
+        toast.error("Delete cancelled", { description: "The workspace changed. Choose the files again." });
+        return;
+      }
+      if (!deleteConfirm) {
+        event.preventDefault();
+        setDeleteConfirm({ scope, paths });
+        return;
+      }
+      const confirmed = confirmedDeletePaths(deleteConfirm, scope, paths);
+      setDeleteConfirm(null);
+      if (confirmed) remove(confirmed);
+      else toast.error("Delete cancelled", { description: "The selection changed. Choose the files again." });
+    };
     // Bumped on every right-click so the menu content remounts and the popper
     // re-anchors to the new cursor (floating-ui won't reposition on an anchor
     // change alone, only on scroll/resize).
@@ -374,6 +410,7 @@ export const FileExplorer = memo(
       [entryIndexByPath, rows],
     );
     const dnd = useExplorerDnd({
+      workspace,
       rootPath: rootPath ?? "",
       isDir: isDirAt,
       onMove: tree.movePaths,
@@ -531,6 +568,16 @@ export const FileExplorer = memo(
           <div className="text-xs text-muted-foreground">
             No current directory
           </div>
+          {onOpenFolder && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-1 h-7 text-xs"
+              onClick={onOpenFolder}
+            >
+              Open folder…
+            </Button>
+          )}
         </div>
       );
     }
@@ -610,6 +657,12 @@ export const FileExplorer = memo(
           }
           break;
         }
+        case "F2": {
+          if (currentIdx < 0 || selectedPaths.size > 1) return;
+          e.preventDefault();
+          tree.beginRename(entryPaths[currentIdx]);
+          break;
+        }
         case "Enter": {
           if (currentIdx < 0) return;
           e.preventDefault();
@@ -641,7 +694,6 @@ export const FileExplorer = memo(
               isSelected={selectedPaths.has(row.path)}
               isRenaming={row.kind === "rename"}
               isDropTarget={dropTargetDir === row.path}
-              multiSelectActive={selectedPaths.size > 1}
               onOpenFile={onOpenFile}
               onSelectPath={handleEntrySelect}
               gitStatusCode={row.gitStatusCode}
@@ -664,6 +716,7 @@ export const FileExplorer = memo(
               depth={row.depth}
               message={row.message}
               tone={row.tone}
+              path={row.path}
             />
           );
       }
@@ -690,6 +743,18 @@ export const FileExplorer = memo(
             {basename(rootPath)}
           </span>
 
+          {onOpenFolder && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={onOpenFolder}
+              title="Open folder…"
+              aria-label="Open folder"
+            >
+              <HugeiconsIcon icon={FolderOpenIcon} size={13} strokeWidth={2} />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -723,7 +788,7 @@ export const FileExplorer = memo(
             variant="ghost"
             size="icon"
             className="size-6 text-muted-foreground hover:text-foreground"
-            onClick={() => tree.refresh(rootPath)}
+            onClick={() => void tree.refreshAll()}
             title="Refresh"
           >
             <HugeiconsIcon icon={Refresh01Icon} size={12} strokeWidth={2} />
@@ -746,7 +811,7 @@ export const FileExplorer = memo(
         {!isSearchActive ? (
           <ContextMenu
             onOpenChange={(open) => {
-              if (!open) setDeleteConfirm(false);
+              if (!open) setDeleteConfirm(null);
             }}
           >
             <ContextMenuTrigger asChild>
@@ -761,6 +826,7 @@ export const FileExplorer = memo(
                 onPointerDown={dnd.onPointerDown}
                 onClickCapture={dnd.onClickCapture}
                 onContextMenuCapture={(e) => {
+                  menuScopeRef.current = pasteScopeRef.current;
                   const el = (e.target as HTMLElement).closest<HTMLElement>(
                     "[data-fs-path]",
                   );
@@ -782,7 +848,7 @@ export const FileExplorer = memo(
                     setMenuIsBatch(false);
                     setMenuTarget(null);
                   }
-                  setDeleteConfirm(false);
+                  setDeleteConfirm(null);
                   setMenuNonce((n) => n + 1);
                 }}
               >
@@ -818,11 +884,17 @@ export const FileExplorer = memo(
                     Loading…
                   </div>
                 )}
-                {root?.status === "error" && (
-                  <div className="px-3 py-2 text-[11px] text-destructive">
-                    {root.message}
-                  </div>
-                )}
+                {root?.status === "error" &&
+                  (rootRefusal ? (
+                    <PrivacyRefusalNotice
+                      refusal={rootRefusal}
+                      className="px-3 py-3"
+                    />
+                  ) : (
+                    <div className="px-3 py-2 text-[11px] text-destructive">
+                      {root.message}
+                    </div>
+                  ))}
                 {root?.status === "loaded" ? (
                   <div
                     style={{
@@ -867,14 +939,9 @@ export const FileExplorer = memo(
                   className={COMPACT_ITEM}
                   variant="destructive"
                   onSelect={(e) => {
-                    if (deleteConfirm) {
-                      void tree.deletePaths([...selectedPathsRef.current]);
-                    } else {
-                      // Keep the menu open on the first click so the user
-                      // can confirm; let it close normally on the second.
-                      e.preventDefault();
-                      setDeleteConfirm(true);
-                    }
+                    confirmDelete(e, [...selectedPathsRef.current], (paths) => {
+                      void tree.deletePaths(paths);
+                    });
                   }}
                 >
                   {deleteConfirm
@@ -889,6 +956,14 @@ export const FileExplorer = memo(
                       onSelect={() => onOpenFile(menuTarget.path, true)}
                     >
                       Open
+                    </ContextMenuItem>
+                  )}
+                  {!menuTarget.isDir && (
+                    <ContextMenuItem
+                      className={COMPACT_ITEM}
+                      onSelect={() => void openInDefaultApp(menuTarget.path)}
+                    >
+                      Open in Default App
                     </ContextMenuItem>
                   )}
                   {menuTarget.isDir && onRevealInTerminal && (
@@ -919,7 +994,7 @@ export const FileExplorer = memo(
                     className={COMPACT_ITEM}
                     onSelect={() => void revealInFinder(menuTarget.path)}
                   >
-                    Reveal in Finder
+                    {REVEAL_LABEL}
                   </ContextMenuItem>
                   <ContextMenuSeparator />
                   <ContextMenuItem
@@ -988,16 +1063,18 @@ export const FileExplorer = memo(
                   <ContextMenuSeparator />
                   <ContextMenuItem
                     className={COMPACT_ITEM}
+                    onSelect={() => tree.beginRename(menuTarget.path)}
+                  >
+                    Rename
+                    <ContextMenuShortcut>F2</ContextMenuShortcut>
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    className={COMPACT_ITEM}
                     variant="destructive"
                     onSelect={(e) => {
-                      if (deleteConfirm) {
-                        void tree.deletePath(menuTarget.path);
-                      } else {
-                        // Keep the menu open on the first click so the user
-                        // can confirm; let it close normally on the second.
-                        e.preventDefault();
-                        setDeleteConfirm(true);
-                      }
+                      confirmDelete(e, [menuTarget.path], (paths) => {
+                        void tree.deletePath(paths[0]);
+                      });
                     }}
                   >
                     {deleteConfirm ? "Click again to confirm" : "Delete"}
@@ -1033,7 +1110,7 @@ export const FileExplorer = memo(
                     className={COMPACT_ITEM}
                     onSelect={() => void revealInFinder(rootPath)}
                   >
-                    Reveal in Finder
+                    {REVEAL_LABEL}
                   </ContextMenuItem>
                   <ContextMenuSeparator />
                   <ContextMenuItem
@@ -1064,7 +1141,7 @@ export const FileExplorer = memo(
                   </ContextMenuItem>
                   <ContextMenuItem
                     className={COMPACT_ITEM}
-                    onSelect={() => tree.refresh(rootPath)}
+                    onSelect={() => void tree.refreshAll()}
                   >
                     Refresh
                   </ContextMenuItem>

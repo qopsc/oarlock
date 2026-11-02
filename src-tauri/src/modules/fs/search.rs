@@ -3,12 +3,12 @@ use std::path::Path;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use super::index::{FileIndexState, IndexKey, Packed};
 use super::supersede::Supersede;
-use super::{blocking, display_path};
-use crate::modules::workspace::{resolve_path, WorkspaceEnv};
+use super::{authorized_root, blocking, display_path, privacy_refused_root};
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv};
 
 #[derive(Serialize, Clone)]
 pub struct SearchHit {
@@ -57,6 +57,8 @@ const MAX_SEARCH_LIMIT: usize = 1000;
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn fs_search(
+    app: AppHandle,
+    window: tauri::Window,
     index: State<'_, FileIndexState>,
     supersede: State<'_, Supersede>,
     root: String,
@@ -66,9 +68,16 @@ pub async fn fs_search(
     show_hidden: Option<bool>,
     request_key: Option<String>,
 ) -> Result<SearchResult, String> {
-    let ticket = request_key.as_deref().map(|key| supersede.begin(key));
+    let ticket = request_key
+        .as_deref()
+        .map(|key| supersede.begin_window(window.label(), key));
+    if ticket.as_ref().is_some_and(|ticket| !ticket.is_admitted()) {
+        return Err("Too many searches are active. Retry when one finishes.".into());
+    }
     let index = index.inner().clone();
     blocking(move || {
+        authorized_root(&app, &root, workspace.as_ref(), Origin::App)?;
+        privacy_refused_root(&root)?;
         let cancelled = || ticket.as_ref().is_some_and(|t| t.is_superseded());
         run_search(
             &index,
@@ -98,7 +107,7 @@ pub fn run_search(
     }
     let cap = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).min(MAX_SEARCH_LIMIT);
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -176,6 +185,7 @@ pub struct ListFilesResult {
 
 #[tauri::command]
 pub async fn fs_list_files(
+    app: AppHandle,
     index: State<'_, FileIndexState>,
     root: String,
     limit: Option<usize>,
@@ -184,7 +194,11 @@ pub async fn fs_list_files(
     show_hidden: Option<bool>,
 ) -> Result<ListFilesResult, String> {
     let index = index.inner().clone();
-    blocking(move || run_list_files(&index, root, limit, max_depth, workspace, show_hidden)).await
+    blocking(move || {
+        authorized_root(&app, &root, workspace.as_ref(), Origin::App)?;
+        run_list_files(&index, root, limit, max_depth, workspace, show_hidden)
+    })
+    .await
 }
 
 pub fn run_list_files(
@@ -203,7 +217,7 @@ pub fn run_list_files(
     let cap = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
     let depth = max_depth.unwrap_or(DEFAULT_DEPTH).clamp(1, HARD_DEPTH);
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }

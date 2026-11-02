@@ -1,0 +1,284 @@
+import type { ToolExecutionOptions } from "ai";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ToolContext } from "./context";
+
+type Managed = {
+  leafId: number;
+  phase: string;
+  rounds: number;
+  maxRounds: number;
+};
+
+const storeMock = vi.hoisted(() => ({
+  getBySessionId: vi.fn(),
+  remove: vi.fn(),
+  bumpRound: vi.fn(),
+  get: vi.fn(),
+}));
+
+const terminalMock = vi.hoisted(() => ({
+  writeToSession: vi.fn((_leaf: number, _text: string) => true),
+  capture: vi.fn(),
+  active: true,
+}));
+const foreground = vi.hoisted(() => ({ running: [true] as (boolean | null)[], calls: 0 }));
+
+vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
+  useManagedAgentsStore: {
+    getState: () => ({
+      getBySessionId: storeMock.getBySessionId,
+      remove: storeMock.remove,
+      bumpRound: storeMock.bumpRound,
+      get: storeMock.get,
+    }),
+  },
+}));
+
+vi.mock("@/modules/terminal", () => ({
+  captureGhosttyInputOwner: terminalMock.capture,
+  // leafShellAtPrompt: false means a foreground job owns the terminal; null is unknown.
+  leafShellAtPrompt: async () => {
+    const index = Math.min(foreground.calls++, foreground.running.length - 1);
+    const value = foreground.running[index];
+    return value === null ? null : !value;
+  },
+}));
+
+import { buildManagedAgentTools } from "./agent";
+
+const toolOptions: ToolExecutionOptions<Record<string, unknown>> = {
+  toolCallId: "tool-call",
+  messages: [],
+  context: {},
+};
+
+type Ctx = {
+  sessionId?: string | null;
+  spawnAgent?: (prompt: string) => { tabId: number } | null;
+  readAgentOutput?: (leafId: number) => string | null;
+};
+
+function makeContext(over: Ctx = {}): ToolContext {
+  return {
+    getCwd: () => "/workspace",
+    getWorkspaceRoot: () => "/workspace",
+    getTerminalContext: () => null,
+    isActiveTerminalPrivate: () => false,
+    injectIntoActivePty: () => false,
+    openPreview: () => false,
+    spawnAgent: over.spawnAgent ?? (() => ({ tabId: 42 })),
+    readAgentOutput: over.readAgentOutput ?? (() => null),
+    readCache: new Map(),
+    getSessionId: () =>
+      over.sessionId === undefined ? "session" : over.sessionId,
+  } as unknown as ToolContext;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: tool results are heterogeneous.
+type Result = Record<string, any>;
+
+async function run(
+  toolName: "spawn_coding_agent" | "send_to_agent" | "read_agent_output",
+  ctx: ToolContext,
+  input: Record<string, unknown>,
+): Promise<Result> {
+  const execute = buildManagedAgentTools(ctx)[toolName].execute;
+  if (!execute) throw new Error(`${toolName} has no execute`);
+  return (await execute(input as never, toolOptions)) as unknown as Result;
+}
+
+const AGENT: Managed = {
+  leafId: 3,
+  phase: "working",
+  rounds: 1,
+  maxRounds: 20,
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  storeMock.getBySessionId.mockReturnValue(undefined);
+  terminalMock.writeToSession.mockReturnValue(true);
+  terminalMock.capture.mockImplementation((leafId: number) => ({
+    write: (text: string) => terminalMock.writeToSession(leafId, text),
+    active: () => terminalMock.active,
+    writeDelivered: async (text: string) => terminalMock.writeToSession(leafId, text),
+  }));
+  terminalMock.active = true;
+  foreground.running = [true];
+  foreground.calls = 0;
+});
+
+describe("spawn_coding_agent", () => {
+  it("errors when there is no active chat session", async () => {
+    const r = await run(
+      "spawn_coding_agent",
+      makeContext({ sessionId: null }),
+      {
+        prompt: "do it",
+      },
+    );
+    expect(r.error).toContain("no active chat session");
+  });
+
+  it("refuses to spawn a second agent in the same session", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const r = await run("spawn_coding_agent", makeContext(), {
+      prompt: "do it",
+    });
+    expect(r.error).toContain("already active");
+  });
+
+  it("spawns and returns the tab id", async () => {
+    const spawnAgent = vi.fn(() => ({ tabId: 42 }));
+    const r = await run("spawn_coding_agent", makeContext({ spawnAgent }), {
+      prompt: "do it",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.tab_id).toBe(42);
+    expect(spawnAgent).toHaveBeenCalledWith("do it");
+  });
+
+  it("reports when the spawn fails", async () => {
+    const r = await run(
+      "spawn_coding_agent",
+      makeContext({ spawnAgent: () => null }),
+      { prompt: "do it" },
+    );
+    expect(r.error).toContain("could not spawn");
+  });
+});
+
+describe("send_to_agent", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+  });
+
+  it("errors when no agent is active", async () => {
+    const r = await run("send_to_agent", makeContext(), {
+      instruction: "fix it",
+    });
+    expect(r.error).toContain("no Claude Code agent is active");
+  });
+
+  it("collapses the instruction to one line, writes it and submits after the delay", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    storeMock.get.mockReturnValue({ ...AGENT, rounds: 2 });
+    const pending = run("send_to_agent", makeContext(), {
+      instruction: "line one\n  line two",
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBe(true);
+    expect(r.sent).toBe("line one line two");
+    expect(terminalMock.writeToSession).toHaveBeenNthCalledWith(1, 3, "line one line two");
+    expect(terminalMock.writeToSession).toHaveBeenNthCalledWith(2, 3, "\r");
+    expect(terminalMock.capture).toHaveBeenCalledTimes(1);
+    expect(storeMock.bumpRound).toHaveBeenCalledWith(3);
+  });
+
+  it("reports failure instead of ok when the terminal changes before Enter", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(10);
+    terminalMock.active = false;
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain("not submitted");
+    expect(terminalMock.writeToSession).toHaveBeenCalledTimes(1);
+    expect(storeMock.bumpRound).not.toHaveBeenCalled();
+  });
+
+  it("refuses to type when the shell is at its prompt, whatever the agent record says", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    foreground.running = [false];
+    const r = await run("send_to_agent", makeContext(), { instruction: "fix it" });
+    expect(r.error).toContain("not running");
+    expect(terminalMock.capture).not.toHaveBeenCalled();
+    expect(terminalMock.writeToSession).not.toHaveBeenCalled();
+  });
+
+  it("does not press Enter when the agent exited while the instruction was typed", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    foreground.running = [true, false];
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain("typed but not submitted");
+    expect(r.error).not.toContain("resend");
+    expect(terminalMock.writeToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a lookup that cannot be told as not running", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    foreground.running = [null];
+    const r = await run("send_to_agent", makeContext(), { instruction: "fix it" });
+    expect(r.error).toContain("not running");
+    expect(terminalMock.writeToSession).not.toHaveBeenCalled();
+  });
+
+  it("types into an agent whose shell has no integration record", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(200);
+    expect((await pending).ok).toBe(true);
+  });
+
+  it("reports failure when the Enter is cancelled before delivery", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    terminalMock.capture.mockImplementation((leafId: number) => ({
+      write: (text: string) => terminalMock.writeToSession(leafId, text),
+      active: () => true,
+      writeDelivered: async () => false,
+    }));
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain("not submitted");
+  });
+
+  it("rejects an instruction with control characters", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const r = await run("send_to_agent", makeContext(), {
+      instruction: "bad\x07bell",
+    });
+    expect(r.error).toContain("control characters");
+    expect(terminalMock.writeToSession).not.toHaveBeenCalled();
+  });
+
+  it("removes the agent when its terminal is gone", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    terminalMock.writeToSession.mockReturnValue(false);
+    const r = await run("send_to_agent", makeContext(), {
+      instruction: "fix it",
+    });
+    expect(r.error).toContain("no longer available");
+    expect(storeMock.remove).toHaveBeenCalledWith(3);
+  });
+});
+
+describe("read_agent_output", () => {
+  it("reports inactive when no agent is in the session", async () => {
+    const r = await run("read_agent_output", makeContext(), {});
+    expect(r).toEqual({ active: false });
+  });
+
+  it("returns the agent status and tail of output", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const readAgentOutput = vi.fn(() => "l1\nl2\nl3");
+    const r = await run("read_agent_output", makeContext({ readAgentOutput }), {
+      lines: 2,
+    });
+    expect(r.active).toBe(true);
+    expect(r.phase).toBe("working");
+    expect(r.rounds).toBe(1);
+    expect(r.output).toBe("l2\nl3");
+    expect(readAgentOutput).toHaveBeenCalledWith(3);
+  });
+});

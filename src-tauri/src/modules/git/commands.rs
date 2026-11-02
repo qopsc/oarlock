@@ -1,10 +1,11 @@
 use tauri::{AppHandle, Manager};
 
-use crate::modules::git::operations;
 use crate::modules::git::types::{
-    DiscardEntry, GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult,
-    GitDiffResult, GitLogEntry, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
+    DiscardEntry, GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
+    GitLogEntry, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
+    GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeRemoveResult,
 };
+use crate::modules::git::{operations, worktree};
 use crate::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
 
 async fn blocking<F, T>(app: AppHandle, f: F) -> Result<T, String>
@@ -34,6 +35,19 @@ pub async fn git_resolve_repo(
 }
 
 #[tauri::command]
+pub async fn git_discover_repos(
+    path: String,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<Vec<String>, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    blocking(app, move |r| {
+        operations::discover_repos(r, &path, &workspace).map_err(Into::into)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn git_panel_snapshot(
     cwd: String,
     workspace: Option<WorkspaceEnv>,
@@ -55,6 +69,19 @@ pub async fn git_status(
     let workspace = WorkspaceEnv::from_option(workspace);
     blocking(app, move |r| {
         operations::status(r, &repo_root, &workspace).map_err(Into::into)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn git_ai_staged_diff(
+    repo_root: String,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<super::ai_diff::AiStagedDiff, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    blocking(app, move |r| {
+        super::ai_diff::staged_diff(r, &repo_root, &workspace).map_err(Into::into)
     })
     .await
 }
@@ -99,6 +126,19 @@ pub async fn git_diff_content(
 }
 
 #[tauri::command]
+pub async fn git_file_base(
+    path: String,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    blocking(app, move |r| {
+        operations::file_base(r, &path, &workspace).map_err(Into::into)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn git_stage(
     repo_root: String,
     paths: Vec<String>,
@@ -128,16 +168,15 @@ pub async fn git_unstage(
 
 #[tauri::command]
 pub async fn git_discard(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
     repo_root: String,
     entries: Vec<DiscardEntry>,
+    roots: Vec<String>,
     workspace: Option<WorkspaceEnv>,
-    app: AppHandle,
 ) -> Result<(), String> {
     let workspace = WorkspaceEnv::from_option(workspace);
-    blocking(app, move |r| {
-        operations::discard(r, &repo_root, &entries, &workspace).map_err(Into::into)
-    })
-    .await
+    super::discard::execute(app, window.label().into(), repo_root, entries, workspace, roots).await
 }
 
 #[tauri::command]
@@ -150,6 +189,36 @@ pub async fn git_commit(
     let workspace = WorkspaceEnv::from_option(workspace);
     blocking(app, move |r| {
         operations::commit(r, &repo_root, &message, &workspace).map_err(Into::into)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn git_undo_commit(
+    repo_root: String,
+    expected_head: String,
+    expected_branch: String,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    blocking(app, move |r| {
+        operations::undo_last_commit(r, &repo_root, &expected_head, &expected_branch, &workspace)
+            .map_err(Into::into)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn git_commit_on_remote(
+    repo_root: String,
+    sha: String,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    blocking(app, move |r| {
+        operations::commit_on_remote(r, &repo_root, &sha, &workspace).map_err(Into::into)
     })
     .await
 }
@@ -174,7 +243,10 @@ pub async fn git_pull_ff_only(
     app: AppHandle,
 ) -> Result<(), String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
+        let root = crate::modules::workspace::resolve_path(&repo_root, &workspace)?;
+        crate::modules::fs::native_store::refuse_write(&owner, &root)?;
         operations::pull_ff_only(r, &repo_root, &workspace).map_err(Into::into)
     })
     .await
@@ -197,7 +269,8 @@ pub async fn git_push(
 pub async fn git_log(
     repo_root: String,
     limit: Option<u32>,
-    before_sha: Option<String>,
+    skip: Option<u32>,
+    anchor_sha: Option<String>,
     workspace: Option<WorkspaceEnv>,
     app: AppHandle,
 ) -> Result<Vec<GitLogEntry>, String> {
@@ -207,7 +280,8 @@ pub async fn git_log(
             r,
             &repo_root,
             limit.unwrap_or(30),
-            before_sha.as_deref(),
+            skip.unwrap_or(0),
+            anchor_sha.as_deref(),
             &workspace,
         )
         .map_err(Into::into)
@@ -303,8 +377,75 @@ pub async fn git_checkout_branch(
     app: AppHandle,
 ) -> Result<(), String> {
     let workspace = WorkspaceEnv::from_option(workspace);
+    let owner = app.clone();
     blocking(app, move |r| {
+        let root = crate::modules::workspace::resolve_path(&repo_root, &workspace)?;
+        crate::modules::fs::native_store::refuse_write(&owner, &root)?;
         operations::checkout_branch(r, &repo_root, &branch, &workspace).map_err(Into::into)
     })
     .await
+}
+
+/// Adds a worktree (`path` defaults to `<repository folder>-<branch>` beside the repository)
+/// and authorizes its folder.
+#[tauri::command]
+pub async fn git_worktree_add(
+    repo_root: String,
+    branch: GitWorktreeBranch,
+    path: Option<String>,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<GitWorktreeAddResult, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
+    blocking(app, move |r| {
+        worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,
+            &super::utils::store_guard(&dirs)).map_err(Into::into)
+    })
+    .await
+}
+
+/// Removes a linked worktree; one with changes only when `force` is set.
+#[tauri::command]
+pub async fn git_worktree_remove(
+    repo_root: String,
+    path: String,
+    force: bool,
+    workspace: Option<WorkspaceEnv>,
+    app: AppHandle,
+) -> Result<GitWorktreeRemoveResult, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
+    blocking(app, move |r| {
+        worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,
+            &super::utils::store_guard(&dirs)).map_err(Into::into)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    /// Defense in depth: the guard's behavior is tested with the real check in
+    /// `worktree.rs` and `discard.rs`, but only these call sites hand it over.
+    fn production(source: &str) -> &str {
+        &source[..source.find("#[cfg(test)]").unwrap()]
+    }
+
+    #[test]
+    fn every_work_tree_changing_command_passes_the_native_store_guard() {
+        let commands = production(include_str!("commands.rs"));
+        let discard = production(include_str!("discard.rs"));
+        for (source, call) in [
+            (commands, "worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,\n            &super::utils::store_guard(&dirs))"),
+            (commands, "worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,\n            &super::utils::store_guard(&dirs))"),
+            (commands, "crate::modules::fs::native_store::refuse_write(&owner, &root)?;\n        operations::checkout_branch("),
+            (discard, "let guard = super::utils::store_guard(&dirs);\n                work.execute(&app.state::<WorkspaceRegistry>(), &guard)"),
+        ] {
+            let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                squash(source).contains(&squash(call)),
+                "missing the native-store guard: {call}"
+            );
+        }
+    }
 }

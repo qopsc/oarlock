@@ -6,6 +6,8 @@ describe("displayAgent", () => {
     expect(displayAgent("claude")).toBe("Claude Code");
     expect(displayAgent("codex")).toBe("Codex");
     expect(displayAgent("pi")).toBe("Pi");
+    expect(displayAgent("antigravity")).toBe("Antigravity");
+    expect(displayAgent("gjc")).toBe("GJC");
   });
 
   it("looks the label up case-insensitively", () => {
@@ -19,5 +21,11 @@ describe("displayAgent", () => {
 
   it("falls back to 'Agent' for an empty id", () => {
     expect(displayAgent("")).toBe("Agent");
+  });
+
+  it("treats inherited object names as ordinary agent labels", () => {
+    expect(displayAgent("__proto__")).toBe("__proto__");
+    expect(displayAgent("constructor")).toBe("Constructor");
+    expect(displayAgent("hasOwnProperty")).toBe("HasOwnProperty");
   });
 });

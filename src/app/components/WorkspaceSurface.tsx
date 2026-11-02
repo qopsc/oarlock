@@ -1,4 +1,9 @@
-import type { ComponentProps } from "react";
+import { useMemo, type ComponentProps } from "react";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import {
+  availableWorkspaceTabs,
+  workspaceUnavailableReason,
+} from "@/modules/workspace/availability";
 import { cn } from "@/lib/utils";
 import { AiDiffStack, EditorStack, GitDiffStack } from "@/modules/editor";
 import { GitHistoryStack } from "@/modules/git-history";
@@ -23,7 +28,9 @@ type Props = {
   onExit: TerminalStackProps["onExit"];
   onFocusLeaf: TerminalStackProps["onFocusLeaf"];
   registerEditorHandle: EditorStackProps["registerHandle"];
+  onOverrideLanguage?: EditorStackProps["onOverrideLanguage"];
   onEditorDirtyChange: EditorStackProps["onDirtyChange"];
+  onEditorBindingChange?: EditorStackProps["onBindingChange"];
   onEditorCloseTab: EditorStackProps["onCloseTab"];
   registerPreviewHandle: PreviewStackProps["registerHandle"];
   onPreviewUrlChange: PreviewStackProps["onUrlChange"];
@@ -55,6 +62,8 @@ export function WorkspaceSurface({
   onFocusLeaf,
   registerEditorHandle,
   onEditorDirtyChange,
+  onOverrideLanguage,
+  onEditorBindingChange,
   onEditorCloseTab,
   registerPreviewHandle,
   onPreviewUrlChange,
@@ -64,7 +73,16 @@ export function WorkspaceSurface({
   onGitHistorySearchHandle,
   onSetMarkdownView,
 }: Props) {
-  const kind = activeTab?.kind;
+  const spaces = useSpaces((s) => s.spaces);
+  const renderedTabs = useMemo(
+    () => availableWorkspaceTabs(tabs, spaces),
+    [tabs, spaces],
+  );
+  const env = spaces.find((s) => s.id === activeTab?.spaceId)?.env ?? {
+    kind: "local",
+  };
+  const unavailable = workspaceUnavailableReason(env);
+  const kind = unavailable ? undefined : activeTab?.kind;
   const isTerminalTab = kind === "terminal";
   const isEditorTab = kind === "editor";
   const isPreviewTab = kind === "preview";
@@ -75,6 +93,17 @@ export function WorkspaceSurface({
 
   return (
     <div className="relative h-full min-h-0">
+      {unavailable && (
+        <div
+          role="status"
+          className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-8 text-center"
+        >
+          <h2 className="text-sm font-medium">Space unavailable</h2>
+          <p className="max-w-md text-xs text-muted-foreground">
+            {unavailable}
+          </p>
+        </div>
+      )}
       <div
         className={cn(
           LAYER,
@@ -84,7 +113,7 @@ export function WorkspaceSurface({
         aria-hidden={!isTerminalTab}
       >
         <TerminalStack
-          tabs={tabs}
+          tabs={renderedTabs}
           activeId={activeId}
           registerHandle={registerTerminalHandle}
           onSearchReady={onSearchReady}
@@ -98,10 +127,12 @@ export function WorkspaceSurface({
         aria-hidden={!isEditorTab}
       >
         <EditorStack
-          tabs={tabs}
+          tabs={renderedTabs}
           activeId={activeId}
           registerHandle={registerEditorHandle}
           onDirtyChange={onEditorDirtyChange}
+          onOverrideLanguage={onOverrideLanguage}
+          onBindingChange={onEditorBindingChange}
           onCloseTab={onEditorCloseTab}
           onSetMarkdownView={onSetMarkdownView}
         />
@@ -111,7 +142,7 @@ export function WorkspaceSurface({
         aria-hidden={!isPreviewTab}
       >
         <PreviewStack
-          tabs={tabs}
+          tabs={renderedTabs}
           activeId={activeId}
           registerHandle={registerPreviewHandle}
           onUrlChange={onPreviewUrlChange}
@@ -122,7 +153,7 @@ export function WorkspaceSurface({
         aria-hidden={!isMarkdownTab}
       >
         <MarkdownStack
-          tabs={tabs}
+          tabs={renderedTabs}
           activeId={activeId}
           onSetMarkdownView={onSetMarkdownView}
         />
@@ -132,7 +163,7 @@ export function WorkspaceSurface({
         aria-hidden={!isAiDiffTab}
       >
         <AiDiffStack
-          tabs={tabs}
+          tabs={renderedTabs}
           activeId={activeId}
           onAccept={onAiDiffAccept}
           onReject={onAiDiffReject}
@@ -142,7 +173,7 @@ export function WorkspaceSurface({
         className={cn(LAYER, !isGitDiffTab && "invisible pointer-events-none")}
         aria-hidden={!isGitDiffTab}
       >
-        <GitDiffStack tabs={tabs} activeId={activeId} />
+        <GitDiffStack tabs={renderedTabs} activeId={activeId} />
       </div>
       <div
         className={cn(
@@ -152,7 +183,7 @@ export function WorkspaceSurface({
         aria-hidden={!isGitHistoryTab}
       >
         <GitHistoryStack
-          tabs={tabs}
+          tabs={renderedTabs}
           activeId={activeId}
           onOpenCommitFile={onOpenCommitFile}
           onSearchHandle={onGitHistorySearchHandle}

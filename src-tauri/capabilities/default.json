@@ -4,10 +4,13 @@
   "description": "Capability for the main window",
   "windows": [
     "main",
-    "settings"
+    "w-*",
+    "settings",
+    "quick"
   ],
   "permissions": [
     "core:default",
+    "core:resources:deny-close",
     "core:window:allow-start-dragging",
     "core:window:allow-close",
     "core:window:allow-destroy",
@@ -16,13 +19,17 @@
     "core:window:allow-is-maximized",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-show",
+    "core:window:allow-hide",
     "core:window:allow-set-focus",
     "core:window:allow-set-title",
+    "core:window:allow-set-progress-bar",
+    "core:window:allow-request-user-attention",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "opener:default",
     "log:default",
     "os:default",
+    "os:allow-hostname",
     "notification:default",
     "store:default",
     "autostart:allow-enable",

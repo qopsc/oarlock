@@ -23,45 +23,22 @@ import {
   locationsPanel,
   openLocationsPanel,
 } from "./locationsPanel";
-import { fileUriToPath } from "./uri";
+import {
+  type LspPos,
+  type LspLocation,
+  type DefinitionResult,
+  normalizeLocations,
+} from "./locations";
+import { installSafeMarkdown } from "./safeMarkdown";
+import { fileUriToPath, sameFileUri } from "./uri";
 
 export {
   languageServerWithTransport,
   SynchronizationMethod,
 } from "codemirror-languageserver";
 
-type LspPos = { line: number; character: number };
-type LspRange = { start: LspPos };
-
-type LspLocation = { uri: string; range: LspRange };
-type LspLocationLink = {
-  targetUri: string;
-  targetRange: LspRange;
-  targetSelectionRange?: LspRange;
-};
-type DefinitionResult =
-  | LspLocation
-  | LspLocation[]
-  | LspLocationLink[]
-  | null
-  | undefined;
-
-function normalizeLocations(result: DefinitionResult): LspLocation[] {
-  if (!result) return [];
-  const list = Array.isArray(result) ? result : [result];
-  const out: LspLocation[] = [];
-  for (const loc of list) {
-    if ("uri" in loc) {
-      out.push(loc);
-    } else if (loc.targetUri) {
-      out.push({
-        uri: loc.targetUri,
-        range: loc.targetSelectionRange ?? loc.targetRange,
-      });
-    }
-  }
-  return out;
-}
+// Hover and completion docs render through the library's `marked.parse`.
+installSafeMarkdown();
 
 function offsetOf(doc: Text, pos: LspPos): number {
   if (pos.line >= doc.lines) return doc.length;
@@ -77,6 +54,7 @@ export type LspFormatResult = "done" | "unsupported";
 // silently doing nothing.
 export async function formatDocumentAndWait(
   view: EditorView,
+  current: () => boolean = () => true,
 ): Promise<LspFormatResult> {
   const plugin = view.plugin(languageServerPlugin);
   if (!plugin) return "unsupported";
@@ -95,7 +73,7 @@ export async function formatDocumentAndWait(
   if (!edits || edits.length === 0) return "done";
   // Edits are offsets into the requested snapshot; typing during the
   // round-trip would corrupt the document.
-  if (view.state.doc !== doc) return "done";
+  if (!current() || view.state.doc !== doc || view.plugin(languageServerPlugin) !== plugin || view.state.readOnly || !view.state.facet(EditorView.editable)) return "done";
   view.dispatch({
     changes: edits.map((e) => ({
       from: offsetOf(doc, e.range.start),
@@ -238,14 +216,36 @@ const linkHover: Extension = [
   }),
 ];
 
+const navigationLifetime = ViewPlugin.define(() => ({
+  active: true,
+  destroy() {
+    this.active = false;
+  },
+}));
+
 export function lspInteractions(opts: {
-  client: TeraxLspClient;
+  client: OarlockLspClient;
   documentUri: string;
   rootPath: string;
   onExternal: (uri: string, line: number) => void;
+  owner?: { current: { active: boolean; generation: number } };
 }): Extension {
+  const requests = new WeakMap<EditorView, number>();
+  const startNavigation = (view: EditorView) => {
+    const lifetime = view.plugin(navigationLifetime);
+    if (!lifetime?.active || opts.owner?.current.active === false) return null;
+    const request = (requests.get(view) ?? 0) + 1;
+    requests.set(view, request);
+    const document = view.state.doc;
+    const selection = view.state.selection;
+    const generation = opts.owner?.current.generation;
+    return () => lifetime.active && requests.get(view) === request &&
+      view.state.doc === document && view.state.selection.eq(selection) &&
+      (opts.owner === undefined || (opts.owner.current.active && opts.owner.current.generation === generation));
+  };
   const navigate = (view: EditorView, loc: LspLocation): void => {
-    if (loc.uri === opts.documentUri) {
+    if (!view.plugin(navigationLifetime)?.active) return;
+    if (sameFileUri(loc.uri, opts.documentUri)) {
       const targetLine = Math.min(
         loc.range.start.line + 1,
         view.state.doc.lines,
@@ -270,15 +270,16 @@ export function lspInteractions(opts: {
     const rel = path.startsWith(`${opts.rootPath}/`)
       ? path.slice(opts.rootPath.length + 1)
       : path;
-    return `${rel}:${loc.range.start.line + 1}`;
+    return `${rel}:${loc.range.start.line + 1}:${loc.range.start.character + 1}`;
   };
 
   const showResults = (
     view: EditorView,
     title: string,
     locs: LspLocation[],
+    current: () => boolean,
   ): void => {
-    if (locs.length === 0) return;
+    if (!current() || locs.length === 0) return;
     if (locs.length === 1) {
       navigate(view, locs[0]);
       return;
@@ -296,11 +297,12 @@ export function lspInteractions(opts: {
     openLocationsPanel(view, {
       title,
       items,
-      onPick: (item) =>
-        navigate(view, {
+      onPick: (item) => {
+        if (current()) navigate(view, {
           uri: item.uri,
           range: { start: { line: item.line, character: item.character } },
-        }),
+        });
+      },
     });
   };
 
@@ -313,6 +315,8 @@ export function lspInteractions(opts: {
     view: EditorView,
     pos: number,
   ): Promise<void> => {
+    const current = startNavigation(view);
+    if (!current) return;
     let result: DefinitionResult;
     try {
       result = await opts.client.textDocumentDefinition({
@@ -322,13 +326,16 @@ export function lspInteractions(opts: {
     } catch {
       return;
     }
-    showResults(view, "Definitions", normalizeLocations(result));
+    if (current())
+      showResults(view, "Definitions", normalizeLocations(result), current);
   };
 
   const findReferences = async (
     view: EditorView,
     pos: number,
   ): Promise<void> => {
+    const current = startNavigation(view);
+    if (!current) return;
     let result: LspLocation[] | null;
     try {
       result = await opts.client.textDocumentReferences({
@@ -339,10 +346,12 @@ export function lspInteractions(opts: {
     } catch {
       return;
     }
-    showResults(view, "References", result ?? []);
+    if (current())
+      showResults(view, "References", normalizeLocations(result), current);
   };
 
   return [
+    navigationLifetime,
     locationsPanel,
     hoverCodeHighlight,
     linkHover,
@@ -398,7 +407,7 @@ type RawRpc = {
 
 // The lib's notify/request maps omit didClose, didSave and the
 // shutdown/exit handshake; servers need all three for correct lifecycle.
-export class TeraxLspClient extends LanguageServerClient {
+export class OarlockLspClient extends LanguageServerClient {
   static hostPid: number | null = null;
 
   // The lib omits the publishDiagnostics capability and servers like
@@ -406,7 +415,7 @@ export class TeraxLspClient extends LanguageServerClient {
   // enables the server-side parent watchdog.
   protected override getInitializeParams() {
     const params = super.getInitializeParams();
-    params.processId = TeraxLspClient.hostPid;
+    params.processId = OarlockLspClient.hostPid;
     params.capabilities.textDocument = {
       ...params.capabilities.textDocument,
       publishDiagnostics: { relatedInformation: true },
@@ -420,8 +429,11 @@ export class TeraxLspClient extends LanguageServerClient {
     position: LspPos;
     context: { includeDeclaration: boolean };
   }): Promise<LspLocation[] | null> {
-    return this.raw.request("textDocument/references", params, 10_000) as
-      Promise<LspLocation[] | null>;
+    return this.raw.request(
+      "textDocument/references",
+      params,
+      10_000,
+    ) as Promise<LspLocation[] | null>;
   }
 
   textDocumentDidClose(uri: string): void {

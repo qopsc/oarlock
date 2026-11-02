@@ -1,31 +1,61 @@
+import { loadCustomEndpoints, onCustomEndpoints } from "./endpoints";
+import {
+  type AgentLaunchCommands,
+  DEFAULT_AGENT_LAUNCH_COMMANDS,
+  normalizeAgentLaunchCommands,
+} from "@/modules/agents/lib/launcher";
 import {
   type AutocompleteProviderId,
   type CustomEndpoint,
   DEFAULT_AUTOCOMPLETE_MODEL,
   DEFAULT_MODEL_ID,
   DEFAULT_STT_PROVIDER,
-  isKnownModelId,
+  canonicalModelId,
+  LEGACY_COMPAT_MODEL_ID,
+  isCompatModelId,
+  isResolvableModelId,
   LMSTUDIO_DEFAULT_BASE_URL,
   MLX_DEFAULT_BASE_URL,
-  type ModelId,
-  migrateLegacyCompatEndpoint,
   OLLAMA_DEFAULT_BASE_URL,
   OPENAI_COMPATIBLE_DEFAULT_BASE_URL,
   type SttProvider,
   WHISPERCPP_DEFAULT_BASE_URL,
 } from "@/modules/ai/config";
 import {
-  type AgentLaunchCommands,
-  DEFAULT_AGENT_LAUNCH_COMMANDS,
-  normalizeAgentLaunchCommands,
-} from "@/modules/agents/lib/launcher";
+  type ApprovalMode,
+  normalizeApprovalMode,
+} from "@/modules/ai/lib/approvalMode";
+import {
+  normalizeReasoningEffortByModel,
+  type ReasoningEffort,
+} from "@/modules/ai/lib/reasoningEffort";
 import type { KeyBinding, ShortcutId } from "@/modules/shortcuts/shortcuts";
+import {
+  type ChangeViewMode,
+  parseChangeViewMode,
+} from "@/modules/source-control/changeViewMode";
+import { parseFontFeatures } from "@/modules/terminal/lib/fontFeatures";
+import {
+  clampPaneLimit,
+  MAX_PANES_PER_TAB,
+} from "@/modules/terminal/lib/panes";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { LazyStore } from "@tauri-apps/plugin-store";
+import {
+  readNativePreferences,
+  watchNativePreferences,
+  mutatePreferences,
+  type PreferenceSnapshot,
+} from "./nativePreferences";
+import {
+  currentPlatform,
+  defaultTerminalBehavior,
+  normalizeTerminalBehavior,
+  type TerminalBehavior,
+} from "./terminalBehavior";
 
 export type ThemePref = "system" | "light" | "dark";
 
-export const DEFAULT_THEME_ID = "terax-default";
+export const DEFAULT_THEME_ID = "oarlock-default";
 
 export type BackgroundKind = "none" | "image";
 
@@ -43,6 +73,7 @@ export const EDITOR_THEMES = [
   "everforest",
   "everforest-light",
   "dracula",
+  "monokai-pro",
   "solarized-dark",
   "solarized-light",
   "nord",
@@ -80,6 +111,7 @@ export const EDITOR_THEME_MODE: Record<EditorThemeId, "light" | "dark"> = {
   everforest: "dark",
   "everforest-light": "light",
   dracula: "dark",
+  "monokai-pro": "dark",
   "solarized-dark": "dark",
   "solarized-light": "light",
   nord: "dark",
@@ -105,6 +137,7 @@ export const EDITOR_THEME_LABELS: Record<EditorThemeId, string> = {
   everforest: "Everforest Dark",
   "everforest-light": "Everforest Light",
   dracula: "Dracula",
+  "monokai-pro": "Monokai Pro",
   "solarized-dark": "Solarized Dark",
   "solarized-light": "Solarized Light",
   nord: "Nord",
@@ -126,10 +159,26 @@ export type Preferences = {
   backgroundOpacity: number;
   backgroundBlur: number;
   windowVibrancy: boolean;
-  defaultModelId: ModelId;
+  /**
+   * Opacity of terminal backgrounds, times the theme's own alpha; below 1 the
+   * window shows what is behind it there (`theme/terminalTranslucency.ts`).
+   */
+  terminalOpacity: number;
+  /** A catalog model id or a custom endpoint's `compat-<id>`. */
+  defaultModelId: string;
   editorTheme: EditorThemePref;
   editorFontSize: number;
   customInstructions: string;
+  /** How new AI conversations start: gated tools ask, or run unasked. */
+  aiApprovalMode: ApprovalMode;
+  /** Also stop this chat's explicit background jobs on Stop or deletion. */
+  aiStopBackgroundJobs: boolean;
+  aiStopSubagents: boolean;
+  aiAllowUnmanagedJobs: boolean;
+  /** Selecting text in a terminal or the editor offers an Ask Oarlock button. */
+  selectionAskAi: boolean;
+  /** The reasoning effort last chosen for each model; absent is its default. */
+  reasoningEffortByModel: Record<string, ReasoningEffort>;
   autostart: boolean;
   restoreWindowState: boolean;
   autocompleteEnabled: boolean;
@@ -146,6 +195,7 @@ export type Preferences = {
   openaiCompatibleModelId: string;
   openaiCompatibleContextLimit: number;
   customEndpoints: CustomEndpoint[];
+  customEndpointsError: string | null;
   openrouterModelId: string;
   sttProvider: SttProvider;
   groqSttModel: string;
@@ -155,8 +205,28 @@ export type Preferences = {
   vimMode: boolean;
   editorWordWrap: boolean;
   editorWordWrapColumn: number;
+  diffViewMode: DiffViewMode;
+  /** Indentation of new files and of files that have none to detect. */
+  editorDefaultIndent: EditorDefaultIndent;
   showHidden: boolean;
   explorerGitDecorations: boolean;
+  /** Which edge of the window the sidebar docks to. */
+  sidebarPosition: SidebarPosition;
+  /** Source Control's changed files as a flat list or a folder tree. */
+  sourceControlViewMode: ChangeViewMode;
+  /**
+   * The app's own file features (explorer, editor, previews, search,
+   * watching, path completion, Open in Default App) reach every folder, not
+   * only the authorized ones. At the user's own risk; off by default.
+   */
+  appAllFolders: boolean;
+  /**
+   * The AI tools reach every folder, not only the authorized ones. The
+   * secret-path deny-list and tool approval still apply. Off by default.
+   */
+  aiAllFolders: boolean;
+  /** Clicked localhost links in terminals open in the preview tab. */
+  terminalLinksInPreview: boolean;
   terminalRenderer: "auto" | "webgl";
   terminalScreenReader: boolean;
   terminalCursorBlink: boolean;
@@ -165,8 +235,26 @@ export type Preferences = {
   terminalFontWeight: string;
   terminalShell: string;
   terminalLetterSpacing: number;
+  /** Cell height as a multiple of the font size. */
+  terminalLineHeight: number;
+  /**
+   * OpenType features of the terminal font, as Ghostty's `font-feature`
+   * takes them (`zero, ss01, -calt`); empty for the font's defaults.
+   */
+  terminalFontFeatures: string;
+  /** Ghostty's minimum contrast for terminal text (1 is off). */
+  terminalMinimumContrast: number;
+  /** A Ghostty/Shadertoy shader run over terminal frames (WebGL renderer). */
+  terminalCustomShader: TerminalCustomShader | null;
+  /** Join punctuation such as `->` and `!=` with the font's ligatures. */
+  terminalLigatures: boolean;
   terminalFontSize: number;
   terminalScrollback: number;
+  /** Panes a terminal tab may be split into, 1 to `MAX_PANES_PER_TAB`. */
+  terminalPaneLimit: number;
+  /** Where a tab the user opens goes in the tab strip. */
+  newTabPosition: NewTabPosition;
+  terminalBehavior: TerminalBehavior;
   confirmCloseRunningTerminal: boolean;
   lastWslDistro: string | null;
   zoomLevel: number;
@@ -211,7 +299,6 @@ export type LspCustomServer = {
   rootMarkers: string[];
 };
 
-const STORE_PATH = "terax-settings.json";
 const KEY_THEME = "theme";
 const KEY_THEME_ID = "themeId";
 const KEY_BG_KIND = "backgroundKind";
@@ -219,10 +306,17 @@ const KEY_BG_IMAGE_ID = "backgroundImageId";
 const KEY_BG_OPACITY = "backgroundOpacity";
 const KEY_BG_BLUR = "backgroundBlur";
 const KEY_WINDOW_VIBRANCY = "windowVibrancy";
+const KEY_TERMINAL_OPACITY = "terminalOpacity";
 const KEY_DEFAULT_MODEL = "defaultModelId";
 const KEY_EDITOR_THEME = "editorTheme";
 const KEY_EDITOR_FONT_SIZE = "editorFontSize";
 const KEY_CUSTOM_INSTRUCTIONS = "customInstructions";
+const KEY_AI_APPROVAL_MODE = "aiApprovalMode";
+const KEY_AI_ALLOW_UNMANAGED_JOBS = "aiAllowUnmanagedJobs";
+const KEY_AI_STOP_SUBAGENTS = "aiStopSubagents";
+const KEY_AI_STOP_BACKGROUND_JOBS = "aiStopBackgroundJobs";
+const KEY_SELECTION_ASK_AI = "selectionAskAi";
+const KEY_REASONING_EFFORT_BY_MODEL = "reasoningEffortByModel";
 const KEY_AUTOSTART = "autostart";
 const KEY_RESTORE_WINDOW = "restoreWindowState";
 export type AutocompleteTrigger = "auto" | "manual";
@@ -240,7 +334,6 @@ const KEY_OLLAMA_MODEL_ID = "ollamaModelId";
 const KEY_OPENAI_COMPAT_BASE_URL = "openaiCompatibleBaseURL";
 const KEY_OPENAI_COMPAT_MODEL_ID = "openaiCompatibleModelId";
 const KEY_OPENAI_COMPAT_CONTEXT_LIMIT = "openaiCompatibleContextLimit";
-const KEY_CUSTOM_ENDPOINTS = "customEndpoints";
 const KEY_OPENROUTER_MODEL_ID = "openrouterModelId";
 const KEY_STT_PROVIDER = "sttProvider";
 const KEY_GROQ_STT_MODEL = "groqSttModel";
@@ -250,9 +343,16 @@ const KEY_RECENT_MODELS = "recentModelIds";
 const KEY_VIM_MODE = "vimMode";
 const KEY_EDITOR_WORD_WRAP = "editorWordWrap";
 const KEY_EDITOR_WORD_WRAP_COLUMN = "editorWordWrapColumn";
+const KEY_DIFF_VIEW_MODE = "diffViewMode";
+const KEY_EDITOR_DEFAULT_INDENT = "editorDefaultIndent";
 const KEY_SHOW_HIDDEN = "showHidden";
 const LEGACY_KEY_SHOW_HIDDEN_DIRS = "showHiddenDirectories";
 const KEY_EXPLORER_GIT_DECORATIONS = "explorerGitDecorations";
+const KEY_SIDEBAR_POSITION = "sidebarPosition";
+const KEY_SOURCE_CONTROL_VIEW_MODE = "sourceControlViewMode";
+const KEY_APP_ALL_FOLDERS = "appAllFolders";
+const KEY_AI_ALL_FOLDERS = "aiAllFolders";
+const KEY_TERMINAL_LINKS_IN_PREVIEW = "terminalLinksInPreview";
 const KEY_TERMINAL_RENDERER = "terminalRenderer";
 const KEY_TERMINAL_SCREEN_READER = "terminalScreenReader";
 const KEY_TERMINAL_CURSOR_BLINK = "terminalCursorBlink";
@@ -261,10 +361,19 @@ const KEY_TERMINAL_FONT_FAMILY = "terminalFontFamily";
 const KEY_TERMINAL_FONT_WEIGHT = "terminalFontWeight";
 const KEY_TERMINAL_SHELL = "terminalShell";
 const KEY_TERMINAL_LETTER_SPACING = "terminalLetterSpacing";
+const KEY_TERMINAL_LINE_HEIGHT = "terminalLineHeight";
+const KEY_TERMINAL_FONT_FEATURES = "terminalFontFeatures";
+const KEY_TERMINAL_MINIMUM_CONTRAST = "terminalMinimumContrast";
+const KEY_TERMINAL_CUSTOM_SHADER = "terminalCustomShader";
+const KEY_TERMINAL_LIGATURES = "terminalLigatures";
 const KEY_TERMINAL_FONT_SIZE = "terminalFontSize";
 const KEY_TERMINAL_SCROLLBACK = "terminalScrollback";
+const KEY_TERMINAL_PANE_LIMIT = "terminalPaneLimit";
+const KEY_NEW_TAB_POSITION = "newTabPosition";
+const KEY_TERMINAL_BEHAVIOR = "terminalBehavior";
 const KEY_CONFIRM_CLOSE_RUNNING_TERMINAL = "confirmCloseRunningTerminal";
 const KEY_LAST_WSL_DISTRO = "lastWslDistro";
+const KEY_MAC_FULL_DISK_ACCESS_SUGGESTED = "macFullDiskAccessSuggested";
 const KEY_ZOOM_LEVEL = "zoomLevel";
 const KEY_AGENT_NOTIFICATIONS = "agentNotifications";
 const KEY_AGENT_NOTIFICATION_SOUND = "agentNotificationSound";
@@ -281,6 +390,65 @@ const KEY_LSP_ACTIVATION = "lspActivation";
 const KEY_LSP_CUSTOM_SERVERS = "lspCustomServers";
 
 const TERMINAL_FONT_SIZE_DEFAULT = 14;
+export const TERMINAL_LINE_HEIGHT_DEFAULT = 1.2;
+export const TERMINAL_LINE_HEIGHTS = [
+  1, 1.1, 1.15, 1.2, 1.25, 1.3, 1.4, 1.5, 1.6, 1.8, 2,
+] as const;
+
+/** A stored feature list, or "" when it is not one `parseFontFeatures` takes. */
+export function normalizeTerminalFontFeatures(value: unknown): string {
+  if (typeof value !== "string" || value.length > 1024) return "";
+  const trimmed = value.trim();
+  return parseFontFeatures(trimmed).error === null ? trimmed : "";
+}
+
+export function clampTerminalLineHeight(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(2, Math.max(1, Math.round(value * 100) / 100))
+    : TERMINAL_LINE_HEIGHT_DEFAULT;
+}
+/** Off, then WCAG's thresholds: large text, AA, AAA. */
+export const TERMINAL_MINIMUM_CONTRASTS = [1, 1.5, 3, 4.5, 7] as const;
+
+export type TerminalCustomShader = {
+  /** The file it came from, for display. */
+  readonly name: string;
+  readonly source: string;
+};
+
+/** Ghostty's shaders are a few KiB; the WebGL renderer refuses more. */
+export const TERMINAL_CUSTOM_SHADER_MAX_BYTES = 256 * 1024;
+
+export function normalizeTerminalCustomShader(
+  value: unknown,
+): TerminalCustomShader | null {
+  if (!value || typeof value !== "object") return null;
+  const { name, source } = value as Record<string, unknown>;
+  if (typeof source !== "string" || source.trim() === "") return null;
+  if (source.length > TERMINAL_CUSTOM_SHADER_MAX_BYTES) return null;
+  return {
+    name: typeof name === "string" && name ? name.slice(0, 200) : "shader",
+    source,
+  };
+}
+
+/** A WCAG contrast ratio, 1 (off) to 21. */
+export function clampMinimumContrast(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(21, Math.max(1, value))
+    : 1;
+}
+
+/** On unless explicitly turned off. */
+export function coerceTerminalLigatures(value: unknown): boolean {
+  return value !== false;
+}
+
+/** The Ask Oarlock button stays on unless it was explicitly turned off. */
+export function coerceSelectionAskAi(value: unknown): boolean {
+  return value !== false;
+}
+
 const TERMINAL_FONT_SIZE_MIN = 8;
 const TERMINAL_FONT_SIZE_MAX = 32;
 
@@ -299,11 +467,13 @@ export const EDITOR_WORD_WRAP_COLUMN_DEFAULT = 80;
 export const EDITOR_WORD_WRAP_COLUMN_MIN = 20;
 export const EDITOR_WORD_WRAP_COLUMN_MAX = 500;
 
-const TERMINAL_SCROLLBACK_DEFAULT = 2000;
+// Ghostty keeps about 10 MB of history per terminal; the global budget in
+// scrollbackBudget.ts bounds the total across terminals.
+const TERMINAL_SCROLLBACK_DEFAULT = 10_000;
 const TERMINAL_SCROLLBACK_MIN = 200;
-const TERMINAL_SCROLLBACK_MAX = 50_000;
+const TERMINAL_SCROLLBACK_MAX = 100_000;
 export const TERMINAL_SCROLLBACK_PRESETS = [
-  500, 1000, 2000, 5000, 10_000, 25_000,
+  1000, 2000, 5000, 10_000, 25_000, 50_000, 100_000,
 ] as const;
 
 export const DEFAULT_PREFERENCES: Preferences = {
@@ -317,11 +487,19 @@ export const DEFAULT_PREFERENCES: Preferences = {
   editorTheme: EDITOR_THEME_AUTO,
   editorFontSize: EDITOR_FONT_SIZE_DEFAULT,
   customInstructions: "",
+  aiApprovalMode: "ask",
+  aiStopBackgroundJobs: false,
+  aiStopSubagents: true,
+  aiAllowUnmanagedJobs: false,
+  selectionAskAi: true,
+  reasoningEffortByModel: {},
   autostart: false,
   // Off by default: a translucent window keeps the compositor blending the
   // whole frame every present. An explicitly stored choice (either value)
   // always wins; only an absent key falls back to this.
   windowVibrancy: false,
+  // Opaque by default, for the same reason.
+  terminalOpacity: 1,
   restoreWindowState: true,
   autocompleteEnabled: false,
   autocompleteTrigger: "auto",
@@ -337,6 +515,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   openaiCompatibleModelId: "",
   openaiCompatibleContextLimit: 128_000,
   customEndpoints: [],
+  customEndpointsError: null,
   openrouterModelId: "",
   sttProvider: DEFAULT_STT_PROVIDER,
   groqSttModel: "whisper-large-v3-turbo",
@@ -346,8 +525,15 @@ export const DEFAULT_PREFERENCES: Preferences = {
   vimMode: false,
   editorWordWrap: false,
   editorWordWrapColumn: EDITOR_WORD_WRAP_COLUMN_DEFAULT,
+  diffViewMode: "inline",
+  editorDefaultIndent: "spaces2",
   showHidden: false,
   explorerGitDecorations: true,
+  sidebarPosition: "left",
+  sourceControlViewMode: "list",
+  appAllFolders: false,
+  aiAllFolders: false,
+  terminalLinksInPreview: false,
   terminalRenderer: "auto",
   terminalScreenReader: false,
   terminalCursorBlink: false,
@@ -356,8 +542,16 @@ export const DEFAULT_PREFERENCES: Preferences = {
   terminalFontWeight: "normal",
   terminalShell: "",
   terminalLetterSpacing: 0,
+  terminalLineHeight: TERMINAL_LINE_HEIGHT_DEFAULT,
+  terminalFontFeatures: "",
+  terminalMinimumContrast: 1,
+  terminalCustomShader: null,
+  terminalLigatures: true,
   terminalFontSize: TERMINAL_FONT_SIZE_DEFAULT,
   terminalScrollback: TERMINAL_SCROLLBACK_DEFAULT,
+  terminalPaneLimit: MAX_PANES_PER_TAB,
+  newTabPosition: "end",
+  terminalBehavior: defaultTerminalBehavior(currentPlatform()),
   confirmCloseRunningTerminal: true,
   lastWslDistro: null,
   zoomLevel: 1.0,
@@ -376,26 +570,37 @@ export const DEFAULT_PREFERENCES: Preferences = {
   lspCustomServers: [],
 };
 
-const store = new LazyStore(STORE_PATH, { defaults: {}, autoSave: 200 });
-
-// LazyStore.onChange only fires within the writing process. The settings
-// page lives in a separate webview, so writes there never reach the main
-// window's subscribers. Mirror every setter through a Tauri event so any
-// window can listen.
-const PREFS_CHANGED_EVENT = "terax://prefs-changed";
-
 async function writePref<T>(key: string, value: T): Promise<void> {
-  await store.set(key, value);
-  await store.save();
-  await emit(PREFS_CHANGED_EVENT, { key, value });
+  await mutatePreferences({ kind: "set", key, value });
 }
 
 export async function loadPreferences(): Promise<Preferences> {
-  // Single IPC roundtrip — fetching keys individually fans out to one
-  // `plugin:store|get` per setting and is the dominant boot cost.
-  const entries = await store.entries();
-  const map = new Map<string, unknown>(entries);
-  const get = <T>(k: string): T | undefined => map.get(k) as T | undefined;
+  let customEndpoints: CustomEndpoint[] = [];
+  let customEndpointsError: string | null = null;
+  try {
+    customEndpoints = await loadCustomEndpoints();
+  } catch (error) {
+    customEndpointsError = String(error);
+  }
+  const snapshot = await readNativePreferences();
+  return parsePreferences(
+    snapshot.values,
+    customEndpoints,
+    customEndpointsError,
+  );
+}
+
+export function parsePreferences(
+  values: Record<string, unknown>,
+  customEndpoints: CustomEndpoint[] = [],
+  customEndpointsError: string | null = null,
+): Preferences {
+  const get = <T>(key: string): T | undefined => values[key] as T | undefined;
+  // A failed read does not prove an endpoint was deleted. Keep its selection
+  // blocked until recovery instead of silently routing to a different provider.
+  const usable = (id: string) =>
+    (customEndpointsError !== null && isCompatModelId(id)) ||
+    isResolvableModelId(id, customEndpoints);
   return {
     theme: get<ThemePref>(KEY_THEME) ?? DEFAULT_PREFERENCES.theme,
     themeId: get<string>(KEY_THEME_ID) ?? DEFAULT_PREFERENCES.themeId,
@@ -410,10 +615,12 @@ export async function loadPreferences(): Promise<Preferences> {
     backgroundBlur: clampBlur(
       get<number>(KEY_BG_BLUR) ?? DEFAULT_PREFERENCES.backgroundBlur,
     ),
-    defaultModelId: ((): ModelId => {
+    defaultModelId: ((): string => {
       const stored = get<string>(KEY_DEFAULT_MODEL);
-      return stored && isKnownModelId(stored)
-        ? stored
+      // Keep an unresolved legacy choice blocked rather than silently routing
+      // it to the default provider after its migrated endpoint was removed.
+      return stored && (stored === LEGACY_COMPAT_MODEL_ID || usable(stored))
+        ? canonicalModelId(stored)
         : DEFAULT_PREFERENCES.defaultModelId;
     })(),
     editorTheme: ((): EditorThemePref => {
@@ -428,12 +635,21 @@ export async function loadPreferences(): Promise<Preferences> {
     customInstructions:
       get<string>(KEY_CUSTOM_INSTRUCTIONS) ??
       DEFAULT_PREFERENCES.customInstructions,
+    aiApprovalMode: normalizeApprovalMode(get<unknown>(KEY_AI_APPROVAL_MODE)),
+    aiStopBackgroundJobs: get<unknown>(KEY_AI_STOP_BACKGROUND_JOBS) === true,
+    aiStopSubagents: get<unknown>(KEY_AI_STOP_SUBAGENTS) !== false,
+    aiAllowUnmanagedJobs: get<unknown>(KEY_AI_ALLOW_UNMANAGED_JOBS) === true,
+    selectionAskAi: coerceSelectionAskAi(get<unknown>(KEY_SELECTION_ASK_AI)),
+    reasoningEffortByModel: normalizeReasoningEffortByModel(
+      get<unknown>(KEY_REASONING_EFFORT_BY_MODEL),
+    ),
     autostart: get<boolean>(KEY_AUTOSTART) ?? DEFAULT_PREFERENCES.autostart,
     restoreWindowState:
       get<boolean>(KEY_RESTORE_WINDOW) ??
       DEFAULT_PREFERENCES.restoreWindowState,
     windowVibrancy:
       get<boolean>(KEY_WINDOW_VIBRANCY) ?? DEFAULT_PREFERENCES.windowVibrancy,
+    terminalOpacity: clampTerminalOpacity(get<unknown>(KEY_TERMINAL_OPACITY)),
     autocompleteEnabled:
       get<boolean>(KEY_AUTOCOMPLETE_ENABLED) ??
       DEFAULT_PREFERENCES.autocompleteEnabled,
@@ -443,9 +659,10 @@ export async function loadPreferences(): Promise<Preferences> {
     autocompleteProvider:
       get<AutocompleteProviderId>(KEY_AUTOCOMPLETE_PROVIDER) ??
       DEFAULT_PREFERENCES.autocompleteProvider,
-    autocompleteModelId:
+    autocompleteModelId: canonicalModelId(
       get<string>(KEY_AUTOCOMPLETE_MODEL) ??
-      DEFAULT_PREFERENCES.autocompleteModelId,
+        DEFAULT_PREFERENCES.autocompleteModelId,
+    ),
     lmstudioBaseURL:
       get<string>(KEY_LMSTUDIO_BASE_URL) ?? DEFAULT_PREFERENCES.lmstudioBaseURL,
     lmstudioModelId:
@@ -465,16 +682,8 @@ export async function loadPreferences(): Promise<Preferences> {
     openaiCompatibleContextLimit:
       get<number>(KEY_OPENAI_COMPAT_CONTEXT_LIMIT) ??
       DEFAULT_PREFERENCES.openaiCompatibleContextLimit,
-    customEndpoints: (() => {
-      const stored = get<CustomEndpoint[]>(KEY_CUSTOM_ENDPOINTS);
-      if (stored && stored.length > 0) return stored;
-      return migrateLegacyCompatEndpoint(
-        get<string>(KEY_OPENAI_COMPAT_BASE_URL) ?? "",
-        get<string>(KEY_OPENAI_COMPAT_MODEL_ID) ?? "",
-        get<number>(KEY_OPENAI_COMPAT_CONTEXT_LIMIT) ?? 128_000,
-        crypto.randomUUID().slice(0, 8),
-      );
-    })(),
+    customEndpoints,
+    customEndpointsError,
     openrouterModelId:
       get<string>(KEY_OPENROUTER_MODEL_ID) ??
       DEFAULT_PREFERENCES.openrouterModelId,
@@ -485,18 +694,33 @@ export async function loadPreferences(): Promise<Preferences> {
     whispercppBaseURL:
       get<string>(KEY_WHISPERCPP_BASE_URL) ??
       DEFAULT_PREFERENCES.whispercppBaseURL,
-    favoriteModelIds: (
-      get<string[]>(KEY_FAVORITE_MODELS) ?? DEFAULT_PREFERENCES.favoriteModelIds
-    ).filter(isKnownModelId),
-    recentModelIds: (
-      get<string[]>(KEY_RECENT_MODELS) ?? DEFAULT_PREFERENCES.recentModelIds
-    ).filter(isKnownModelId),
+    favoriteModelIds: [
+      ...new Set(
+        (
+          get<string[]>(KEY_FAVORITE_MODELS) ??
+          DEFAULT_PREFERENCES.favoriteModelIds
+        )
+          .map(canonicalModelId)
+          .filter(usable),
+      ),
+    ],
+    recentModelIds: [
+      ...new Set(
+        (get<string[]>(KEY_RECENT_MODELS) ?? DEFAULT_PREFERENCES.recentModelIds)
+          .map(canonicalModelId)
+          .filter(usable),
+      ),
+    ],
     vimMode: get<boolean>(KEY_VIM_MODE) ?? DEFAULT_PREFERENCES.vimMode,
     editorWordWrap:
       get<boolean>(KEY_EDITOR_WORD_WRAP) ?? DEFAULT_PREFERENCES.editorWordWrap,
     editorWordWrapColumn: clampEditorWordWrapColumn(
       get<number>(KEY_EDITOR_WORD_WRAP_COLUMN) ??
         DEFAULT_PREFERENCES.editorWordWrapColumn,
+    ),
+    diffViewMode: parseDiffViewMode(get<unknown>(KEY_DIFF_VIEW_MODE)),
+    editorDefaultIndent: parseEditorDefaultIndent(
+      get<unknown>(KEY_EDITOR_DEFAULT_INDENT),
     ),
     showHidden:
       get<boolean>(KEY_SHOW_HIDDEN) ??
@@ -505,6 +729,16 @@ export async function loadPreferences(): Promise<Preferences> {
     explorerGitDecorations:
       get<boolean>(KEY_EXPLORER_GIT_DECORATIONS) ??
       DEFAULT_PREFERENCES.explorerGitDecorations,
+    sidebarPosition: parseSidebarPosition(get<unknown>(KEY_SIDEBAR_POSITION)),
+    sourceControlViewMode: parseChangeViewMode(
+      get<unknown>(KEY_SOURCE_CONTROL_VIEW_MODE),
+    ),
+    // Only a stored `true` widens access; anything else is the default, off.
+    appAllFolders: get<unknown>(KEY_APP_ALL_FOLDERS) === true,
+    aiAllFolders: get<unknown>(KEY_AI_ALL_FOLDERS) === true,
+    terminalLinksInPreview:
+      get<boolean>(KEY_TERMINAL_LINKS_IN_PREVIEW) ??
+      DEFAULT_PREFERENCES.terminalLinksInPreview,
     terminalRenderer:
       get<string>(KEY_TERMINAL_RENDERER) === "webgl" ? "webgl" : "auto",
     terminalScreenReader: get<boolean>(KEY_TERMINAL_SCREEN_READER) === true,
@@ -526,12 +760,33 @@ export async function loadPreferences(): Promise<Preferences> {
     terminalLetterSpacing:
       get<number>(KEY_TERMINAL_LETTER_SPACING) ??
       DEFAULT_PREFERENCES.terminalLetterSpacing,
+    terminalLineHeight: clampTerminalLineHeight(
+      get<number>(KEY_TERMINAL_LINE_HEIGHT),
+    ),
+    terminalFontFeatures: normalizeTerminalFontFeatures(
+      get<unknown>(KEY_TERMINAL_FONT_FEATURES),
+    ),
+    terminalMinimumContrast: clampMinimumContrast(
+      get<number>(KEY_TERMINAL_MINIMUM_CONTRAST),
+    ),
+    terminalCustomShader: normalizeTerminalCustomShader(
+      get<unknown>(KEY_TERMINAL_CUSTOM_SHADER),
+    ),
+    terminalLigatures: coerceTerminalLigatures(
+      get<unknown>(KEY_TERMINAL_LIGATURES),
+    ),
     terminalFontSize:
       get<number>(KEY_TERMINAL_FONT_SIZE) ??
       DEFAULT_PREFERENCES.terminalFontSize,
     terminalScrollback: clampScrollback(
       get<number>(KEY_TERMINAL_SCROLLBACK) ??
         DEFAULT_PREFERENCES.terminalScrollback,
+    ),
+    terminalPaneLimit: clampPaneLimit(get<unknown>(KEY_TERMINAL_PANE_LIMIT)),
+    newTabPosition: parseNewTabPosition(get<unknown>(KEY_NEW_TAB_POSITION)),
+    terminalBehavior: normalizeTerminalBehavior(
+      get<unknown>(KEY_TERMINAL_BEHAVIOR),
+      DEFAULT_PREFERENCES.terminalBehavior,
     ),
     confirmCloseRunningTerminal:
       get<boolean>(KEY_CONFIRM_CLOSE_RUNNING_TERMINAL) ??
@@ -586,13 +841,11 @@ export async function setLspActivation(
   id: string,
   value: LspActivation | null,
 ): Promise<void> {
-  const current =
-    ((await store.get(KEY_LSP_ACTIVATION)) as Record<string, LspActivation>) ??
-    {};
-  const next = { ...current };
-  if (value === null) delete next[id];
-  else next[id] = value;
-  await writePref(KEY_LSP_ACTIVATION, next);
+  await mutatePreferences({
+    kind: "patch",
+    key: KEY_LSP_ACTIVATION,
+    values: { [id]: value },
+  });
 }
 
 export async function setLspCustomServers(
@@ -606,7 +859,7 @@ export async function setTheme(value: ThemePref): Promise<void> {
 }
 
 export async function setThemeId(value: string): Promise<void> {
-  await writePref(KEY_THEME_ID, value);
+  await mutatePreferences({ kind: "themeselection", id: value });
 }
 
 /** Slider stores 0..1. Actual rendered opacity is halved in SurfaceLayer
@@ -623,16 +876,6 @@ function clampBlur(v: number): number {
   return Math.min(64, Math.max(0, Math.round(v)));
 }
 
-export async function setBackgroundKind(value: BackgroundKind): Promise<void> {
-  await writePref(KEY_BG_KIND, value);
-}
-
-export async function setBackgroundImageId(
-  value: string | null,
-): Promise<void> {
-  await writePref(KEY_BG_IMAGE_ID, value);
-}
-
 export async function setBackgroundOpacity(value: number): Promise<void> {
   await writePref(KEY_BG_OPACITY, clampBgOpacity(value));
 }
@@ -641,7 +884,7 @@ export async function setBackgroundBlur(value: number): Promise<void> {
   await writePref(KEY_BG_BLUR, clampBlur(value));
 }
 
-export async function setDefaultModel(value: ModelId): Promise<void> {
+export async function setDefaultModel(value: string): Promise<void> {
   await writePref(KEY_DEFAULT_MODEL, value);
 }
 
@@ -665,6 +908,35 @@ export async function setCustomInstructions(value: string): Promise<void> {
   await writePref(KEY_CUSTOM_INSTRUCTIONS, value);
 }
 
+export async function setAiApprovalMode(value: ApprovalMode): Promise<void> {
+  await writePref(KEY_AI_APPROVAL_MODE, normalizeApprovalMode(value));
+}
+
+export async function setAiAllowUnmanagedJobs(value: boolean): Promise<void> {
+  await writePref(KEY_AI_ALLOW_UNMANAGED_JOBS, value === true);
+}
+
+export async function setAiStopSubagents(value: boolean): Promise<void> {
+  await writePref(KEY_AI_STOP_SUBAGENTS, value !== false);
+}
+
+export async function setAiStopBackgroundJobs(value: boolean): Promise<void> {
+  await writePref(KEY_AI_STOP_BACKGROUND_JOBS, value === true);
+}
+
+export async function setSelectionAskAi(value: boolean): Promise<void> {
+  await writePref(KEY_SELECTION_ASK_AI, coerceSelectionAskAi(value));
+}
+
+export async function setReasoningEffortByModel(
+  value: Record<string, ReasoningEffort>,
+): Promise<void> {
+  await writePref(
+    KEY_REASONING_EFFORT_BY_MODEL,
+    normalizeReasoningEffortByModel(value),
+  );
+}
+
 export async function setAutostart(value: boolean): Promise<void> {
   await writePref(KEY_AUTOSTART, value);
 }
@@ -675,6 +947,20 @@ export async function setRestoreWindowState(value: boolean): Promise<void> {
 
 export async function setWindowVibrancy(value: boolean): Promise<void> {
   await writePref(KEY_WINDOW_VIBRANCY, value);
+}
+
+/** Below this, terminal text over a busy desktop is no longer readable. */
+export const TERMINAL_OPACITY_MIN = 0.3;
+
+/** A stored terminal opacity, in hundredths from the minimum to 1 (opaque). */
+export function clampTerminalOpacity(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(1, Math.max(TERMINAL_OPACITY_MIN, Math.round(value * 100) / 100))
+    : 1;
+}
+
+export async function setTerminalOpacity(value: number): Promise<void> {
+  await writePref(KEY_TERMINAL_OPACITY, clampTerminalOpacity(value));
 }
 
 export async function setAutocompleteTrigger(
@@ -738,12 +1024,6 @@ export async function setOpenaiCompatibleContextLimit(
   await writePref(KEY_OPENAI_COMPAT_CONTEXT_LIMIT, clamped);
 }
 
-export async function setCustomEndpoints(
-  value: CustomEndpoint[],
-): Promise<void> {
-  await writePref(KEY_CUSTOM_ENDPOINTS, value);
-}
-
 export async function setOpenrouterModelId(value: string): Promise<void> {
   await writePref(KEY_OPENROUTER_MODEL_ID, value);
 }
@@ -772,6 +1052,57 @@ export async function setVimMode(value: boolean): Promise<void> {
   await writePref(KEY_VIM_MODE, value);
 }
 
+/** At the end of the strip, or right after the active tab. */
+export type NewTabPosition = "end" | "afterCurrent";
+
+export function parseNewTabPosition(value: unknown): NewTabPosition {
+  return value === "afterCurrent" ? "afterCurrent" : "end";
+}
+
+export async function setNewTabPosition(value: NewTabPosition): Promise<void> {
+  await writePref(KEY_NEW_TAB_POSITION, parseNewTabPosition(value));
+}
+
+export type SidebarPosition = "left" | "right";
+
+export function parseSidebarPosition(value: unknown): SidebarPosition {
+  return value === "right" ? "right" : "left";
+}
+
+export async function setSidebarPosition(
+  value: SidebarPosition,
+): Promise<void> {
+  await writePref(KEY_SIDEBAR_POSITION, parseSidebarPosition(value));
+}
+
+export async function setSourceControlViewMode(
+  value: ChangeViewMode,
+): Promise<void> {
+  await writePref(KEY_SOURCE_CONTROL_VIEW_MODE, parseChangeViewMode(value));
+}
+
+export type DiffViewMode = "inline" | "split";
+
+export function parseDiffViewMode(value: unknown): DiffViewMode {
+  return value === "split" ? "split" : "inline";
+}
+
+export async function setDiffViewMode(value: DiffViewMode): Promise<void> {
+  await writePref(KEY_DIFF_VIEW_MODE, value);
+}
+
+export type EditorDefaultIndent = "spaces2" | "spaces4" | "tab";
+
+export function parseEditorDefaultIndent(value: unknown): EditorDefaultIndent {
+  return value === "spaces4" || value === "tab" ? value : "spaces2";
+}
+
+export async function setEditorDefaultIndent(
+  value: EditorDefaultIndent,
+): Promise<void> {
+  await writePref(KEY_EDITOR_DEFAULT_INDENT, value);
+}
+
 export async function setEditorWordWrap(value: boolean): Promise<void> {
   await writePref(KEY_EDITOR_WORD_WRAP, value);
 }
@@ -795,8 +1126,20 @@ export async function setShowHidden(value: boolean): Promise<void> {
   await writePref(KEY_SHOW_HIDDEN, value);
 }
 
+export async function setTerminalLinksInPreview(value: boolean): Promise<void> {
+  await writePref(KEY_TERMINAL_LINKS_IN_PREVIEW, value);
+}
+
 export async function setExplorerGitDecorations(value: boolean): Promise<void> {
   await writePref(KEY_EXPLORER_GIT_DECORATIONS, value);
+}
+
+export async function setAppAllFolders(value: boolean): Promise<void> {
+  await writePref(KEY_APP_ALL_FOLDERS, value === true);
+}
+
+export async function setAiAllFolders(value: boolean): Promise<void> {
+  await writePref(KEY_AI_ALL_FOLDERS, value === true);
 }
 
 export async function setTerminalRenderer(
@@ -849,6 +1192,45 @@ export async function setTerminalLetterSpacing(value: number): Promise<void> {
   await writePref(KEY_TERMINAL_LETTER_SPACING, clamped);
 }
 
+export async function setTerminalLineHeight(value: number): Promise<void> {
+  await writePref(KEY_TERMINAL_LINE_HEIGHT, clampTerminalLineHeight(value));
+}
+
+/** Stores a feature list `parseFontFeatures` accepts; others clear it. */
+export async function setTerminalFontFeatures(value: string): Promise<void> {
+  await writePref(
+    KEY_TERMINAL_FONT_FEATURES,
+    normalizeTerminalFontFeatures(value),
+  );
+}
+
+export async function setTerminalCustomShader(
+  value: TerminalCustomShader | null,
+): Promise<void> {
+  await writePref(
+    KEY_TERMINAL_CUSTOM_SHADER,
+    normalizeTerminalCustomShader(value),
+  );
+}
+
+export async function setTerminalCustomShaderAtRevision(
+  value: TerminalCustomShader | null,
+  revision: number,
+): Promise<void> {
+  await mutatePreferences({
+    kind: "set", key: KEY_TERMINAL_CUSTOM_SHADER,
+    value: normalizeTerminalCustomShader(value),
+  }, revision);
+}
+
+export async function setTerminalMinimumContrast(value: number): Promise<void> {
+  await writePref(KEY_TERMINAL_MINIMUM_CONTRAST, clampMinimumContrast(value));
+}
+
+export async function setTerminalLigatures(value: boolean): Promise<void> {
+  await writePref(KEY_TERMINAL_LIGATURES, coerceTerminalLigatures(value));
+}
+
 export async function setTerminalFontSize(value: number): Promise<void> {
   const clamped = Number.isFinite(value)
     ? Math.min(
@@ -871,6 +1253,30 @@ export async function setTerminalScrollback(value: number): Promise<void> {
   await writePref(KEY_TERMINAL_SCROLLBACK, clampScrollback(value));
 }
 
+export async function setTerminalPaneLimit(value: number): Promise<void> {
+  await writePref(KEY_TERMINAL_PANE_LIMIT, clampPaneLimit(value));
+}
+
+/** Changes some terminal behaviour switches, keeping the others. */
+export async function setTerminalBehavior(
+  patch: Partial<TerminalBehavior>,
+): Promise<void> {
+  const normalized = normalizeTerminalBehavior(
+    patch,
+    DEFAULT_PREFERENCES.terminalBehavior,
+  );
+  const values = Object.fromEntries(
+    Object.keys(patch)
+      .filter((key) => key in normalized)
+      .map((key) => [key, normalized[key as keyof TerminalBehavior]]),
+  );
+  await mutatePreferences({
+    kind: "patch",
+    key: KEY_TERMINAL_BEHAVIOR,
+    values,
+  });
+}
+
 export async function setConfirmCloseRunningTerminal(
   value: boolean,
 ): Promise<void> {
@@ -879,6 +1285,22 @@ export async function setConfirmCloseRunningTerminal(
 
 export async function setLastWslDistro(value: string | null): Promise<void> {
   await writePref(KEY_LAST_WSL_DISTRO, value);
+}
+
+/**
+ * Whether the first-run notice suggesting Full Disk Access (macOS) has been
+ * answered. App state rather than a preference: read once by the main window.
+ */
+export async function macFullDiskAccessSuggested(): Promise<boolean> {
+  return (
+    (await readNativePreferences()).values[
+      KEY_MAC_FULL_DISK_ACCESS_SUGGESTED
+    ] === true
+  );
+}
+
+export async function setMacFullDiskAccessSuggested(): Promise<void> {
+  await writePref(KEY_MAC_FULL_DISK_ACCESS_SUGGESTED, true);
 }
 
 export async function setZoomLevel(value: number): Promise<void> {
@@ -914,10 +1336,10 @@ export async function setEditorFormatter(
   await writePref(KEY_EDITOR_FORMATTER, value);
 }
 
-export async function setEditorFormatterByLang(
-  value: Record<string, EditorFormatter>,
+export async function patchEditorFormatterByLang(
+  values: Record<string, EditorFormatter | null>,
 ): Promise<void> {
-  await writePref(KEY_EDITOR_FORMATTER_BY_LANG, value);
+  await mutatePreferences({ kind: "patch", key: KEY_EDITOR_FORMATTER_BY_LANG, values });
 }
 
 export async function setEditorCustomFormatCommand(
@@ -955,98 +1377,119 @@ export async function setShortcuts(
 
 export type PrefKey = keyof Preferences;
 
-/** Subscribe to changes from any window (settings → main). */
-export async function onPreferencesChange(
+/** Observe a revisioned snapshot, including startup, as one UI update. */
+export async function observePreferences(
+  cb: (preferences: Preferences) => void,
+  failed: (error: unknown) => void,
+  pending?: () => void,
+): Promise<UnlistenFn> {
+  let snapshot: PreferenceSnapshot | undefined;
+  let endpoints: CustomEndpoint[] = [];
+  let endpointsError: string | null = null;
+  let endpointsReady = false;
+  let previous: Preferences | undefined;
+  let recovering = false;
+  let parsedValues: Record<string, unknown> | undefined;
+  let parsedEndpoints: CustomEndpoint[] | undefined;
+  let parsedEndpointError: string | null = null;
+  const endpointDependent = new Set([
+    "defaultModelId",
+    "favoriteModelIds",
+    "recentModelIds",
+    "customEndpoints",
+    "customEndpointsError",
+  ]);
+  const publish = (recovered = false) => {
+    if (!snapshot || !endpointsReady || recovering) return;
+    const next = parsePreferences(snapshot.values, endpoints, endpointsError);
+    let changed = !previous || recovered;
+    for (const key of Object.keys(next) as (keyof Preferences)[]) {
+      if (
+        previous &&
+        ((parsedValues &&
+          Object.is(snapshot.values[key], parsedValues[key]) &&
+          (!endpointDependent.has(key) ||
+            (parsedEndpoints === endpoints &&
+              parsedEndpointError === endpointsError))) ||
+          Object.is(next[key], previous[key]) ||
+          JSON.stringify(next[key]) === JSON.stringify(previous[key]))
+      ) {
+        Object.assign(next, { [key]: previous[key] });
+      } else changed = true;
+    }
+    parsedValues = snapshot.values;
+    parsedEndpoints = endpoints;
+    parsedEndpointError = endpointsError;
+    if (changed) {
+      previous = next;
+      cb(next);
+    }
+  };
+  const results = await Promise.allSettled([
+    watchNativePreferences(
+      (next) => {
+        if (snapshot && next.revision <= snapshot.revision) return;
+        snapshot = next;
+        const recovered = recovering;
+        recovering = false;
+        publish(recovered);
+      },
+      (error) => {
+        recovering = true;
+        failed(error);
+      },
+      () => {
+        if (!recovering) {
+          recovering = true;
+          pending?.();
+        }
+      },
+    ),
+    onCustomEndpoints(
+      (value) => {
+        endpoints = value;
+        endpointsError = null;
+        endpointsReady = true;
+        publish();
+      },
+      (error) => {
+        endpointsError = String(error);
+        endpointsReady = true;
+        publish();
+      },
+    ),
+  ]);
+  const error = results.find((result) => result.status === "rejected");
+  if (error?.status === "rejected") {
+    for (const result of results)
+      if (result.status === "fulfilled") result.value();
+    throw error.reason;
+  }
+  return () => {
+    for (const result of results)
+      if (result.status === "fulfilled") result.value();
+  };
+}
+
+/** Compatibility observer; all values come from the same normalized snapshot. */
+export function onPreferencesChange(
   cb: (key: PrefKey, value: unknown) => void,
 ): Promise<UnlistenFn> {
-  const map: Record<string, PrefKey> = {
-    [KEY_THEME]: "theme",
-    [KEY_THEME_ID]: "themeId",
-    [KEY_BG_KIND]: "backgroundKind",
-    [KEY_BG_IMAGE_ID]: "backgroundImageId",
-    [KEY_BG_OPACITY]: "backgroundOpacity",
-    [KEY_BG_BLUR]: "backgroundBlur",
-    [KEY_WINDOW_VIBRANCY]: "windowVibrancy",
-    [KEY_DEFAULT_MODEL]: "defaultModelId",
-    [KEY_EDITOR_THEME]: "editorTheme",
-    [KEY_EDITOR_FONT_SIZE]: "editorFontSize",
-    [KEY_CUSTOM_INSTRUCTIONS]: "customInstructions",
-    [KEY_AUTOSTART]: "autostart",
-    [KEY_RESTORE_WINDOW]: "restoreWindowState",
-    [KEY_AUTOCOMPLETE_ENABLED]: "autocompleteEnabled",
-    [KEY_AUTOCOMPLETE_TRIGGER]: "autocompleteTrigger",
-    [KEY_AUTOCOMPLETE_PROVIDER]: "autocompleteProvider",
-    [KEY_AUTOCOMPLETE_MODEL]: "autocompleteModelId",
-    [KEY_LMSTUDIO_BASE_URL]: "lmstudioBaseURL",
-    [KEY_LMSTUDIO_MODEL_ID]: "lmstudioModelId",
-    [KEY_MLX_BASE_URL]: "mlxBaseURL",
-    [KEY_MLX_MODEL_ID]: "mlxModelId",
-    [KEY_OLLAMA_BASE_URL]: "ollamaBaseURL",
-    [KEY_OLLAMA_MODEL_ID]: "ollamaModelId",
-    [KEY_OPENAI_COMPAT_BASE_URL]: "openaiCompatibleBaseURL",
-    [KEY_OPENAI_COMPAT_MODEL_ID]: "openaiCompatibleModelId",
-    [KEY_OPENAI_COMPAT_CONTEXT_LIMIT]: "openaiCompatibleContextLimit",
-    [KEY_CUSTOM_ENDPOINTS]: "customEndpoints",
-    [KEY_OPENROUTER_MODEL_ID]: "openrouterModelId",
-    [KEY_STT_PROVIDER]: "sttProvider",
-    [KEY_GROQ_STT_MODEL]: "groqSttModel",
-    [KEY_WHISPERCPP_BASE_URL]: "whispercppBaseURL",
-    [KEY_FAVORITE_MODELS]: "favoriteModelIds",
-    [KEY_RECENT_MODELS]: "recentModelIds",
-    [KEY_VIM_MODE]: "vimMode",
-    [KEY_EDITOR_WORD_WRAP]: "editorWordWrap",
-    [KEY_EDITOR_WORD_WRAP_COLUMN]: "editorWordWrapColumn",
-    [KEY_SHOW_HIDDEN]: "showHidden",
-    [KEY_EXPLORER_GIT_DECORATIONS]: "explorerGitDecorations",
-    [KEY_TERMINAL_RENDERER]: "terminalRenderer",
-    [KEY_TERMINAL_SCREEN_READER]: "terminalScreenReader",
-    [KEY_TERMINAL_CURSOR_BLINK]: "terminalCursorBlink",
-    [KEY_TERMINAL_CURSOR_STYLE]: "terminalCursorStyle",
-    [KEY_TERMINAL_FONT_FAMILY]: "terminalFontFamily",
-    [KEY_TERMINAL_FONT_WEIGHT]: "terminalFontWeight",
-    [KEY_TERMINAL_SHELL]: "terminalShell",
-    [KEY_TERMINAL_LETTER_SPACING]: "terminalLetterSpacing",
-    [KEY_TERMINAL_FONT_SIZE]: "terminalFontSize",
-    [KEY_TERMINAL_SCROLLBACK]: "terminalScrollback",
-    [KEY_CONFIRM_CLOSE_RUNNING_TERMINAL]: "confirmCloseRunningTerminal",
-    [KEY_LAST_WSL_DISTRO]: "lastWslDistro",
-    [KEY_ZOOM_LEVEL]: "zoomLevel",
-    [KEY_AGENT_NOTIFICATIONS]: "agentNotifications",
-    [KEY_AGENT_NOTIFICATION_SOUND]: "agentNotificationSound",
-    [KEY_AGENT_LAUNCH_COMMANDS]: "agentLaunchCommands",
-    [KEY_DEFAULT_WORKSPACE_ENV]: "defaultWorkspaceEnv",
-    [KEY_SHORTCUTS]: "shortcuts",
-    [KEY_EDITOR_AUTO_SAVE]: "editorAutoSave",
-    [KEY_EDITOR_AUTO_SAVE_DELAY]: "editorAutoSaveDelay",
-    [KEY_EDITOR_FORMAT_ON_SAVE]: "editorFormatOnSave",
-    [KEY_EDITOR_FORMATTER]: "editorFormatter",
-    [KEY_EDITOR_FORMATTER_BY_LANG]: "editorFormatterByLang",
-    [KEY_EDITOR_CUSTOM_FORMAT_COMMAND]: "editorCustomFormatCommand",
-    [KEY_LSP_ACTIVATION]: "lspActivation",
-    [KEY_LSP_CUSTOM_SERVERS]: "lspCustomServers",
-  };
-  // Same-process writes still fire onChange immediately; cross-window writes
-  // arrive via the Tauri event emitted by writePref().
-  const unsubLocal = await store.onChange<unknown>((key, value) => {
-    const mapped = map[key];
-    if (mapped) cb(mapped, value);
-  });
-  const unsubEvent = await listen<{ key: string; value: unknown }>(
-    PREFS_CHANGED_EVENT,
-    (e) => {
-      const mapped = map[e.payload.key];
-      if (mapped) cb(mapped, e.payload.value);
+  let previous: Preferences | undefined;
+  return observePreferences(
+    (next) => {
+      for (const key of Object.keys(next) as PrefKey[])
+        if (!previous || !Object.is(previous[key], next[key]))
+          cb(key, next[key]);
+      previous = next;
     },
+    (error) => console.error("[preferences]", error),
   );
-  return () => {
-    unsubLocal();
-    unsubEvent();
-  };
 }
 
 // API key changes are stored in OS keychain (not the prefs store),
 // so we broadcast via a Tauri event for cross-window listeners.
-const KEYS_CHANGED_EVENT = "terax://ai-keys-changed";
+const KEYS_CHANGED_EVENT = "oarlock://ai-keys-changed";
 
 export async function emitKeysChanged(): Promise<void> {
   await emit(KEYS_CHANGED_EVENT);

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,13 @@ use tauri::Manager;
 
 use super::framing::{encode_frame, FrameDecoder};
 
+pub(super) const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTPUT_WINDOW: Duration = Duration::from_secs(10);
+const OUTPUT_MAX_BYTES: usize = 512 * 1024 * 1024;
+const OUTPUT_MAX_MESSAGES: usize = 50_000;
+const EXCESSIVE_OUTPUT: &str = "excessive output";
+
 const READ_BUF: usize = 32 * 1024;
 const STDERR_LINE_CAP: usize = 512;
 const STDERR_TAIL_LINES: usize = 8;
@@ -21,6 +29,69 @@ const MEM_STARTUP_GRACE: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_RSS_MB: u64 = 4096;
 // Pipe pumps and the waiter only shuffle bytes, so they need very little stack.
 const THREAD_STACK: usize = 256 * 1024;
+
+struct OutputBucket {
+    second: u64,
+    last: Instant,
+    bytes: usize,
+    messages: usize,
+}
+
+struct OutputBudget {
+    start: Instant,
+    buckets: VecDeque<OutputBucket>,
+    bytes: usize,
+    messages: usize,
+}
+
+impl OutputBudget {
+    fn new(start: Instant) -> Self {
+        Self {
+            start,
+            buckets: VecDeque::new(),
+            bytes: 0,
+            messages: 0,
+        }
+    }
+
+    fn admit(&mut self, now: Instant, bytes: usize) -> bool {
+        // Retain a partially expired bucket until its last message expires.
+        while self
+            .buckets
+            .front()
+            .is_some_and(|bucket| now.saturating_duration_since(bucket.last) >= OUTPUT_WINDOW)
+        {
+            let old = self.buckets.pop_front().expect("front exists");
+            self.bytes -= old.bytes;
+            self.messages -= old.messages;
+        }
+        if bytes > OUTPUT_MAX_BYTES.saturating_sub(self.bytes)
+            || self.messages >= OUTPUT_MAX_MESSAGES
+        {
+            return false;
+        }
+        let second = now.saturating_duration_since(self.start).as_secs();
+        if self
+            .buckets
+            .back()
+            .is_none_or(|bucket| bucket.second != second)
+        {
+            self.buckets.push_back(OutputBucket {
+                second,
+                last: now,
+                bytes: 0,
+                messages: 0,
+            });
+        }
+        let bucket = self.buckets.back_mut().expect("bucket inserted");
+        bucket.last = now;
+        bucket.bytes += bytes;
+        bucket.messages += 1;
+        self.bytes += bytes;
+        self.messages += 1;
+        true
+    }
+}
 
 fn spawn_thread(
     name: String,
@@ -49,6 +120,24 @@ fn next_memory_check(now: Instant, first: bool) -> Instant {
     }
 }
 
+fn wait_lsp_exit(
+    session: &LspSession,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(unix)]
+    {
+        if session.tree.wait_until(deadline)? {
+            session.tree.finish_foreground().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        session.child.wait_deadline(deadline)
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LspExit {
@@ -58,33 +147,123 @@ pub struct LspExit {
 }
 
 pub struct LspSession {
+    #[cfg(unix)]
+    tree: Arc<crate::modules::proc::group::ProcessTree>,
     #[cfg(windows)]
     _job: Option<crate::modules::proc::job::ProcessJob>,
+    #[cfg(not(unix))]
     child: Arc<SharedChild>,
     stdin: Mutex<Option<ChildStdin>>,
+    stopping: AtomicBool,
+    writing: AtomicBool,
+    kill_reason: Arc<Mutex<Option<String>>>,
     pub(super) exited: Arc<AtomicBool>,
 }
 
+struct WritePermit(Arc<LspSession>);
+impl Drop for WritePermit {
+    fn drop(&mut self) {
+        self.0.writing.store(false, Ordering::Release);
+    }
+}
+
 impl LspSession {
+    fn stop_with_reason(&self, reason: String) -> String {
+        let mut saved = self.kill_reason.lock().unwrap();
+        if saved.is_none() {
+            *saved = Some(reason.clone());
+        }
+        drop(saved);
+        self.kill();
+        reason
+    }
+
+    pub async fn send(self: &Arc<Self>, message: String) -> Result<(), String> {
+        self.send_with_timeout(message, WRITE_TIMEOUT).await
+    }
+
+    async fn send_with_timeout(
+        self: &Arc<Self>,
+        message: String,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if message.len() > MAX_WRITE_BYTES {
+            return Err(self.stop_with_reason(
+                "Language server write exceeds 16 MiB. Restart the language server.".into(),
+            ));
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("lsp session is stopping".into());
+        }
+        if self
+            .writing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(self.stop_with_reason(
+                "Concurrent language server writes refused. Restart the language server.".into(),
+            ));
+        }
+        let permit = WritePermit(self.clone());
+        let writing = tauri::async_runtime::spawn_blocking(move || {
+            let result = permit.0.write_message(&message);
+            drop(permit);
+            result
+        });
+        match tokio::time::timeout(timeout, writing).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(self.stop_with_reason(error)),
+            Ok(Err(error)) => {
+                Err(self.stop_with_reason(format!("Language server writer failed: {error}")))
+            }
+            Err(_) => Err(self.stop_with_reason(
+                "Language server write stalled for 30 seconds. Restart the language server.".into(),
+            )),
+        }
+    }
+
     pub fn write_message(&self, payload: &str) -> Result<(), String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("lsp session is stopping".into());
+        }
         let mut guard = self.stdin.lock().unwrap();
+        if self.stopping.load(Ordering::Acquire) {
+            *guard = None;
+            return Err("lsp session is stopping".into());
+        }
         let stdin = guard.as_mut().ok_or("lsp session stdin closed")?;
-        stdin
+        let result = stdin
             .write_all(&encode_frame(payload))
             .and_then(|_| stdin.flush())
-            .map_err(|e| format!("lsp write failed: {e}"))
+            .map_err(|e| format!("lsp write failed: {e}"));
+        if self.stopping.load(Ordering::Acquire) {
+            *guard = None;
+        }
+        result
     }
 
     // Servers fork helpers (cargo check, rustc, proc-macro hosts); killing
     // only the leader leaves them burning CPU. Unix: signal the process
     // group. Windows: the Job Object covers the tree.
     pub fn kill(&self) {
-        *self.stdin.lock().unwrap() = None;
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
         }
+        #[cfg(unix)]
+        self.tree.kill_now();
+        #[cfg(windows)]
+        if let Some(job) = &self._job {
+            if let Err(error) = job.terminate() {
+                log::warn!("lsp process-tree termination failed: {error}");
+            }
+        }
+        #[cfg(not(unix))]
         let _ = self.child.kill();
+        // A full pipe holds this mutex. Stop must not wait on server input;
+        // the active writer closes its handle when termination releases it.
+        if let Ok(mut stdin) = self.stdin.try_lock() {
+            *stdin = None;
+        }
     }
 }
 
@@ -94,12 +273,30 @@ impl Drop for LspSession {
     }
 }
 
+struct StartGuard {
+    session: Arc<LspSession>,
+    armed: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.kill();
+            #[cfg(unix)]
+            let _ = self.session.tree.finish_foreground();
+            #[cfg(not(unix))]
+            let _ = self.session.child.wait();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     id: u32,
     app: tauri::AppHandle,
     binary: &std::path::Path,
     args: &[String],
+    server_env: &super::env::ServerEnv,
     extra_env: &std::collections::HashMap<String, String>,
     root: &std::path::Path,
     max_rss_mb: Option<u64>,
@@ -109,7 +306,7 @@ pub fn spawn(
     let mut cmd = Command::new(binary);
     cmd.args(args)
         .current_dir(root)
-        .envs(super::env::server_env_overlay())
+        .envs(server_env)
         .envs(extra_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -128,18 +325,26 @@ pub fn spawn(
         SharedChild::spawn(&mut cmd)
             .map_err(|e| format!("lsp spawn failed for {}: {e}", binary.display()))?,
     );
+    #[cfg(unix)]
+    let tree = Arc::new(crate::modules::proc::group::ProcessTree::new(child.clone()));
     let kill_on_fail = || {
-        let _ = child.kill();
+        #[cfg(unix)]
+        let _ = tree.finish_foreground();
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     };
     let stdin = child.take_stdin().ok_or_else(|| {
         kill_on_fail();
         "lsp: no stdin pipe".to_string()
     })?;
-    let mut stdout = child.take_stdout().ok_or_else(|| {
+    let stdout = child.take_stdout().ok_or_else(|| {
         kill_on_fail();
         "lsp: no stdout pipe".to_string()
     })?;
-    let mut stderr = child.take_stderr().ok_or_else(|| {
+    let stderr = child.take_stderr().ok_or_else(|| {
         kill_on_fail();
         "lsp: no stderr pipe".to_string()
     })?;
@@ -153,18 +358,39 @@ pub fn spawn(
         }
     };
 
+    let kill_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let exited = Arc::new(AtomicBool::new(false));
     let session = Arc::new(LspSession {
+        #[cfg(unix)]
+        tree,
         #[cfg(windows)]
         _job: job,
+        #[cfg(not(unix))]
         child: child.clone(),
         stdin: Mutex::new(Some(stdin)),
+        stopping: AtomicBool::new(false),
+        writing: AtomicBool::new(false),
+        kill_reason: kill_reason.clone(),
         exited: exited.clone(),
     });
+    let mut start_guard = StartGuard {
+        session: session.clone(),
+        armed: true,
+    };
+
+    #[cfg(unix)]
+    let (mut stdout, stdout_wake) = crate::modules::proc::capture::InterruptibleReader::new(stdout)
+        .map_err(|error| format!("lsp stdout wake setup failed: {error}"))?;
+    #[cfg(unix)]
+    let (mut stderr, stderr_wake) = crate::modules::proc::capture::InterruptibleReader::new(stderr)
+        .map_err(|error| format!("lsp stderr wake setup failed: {error}"))?;
+    #[cfg(not(unix))]
+    let (mut stdout, mut stderr) = (stdout, stderr);
 
     let session_reader = session.clone();
-    let reader_thread = spawn_thread(format!("terax-lsp-reader-{id}"), move || {
+    let reader_thread = spawn_thread(format!("oarlock-lsp-reader-{id}"), move || {
         let mut decoder = FrameDecoder::default();
+        let mut budget = OutputBudget::new(Instant::now());
         let mut buf = [0u8; READ_BUF];
         loop {
             match stdout.read(&mut buf) {
@@ -172,6 +398,11 @@ pub fn spawn(
                 Ok(n) => match decoder.push(&buf[..n]) {
                     Ok(messages) => {
                         for msg in messages {
+                            if !budget.admit(Instant::now(), msg.len()) {
+                                log::warn!("lsp id={id} exceeded its output budget; killing server");
+                                session_reader.stop_with_reason(EXCESSIVE_OUTPUT.into());
+                                return;
+                            }
                             if on_message.send(Response::new(msg.into_bytes())).is_err() {
                                 log::info!("lsp id={id}: channel closed; killing server");
                                 session_reader.kill();
@@ -196,7 +427,7 @@ pub fn spawn(
     let stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>> =
         Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let stderr_tail_w = stderr_tail.clone();
-    spawn_thread(format!("terax-lsp-stderr-{id}"), move || {
+    let stderr_thread = spawn_thread(format!("oarlock-lsp-stderr-{id}"), move || {
         let mut buf = [0u8; 4096];
         let mut line: Vec<u8> = Vec::new();
         let push_line = |line: &mut Vec<u8>| {
@@ -227,19 +458,17 @@ pub fn spawn(
         push_line(&mut line);
     })?;
 
-    let kill_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cap_mb = max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
     let pid = child.id();
     let session_w = session.clone();
-    let child_waiter = child;
     let exited_w = exited;
     // One thread both reaps the server and polices its memory: the wait is a
     // timed condvar sleep, so an idle server costs two wakeups per minute and
     // no dedicated polling thread.
-    spawn_thread(format!("terax-lsp-waiter-{id}"), move || {
+    spawn_thread(format!("oarlock-lsp-waiter-{id}"), move || {
         let mut check_at = next_memory_check(Instant::now(), true);
         let code = loop {
-            match child_waiter.wait_deadline(check_at) {
+            match wait_lsp_exit(&session_w, check_at) {
                 Ok(Some(status)) => break status.code(),
                 Ok(None) => {
                     if let Some(rss) = crate::modules::proc::rss::rss_bytes(pid) {
@@ -257,6 +486,11 @@ pub fn spawn(
                 }
                 Err(e) => {
                     log::warn!("lsp id={id} wait failed: {e}");
+                    session_w.kill();
+                    #[cfg(unix)]
+                    let _ = session_w.tree.finish_foreground();
+                    #[cfg(not(unix))]
+                    let _ = session_w.child.wait();
                     break None;
                 }
             }
@@ -265,8 +499,19 @@ pub fn spawn(
         // Bounded, not join: a grandchild inheriting stdout keeps the
         // pipe open past child exit and would hang us.
         let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline && !reader_thread.is_finished() {
+        while Instant::now() < deadline
+            && (!reader_thread.is_finished() || !stderr_thread.is_finished())
+        {
             thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(unix)]
+        {
+            if !reader_thread.is_finished() {
+                let _ = stdout_wake.shutdown(std::net::Shutdown::Write);
+            }
+            if !stderr_thread.is_finished() {
+                let _ = stderr_wake.shutdown(std::net::Shutdown::Write);
+            }
         }
         if let Some(state) = app.try_state::<super::LspState>() {
             state.take(id);
@@ -283,6 +528,8 @@ pub fn spawn(
         }
     })?;
 
+    start_guard.armed = false;
+
     Ok(session)
 }
 
@@ -292,8 +539,11 @@ mod tests {
 
     fn dummy_session(child: Arc<SharedChild>, stdin: Option<ChildStdin>) -> LspSession {
         LspSession {
-            child,
+            tree: Arc::new(crate::modules::proc::group::ProcessTree::new(child.clone())),
             stdin: Mutex::new(stdin),
+            stopping: AtomicBool::new(false),
+            writing: AtomicBool::new(false),
+            kill_reason: Arc::new(Mutex::new(None)),
             exited: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -312,6 +562,81 @@ mod tests {
         assert_eq!(over_budget(4096 * mb, 4096), None);
         assert_eq!(over_budget(4096 * mb + mb - 1, 4096), None);
         assert_eq!(over_budget(4097 * mb, 4096), Some(4097));
+    }
+
+    #[test]
+    fn natural_server_exit_terminates_its_remaining_process_group() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let trigger = dir.path().join("trigger");
+        let script = format!(
+            "(while [ ! -e '{}' ]; do sleep 0.02; done; touch '{}') & exit 0",
+            trigger.display(), marker.display()
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &script])
+            .stdin(Stdio::piped())
+            .process_group(0);
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = dummy_session(child.clone(), child.take_stdin());
+        let status = wait_lsp_exit(&session, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .expect("server should exit");
+        assert!(status.success());
+        std::fs::write(trigger, b"go").unwrap();
+        thread::sleep(Duration::from_millis(700));
+        assert!(!marker.exists(), "server descendant survived natural exit");
+    }
+
+    #[test]
+    fn failed_start_cleans_up_even_if_a_reader_keeps_the_session_alive() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::piped());
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+        let reader_owner = session.clone();
+        drop(StartGuard {
+            session,
+            armed: true,
+        });
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+        drop(reader_owner);
+    }
+
+    #[test]
+    fn output_budget_enforces_bytes_and_expires_old_buckets() {
+        let start = Instant::now();
+        let mut budget = OutputBudget::new(start);
+        assert!(budget.admit(start, OUTPUT_MAX_BYTES));
+        assert!(!budget.admit(start + Duration::from_millis(999), 1));
+        assert!(budget.admit(start + OUTPUT_WINDOW, 1));
+    }
+
+    #[test]
+    fn output_budget_enforces_message_count_across_bucket_boundaries() {
+        let start = Instant::now();
+        let mut budget = OutputBudget::new(start);
+        for i in 0..OUTPUT_MAX_MESSAGES {
+            let now =
+                start + Duration::from_millis(if i < OUTPUT_MAX_MESSAGES / 2 { 0 } else { 999 });
+            assert!(budget.admit(now, 0));
+        }
+        assert!(!budget.admit(start + Duration::from_millis(999), 0));
+        assert!(budget.admit(start + OUTPUT_WINDOW + Duration::from_secs(1), 0));
+    }
+
+    #[test]
+    fn output_budget_keeps_a_partial_second_until_all_its_messages_expire() {
+        let start = Instant::now();
+        let mut budget = OutputBudget::new(start);
+        assert!(budget.admit(start, OUTPUT_MAX_BYTES - 1));
+        assert!(budget.admit(start + Duration::from_millis(999), 1));
+        assert!(!budget.admit(start + OUTPUT_WINDOW, 1));
+        assert!(budget.admit(start + OUTPUT_WINDOW + Duration::from_millis(999), 1));
     }
 
     #[test]
@@ -390,6 +715,121 @@ mod tests {
     }
 
     #[test]
+    fn releasing_one_window_terminates_only_its_language_server() {
+        let state = super::super::LspState::default();
+        let make = || {
+            let mut cmd = Command::new("/bin/sleep");
+            cmd.arg("30").stdin(Stdio::piped());
+            let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+            let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+            (child, session)
+        };
+        let (a, session_a) = make();
+        let (b, session_b) = make();
+        {
+            let mut registry = state.sessions.write().unwrap();
+            registry.reserve(1, "a", "page-a", "rust", 0).unwrap();
+            registry.publish(1, session_a).unwrap();
+            registry.reserve(2, "b", "page-b", "rust", 0).unwrap();
+            registry.publish(2, session_b).unwrap();
+        }
+        state.release_window("a");
+        let stopped = a
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some();
+        let other_running = b.try_wait().unwrap().is_none();
+        // Always clean up both processes before reporting assertions.
+        state.kill_all();
+        let _ = a.kill();
+        let _ = a.wait();
+        let _ = b.wait();
+        assert!(stopped, "closing the owner left its language server alive");
+        assert!(
+            other_running,
+            "closing one window killed another window's server"
+        );
+    }
+
+    fn sleeping_writer() -> (Arc<SharedChild>, Arc<LspSession>) {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::piped());
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+        (child, session)
+    }
+
+    #[tokio::test]
+    async fn a_stalled_write_terminates_the_process_and_releases_its_permit() {
+        let (child, session) = sleeping_writer();
+        let result = session
+            .send_with_timeout("x".repeat(1024 * 1024), Duration::from_millis(50))
+            .await;
+        assert!(result.unwrap_err().contains("stalled"));
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.writing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "writer kept its permit after termination"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(session
+            .kill_reason
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains("stalled"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_writer_is_rejected_before_waiting_for_the_pipe_lock() {
+        let (child, session) = sleeping_writer();
+        let first = tokio::spawn({
+            let session = session.clone();
+            async move { session.send("x".repeat(1024 * 1024)).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session.writing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "first writer never reserved ownership"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(session
+            .send("second".into())
+            .await
+            .unwrap_err()
+            .contains("Concurrent"));
+        assert!(first.await.unwrap().is_err());
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_native_messages_are_refused_before_writing() {
+        let (child, session) = sleeping_writer();
+        assert!(session
+            .send("x".repeat(MAX_WRITE_BYTES + 1))
+            .await
+            .unwrap_err()
+            .contains("16 MiB"));
+        assert!(!session.writing.load(Ordering::Acquire));
+        assert!(child
+            .wait_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn write_after_kill_errors() {
         let mut cmd = Command::new("/bin/cat");
         cmd.stdin(Stdio::piped()).stdout(Stdio::null());
@@ -399,5 +839,43 @@ mod tests {
 
         session.kill();
         assert!(session.write_message("{}").is_err());
+    }
+
+    #[test]
+    fn stopping_a_server_does_not_wait_for_its_blocked_stdin_writer() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::piped());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = Arc::new(SharedChild::spawn(&mut cmd).unwrap());
+        let session = Arc::new(dummy_session(child.clone(), child.take_stdin()));
+        let writer = session.clone();
+        let write = thread::spawn(move || writer.write_message(&"x".repeat(1024 * 1024)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.stdin.try_lock().is_ok() {
+            assert!(Instant::now() < deadline, "writer never acquired stdin");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let stopper = session.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let stop = thread::spawn(move || {
+            stopper.kill();
+            done.send(()).unwrap();
+        });
+        let prompt = result.recv_timeout(Duration::from_millis(500)).is_ok();
+        // Always rescue and join the reproduction before reporting a failure.
+        let _ = child.kill();
+        let _ = child.wait();
+        stop.join().unwrap();
+        assert!(write.join().unwrap().is_err());
+        assert!(prompt, "Stop waited on a full language-server stdin pipe");
     }
 }

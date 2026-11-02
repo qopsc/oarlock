@@ -1,19 +1,26 @@
+import { requireCurrentPreferences } from "@/modules/settings/readiness";
+import { assertChatNotStopping } from "./chatStop";
 import { Chat, type UIMessage } from "@ai-sdk/react";
 import {
   type ChatTransport,
   lastAssistantMessageIsCompleteWithApprovalResponses,
 } from "ai";
-import { getModel, providerNeedsKey, type ModelId } from "../config";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { BUILTIN_AGENTS } from "../lib/agents";
 import { useAgentsStore } from "./agentsStore";
 import { usePlanStore } from "./planStore";
+import {
+  denyUnansweredApprovals,
+  EXPIRED_APPROVAL_REASON,
+} from "../lib/toolApprovals";
 import { createContextAwareTransport } from "../lib/transport";
 import type { ToolContext } from "../tools/tools";
 import {
   chats,
-  getActiveProviderKey,
+  countConversationUsage,
+  patchConversationMeta,
   seedMessages,
+  sessionApprovalMode,
   touchChat,
   useChatStore,
 } from "./chatStore";
@@ -38,8 +45,24 @@ function makeChat(sessionId: string): Chat<UIMessage> {
   };
 
   const transport = createContextAwareTransport({
+    assertReady: requireCurrentPreferences,
     getKeys: () => useChatStore.getState().apiKeys,
     toolContext,
+    captureToolContext: () => {
+      const current = useChatStore.getState().live;
+      const live = current.capture?.() ?? current;
+      return {
+        ...toolContext,
+        spaceId: live.spaceId,
+        getCwd: live.getCwd,
+        getWorkspaceRoot: live.getWorkspaceRoot,
+        getTerminalContext: live.getTerminalContext,
+        isActiveTerminalPrivate: live.isActiveTerminalPrivate,
+        injectIntoActivePty: live.injectIntoActivePty,
+        openPreview: live.openPreview,
+        spawnAgent: (prompt) => live.spawnManagedAgent(prompt, sessionId),
+      };
+    },
     getModelId: () => useChatStore.getState().selectedModelId,
     getCustomInstructions: () =>
       usePreferencesStore.getState().customInstructions,
@@ -59,44 +82,42 @@ function makeChat(sessionId: string): Chat<UIMessage> {
       };
     },
     getPlanMode: () => usePlanStore.getState().active,
+    getApprovalMode: () =>
+      sessionApprovalMode(useChatStore.getState().sessions, sessionId),
+    getReasoningEffort: () =>
+      usePreferencesStore.getState().reasoningEffortByModel[
+        useChatStore.getState().selectedModelId
+      ],
+    getSkills: async (root, workspace) => {
+      const { loadAgentSkills } = await import("@/modules/skills/catalog");
+      return loadAgentSkills(root, workspace);
+    },
     getLmstudioBaseURL: () => usePreferencesStore.getState().lmstudioBaseURL,
     getLmstudioModelId: () => usePreferencesStore.getState().lmstudioModelId,
     getMlxBaseURL: () => usePreferencesStore.getState().mlxBaseURL,
     getMlxModelId: () => usePreferencesStore.getState().mlxModelId,
     getOllamaBaseURL: () => usePreferencesStore.getState().ollamaBaseURL,
     getOllamaModelId: () => usePreferencesStore.getState().ollamaModelId,
-    getOpenaiCompatibleBaseURL: () =>
-      usePreferencesStore.getState().openaiCompatibleBaseURL,
-    getOpenaiCompatibleModelId: () =>
-      usePreferencesStore.getState().openaiCompatibleModelId,
-    getOpenaiCompatibleContextLimit: () =>
-      usePreferencesStore.getState().openaiCompatibleContextLimit,
     getOpenrouterModelId: () =>
       usePreferencesStore.getState().openrouterModelId,
     getCustomEndpoints: () => usePreferencesStore.getState().customEndpoints,
     getCustomEndpointKeys: () => useChatStore.getState().customEndpointKeys,
+    // What the run reports is this conversation's: it shows while this is
+    // the open conversation and changes nothing for another one.
     onStep: (step) => {
-      useChatStore.getState().patchAgentMeta({ step });
+      patchConversationMeta(sessionId, { step });
     },
     onCompact: (info) => {
-      useChatStore.getState().patchAgentMeta({
+      patchConversationMeta(sessionId, {
         compactionNotice: { droppedCount: info.droppedCount, at: Date.now() },
       });
     },
     onFinishMeta: (info) => {
-      useChatStore.getState().patchAgentMeta({ hitStepCap: info.hitStepCap });
+      patchConversationMeta(sessionId, { hitStepCap: info.hitStepCap });
     },
-    onUsage: (delta) => {
-      const cur = useChatStore.getState().agentMeta.tokens;
-      useChatStore.getState().patchAgentMeta({
-        tokens: {
-          inputTokens: cur.inputTokens + delta.inputTokens,
-          outputTokens: cur.outputTokens + delta.outputTokens,
-          cachedInputTokens: cur.cachedInputTokens + delta.cachedInputTokens,
-        },
-        lastInputTokens: delta.lastInputTokens,
-        lastCachedTokens: delta.lastCachedTokens,
-      });
+    onUsage: ({ modelId, lastInputTokens, lastCachedTokens, ...usage }) => {
+      if (!countConversationUsage(sessionId, modelId, usage)) return;
+      patchConversationMeta(sessionId, { lastInputTokens, lastCachedTokens });
     },
   }) as unknown as ChatTransport<UIMessage>;
 
@@ -106,10 +127,12 @@ function makeChat(sessionId: string): Chat<UIMessage> {
   return new Chat<UIMessage>({
     id: sessionId,
     transport,
-    messages: initialMessages,
+    messages: initialMessages
+      ? denyUnansweredApprovals(initialMessages, EXPIRED_APPROVAL_REASON)
+      : undefined,
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
     onError: (e) => {
-      useChatStore.getState().patchAgentMeta({
+      patchConversationMeta(sessionId, {
         status: "error",
         error: e instanceof Error ? e.message : String(e),
       });
@@ -128,16 +151,40 @@ export function getOrCreateChat(sessionId: string): Chat<UIMessage> {
   return c;
 }
 
+type OutgoingMessage = Parameters<Chat<UIMessage>["sendMessage"]>[0];
+
+/** Every user message goes through here: it supersedes approvals still
+ *  waiting, which are settled as denied first so the request carries a result
+ *  for each call. */
+export async function sendUserMessage(
+  chat: Chat<UIMessage>,
+  message: OutgoingMessage,
+  onAccepted?: (userMessageId: string) => void,
+): Promise<void> {
+  // Keep context capture synchronous with submission. The transport checks the
+  // shared native barrier before any work starts, including approval continuations.
+  requireCurrentPreferences();
+  assertChatNotStopping(chat.id);
+  const settled = denyUnansweredApprovals(chat.messages);
+  if (settled !== chat.messages) chat.messages = settled;
+  // The transport claims the composer's owner by message id, and the SDK runs the transport
+  // before sendMessage returns, so a full message is accepted under its id first.
+  if (message && "parts" in message) {
+    const id = (message as { id?: string }).id ?? crypto.randomUUID();
+    onAccepted?.(id);
+    return chat.sendMessage({ ...message, id } as OutgoingMessage);
+  }
+  const sent = chat.sendMessage(message);
+  onAccepted?.([...chat.messages].reverse().find((m) => m.role === "user")?.id ?? "");
+  return sent;
+}
+
+/** Sends `text` in the active session. A model that cannot run (a missing
+ *  key or endpoint) fails the request, which the chat shows like any other
+ *  error, instead of dropping the message unseen. */
 export async function sendMessage(text: string): Promise<boolean> {
-  const state = useChatStore.getState();
-  const sessionId = state.activeSessionId;
+  const sessionId = useChatStore.getState().activeSessionId;
   if (!sessionId) return false;
-  if (
-    providerNeedsKey(getModel(state.selectedModelId as ModelId).provider) &&
-    !getActiveProviderKey()
-  )
-    return false;
-  const c = getOrCreateChat(sessionId);
-  await c.sendMessage({ text });
+  await sendUserMessage(getOrCreateChat(sessionId), { text });
   return true;
 }

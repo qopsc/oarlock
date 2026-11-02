@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UIMessage } from "@ai-sdk/react";
 
-type Meta = { id: string; migrate: boolean; durable: boolean };
+type Meta = {
+  id: string;
+  migrate: boolean;
+  durable: boolean;
+  expectedRevision?: number | null;
+};
 
 const storage = vi.hoisted(() => {
   const data = new Map<string, unknown>();
   const files = new Map<string, unknown>();
   const saves: Array<Meta & { messages: unknown }> = [];
+  const revisions = new Map<string, number>();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const defaultInvoke = async (
@@ -14,22 +20,69 @@ const storage = vi.hoisted(() => {
     arg?: unknown,
     options?: { headers: Record<string, string> },
   ): Promise<unknown> => {
+    if (command === "ai_sessions_snapshot")
+      return {
+        revision: Number(data.get("revision") ?? 0),
+        sessions: data.get("sessions") ?? [],
+      };
+    if (command === "ai_sessions_mutate") {
+      const { delta } = arg as {
+        delta: {
+          creates: Record<string, unknown>[];
+          updates: { id: string; patch: object }[];
+          deletes: string[];
+        };
+      };
+      let list = (data.get("sessions") ?? []) as Record<string, unknown>[];
+      list = list
+        .filter((s) => !delta.deletes.includes(s.id as string))
+        .map((s) => ({
+          ...s,
+          ...delta.updates.find((u) => u.id === s.id)?.patch,
+        }));
+      list = [
+        ...delta.creates.filter((s) => !list.some((v) => v.id === s.id)),
+        ...list,
+      ];
+      data.set("sessions", list);
+      const revision = Number(data.get("revision") ?? 0) + 1;
+      data.set("revision", revision);
+      return { revision, sessions: list };
+    }
     if (command === "ai_session_save") {
       const meta = JSON.parse(
-        options?.headers["x-terax-session"] ?? "{}",
+        options?.headers["x-oarlock-session"] ?? "{}",
       ) as Meta;
       const messages = JSON.parse(decoder.decode(arg as Uint8Array));
+      const current = revisions.get(meta.id) ?? 0;
+      if (
+        !meta.migrate &&
+        (meta.expectedRevision == null
+          ? files.has(meta.id) || current !== 0
+          : meta.expectedRevision !== current)
+      ) {
+        throw new Error("conflict: conversation changed in another window");
+      }
       saves.push({ ...meta, messages });
-      if (!meta.migrate || !files.has(meta.id)) files.set(meta.id, messages);
-      return undefined;
+      if (meta.migrate && files.has(meta.id)) return current;
+      files.set(meta.id, messages);
+      revisions.set(meta.id, current + 1);
+      return current + 1;
     }
     const { id } = (arg ?? {}) as { id: string };
     if (command === "ai_session_load") {
-      return files.has(id)
-        ? encoder.encode(JSON.stringify(files.get(id))).buffer
-        : new ArrayBuffer(0);
+      const body = files.has(id)
+        ? encoder.encode(JSON.stringify(files.get(id)))
+        : new Uint8Array();
+      const payload = new Uint8Array(4 + body.byteLength);
+      new DataView(payload.buffer).setUint32(0, revisions.get(id) ?? 0, true);
+      payload.set(body, 4);
+      return payload.buffer;
     }
-    if (command === "ai_session_delete") files.delete(id);
+    if (command === "ai_session_delete") {
+      files.delete(id);
+      revisions.set(id, (revisions.get(id) ?? 0) + 1);
+    }
     return undefined;
   };
   const invoke = vi.fn(defaultInvoke);
@@ -52,6 +105,7 @@ const storage = vi.hoisted(() => {
   return {
     data,
     files,
+    revisions,
     saves,
     invoke,
     defaultInvoke,
@@ -78,6 +132,7 @@ const calls = (command: string) =>
 
 beforeEach(() => {
   storage.data.clear();
+  storage.revisions.clear();
   storage.files.clear();
   storage.saves.length = 0;
   storage.invoke.mockReset();
@@ -100,12 +155,19 @@ describe("session persistence", () => {
     await expect(mod.loadAll()).resolves.toEqual({
       sessions: [],
       activeId: null,
+      activeElsewhere: new Set(),
     });
     const sessions = [{ id: "s-1", title: "T", createdAt: 1, updatedAt: 2 }];
     storage.data.set("sessions", sessions);
     storage.data.set("activeId", "s-1");
+    // Another window's open chat.
+    storage.data.set("activeId:w-a", "s-2");
     storage.files.set("s-1", message("retained on disk"));
-    await expect(mod.loadAll()).resolves.toEqual({ sessions, activeId: "s-1" });
+    await expect(mod.loadAll()).resolves.toEqual({
+      sessions,
+      activeId: "s-1",
+      activeElsewhere: new Set(["s-2"]),
+    });
     expect(storage.entries).not.toHaveBeenCalled();
     expect(calls("ai_session_save")).toHaveLength(0);
     expect(calls("ai_session_load")).toHaveLength(0);
@@ -249,7 +311,7 @@ describe("session persistence", () => {
         release = resolve;
       });
       const meta = JSON.parse(
-        options?.headers["x-terax-session"] ?? "{}",
+        options?.headers["x-oarlock-session"] ?? "{}",
       ) as Meta;
       storage.saves.push({
         ...meta,
@@ -376,4 +438,100 @@ describe("session persistence", () => {
     storage.files.set("s-2", message("kept"));
     await expect(mod.loadMessages("s-2")).resolves.toEqual(message("kept"));
   });
+});
+
+it("rejects a stale window's history without replacing newer messages", async () => {
+  storage.files.set("shared", message("original"));
+  const a = await reload();
+  const b = await reload();
+  await a.loadMessages("shared");
+  await b.loadMessages("shared");
+  await a.saveMessages("shared", message("from A"));
+  await expect(b.saveMessages("shared", message("from B"))).rejects.toThrow(
+    "conflict:",
+  );
+  expect(storage.files.get("shared")).toEqual(message("from A"));
+  expect(toasts.error).toHaveBeenCalledWith(
+    "Conversation changed in another window",
+    expect.anything(),
+  );
+  expect((await b.flushSessionWrites({ timeoutMs: 50 })).failed).toContain(
+    "shared",
+  );
+});
+
+it("does not resurrect a chat deleted while another window was editing", async () => {
+  storage.files.set("shared", message("original"));
+  const a = await reload();
+  const b = await reload();
+  await b.loadMessages("shared");
+  await a.deleteSessionData("shared");
+  await expect(b.saveMessages("shared", message("stale"))).rejects.toThrow(
+    "conflict:",
+  );
+  expect(storage.files.has("shared")).toBe(false);
+});
+
+it("preserves the losing window's messages as a new conversation on request", async () => {
+  storage.files.set("shared", message("original"));
+  const a = await reload();
+  const b = await reload();
+  await a.loadMessages("shared");
+  await b.loadMessages("shared");
+  await a.saveMessages("shared", message("from A"));
+  await expect(b.saveMessages("shared", message("from B"))).rejects.toThrow(
+    "conflict:",
+  );
+  const notice =
+    toasts.error.mock.calls[toasts.error.mock.calls.length - 1]?.[1];
+  expect(notice.action.label).toBe("Save a copy");
+  notice.action.onClick();
+  await vi.waitFor(() => expect(storage.files.size).toBe(2));
+  await vi.waitFor(() =>
+    expect(storage.data.get("sessions")).toEqual([
+      expect.objectContaining({ title: "New chat (copy)" }),
+    ]),
+  );
+  expect(storage.files.get("shared")).toEqual(message("from A"));
+  expect([...storage.files.values()]).toContainEqual(message("from B"));
+  expect((await b.flushSessionWrites()).ok).toBe(true);
+});
+
+it("merges independent windows' metadata transactions instead of replacing snapshots", async () => {
+  const meta = (id: string) => ({ id, title: id, createdAt: 1, updatedAt: 1 });
+  storage.data.set("sessions", [meta("existing")]);
+  const a = await reload();
+  const b = await reload();
+  const [left, right] = await Promise.all([a.loadAll(), b.loadAll()]);
+  await Promise.all([
+    a.saveSessionsList([meta("a"), ...left.sessions], left.sessions),
+    b.saveSessionsList([meta("b"), ...right.sessions], right.sessions),
+  ]);
+  expect((await a.loadAll()).sessions.map((s) => s.id).sort()).toEqual([
+    "a",
+    "b",
+    "existing",
+  ]);
+  expect(calls("ai_sessions_mutate").map((c) => c[1])).toEqual([
+    { delta: { creates: [meta("a")], updates: [], deletes: [], base: 0 } },
+    { delta: { creates: [meta("b")], updates: [], deletes: [], base: 0 } },
+  ]);
+});
+
+it("keeps the base revision a create was enqueued with through a retry", async () => {
+  const meta = (id: string) => ({ id, title: id, createdAt: 1, updatedAt: 1 });
+  storage.data.set("sessions", []);
+  storage.data.set("revision", 3);
+  const sessions = await reload();
+  await sessions.loadAll();
+  storage.invoke.mockClear();
+  storage.invoke.mockRejectedValueOnce(new Error("disk full"));
+  await expect(sessions.saveSessionsList([meta("a")], [])).rejects.toThrow();
+  storage.data.set("revision", 400);
+  storage.invoke.mockClear();
+  await sessions.saveSessionsList([meta("a"), meta("b")], [meta("a")]).catch(() => {});
+  const bases = calls("ai_sessions_mutate").map(
+    ([, arg]) => (arg as { delta: { base: number } }).delta.base,
+  );
+  expect(bases[0]).toBe(3);
 });

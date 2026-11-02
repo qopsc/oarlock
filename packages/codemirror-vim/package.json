@@ -1,0 +1,29 @@
+{
+  "name": "@replit/codemirror-vim",
+  "version": "6.4.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./worker-budget": {
+      "types": "./worker-budget.d.ts",
+      "default": "./worker-budget.js"
+    }
+  },
+  "dependencies": {
+    "@replit/codemirror-vim-core": "workspace:*"
+  },
+  "peerDependencies": {
+    "@codemirror/commands": "6.x.x",
+    "@codemirror/language": "6.x.x",
+    "@codemirror/search": "6.x.x",
+    "@codemirror/state": "6.x.x",
+    "@codemirror/view": "6.x.x"
+  }
+}

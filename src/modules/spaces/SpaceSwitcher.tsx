@@ -1,3 +1,4 @@
+import { workspaceUnavailableReason } from "@/modules/workspace/availability";
 import { Kbd } from "@/components/ui/kbd";
 import {
   Popover,
@@ -12,14 +13,16 @@ import {
   ArrowRight01Icon,
   Cancel01Icon,
   Delete02Icon,
+  FolderOpenIcon,
   PencilEdit02Icon,
   PlusSignIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { InlineRename } from "./components/InlineRename";
 import { accentFor } from "./lib/spaceColor";
+import { releaseSpaceDrag, spaceDragEndAction } from "./lib/dragEnd";
 import type { SpaceMeta } from "./lib/store";
 import { useSpaces } from "./lib/useSpaces";
 import { SpaceAvatar } from "./SpaceAvatar";
@@ -29,6 +32,7 @@ type Props = {
   onOpenChange: (open: boolean) => void;
   tabs: Tab[];
   onNewSpace: () => void;
+  onOpenFolder: () => void;
   onDeleteSpace: (id: string) => void;
   onNewTabInSpace: (spaceId: string) => void;
   onJumpTab: (id: number) => void;
@@ -51,6 +55,8 @@ type DragState = {
   kind: "space" | "tab";
   id: string | number;
   active: boolean;
+  capture: Element;
+  previousSelection: string | null;
 };
 
 type DropTarget =
@@ -76,6 +82,7 @@ export function SpaceSwitcher({
   onOpenChange,
   tabs,
   onNewSpace,
+  onOpenFolder,
   onDeleteSpace,
   onNewTabInSpace,
   onJumpTab,
@@ -139,23 +146,30 @@ export function SpaceSwitcher({
       return next;
     });
 
-  const endDrag = (el: Element) => {
+  const endDrag = useCallback((updateState = true) => {
     const st = drag.current;
-    if (st) el.releasePointerCapture?.(st.pointerId);
+    // Clear ownership before releasing capture, which can itself emit an event.
     drag.current = null;
     dropRef.current = null;
-    setDragging(null);
-    setDrop(null);
-    setOverlay(null);
-    document.body.style.userSelect = "";
-  };
+    releaseSpaceDrag(st, document.body.style);
+    if (updateState) {
+      setDragging(null);
+      setDrop(null);
+      setOverlay(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open && drag.current) endDrag();
+  }, [open, endDrag]);
+  useEffect(() => () => endDrag(false), [endDrag]);
 
   const onPointerDown = (
     e: React.PointerEvent,
     kind: "space" | "tab",
     id: string | number,
   ) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || drag.current) return;
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
     drag.current = {
       pointerId: e.pointerId,
@@ -164,6 +178,8 @@ export function SpaceSwitcher({
       kind,
       id,
       active: false,
+      capture: e.currentTarget,
+      previousSelection: null,
     };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
@@ -174,6 +190,7 @@ export function SpaceSwitcher({
     if (!st.active) {
       if (Math.hypot(e.clientX - st.startX, e.clientY - st.startY) < 5) return;
       st.active = true;
+      st.previousSelection = document.body.style.userSelect;
       setDragging({ kind: st.kind, id: st.id });
       document.body.style.userSelect = "none";
     }
@@ -189,13 +206,15 @@ export function SpaceSwitcher({
       return;
     }
     const rect = hit.getBoundingClientRect();
-    const edge: Edge = e.clientY < rect.top + rect.height / 2 ? "top" : "bottom";
+    const edge: Edge =
+      e.clientY < rect.top + rect.height / 2 ? "top" : "bottom";
     const kind = hit.getAttribute("data-drop");
     let next: DropTarget | null = null;
     if (st.kind === "space") {
       if (kind === "space") {
         const spaceId = hit.getAttribute("data-space-id");
-        if (spaceId && spaceId !== st.id) next = { kind: "space", spaceId, edge };
+        if (spaceId && spaceId !== st.id)
+          next = { kind: "space", spaceId, edge };
       }
     } else if (kind === "tab") {
       const tabId = Number(hit.getAttribute("data-tab-id"));
@@ -226,11 +245,18 @@ export function SpaceSwitcher({
     }
   };
 
+  // Opened with the pointer, focus goes to the list rather than its first
+  // row, which WebKit would ring as if reached by keyboard. Opened with the
+  // shortcut, the first row takes focus for the keyboard.
+  const openedByPointer = useRef(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+
   const onPointerUp = (e: React.PointerEvent, onActivate?: () => void) => {
-    const st = drag.current;
-    if (st?.active) commit();
-    else if (st) onActivate?.();
-    endDrag(e.currentTarget);
+    const action = spaceDragEndAction(drag.current, e.pointerId, e.type);
+    if (action === "ignore") return;
+    if (action === "commit") commit();
+    else if (action === "activate") onActivate?.();
+    endDrag();
   };
 
   if (!current) return null;
@@ -240,6 +266,9 @@ export function SpaceSwitcher({
       <PopoverTrigger asChild>
         <button
           type="button"
+          onPointerDown={() => {
+            openedByPointer.current = !open;
+          }}
           title={shortcut ? `Spaces · ${shortcut}` : "Spaces"}
           className="flex h-7 shrink-0 items-center gap-2 rounded-md px-2 text-muted-foreground/90 outline-none transition-colors hover:bg-accent hover:text-foreground data-[state=open]:bg-accent data-[state=open]:text-foreground"
         >
@@ -254,7 +283,19 @@ export function SpaceSwitcher({
           />
         </button>
       </PopoverTrigger>
-      <PopoverContent align="start" sideOffset={6} className="w-[20rem] p-1.5">
+      <PopoverContent
+        ref={contentRef}
+        align="start"
+        sideOffset={6}
+        className="w-[20rem] p-1.5"
+        onOpenAutoFocus={(e) => {
+          if (openedByPointer.current) {
+            e.preventDefault();
+            contentRef.current?.focus({ preventScroll: true });
+          }
+          openedByPointer.current = false;
+        }}
+      >
         <div className="flex items-center justify-between px-1.5 pb-1.5 pt-0.5">
           <span className="text-xs font-semibold text-foreground">Spaces</span>
           {shortcut && (
@@ -306,6 +347,17 @@ export function SpaceSwitcher({
           >
             <HugeiconsIcon icon={PlusSignIcon} size={14} strokeWidth={1.75} />
             <span className="flex-1">New space</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onOpenChange(false);
+              onOpenFolder();
+            }}
+            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+          >
+            <HugeiconsIcon icon={FolderOpenIcon} size={14} strokeWidth={1.75} />
+            <span className="flex-1">Open folder…</span>
           </button>
         </div>
       </PopoverContent>
@@ -396,10 +448,13 @@ function SpaceRow({
         data-space-id={space.id}
         role="button"
         tabIndex={editing ? -1 : 0}
-        onPointerDown={editing ? undefined : (e) => onPointerDown(e, "space", space.id)}
+        onPointerDown={
+          editing ? undefined : (e) => onPointerDown(e, "space", space.id)
+        }
         onPointerMove={onPointerMove}
         onPointerUp={editing ? undefined : (e) => onPointerUp(e, onSwitch)}
         onPointerCancel={(e) => onPointerUp(e)}
+        onLostPointerCapture={(e) => onPointerUp(e)}
         onKeyDown={(e) => {
           if (editing) return;
           if (e.key === "Enter") {
@@ -443,6 +498,11 @@ function SpaceRow({
         ) : (
           <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
             {space.name}
+            {workspaceUnavailableReason(space.env) && (
+              <span className="ml-2 font-normal text-muted-foreground">
+                Unavailable
+              </span>
+            )}
           </span>
         )}
         {!editing && (
@@ -459,7 +519,11 @@ function SpaceRow({
                 label="Rename space"
                 onClick={onStartRename}
               />
-              <RowAction icon={PlusSignIcon} label="New tab" onClick={onNewTab} />
+              <RowAction
+                icon={PlusSignIcon}
+                label="New tab"
+                onClick={onNewTab}
+              />
               {canDelete && (
                 <RowAction
                   icon={Delete02Icon}
@@ -540,6 +604,7 @@ function TabRow({
         onPointerMove={onPointerMove}
         onPointerUp={(e) => onPointerUp(e, onJump)}
         onPointerCancel={(e) => onPointerUp(e)}
+        onLostPointerCapture={(e) => onPointerUp(e)}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();

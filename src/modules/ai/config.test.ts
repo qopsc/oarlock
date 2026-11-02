@@ -1,17 +1,18 @@
-﻿import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   compatModelIdForEndpoint,
   endpointIdFromCompatModel,
   estimateCost,
   getModelContextLimit,
   isCompatModelId,
-  migrateLegacyCompatEndpoint,
+  isResolvableModelId,
   modelKeepsReasoning,
   modelSupportsTemperature,
   modelUsesReasoningTokens,
   MODELS,
   MODEL_CONTEXT_LIMITS,
   MODEL_PRICING,
+  resolveContextLimit,
   resolveModel,
   type CustomEndpoint,
 } from "./config";
@@ -101,14 +102,19 @@ describe("current model pricing", () => {
     ["claude-fable-5", 10, 50, 1],
     ["claude-sonnet-5", 3, 15, 0.3],
     ["grok-4.5", 2, 6, 0.5],
-  ] as const)("uses the published token pricing for %s", (modelId, input, output, cacheRead) => {
-    expect(MODEL_PRICING[modelId]).toEqual({ input, output, cacheRead });
-  });
+  ] as const)(
+    "uses the published token pricing for %s",
+    (modelId, input, output, cacheRead) => {
+      expect(MODEL_PRICING[modelId]).toEqual({ input, output, cacheRead });
+    },
+  );
 });
 
 describe("modelKeepsReasoning", () => {
   it("keeps reasoning for compat endpoints (freeform provider)", () => {
-    const info = resolveModel(compatModelIdForEndpoint(endpoint.id), [endpoint]);
+    const info = resolveModel(compatModelIdForEndpoint(endpoint.id), [
+      endpoint,
+    ]);
     expect(modelKeepsReasoning(info)).toBe(true);
   });
 
@@ -148,31 +154,46 @@ describe("model sampling capabilities", () => {
     ["anthropic", "claude-sonnet-5"],
     ["xai", "grok-4.5"],
     ["groq", "openai/gpt-oss-20b"],
-  ] as const)("allocates a reasoning output budget for %s/%s", (provider, modelId) => {
-    expect(modelUsesReasoningTokens(provider, modelId)).toBe(true);
+  ] as const)(
+    "allocates a reasoning output budget for %s/%s",
+    (provider, modelId) => {
+      expect(modelUsesReasoningTokens(provider, modelId)).toBe(true);
+    },
+  );
+});
+
+describe("resolveContextLimit", () => {
+  it("takes a custom endpoint's limit from its settings", () => {
+    const id = compatModelIdForEndpoint(endpoint.id);
+    expect(resolveContextLimit(id, [endpoint])).toBe(64_000);
+    expect(resolveContextLimit(id, [])).toBe(128_000);
+    expect(
+      resolveContextLimit("openai-compatible-custom", [
+        { ...endpoint, id: "legacy" },
+      ]),
+    ).toBe(64_000);
+    expect(resolveContextLimit("openai-compatible-custom", [])).toBe(128_000);
+    expect(resolveContextLimit("gpt-5.4-mini", [endpoint])).toBe(
+      MODEL_CONTEXT_LIMITS["gpt-5.4-mini"],
+    );
   });
 });
 
-describe("migrateLegacyCompatEndpoint", () => {
-  it("migrates a fully configured legacy endpoint", () => {
-    const out = migrateLegacyCompatEndpoint(
-      "https://api.example.com/v1",
-      "llama-3.3-70b",
-      32_000,
-      "fixedid1",
-    );
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({
-      id: "fixedid1",
-      baseURL: "https://api.example.com/v1",
-      modelId: "llama-3.3-70b",
-      contextLimit: 32_000,
-    });
+describe("isResolvableModelId", () => {
+  it("accepts catalog ids and rejects unknown ones", () => {
+    expect(isResolvableModelId("gpt-5.4-mini", [])).toBe(true);
+    expect(isResolvableModelId("nope-not-real", [endpoint])).toBe(false);
+    expect(isResolvableModelId("", [endpoint])).toBe(false);
   });
 
-  it("skips migration when base URL or model id is missing", () => {
-    expect(migrateLegacyCompatEndpoint("", "m", 1, "x")).toEqual([]);
-    expect(migrateLegacyCompatEndpoint("u", "  ", 1, "x")).toEqual([]);
+  it("accepts a compat id only while its endpoint exists and is complete", () => {
+    const id = compatModelIdForEndpoint(endpoint.id);
+    expect(isResolvableModelId(id, [endpoint])).toBe(true);
+    expect(isResolvableModelId(id, [])).toBe(false);
+    expect(isResolvableModelId(id, [{ ...endpoint, baseURL: "  " }])).toBe(
+      false,
+    );
+    expect(isResolvableModelId(id, [{ ...endpoint, modelId: "" }])).toBe(false);
   });
 });
 
@@ -217,7 +238,11 @@ describe("estimateCost", () => {
   });
 
   it("falls back to the input price when a model has no cache-read rate", () => {
-    const grok = { inputTokens: 1_000_000, outputTokens: 0, cachedInputTokens: 400_000 };
+    const grok = {
+      inputTokens: 1_000_000,
+      outputTokens: 0,
+      cachedInputTokens: 400_000,
+    };
     expect(estimateCost("grok-4.20-reasoning", grok)).toBeCloseTo(3, 6);
   });
 
@@ -225,4 +250,16 @@ describe("estimateCost", () => {
     const over = { inputTokens: 100, outputTokens: 0, cachedInputTokens: 900 };
     expect(estimateCost("gpt-5.6", over)).toBeGreaterThanOrEqual(0);
   });
+});
+
+it("legacy model references resolve to native metadata and become unavailable when it is removed", () => {
+  const endpoints = [{ ...endpoint, id: "legacy" }];
+  expect(isCompatModelId("openai-compatible-custom")).toBe(true);
+  expect(endpointIdFromCompatModel("openai-compatible-custom")).toBe("legacy");
+  expect(resolveModel("openai-compatible-custom", endpoints)).toMatchObject({
+    label: endpoint.modelId,
+    description: `${endpoint.name}: ${endpoint.baseURL}`,
+  });
+  expect(isResolvableModelId("openai-compatible-custom", endpoints)).toBe(true);
+  expect(isResolvableModelId("openai-compatible-custom", [])).toBe(false);
 });

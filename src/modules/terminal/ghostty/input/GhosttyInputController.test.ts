@@ -1,28 +1,42 @@
 import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
 import { readFile } from "node:fs/promises";
-import { TeraxGhostty } from "@terax/ghostty-core/adapted";
-import { describe, expect, it, vi } from "vitest";
+import { OarlockGhostty } from "@oarlock/ghostty-core/adapted";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { FakeElement, FakeTextArea } from "./fakeTextArea";
+import { AdaptedGhosttyTerminalModel } from "../AdaptedGhosttyTerminalModel";
 import {
+  baseCharacter,
   GhosttyInputController,
-  terminalMouseModifiers,
 } from "./GhosttyInputController";
+import { supportedKittyKeyboardFlags } from "./terminalInputEncoding";
 
-describe("terminalMouseModifiers", () => {
-  it("encodes xterm Shift, Alt, and Control bits", () => {
-    expect(
-      terminalMouseModifiers({ shiftKey: true, altKey: true, ctrlKey: true }),
-    ).toBe(28);
-  });
-
-  it("does not confuse the macOS Command modifier with Alt", () => {
-    const commandOnly = {
-      shiftKey: false,
-      altKey: false,
-      ctrlKey: false,
-      metaKey: true,
+const clipboard = vi.hoisted(() => ({
+  text: "",
+  pending: null as Promise<string> | null,
+  image: false,
+  snapshots: 0,
+}));
+vi.mock("@/modules/terminal/lib/terminalClipboard", () => ({
+  readTerminalClipboardSnapshot: async () => {
+    clipboard.snapshots += 1;
+    return {
+      revision: "1",
+      text: await (clipboard.pending ?? clipboard.text),
+      image: clipboard.image ? Uint8Array.of(1) : null,
     };
-    expect(terminalMouseModifiers(commandOnly)).toBe(0);
+  },
+}));
+
+describe("baseCharacter", () => {
+  it("returns what a key types without Option, by physical position", () => {
+    expect(baseCharacter({ code: "KeyF", shiftKey: false })).toBe("f");
+    expect(baseCharacter({ code: "KeyF", shiftKey: true })).toBe("F");
+    expect(baseCharacter({ code: "Digit2", shiftKey: false })).toBe("2");
+    expect(baseCharacter({ code: "Digit2", shiftKey: true })).toBe("@");
+    expect(baseCharacter({ code: "Period", shiftKey: false })).toBe(".");
+    expect(baseCharacter({ code: "Slash", shiftKey: true })).toBe("?");
+    expect(baseCharacter({ code: "Space", shiftKey: false })).toBe(" ");
+    expect(baseCharacter({ code: "ArrowLeft", shiftKey: false })).toBe("");
   });
 });
 
@@ -36,7 +50,9 @@ describe("GhosttyInputController", () => {
           import.meta.url,
         ),
       );
-      const core = await TeraxGhostty.loadBytes(Uint8Array.from(bytes).buffer);
+      const core = await OarlockGhostty.loadBytes(
+        Uint8Array.from(bytes).buffer,
+      );
       const terminal = core.createTerminal(80, 24);
       const input = new FakeTextArea();
       const onData = vi.fn();
@@ -141,7 +157,9 @@ describe("GhosttyInputController", () => {
           import.meta.url,
         ),
       );
-      const core = await TeraxGhostty.loadBytes(Uint8Array.from(bytes).buffer);
+      const core = await OarlockGhostty.loadBytes(
+        Uint8Array.from(bytes).buffer,
+      );
       const terminal = core.createTerminal(80, 24);
       const input = new FakeTextArea();
       const onData = vi.fn();
@@ -256,6 +274,30 @@ describe("GhosttyInputController", () => {
     );
     expect(onText.mock.calls).toEqual([["x"], ["あ"]]);
     expect(onData).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it("counts a key as input only when it types something, not a bare modifier", () => {
+    const input = new FakeTextArea();
+    const onInput = vi.fn();
+    const controller = new GhosttyInputController({
+      model: { ...inputModel(), encodeKey: () => new Uint8Array([97]) },
+      input: input as unknown as HTMLTextAreaElement,
+      pointerTarget: new FakeElement() as unknown as HTMLElement,
+      cellSize: () => ({ width: 10, height: 20 }),
+      isMac: true,
+      onCopy: () => false,
+      onData: vi.fn(),
+      onInput,
+    });
+    for (const [key, code] of [["Shift", "ShiftLeft"], ["Control", "ControlLeft"],
+      ["Alt", "AltLeft"], ["Meta", "MetaLeft"], ["CapsLock", "CapsLock"]]) {
+      input.dispatchEvent(keyboardEvent({ key, code }));
+    }
+    expect(onInput).not.toHaveBeenCalled();
+    input.dispatchEvent(keyboardEvent({ key: "a", code: "KeyA" }));
+    input.dispatchEvent(keyboardEvent({ key: "ArrowLeft", code: "ArrowLeft", repeat: true }));
+    expect(onInput).toHaveBeenCalledTimes(2);
     controller.dispose();
   });
 
@@ -408,66 +450,674 @@ describe("GhosttyInputController", () => {
     expect(new TextDecoder().decode(onData.mock.calls[0][0])).toBe("å");
     controller.dispose();
   });
+});
 
-  it("reports the cell that is drawn under the pointer while the grid is shifted up", () => {
-    const input = new FakeTextArea();
-    const pointerTarget = new FakeElement();
-    const onData = vi.fn();
-    let shift = 40;
-    const controller = new GhosttyInputController({
-      model: inputModel((mode) => mode === 1003 || mode === 1006),
-      input: input as unknown as HTMLTextAreaElement,
-      pointerTarget: pointerTarget as unknown as HTMLElement,
-      cellSize: () => ({ width: 10, height: 20 }),
-      gridShiftY: () => shift,
-      onData,
-      onCopy: () => false,
-      isMac: false,
-    });
-    const report = (clientY: number) => {
-      onData.mockClear();
-      pointerTarget.dispatchEvent(
-        mouseEvent("mousemove", { clientX: 15, clientY }),
+describe.each(["ghostty-vt.wasm", "ghostty-vt-scalar.wasm"])(
+  "GhosttyInputController with the Ghostty core (%s)",
+  (artifact) => {
+    let core: OarlockGhostty;
+    const decoder = new TextDecoder();
+
+    beforeAll(async () => {
+      const bytes = await readFile(
+        new URL(
+          `../../../../../packages/ghostty-core/adapted/${artifact}`,
+          import.meta.url,
+        ),
       );
-      return new TextDecoder().decode(onData.mock.calls[0][0]);
-    };
-    // 25 px down with the grid moved up 40 px is 65 px into the grid: row 4 (1-based).
-    expect(report(25)).toBe("\x1b[<32;2;4M");
-    shift = 0;
-    expect(report(31)).toBe("\x1b[<32;2;2M");
-    controller.dispose();
-  });
-
-  it("deduplicates identical mouse-motion reports within a cell", () => {
-    const input = new FakeTextArea();
-    const pointerTarget = new FakeElement();
-    const onData = vi.fn();
-    const controller = new GhosttyInputController({
-      model: inputModel((mode) => mode === 1003 || mode === 1006),
-      input: input as unknown as HTMLTextAreaElement,
-      pointerTarget: pointerTarget as unknown as HTMLElement,
-      cellSize: () => ({ width: 10, height: 20 }),
-      onData,
-      onCopy: () => false,
-      isMac: false,
+      core = await OarlockGhostty.loadBytes(Uint8Array.from(bytes).buffer);
     });
 
-    for (let index = 0; index < 2; index += 1) {
-      pointerTarget.dispatchEvent(
-        mouseEvent("mousemove", {
-          clientX: 15,
-          clientY: 25,
-        }),
-      );
+    function setup(
+      options: Partial<
+        ConstructorParameters<typeof GhosttyInputController>[0]
+      > & { devicePixelRatio?: number; kittyKeyboardFlags?: number } = {},
+    ) {
+      const replies: string[] = [];
+      const model = new AdaptedGhosttyTerminalModel(core, {
+        backend: "ghostty-webgpu",
+        cols: 80,
+        rows: 24,
+        kittyKeyboardFlags: options.kittyKeyboardFlags,
+        onReply: (bytes) => replies.push(decoder.decode(bytes)),
+      });
+      const scale = options.devicePixelRatio ?? 1;
+      model.setPixelSize(800 * scale, 480 * scale);
+      const input = new FakeTextArea();
+      const pointerTarget = new FakeElement();
+      const sent: string[] = [];
+      const controller = new GhosttyInputController({
+        model,
+        input: input as unknown as HTMLTextAreaElement,
+        pointerTarget: pointerTarget as unknown as HTMLElement,
+        cellSize: () => ({ width: 10, height: 20 }),
+        onData: (bytes) => sent.push(decoder.decode(bytes)),
+        onCopy: () => false,
+        isMac: false,
+        ...options,
+      });
+      return {
+        model,
+        input,
+        pointerTarget,
+        sent,
+        replies,
+        write: (text: string) => model.write(new TextEncoder().encode(text)),
+        dispose: () => {
+          controller.dispose();
+          model.dispose();
+        },
+        controller,
+      };
     }
 
-    expect(onData).toHaveBeenCalledOnce();
-    expect(new TextDecoder().decode(onData.mock.calls[0][0])).toBe(
-      "\x1b[<32;2;2M",
+    it("reports presses and releases in the program's format", () => {
+      const { pointerTarget, sent, write, dispose } = setup();
+      write("\x1b[?1000h\x1b[?1006h");
+      for (const [button, code] of [
+        [0, 0],
+        [1, 1],
+        [2, 2],
+      ] as const) {
+        pointerTarget.dispatchEvent(
+          mouseEvent("mousedown", { button, clientX: 25, clientY: 65 }),
+        );
+        pointerTarget.dispatchEvent(
+          mouseEvent("mouseup", { button, clientX: 25, clientY: 65 }),
+        );
+        expect(sent.splice(0)).toEqual([
+          `\x1b[<${code};3;4M`,
+          `\x1b[<${code};3;4m`,
+        ]);
+      }
+      // Shift leaves the mouse to selection.
+      pointerTarget.dispatchEvent(
+        mouseEvent("mousedown", { shiftKey: true, clientX: 25, clientY: 65 }),
+      );
+      expect(sent).toEqual([]);
+      dispose();
+    });
+
+    it("reports buttonless motion once per cell where the grid is drawn", () => {
+      let shift = 40;
+      const { pointerTarget, sent, write, dispose } = setup({
+        gridShiftY: () => shift,
+      });
+      write("\x1b[?1003h\x1b[?1006h");
+      const move = (clientY: number) =>
+        pointerTarget.dispatchEvent(
+          mouseEvent("mousemove", { clientX: 15, clientY }),
+        );
+      // 25 px down with the grid moved up 40 px is 65 px into the grid: row 4.
+      move(25);
+      move(26);
+      shift = 0;
+      move(31);
+      expect(sent).toEqual(["\x1b[<35;2;4M", "\x1b[<35;2;2M"]);
+      dispose();
+    });
+
+    it("reports SGR pixels in the terminal's device pixels", () => {
+      const { pointerTarget, sent, write, dispose } = setup({
+        devicePixelRatio: 2,
+      });
+      write("\x1b[?1003h\x1b[?1016h");
+      pointerTarget.dispatchEvent(
+        mouseEvent("mousemove", { clientX: 15, clientY: 25 }),
+      );
+      expect(sent).toEqual(["\x1b[<35;30;50M"]);
+      dispose();
+    });
+
+    it("turns wheel notches and trackpad distance into wheel buttons", () => {
+      const { pointerTarget, sent, write, dispose } = setup({
+        scrollMultiplier: () => 3,
+      });
+      write("\x1b[?1000h\x1b[?1006h");
+      pointerTarget.dispatchEvent(
+        wheelEvent({ deltaMode: 1, deltaY: 1, clientX: 5, clientY: 5 }),
+      );
+      expect(sent.splice(0)).toEqual(Array(3).fill("\x1b[<65;1;1M"));
+      pointerTarget.dispatchEvent(
+        wheelEvent({ deltaMode: 1, deltaX: -1, clientX: 5, clientY: 5 }),
+      );
+      expect(sent.splice(0)).toEqual(Array(3).fill("\x1b[<66;1;1M"));
+      // 20 px is one cell: 8 px scrolls nothing yet, 12 more complete a row.
+      pointerTarget.dispatchEvent(wheelEvent({ deltaY: -8 }));
+      expect(sent).toEqual([]);
+      pointerTarget.dispatchEvent(wheelEvent({ deltaY: -12 }));
+      expect(sent).toEqual(["\x1b[<64;1;1M"]);
+      dispose();
+    });
+
+    it("sends cursor keys for the wheel in full-screen programs that do not track it", () => {
+      const { pointerTarget, sent, write, dispose } = setup();
+      write("\x1b[?1049h\x1b[?1h");
+      pointerTarget.dispatchEvent(wheelEvent({ deltaMode: 1, deltaY: 1 }));
+      expect(sent).toEqual(Array(3).fill("\x1bOB"));
+      dispose();
+    });
+
+    // crynta/terax-ai#781: alternate scroll can be off by default.
+    it("leaves full-screen programs alone with alternate scroll off, unless they ask", () => {
+      const { model, pointerTarget, sent, write, dispose } = setup();
+      model.setAlternateScroll(false);
+      write("\x1b[?1049h");
+      const wheel = wheelEvent({ deltaMode: 1, deltaY: -1 });
+      pointerTarget.dispatchEvent(wheel);
+      expect(sent).toEqual([]);
+      expect(wheel.defaultPrevented).toBe(false);
+      write("\x1b[?1007h");
+      pointerTarget.dispatchEvent(wheelEvent({ deltaMode: 1, deltaY: -1 }));
+      expect(sent).toEqual(Array(3).fill("\x1b[A"));
+      dispose();
+    });
+
+    it("scrolls history with the wheel when nothing tracks it", () => {
+      const { model, pointerTarget, sent, write, dispose } = setup();
+      write("line\r\n".repeat(60));
+      const before = model.scrollPosition().offset;
+      pointerTarget.dispatchEvent(wheelEvent({ deltaMode: 1, deltaY: -1 }));
+      // The offset counts lines scrolled up from the bottom.
+      expect(model.scrollPosition().offset).toBe(before + 3);
+      expect(sent).toEqual([]);
+      dispose();
+    });
+
+    it("types Alt with the configured macOS Option key", () => {
+      let setting: "off" | "left" | "right" | "both" = "left";
+      const { input, sent, dispose } = setup({
+        isMac: true,
+        optionAsAlt: () => setting,
+      });
+      const option = (code: "AltLeft" | "AltRight", type: string) =>
+        input.dispatchEvent(
+          keyboardEvent({ key: "Alt", code, altKey: type === "keydown" }, type),
+        );
+      const type = (shiftKey = false) =>
+        input.dispatchEvent(
+          keyboardEvent({ key: "ƒ", code: "KeyF", altKey: true, shiftKey }),
+        );
+      option("AltLeft", "keydown");
+      type();
+      type(true);
+      expect(sent.splice(0)).toEqual(["\x1bf", "\x1bF"]);
+      setting = "right";
+      type();
+      expect(sent.splice(0)).toEqual(["ƒ"]);
+      option("AltLeft", "keyup");
+      option("AltRight", "keydown");
+      type();
+      expect(sent.splice(0)).toEqual(["\x1bf"]);
+      setting = "off";
+      type();
+      expect(sent.splice(0)).toEqual(["ƒ"]);
+      dispose();
+    });
+
+    // crynta/terax-ai#1381: Neovim pushes flags 3, and Shift+; must type ":".
+    it.each([
+      [false, 0],
+      [false, 1],
+      [false, 3],
+      [false, 5],
+      [false, 7],
+      [true, 0],
+      [true, 1],
+      [true, 3],
+      [true, 5],
+      [true, 7],
+    ])(
+      "types Shift text as text in Kitty modes below report-all (macOS %s, flags %i)",
+      (isMac, flags) => {
+        const { input, sent, write, dispose } = setup({ isMac });
+        write(`\x1b[>${flags}u`);
+        const typed = [
+          { key: ":", code: "Semicolon" },
+          { key: "!", code: "Digit1" },
+          { key: "A", code: "KeyA" },
+          { key: '"', code: "Quote" },
+          // Another layout's shifted character (German Shift+7).
+          { key: "/", code: "Digit7" },
+        ].map((values) => {
+          input.dispatchEvent(keyboardEvent({ ...values, shiftKey: true }));
+          return sent.splice(0).join("");
+        });
+        expect(typed).toEqual([":", "!", "A", '"', "/"]);
+        // Shift stays a modifier where it types nothing different, and
+        // with Control.
+        input.dispatchEvent(
+          keyboardEvent({ key: " ", code: "Space", shiftKey: true }),
+        );
+        input.dispatchEvent(
+          keyboardEvent({
+            key: "A",
+            code: "KeyA",
+            shiftKey: true,
+            ctrlKey: true,
+          }),
+        );
+        expect(sent).toEqual([
+          flags === 0 ? " " : "\x1b[32;2u",
+          flags & 4 ? "\x1b[97:65;6u" : "\x1b[97;6u",
+        ]);
+        dispose();
+      },
     );
-    controller.dispose();
-  });
-});
+
+    // crynta/terax-ai#1384, #240, #619: Windows Terminal's clipboard keys.
+    it("copies and pastes with Windows Terminal's keys on Windows", async () => {
+      let selected = true;
+      const onCopy = vi.fn(() => selected);
+      let smart = true;
+      const { input, sent, write, dispose } = setup({
+        isWindows: true,
+        onCopy,
+        smartCopyPaste: () => smart,
+      });
+      const press = (chord: Partial<KeyboardEvent>) => {
+        const event = keyboardEvent(chord);
+        input.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      const ctrlC = { key: "c", code: "KeyC", ctrlKey: true };
+      const ctrlV = { key: "v", code: "KeyV", ctrlKey: true };
+      // Ctrl+C copies a selection and clears it; without one it interrupts.
+      expect(press(ctrlC)).toBe(true);
+      expect(onCopy).toHaveBeenLastCalledWith(true);
+      selected = false;
+      expect(press(ctrlC)).toBe(true);
+      expect(sent.splice(0)).toEqual(["\x03"]);
+      // Ctrl+V pastes text (dictation tools send it too).
+      clipboard.text = "echo hi";
+      write("\x1b[?2004h");
+      expect(press(ctrlV)).toBe(true);
+      await vi.waitFor(() =>
+        expect(sent.splice(0)).toEqual(["\x1b[200~echo hi\x1b[201~"]),
+      );
+      // With no text the program gets Ctrl+V and reads an image itself.
+      clipboard.text = "";
+      press(ctrlV);
+      await vi.waitFor(() => expect(sent.splice(0)).toEqual(["\x16"]));
+      // Shift+Insert and Ctrl+Insert, and the Ctrl+Shift keys, always work.
+      clipboard.text = "x";
+      selected = true;
+      smart = false;
+      expect(press({ key: "Insert", code: "Insert", shiftKey: true })).toBe(
+        true,
+      );
+      expect(
+        press({ key: "V", code: "KeyV", ctrlKey: true, shiftKey: true }),
+      ).toBe(true);
+      await vi.waitFor(() =>
+        expect(sent.splice(0)).toEqual([
+          "\x1b[200~x\x1b[201~",
+          "\x1b[200~x\x1b[201~",
+        ]),
+      );
+      onCopy.mockClear();
+      expect(press({ key: "Insert", code: "Insert", ctrlKey: true })).toBe(
+        true,
+      );
+      expect(onCopy).toHaveBeenLastCalledWith(false);
+      // Turned off, plain Ctrl+C and Ctrl+V go to the program.
+      onCopy.mockClear();
+      press(ctrlC);
+      press(ctrlV);
+      expect(onCopy).not.toHaveBeenCalled();
+      expect(sent).toEqual(["\x03", "\x16"]);
+      dispose();
+    });
+
+    // crynta/terax-ai#192: agents read a clipboard image on Ctrl+V.
+    it.each([
+      [
+        "macOS Cmd+V",
+        { isMac: true },
+        { key: "v", code: "KeyV", metaKey: true },
+      ],
+      [
+        "Linux Ctrl+Shift+V",
+        {},
+        { key: "V", code: "KeyV", ctrlKey: true, shiftKey: true },
+      ],
+      [
+        "Linux Shift+Insert",
+        {},
+        { key: "Insert", code: "Insert", shiftKey: true },
+      ],
+      [
+        "Windows Ctrl+Shift+V",
+        { isWindows: true },
+        { key: "V", code: "KeyV", ctrlKey: true, shiftKey: true },
+      ],
+      [
+        "Windows Shift+Insert",
+        { isWindows: true },
+        { key: "Insert", code: "Insert", shiftKey: true },
+      ],
+    ] as const)(
+      "sends Ctrl+V for %s when the clipboard holds only an image",
+      async (_name, platform, chord) => {
+        let image = true;
+        clipboard.image = image;
+        clipboard.snapshots = 0;
+        const { input, sent, model, replies, write, dispose } = setup({
+          ...platform,
+        });
+        clipboard.text = "";
+        const paste = () => input.dispatchEvent(keyboardEvent(chord));
+        paste();
+        await vi.waitFor(() => expect(sent.splice(0)).toEqual(["\x16"]));
+        // In the program's keyboard mode, with the release it asked for.
+        write("\x1b[>3u");
+        paste();
+        await vi.waitFor(() =>
+          expect(sent.splice(0)).toEqual(["\x1b[118;5u", "\x1b[118;5:3u"]),
+        );
+        write("\x1b[<u");
+        // An empty clipboard pastes nothing.
+        image = false;
+        clipboard.image = image;
+        paste();
+        await vi.waitFor(() => expect(clipboard.snapshots).toBe(3));
+        await Promise.resolve();
+        expect(sent).toEqual([]);
+        // A program taking Kitty paste events is offered the image instead.
+        image = true;
+        clipboard.image = image;
+        model.setClipboardPolicy({ readsToHost: true, writesAllowed: true });
+        write("\x1b[?5522h");
+        paste();
+        await vi.waitFor(() =>
+          expect(replies.join("")).toContain("\x1b]5522;type=read:status=OK"),
+        );
+        expect(sent).toEqual([]);
+        clipboard.image = false;
+        dispose();
+      },
+    );
+
+    it("offers native menu image files without rereading a newer clipboard", async () => {
+      const reads = clipboard.snapshots;
+      const { input, model, replies, write, dispose } = setup();
+      model.setClipboardPolicy({ readsToHost: true, writesAllowed: true });
+      write("\x1b[?5522h");
+      const event = new Event("paste", { cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: {
+          getData: () => "",
+          types: ["Files"],
+          items: [{ type: "image/png" }],
+        },
+      });
+      input.dispatchEvent(event);
+      await vi.waitFor(() =>
+        expect(replies.join("")).toContain("\x1b]5522;type=read:status=OK"),
+      );
+      expect(event.defaultPrevented).toBe(true);
+      expect(clipboard.snapshots).toBe(reads);
+      dispose();
+    });
+
+    it("keeps Ctrl+C and Ctrl+V for the program on Linux", async () => {
+      const onCopy = vi.fn(() => true);
+      const { input, sent, dispose } = setup({
+        onCopy,
+        smartCopyPaste: () => true,
+      });
+      clipboard.text = "x";
+      for (const values of [
+        { key: "c", code: "KeyC", ctrlKey: true },
+        { key: "v", code: "KeyV", ctrlKey: true },
+        { key: "Insert", code: "Insert", shiftKey: true },
+        { key: "Insert", code: "Insert", ctrlKey: true },
+      ]) {
+        input.dispatchEvent(keyboardEvent(values));
+      }
+      await vi.waitFor(() => expect(sent).toEqual(["\x03", "\x16", "x"]));
+      expect(onCopy.mock.calls).toEqual([[false]]);
+      dispose();
+    });
+
+    // crynta/terax-ai#904, #1303: a fast double letter, the second through
+    // the input method (keyCode 229, then its insertText).
+    it("types a repeated letter that arrives through another event", () => {
+      const { input, sent, dispose } = setup({ isMac: true });
+      const insert = (data: string) =>
+        input.dispatchEvent(
+          Object.assign(new Event("beforeinput", { cancelable: true }), {
+            inputType: "insertText",
+            data,
+            isComposing: false,
+          }),
+        );
+      input.dispatchEvent(keyboardEvent({ key: "s", code: "KeyS" }));
+      input.dispatchEvent(keyboardEvent({ key: "s", code: "KeyS" }, "keyup"));
+      input.dispatchEvent(
+        keyboardEvent({ key: "s", code: "KeyS", keyCode: 229 }),
+      );
+      insert("s");
+      // Within one keystroke a copy by another event is still dropped.
+      input.dispatchEvent(
+        keyboardEvent({ key: "l", code: "KeyL", keyCode: 229 }),
+      );
+      insert("l");
+      input.dispatchEvent(
+        Object.assign(new Event("compositionend"), { data: "l" }),
+      );
+      expect(sent).toEqual(["s", "s", "l"]);
+      dispose();
+    });
+
+    // crynta/terax-ai#1009, #1215, #956.
+    it("delivers Option+Arrow and Option+Backspace that WKWebView stamped 229", () => {
+      const { input, sent, dispose } = setup({ isMac: true });
+      for (const code of ["ArrowLeft", "ArrowRight", "Backspace"]) {
+        input.dispatchEvent(
+          keyboardEvent({ key: code, code, altKey: true, keyCode: 229 }),
+        );
+      }
+      // A character key stamped 229 still waits for the IME's text.
+      const pending = keyboardEvent({ key: "a", code: "KeyA", keyCode: 229 });
+      input.dispatchEvent(pending);
+      expect(pending.defaultPrevented).toBe(false);
+      expect(sent).toEqual(["\x1bb", "\x1bf", "\x17"]);
+      dispose();
+    });
+
+    // crynta/terax-ai#1288: Kitty programs read Shift+Enter, not Alt+Enter.
+    it("encodes Shift+Enter in the program's keyboard mode", () => {
+      const { input, sent, write, dispose } = setup();
+      const shiftEnter = () =>
+        input.dispatchEvent(
+          keyboardEvent({ key: "Enter", code: "Enter", shiftKey: true }),
+        );
+      shiftEnter();
+      write("\x1b[>1u");
+      shiftEnter();
+      write("\x1b[<u\x1b[>4;2m");
+      shiftEnter();
+      expect(sent).toEqual(["\x1b\r", "\x1b[13;2u", "\x1b[27;2;13~"]);
+      dispose();
+    });
+
+    // crynta/terax-ai#1378: pi asks for flags 7, and Windows' inbox ConPTY
+    // drops every input CSI with a ':' sub-parameter (its arrows, here).
+    it("withholds Kitty flags the platform cannot carry", () => {
+      const { input, sent, replies, write, dispose } = setup({
+        kittyKeyboardFlags: supportedKittyKeyboardFlags("windows"),
+      });
+      write("\x1b[>7u\x1b[?u");
+      expect(replies.splice(0)).toEqual(["\x1b[?1u"]);
+      const keys = [
+        { key: "ArrowUp", code: "ArrowUp" },
+        { key: "Home", code: "Home" },
+        { key: "A", code: "KeyA", shiftKey: true },
+        { key: "Escape", code: "Escape" },
+      ];
+      for (const values of keys) {
+        input.dispatchEvent(keyboardEvent(values));
+        input.dispatchEvent(keyboardEvent(values, "keyup"));
+      }
+      expect(sent).toEqual(["\x1b[A", "\x1b[H", "A", "\x1b[27u"]);
+      // Sets and ors are limited too; clearing needs no limit.
+      write("\x1b[=31u\x1b[?u\x1b[=6;2u\x1b[?u\x1b[=8;3u\x1b[?u");
+      expect(replies.join("")).toBe("\x1b[?25u\x1b[?25u\x1b[?17u");
+      dispose();
+    });
+
+    it("reports the lock keys with every key, as Ghostty and Kitty do", () => {
+      const { input, sent, write, dispose } = setup();
+      const numLock = (key: string) => key === "NumLock";
+      write("\x1b[>9u");
+      input.dispatchEvent(
+        keyboardEvent({
+          key: "ArrowUp",
+          code: "ArrowUp",
+          getModifierState: numLock,
+        }),
+      );
+      input.dispatchEvent(
+        keyboardEvent({ key: "1", code: "Numpad1", getModifierState: numLock }),
+      );
+      // Programs speaking the protocol mask the lock bits (pi, Neovim).
+      expect(sent).toEqual(["\x1b[1;129A", "\x1b[57400;129u"]);
+      dispose();
+    });
+
+    it("reports the unshifted key with Shift under report-all", () => {
+      const { input, sent, write, dispose } = setup();
+      write("\x1b[>15u");
+      input.dispatchEvent(
+        keyboardEvent({ key: ":", code: "Semicolon", shiftKey: true }),
+      );
+      input.dispatchEvent(
+        keyboardEvent({ key: "A", code: "KeyA", shiftKey: true }),
+      );
+      expect(sent).toEqual(["\x1b[59:58;2u", "\x1b[97:65;2u"]);
+      dispose();
+    });
+
+    it("encodes Option-as-Alt with Shift from the unshifted key", () => {
+      const { input, sent, write, dispose } = setup({
+        isMac: true,
+        optionAsAlt: () => "both",
+      });
+      const type = () =>
+        input.dispatchEvent(
+          keyboardEvent({
+            key: "Ú",
+            code: "Semicolon",
+            altKey: true,
+            shiftKey: true,
+          }),
+        );
+      type();
+      write("\x1b[>1u");
+      type();
+      expect(sent).toEqual(["\x1b:", "\x1b[59;4u"]);
+      dispose();
+    });
+
+    it("asks before an unbracketed paste with line breaks", async () => {
+      const answers = [false, true];
+      const confirmPaste = vi.fn(async () => answers.shift() ?? false);
+      const { controller, sent, write, dispose } = setup({ confirmPaste });
+      controller.paste("echo safe");
+      expect(sent.splice(0)).toEqual(["echo safe"]);
+      controller.paste("rm -rf ~\n");
+      await Promise.resolve();
+      expect(sent).toEqual([]);
+      controller.paste("echo ok\n");
+      await vi.waitFor(() => expect(sent).toEqual(["echo ok\r"]));
+      write("\x1b[?2004h");
+      controller.paste("bracketed\n");
+      expect(confirmPaste).toHaveBeenCalledTimes(2);
+      expect(sent[1]).toBe("\x1b[200~bracketed\r\x1b[201~");
+      dispose();
+    });
+
+    it("tells a program with Kitty paste events of clipboard pastes, not their text", async () => {
+      const reads = clipboard.snapshots;
+      const { controller, input, model, sent, replies, write, dispose } =
+        setup();
+      /** The MIME types the next paste event lists. */
+      const listed = async () => {
+        await vi.waitFor(() => expect(replies.length).toBeGreaterThan(0));
+        const event = replies.splice(0).join("");
+        expect(event).toMatch(
+          /^\x1b\]5522;type=read:status=OK(:loc=primary)?:pw=[A-Za-z0-9+/]+=*\x1b\\/,
+        );
+        const listing =
+          /status=DATA:mime=Lg==(?::loc=primary)?:pw=[^;]+;([^\x1b]*)/.exec(
+            event,
+          )?.[1];
+        return listing === undefined ? null : atob(listing);
+      };
+      model.setClipboardPolicy({ readsToHost: true, writesAllowed: true });
+      controller.pasteFromClipboard("one");
+      expect(sent.splice(0)).toEqual(["one"]);
+      expect(clipboard.snapshots).toBe(reads);
+
+      write("\x1b[?5522h");
+      controller.pasteFromClipboard("two", true);
+      // Text that did not come from a clipboard is still typed.
+      controller.paste("dropped");
+      expect(sent.splice(0)).toEqual(["dropped"]);
+      // The primary selection holds text only.
+      expect(await listed()).toBe("text/plain\n");
+      // A clipboard image is offered as PNG, alone when there is no text.
+      controller.pasteFromClipboard("", false, true);
+      expect(await listed()).toBe("image/png\n");
+      controller.pasteFromClipboard("four", false, true);
+      expect(await listed()).toBe("text/plain image/png\n");
+      expect(sent).toEqual([]);
+      // An empty clipboard pastes nothing.
+      controller.pasteFromClipboard("");
+      await Promise.resolve();
+      expect(replies).toEqual([]);
+      expect(sent).toEqual([]);
+
+      // beforeinput carries text only; do not combine it with a newer OS image.
+      input.dispatchEvent(
+        Object.assign(new Event("beforeinput", { cancelable: true }), {
+          inputType: "insertFromPaste",
+          data: "menu text",
+          isComposing: false,
+        }),
+      );
+      expect(await listed()).toBe("text/plain\n");
+      expect(clipboard.snapshots).toBe(reads);
+
+      // Without the host serving reads the program could not fetch it.
+      model.setClipboardPolicy({ readsToHost: false, writesAllowed: true });
+      controller.pasteFromClipboard("three");
+      expect(sent.splice(0)).toEqual(["three"]);
+      expect(replies).toEqual([]);
+      dispose();
+    });
+
+    it("finishes selections and middle-click pastes only when the program does not track the mouse", () => {
+      const onSelectionFinished = vi.fn();
+      const onMiddleClick = vi.fn(() => true);
+      const { pointerTarget, write, dispose } = setup({
+        onSelectionFinished,
+        onMiddleClick,
+      });
+      pointerTarget.dispatchEvent(mouseEvent("pointerup", { button: 0 }));
+      pointerTarget.dispatchEvent(mouseEvent("mousedown", { button: 1 }));
+      expect(onSelectionFinished).toHaveBeenCalledOnce();
+      expect(onMiddleClick).toHaveBeenCalledOnce();
+      write("\x1b[?1000h");
+      pointerTarget.dispatchEvent(mouseEvent("pointerup", { button: 0 }));
+      pointerTarget.dispatchEvent(mouseEvent("mousedown", { button: 1 }));
+      expect(onSelectionFinished).toHaveBeenCalledOnce();
+      expect(onMiddleClick).toHaveBeenCalledOnce();
+      dispose();
+    });
+  },
+);
 
 function inputModel(
   mode: (value: number) => boolean = () => false,
@@ -509,6 +1159,16 @@ function keyboardEvent(
   }) as KeyboardEvent;
 }
 
+function wheelEvent(values: Partial<WheelEvent>): WheelEvent {
+  return Object.assign(mouseEvent("wheel", {}), {
+    deltaMode: 0,
+    deltaX: 0,
+    deltaY: 0,
+    deltaZ: 0,
+    ...values,
+  }) as WheelEvent;
+}
+
 function mouseEvent(type: string, values: Partial<MouseEvent>): MouseEvent {
   return Object.assign(new Event(type, { bubbles: true, cancelable: true }), {
     altKey: false,
@@ -521,3 +1181,53 @@ function mouseEvent(type: string, values: Partial<MouseEvent>): MouseEvent {
     ...values,
   }) as MouseEvent;
 }
+
+it("does not inspect a disposed model when a delayed empty clipboard read finishes", async () => {
+  let finish!: (text: string) => void;
+  clipboard.pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const input = new FakeTextArea();
+  const pasteEventsWanted = vi.fn(() => false);
+  const controller = new GhosttyInputController({
+    model: { ...inputModel(), pasteEventsWanted },
+    input: input as unknown as HTMLTextAreaElement,
+    pointerTarget: new FakeElement() as unknown as HTMLElement,
+    cellSize: () => ({ width: 10, height: 20 }),
+    isMac: true,
+    onCopy: () => false,
+    onData: vi.fn(),
+  });
+  input.dispatchEvent(keyboardEvent({ key: "v", code: "KeyV", metaKey: true }));
+  controller.dispose();
+  pasteEventsWanted.mockClear();
+  finish("");
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  clipboard.pending = null;
+  expect(pasteEventsWanted).not.toHaveBeenCalled();
+});
+
+it("reports a failed snapshot without forwarding Ctrl+V to the program", async () => {
+  clipboard.pending = Promise.reject(new Error("Clipboard changed"));
+  const onData = vi.fn();
+  const onClipboardError = vi.fn();
+  const input = new FakeTextArea();
+  const controller = new GhosttyInputController({
+    model: inputModel(),
+    input: input as unknown as HTMLTextAreaElement,
+    pointerTarget: new FakeElement() as unknown as HTMLElement,
+    cellSize: () => ({ width: 10, height: 20 }),
+    isWindows: true,
+    smartCopyPaste: () => true,
+    onCopy: () => false,
+    onData,
+    onClipboardError,
+  });
+  input.dispatchEvent(keyboardEvent({ key: "v", code: "KeyV", ctrlKey: true }));
+  await vi.waitFor(() => expect(onClipboardError).toHaveBeenCalledOnce());
+  expect(onData).not.toHaveBeenCalled();
+  clipboard.pending = null;
+  controller.dispose();
+});

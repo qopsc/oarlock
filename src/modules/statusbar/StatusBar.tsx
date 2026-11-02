@@ -20,8 +20,13 @@ import { WorkspaceEnvSelector } from "./WorkspaceEnvSelector";
 type Props = {
   cwd: string | null;
   filePath?: string | null;
+  overrideLanguage?: string | null;
   home: string | null;
+  /** The workspace folder; breadcrumb paths are copied relative to it. */
+  root: string | null;
   onCd: (path: string) => void;
+  /** Opens a terminal tab in a breadcrumb's folder. */
+  onOpenTerminal: (path: string) => void;
   onWorkspaceChange: (env: WorkspaceEnv) => void;
   onOpenMini: () => void;
   /** Opens the panel, or Settings > Models when no API key is loaded. */
@@ -34,8 +39,11 @@ type Props = {
 export function StatusBar({
   cwd,
   filePath,
+  overrideLanguage,
   home,
+  root,
   onCd,
+  onOpenTerminal,
   onWorkspaceChange,
   onOpenMini,
   onOpenAi,
@@ -48,8 +56,18 @@ export function StatusBar({
     <footer className="flex h-8 shrink-0 items-center justify-between gap-3 pl-3 pr-4 text-[11px]">
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <WorkspaceEnvSelector onSelect={onWorkspaceChange} />
-        <CwdBreadcrumb cwd={cwd} filePath={filePath} home={home} onCd={onCd} />
-        <LspStatusPill filePath={filePath ?? null} />
+        <CwdBreadcrumb
+          cwd={cwd}
+          filePath={filePath}
+          home={home}
+          root={root}
+          onCd={onCd}
+          onOpenTerminal={onOpenTerminal}
+        />
+        <LspStatusPill
+          filePath={filePath ?? null}
+          overrideLanguage={overrideLanguage}
+        />
         <DiagnosticsBadge filePath={filePath ?? null} />
         {privateActive ? (
           <Tooltip>

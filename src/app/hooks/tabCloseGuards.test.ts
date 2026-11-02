@@ -3,6 +3,7 @@ import {
   type CloseHazardSnapshot,
   type CloseManyHazards,
   deletedPathTabs,
+  partitionDeletedTabs,
   evaluateCloseHazards,
   hasOpenPathTab,
   hasCloseManyHazards,
@@ -99,6 +100,14 @@ describe("path-backed explorer mutations", () => {
     );
   });
 
+  it("detached drafts do not claim their former filesystem destination", () => {
+    const draft = { ...editor(2, "/repo/a.ts", true), detached: true };
+    expect(hasOpenPathTab([draft], "/repo/a.ts")).toBe(false);
+    expect(
+      hasOpenPathTab([draft, editor(3, "/repo/a.ts", false)], "/repo/a.ts"),
+    ).toBe(true);
+  });
+
   it("collects every dirty editor affected by unrelated batch paths", () => {
     expect(
       deletedPathTabs(
@@ -192,4 +201,32 @@ describe("evaluateCloseHazards", () => {
     const result = await evaluateCloseHazards(capture, async () => false, true);
     expect(result).toEqual(hazards([], [last]));
   });
+});
+
+it("native deletion consults live buffers before the dirty tab decoration catches up", () => {
+  const tabs: EditorTab[] = [
+    {
+      id: 1,
+      kind: "editor",
+      spaceId: "a",
+      path: "/a",
+      title: "a",
+      dirty: false,
+      preview: false,
+    },
+  ];
+  expect(partitionDeletedTabs(tabs, [1], () => true)).toEqual({
+    cleanIds: [],
+    dirtyIds: [1],
+  });
+  expect(partitionDeletedTabs(tabs, [1], () => undefined)).toEqual({
+    cleanIds: [1],
+    dirtyIds: [],
+  });
+});
+
+it("entry mutation paths normalize drive letters and trailing separators", () => {
+  expect(
+    renamedPath("c:\\repo\\src\\a.ts", "C:/repo/src/", "C:/repo/lib/"),
+  ).toBe("C:/repo/lib/a.ts");
 });

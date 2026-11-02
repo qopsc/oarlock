@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 
 use bytes::Bytes;
 use futures_util::{future::Abortable, FutureExt, StreamExt};
@@ -11,10 +11,15 @@ use tauri::ipc::{InvokeBody, JavaScriptChannelId, Request, Response};
 use tauri::{State, WebviewWindow};
 
 mod clients;
+pub(crate) mod deadline;
+mod dns;
+pub mod image;
 mod ip;
+pub mod page;
+pub mod probe;
 mod stream;
 use super::ipc_body;
-use clients::{client_for, Profile};
+pub(crate) use clients::{client_for, Profile};
 use ip::{ip_kind, IpKind};
 pub use stream::AiStreamState;
 
@@ -31,7 +36,7 @@ const HEADER_BLOCKLIST: &[&str] = &[
     "expect",
 ];
 
-fn is_blocked_host_name(host: &str) -> bool {
+pub(crate) fn is_blocked_host_name(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     matches!(
         host.as_str(),
@@ -47,15 +52,7 @@ async fn resolve_and_classify(host: &str) -> Result<(IpKind, Vec<IpAddr>), Strin
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Ok((ip_kind(ip), vec![ip]));
     }
-    let host_owned = host.to_string();
-    let lookup = tokio::task::spawn_blocking(move || {
-        (host_owned.as_str(), 0u16)
-            .to_socket_addrs()
-            .map(|it| it.map(|a| a.ip()).collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| format!("dns: {e}"))?;
+    let lookup = dns::lookup(host).await?;
     if lookup.is_empty() {
         return Err("dns: no addresses".into());
     }
@@ -96,7 +93,7 @@ fn validate_url(url: &str, allow_private: bool) -> Result<reqwest::Url, String> 
 /// Classify the host AND return safe IPs to pin reqwest's resolver to.
 /// Defeats DNS rebinding (second-lookup-returns-different-IP) by reusing
 /// exactly the addresses that passed `ip_kind`.
-async fn classify_and_collect_safe_ips(
+pub(crate) async fn classify_and_collect_safe_ips(
     host: &str,
     allow_private: bool,
 ) -> Result<Vec<IpAddr>, String> {
@@ -124,7 +121,74 @@ async fn classify_and_collect_safe_ips(
     Ok(safe)
 }
 
-fn sanitize_headers(headers: Option<HashMap<String, String>>) -> Result<HeaderMap, String> {
+/// Whether `host` (a server URL the user configured) is a local or private
+/// one, which its requests may then keep reaching: a public host never may,
+/// so a DNS answer cannot move it onto the user's network. Metadata hosts
+/// are refused.
+pub(crate) async fn host_is_private(host: &str) -> Result<bool, String> {
+    if is_blocked_host_name(host) {
+        return Err(format!("host not allowed: {host}"));
+    }
+    match resolve_and_classify(host).await?.0 {
+        IpKind::BlockedMetadata => Err(format!("host not allowed: {host}")),
+        IpKind::Loopback | IpKind::Private => Ok(true),
+        IpKind::Public => Ok(false),
+    }
+}
+
+/// What each host name was the first time this process looked at it, private or public. A name
+/// that answered with a public address stays public: a DNS answer that later moves it onto the
+/// user's network is refused instead of receiving the request and its credentials.
+#[derive(Default)]
+struct HostClasses {
+    seen: Vec<(String, bool)>,
+}
+
+const HOST_CLASS_LIMIT: usize = 64;
+
+impl HostClasses {
+    fn get(&self, host: &str) -> Option<bool> {
+        self.seen.iter().find(|(h, _)| h == host).map(|(_, p)| *p)
+    }
+
+    /// Remembers `private` for `host` unless it has been classified already; returns the class
+    /// that stands.
+    fn remember(&mut self, host: String, private: bool) -> bool {
+        if let Some(known) = self.get(&host) {
+            return known;
+        }
+        if self.seen.len() >= HOST_CLASS_LIMIT {
+            self.seen.remove(0);
+        }
+        self.seen.push((host, private));
+        private
+    }
+}
+
+fn host_classes() -> std::sync::MutexGuard<'static, HostClasses> {
+    static CLASSES: std::sync::Mutex<HostClasses> =
+        std::sync::Mutex::new(HostClasses { seen: Vec::new() });
+    CLASSES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a request to a user-configured AI endpoint may reach private and loopback addresses:
+/// decided here from the host, never on the page's word. An endpoint on the user's own network
+/// (`localhost`, a LAN address or name) may; a public name may not, and keeps that class.
+pub(crate) async fn endpoint_allows_private(host: &str) -> Result<bool, String> {
+    let key = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if let Some(known) = host_classes().get(&key) {
+        return Ok(known);
+    }
+    let private = host_is_private(host).await?;
+    Ok(host_classes().remember(key, private))
+}
+
+pub(crate) fn sanitize_headers(
+    headers: Option<HashMap<String, String>>,
+) -> Result<HeaderMap, String> {
     let mut map = HeaderMap::new();
     let Some(h) = headers else { return Ok(map) };
     for (k, v) in h {
@@ -143,27 +207,43 @@ fn sanitize_headers(headers: Option<HashMap<String, String>>) -> Result<HeaderMa
     Ok(map)
 }
 
-#[tauri::command]
-pub async fn lm_ping(base_url: String) -> Result<u16, String> {
+/// reqwest's own message ("error sending request for url (...)") hides why a
+/// request failed; its sources name the cause (DNS, refused, TLS certificate).
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = cause.source();
+    }
+    message
+}
+
+async fn probe_endpoint(base_url: String) -> Result<u16, String> {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("empty base url".into());
     }
     let probe = format!("{trimmed}/models");
-    let parsed = validate_url(&probe, true)?;
+    let parsed = validate_url(&probe, false)?;
     let host = parsed
         .host_str()
         .ok_or_else(|| "missing host".to_string())?
         .to_string();
-    let safe_ips = classify_and_collect_safe_ips(&host, true).await?;
+    let allow_private = endpoint_allows_private(&host).await?;
+    let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
 
-    let client = client_for(Profile::Ping, &host, &safe_ips, true)?;
+    let client = client_for(Profile::Ping, &host, &safe_ips, allow_private)?;
     client
         .get(parsed)
         .send()
         .await
         .map(|r| r.status().as_u16())
-        .map_err(|e| e.to_string())
+        .map_err(|e| error_chain(&e))
 }
 
 // AI HTTP proxy — bypasses webview CORS / Mixed-Content / PNA so local-network
@@ -186,24 +266,30 @@ fn build_request(
     Ok(req)
 }
 
-fn header_map_to_strings(headers: &HeaderMap) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(headers.len());
-    for (k, v) in headers {
-        if let Ok(s) = v.to_str() {
-            out.insert(k.as_str().to_ascii_lowercase(), s.to_string());
-        }
-    }
-    out
+/// Preserve repeated fields; flattening to a map loses authentication challenges
+/// and joining here would corrupt Set-Cookie values containing Expires commas.
+pub(crate) fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|text| (name.as_str().to_owned(), text.to_owned()))
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
 struct StreamHeaders {
     status: u16,
-    headers: HashMap<String, String>,
+    #[serde(rename = "statusText")]
+    status_text: &'static str,
+    headers: Vec<(String, String)>,
 }
 
 /// Packet kinds the webview decodes: 0 headers, 1 body, 2 end, 3 error.
-fn stream_packet(kind: u8, bytes: &[u8]) -> Response {
+pub(crate) fn stream_packet(kind: u8, bytes: &[u8]) -> Response {
     let mut packet = Vec::with_capacity(bytes.len() + 1);
     packet.push(kind);
     packet.extend_from_slice(bytes);
@@ -216,7 +302,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 /// returns, while the request task outlives the command, so exactly one copy
 /// is needed to hand the body over. The platform fallback that delivers JSON
 /// instead of raw bytes is handled by `ipc_body`.
-fn request_body(body: &InvokeBody) -> Result<Option<Bytes>, String> {
+pub(crate) fn request_body(body: &InvokeBody) -> Result<Option<Bytes>, String> {
     let bytes = ipc_body::bytes_of(body, MAX_REQUEST_BYTES, ipc_body::JSON_FALLBACK_MAX_BYTES)?;
     Ok(match bytes {
         _ if bytes.is_empty() => None,
@@ -225,14 +311,25 @@ fn request_body(body: &InvokeBody) -> Result<Option<Bytes>, String> {
     })
 }
 
+/// Reserve ownership/capacity before copying the IPC upload. Admission must
+/// release its locks before returning; a large copy must not block retirement.
+/// If body validation fails, the returned ownership guard drops automatically.
+pub(crate) fn admit_request_body<T>(
+    body: &InvokeBody,
+    admit: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<Bytes>), String> {
+    let owner = admit()?;
+    Ok((owner, request_body(body)?))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamRequest {
     request_id: String,
+    page_generation: String,
     url: String,
     method: String,
     headers: Option<HashMap<String, String>>,
-    allow_private_network: Option<bool>,
     on_event: JavaScriptChannelId,
 }
 
@@ -240,37 +337,42 @@ struct StreamRequest {
 pub async fn ai_http_stream(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
+    pages: State<'_, page::NetworkPages>,
     request: Request<'_>,
 ) -> Result<(), String> {
     let metadata = request
         .headers()
-        .get("x-terax-ai-request")
+        .get("x-oarlock-ai-request")
         .and_then(|value| value.to_str().ok())
         .filter(|value| value.len() <= 64 * 1024)
         .ok_or("missing or oversized AI request metadata")?;
     let StreamRequest {
         request_id,
+        page_generation,
         url,
         method,
         headers,
-        allow_private_network,
         on_event,
     } = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
     let on_event = on_event.channel_on::<_, Response>(window.as_ref().clone());
-    let body = request_body(request.body())?;
-    let (lease, registration) = state.start(window.label(), &request_id)?;
+    let ((lease, registration), body) = admit_request_body(request.body(), || {
+        pages.with_page(window.label(), &page_generation, || {
+            state.start(window.label(), &request_id)
+        })
+    })?;
     tauri::async_runtime::spawn(async move {
         let run = async {
-            let allow_private = allow_private_network.unwrap_or(false);
-            let parsed = validate_url(&url, allow_private)?;
+            let parsed = validate_url(&url, false)?;
             let host = parsed.host_str().ok_or("missing host")?.to_string();
+            let allow_private = endpoint_allows_private(&host).await?;
             let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
             let client = client_for(Profile::Stream, &host, &safe_ips, allow_private)?;
             let request = build_request(&client, &method, parsed, headers, body)?;
-            let response = request.send().await.map_err(|e| e.to_string())?;
+            let response = request.send().await.map_err(|e| error_chain(&e))?;
             let metadata = serde_json::to_vec(&StreamHeaders {
                 status: response.status().as_u16(),
-                headers: header_map_to_strings(response.headers()),
+                status_text: response.status().canonical_reason().unwrap_or(""),
+                headers: header_pairs(response.headers()),
             })
             .map_err(|e| e.to_string())?;
             on_event
@@ -300,7 +402,7 @@ pub async fn ai_http_stream(
 /// while the window is full the next packet keeps filling from the network, so
 /// a slow consumer sees fewer, larger messages rather than a backlog of tiny
 /// ones.
-async fn pump<S, E>(
+pub(crate) async fn pump<S, E>(
     mut chunks: S,
     control: &stream::StreamControl,
     mut send: impl FnMut(Vec<u8>) -> Result<(), String>,
@@ -343,11 +445,18 @@ where
             }
             continue;
         }
+        // Network activity is not consumer progress. Keep the same wait while
+        // absorbing data; only a credit notification may renew its deadline.
+        let changed = control.credit_changed();
+        tokio::pin!(changed);
         while !control.try_reserve(payload_len(&packet))? {
             let can_absorb = payload_len(&packet) < CHUNK_BYTES && carry.is_empty() && !ended;
             if can_absorb {
                 tokio::select! {
-                    changed = control.credit_changed() => changed?,
+                    result = &mut changed => {
+                        result?;
+                        changed.set(control.credit_changed());
+                    },
                     next = chunks.next() => match next {
                         Some(Ok(next)) => {
                             carry = next;
@@ -361,7 +470,8 @@ where
                     },
                 }
             } else {
-                control.credit_changed().await?;
+                changed.as_mut().await?;
+                changed.set(control.credit_changed());
             }
         }
         send(std::mem::replace(&mut packet, new_packet(1, 0)))?;
@@ -375,10 +485,14 @@ where
 pub async fn ai_http_cancel(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
+    pages: State<'_, page::NetworkPages>,
+    page_generation: String,
     request_id: String,
 ) -> Result<(), String> {
-    state.cancel(window.label(), &request_id);
-    Ok(())
+    pages.with_page(window.label(), &page_generation, || {
+        state.cancel(window.label(), &request_id);
+        Ok(())
+    })
 }
 
 /// Async so the acknowledgment never rides the main thread, which is where
@@ -387,16 +501,87 @@ pub async fn ai_http_cancel(
 pub async fn ai_http_ack(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
+    pages: State<'_, page::NetworkPages>,
+    page_generation: String,
     request_id: String,
     bytes: u64,
 ) -> Result<(), String> {
-    state.acknowledge(window.label(), &request_id, bytes)
+    pages.with_page(window.label(), &page_generation, || {
+        state.acknowledge(window.label(), &request_id, bytes)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_keeps_the_class_it_first_had() {
+        let mut classes = HostClasses::default();
+        assert!(!classes.remember("api.example.com".into(), false));
+        assert!(
+            !classes.remember("api.example.com".into(), true),
+            "a name that answered public and later private stays public"
+        );
+        assert!(classes.remember("nas.lan".into(), true));
+        assert!(classes.remember("nas.lan".into(), false));
+        for n in 0..HOST_CLASS_LIMIT {
+            classes.remember(format!("h{n}"), false);
+        }
+        assert_eq!(classes.seen.len(), HOST_CLASS_LIMIT);
+        assert_eq!(classes.get("api.example.com"), None, "oldest dropped");
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_host_decides_private_access_not_the_page() {
+        assert!(endpoint_allows_private("127.0.0.1").await.unwrap());
+        assert!(endpoint_allows_private("[::1]").await.unwrap());
+        assert!(endpoint_allows_private("192.168.1.20").await.unwrap());
+        assert!(!endpoint_allows_private("93.184.216.34").await.unwrap());
+        assert!(endpoint_allows_private("169.254.169.254").await.is_err());
+        assert!(endpoint_allows_private("metadata.google.internal").await.is_err());
+    }
     use std::net::Ipv4Addr;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_names_the_cause() {
+        let error = Layer(
+            "error sending request for url (https://llm.internal/v1/models)",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer(
+                    "invalid peer certificate: UnknownIssuer",
+                    None,
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error sending request for url (https://llm.internal/v1/models): \
+             client error (Connect): invalid peer certificate: UnknownIssuer"
+        );
+        // A layer that repeats its source's text is not shown twice.
+        let repeated = Layer(
+            "dns: no addresses",
+            Some(Box::new(Layer("no addresses", None))),
+        );
+        assert_eq!(error_chain(&repeated), "dns: no addresses");
+    }
 
     #[test]
     fn metadata_ips_classified_as_blocked() {
@@ -583,6 +768,55 @@ mod tests {
     }
 
     #[test]
+    fn rejected_uploads_do_not_decode_bodies_and_bad_bodies_release_capacity() {
+        let pages = page::NetworkPages::default();
+        let state = AiStreamState::default();
+        pages.begin("main", || {}).unwrap();
+        let token = pages.finish("main").unwrap();
+        // An invalid body would fail decoding if admission did not run first.
+        let body = InvokeBody::Json(serde_json::json!("not a byte array"));
+        let stale = admit_request_body(&body, || {
+            pages.with_page("main", "expired", || state.start("main", "upload"))
+        });
+        assert!(matches!(stale, Err(error) if error.contains("expired")));
+        let held = state.start_bounded("main", "held", 1).unwrap();
+        let full = admit_request_body(&body, || {
+            pages.with_page("main", &token, || state.start_bounded("main", "upload", 1))
+        });
+        assert!(matches!(full, Err(error) if error.contains("too many")));
+        drop(held);
+        assert!(admit_request_body(&body, || {
+            pages.with_page("main", &token, || state.start_bounded("main", "upload", 1))
+        })
+        .is_err());
+        assert!(state.start_bounded("main", "upload", 1).is_ok());
+    }
+
+    #[test]
+    fn response_metadata_preserves_repeated_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "www-authenticate",
+            HeaderValue::from_static("Bearer realm=api"),
+        );
+        headers.append(
+            "www-authenticate",
+            HeaderValue::from_static("Basic realm=legacy"),
+        );
+        let metadata = serde_json::to_string(&StreamHeaders {
+            status: 401,
+            status_text: "Unauthorized",
+            headers: header_pairs(&headers),
+        })
+        .unwrap();
+        assert!(
+            metadata.contains("Bearer realm=api"),
+            "first challenge was discarded: {metadata}"
+        );
+        assert!(metadata.contains("Basic realm=legacy"));
+    }
+
+    #[test]
     fn ipv6_literal_hosts_resolve_without_dns() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -594,6 +828,24 @@ mod tests {
             .block_on(resolve_and_classify("[2606:4700::1111]"))
             .unwrap();
         assert_eq!(kind, IpKind::Public);
+    }
+
+    #[test]
+    fn a_configured_host_is_private_only_when_it_resolves_there() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(host_is_private("127.0.0.1")), Ok(true));
+        assert_eq!(rt.block_on(host_is_private("[::1]")), Ok(true));
+        assert_eq!(rt.block_on(host_is_private("10.0.0.7")), Ok(true));
+        assert_eq!(rt.block_on(host_is_private("1.1.1.1")), Ok(false));
+        assert!(rt.block_on(host_is_private("169.254.169.254")).is_err());
+        assert!(rt
+            .block_on(host_is_private("[::ffff:169.254.169.254]"))
+            .is_err());
+        assert!(rt
+            .block_on(host_is_private("metadata.google.internal"))
+            .is_err());
     }
 
     #[test]
@@ -768,5 +1020,40 @@ mod tests {
             })
             .await;
         }
+
+        #[tokio::test(start_paused = true)]
+        async fn incoming_bytes_do_not_extend_a_stalled_consumers_deadline() {
+            local(async {
+                let (net_tx, net_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                let chunks: Chunks =
+                    Box::pin(futures_util::stream::unfold(net_rx, |mut rx| async move {
+                        rx.recv().await.map(|b| (Ok::<_, String>(b), rx))
+                    }));
+                let (task, rx, _state) = run_pump(chunks);
+                net_tx.send(Bytes::from(vec![0; 128 * 1024 + 1])).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rx.try_iter().count(), 2);
+                tokio::time::advance(std::time::Duration::from_secs(110)).await;
+                net_tx.send(Bytes::from_static(b"x")).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(std::time::Duration::from_secs(11)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    task.is_finished(),
+                    "incoming bytes reset the consumer deadline"
+                );
+                assert!(task.await.unwrap().unwrap_err().contains("stopped reading"));
+            })
+            .await;
+        }
     }
 }
+
+#[cfg(test)]
+mod clients_boundary_tests;

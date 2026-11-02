@@ -1,34 +1,49 @@
+import {
+  beginRun,
+  claimRun,
+  restorePaused,
+  takePaused,
+  type RunOwner,
+} from "./runOwner";
+import {
+  denyUnansweredApprovals,
+  EXPIRED_APPROVAL_REASON,
+} from "./toolApprovals";
+import { assertWorkspaceAvailable } from "@/modules/workspace/availability";
+import { beginRunAdmission } from "../store/chatStop";
+import { currentWorkspaceEnv } from "@/modules/workspace/env";
+import { mcpToolsForRun } from "@/modules/mcp";
 import type { UIMessage } from "@ai-sdk/react";
-import type { CustomEndpoint } from "../config";
+import { toUIMessageStream } from "ai";
+import type { AgentSkills } from "@/modules/skills/catalog";
+import { type CustomEndpoint, resolveContextLimit } from "../config";
 import { runAgentStream, type AgentUsageDelta } from "./agent";
+import { maxMemoryBytes } from "./compact";
 import type { ProviderKeys, CustomEndpointKeys } from "./keyring";
 import { formatAiError } from "./errors";
-import { native } from "./native";
+import { pathText } from "./messageBlocks";
+import { native, createNative, type ProjectMemory } from "./native";
 import type { ToolContext } from "../tools/tools";
+import type { ApprovalMode } from "./approvalMode";
+import type { ReasoningEffort } from "./reasoningEffort";
 
-const TERAX_MD_MAX_BYTES = 32 * 1024;
-type MemoryCacheEntry = { content: string | null; mtime: number };
-const projectMemoryCache = new Map<string, MemoryCacheEntry>();
-
-async function readTeraxMd(workspaceRoot: string | null): Promise<string | null> {
+/**
+ * The project's AGENTS.md for this run. The backend reads it and returns it only
+ * while the user allows its current content (project trust), so it is asked on
+ * every run: a withdrawn answer or a changed file stops reaching the model at
+ * once. Without it the run goes on with no project memory. The whole file is
+ * sent, whatever its size; above `limit` bytes (more than the model could take)
+ * only its size comes back, and the run says it does not fit.
+ */
+async function readAgentsMd(
+  workspaceRoot: string | null,
+  limit: number,
+  client = native,
+): Promise<ProjectMemory | null> {
   if (!workspaceRoot) return null;
-  const path = `${workspaceRoot.replace(/\/$/, "")}/TERAX.md`;
-  const cached = projectMemoryCache.get(workspaceRoot);
-  if (cached && Date.now() - cached.mtime < 30_000) return cached.content;
   try {
-    const r = await native.readFile(path);
-    if (r.kind !== "text") {
-      projectMemoryCache.set(workspaceRoot, { content: null, mtime: Date.now() });
-      return null;
-    }
-    const content =
-      r.content.length > TERAX_MD_MAX_BYTES
-        ? r.content.slice(0, TERAX_MD_MAX_BYTES)
-        : r.content;
-    projectMemoryCache.set(workspaceRoot, { content, mtime: Date.now() });
-    return content;
+    return await client.readProjectMemory(workspaceRoot, limit);
   } catch {
-    projectMemoryCache.set(workspaceRoot, { content: null, mtime: Date.now() });
     return null;
   }
 }
@@ -41,8 +56,10 @@ type LiveSnapshot = {
 };
 
 type Deps = {
+  assertReady: () => void;
   getKeys: () => ProviderKeys;
   toolContext: ToolContext;
+  captureToolContext?: () => ToolContext;
   getModelId: () => string;
   getCustomInstructions: () => string;
   getAgentPersona: () => { name: string; instructions: string } | null;
@@ -53,9 +70,6 @@ type Deps = {
   getMlxModelId?: () => string | undefined;
   getOllamaBaseURL?: () => string | undefined;
   getOllamaModelId?: () => string | undefined;
-  getOpenaiCompatibleBaseURL?: () => string | undefined;
-  getOpenaiCompatibleModelId?: () => string | undefined;
-  getOpenaiCompatibleContextLimit?: () => number | undefined;
   getOpenrouterModelId?: () => string | undefined;
   getCustomEndpoints?: () => readonly CustomEndpoint[];
   getCustomEndpointKeys?: () => CustomEndpointKeys;
@@ -64,6 +78,15 @@ type Deps = {
   onCompact?: (info: { droppedCount: number }) => void;
   onFinishMeta?: (info: { hitStepCap: boolean; finishReason: string }) => void;
   getPlanMode?: () => boolean;
+  /** The conversation's approval mode, read on every gated tool call. */
+  getApprovalMode?: () => ApprovalMode;
+  /** The effort remembered for the run's model, if one was chosen. */
+  getReasoningEffort?: () => ReasoningEffort | undefined;
+  /** The skills a run in this workspace may use. */
+  getSkills?: (
+    workspaceRoot: string | null,
+    workspace: import("@/modules/workspace/env").WorkspaceEnv,
+  ) => Promise<AgentSkills>;
 };
 
 type SendOptions = {
@@ -73,44 +96,164 @@ type SendOptions = {
 };
 
 export function createContextAwareTransport(deps: Deps) {
+  let cacheScope = "";
+  let readCache = deps.toolContext.readCache;
+  let binding:
+    | {
+        userId: string | undefined;
+        live: LiveSnapshot;
+        toolContext: ToolContext &
+          Required<Pick<ToolContext, "native" | "workspace">>;
+      }
+    | undefined;
   const run = async (options: SendOptions) => {
-    const live = deps.getLive();
-    const projectMemory = await readTeraxMd(live.workspaceRoot);
-    const envBlock = formatEnvBlock(live);
-    const messagesForRun = envBlock
-      ? injectEnvIntoLastUser(options.messages, envBlock)
-      : options.messages;
-    const result = await runAgentStream({
-      keys: deps.getKeys(),
-      modelId: deps.getModelId(),
-      customInstructions: deps.getCustomInstructions(),
-      agentPersona: deps.getAgentPersona(),
-      toolContext: deps.toolContext,
-      onStep: deps.onStep,
-      onUsage: deps.onUsage,
-      onCompact: deps.onCompact,
-      onFinishMeta: deps.onFinishMeta,
-      lmstudioBaseURL: deps.getLmstudioBaseURL?.(),
-      lmstudioModelId: deps.getLmstudioModelId?.(),
-      mlxBaseURL: deps.getMlxBaseURL?.(),
-      mlxModelId: deps.getMlxModelId?.(),
-      ollamaBaseURL: deps.getOllamaBaseURL?.(),
-      ollamaModelId: deps.getOllamaModelId?.(),
-      openaiCompatibleBaseURL: deps.getOpenaiCompatibleBaseURL?.(),
-      openaiCompatibleModelId: deps.getOpenaiCompatibleModelId?.(),
-      openaiCompatibleContextLimit: deps.getOpenaiCompatibleContextLimit?.(),
-      openrouterModelId: deps.getOpenrouterModelId?.(),
-      customEndpoints: deps.getCustomEndpoints?.(),
-      customEndpointKeys: deps.getCustomEndpointKeys?.(),
-      planMode: deps.getPlanMode?.(),
-      projectMemory,
-      uiMessages: messagesForRun,
-      abortSignal: options.abortSignal,
-    });
-    return result.toUIMessageStream({
-      originalMessages: options.messages,
-      onError: formatAiError,
-    });
+    // A waiting approval keeps its record when the run fails before it used it
+    // (restored in the finally below), unless Stop closed it.
+    deps.assertReady();
+    const chatId = deps.toolContext.getSessionId?.();
+    const previous = takePaused(chatId ?? null);
+    let owner: RunOwner | undefined;
+    let mcpPromise: ReturnType<typeof mcpToolsForRun> | undefined;
+    let transferred = false;
+    let previousClosed = false;
+    const stillWanted = () => {
+      options.abortSignal?.throwIfAborted();
+      owner?.signal.throwIfAborted();
+    };
+    try {
+      owner =
+        (chatId ? claimRun(chatId, options.messages) : undefined) ??
+        beginRun(chatId ?? null, {
+          kind: "turn",
+          admit: chatId ? (id) => beginRunAdmission(chatId, id) : undefined,
+        });
+      const last = options.messages[options.messages.length - 1];
+      if (!binding && last?.role === "assistant") {
+        const tail = [last];
+        if (denyUnansweredApprovals(tail) !== tail)
+          throw new Error(EXPIRED_APPROVAL_REASON);
+      }
+      const userId = [...options.messages]
+        .reverse()
+        .find((m) => m.role === "user")?.id;
+      if (!binding || binding.userId !== userId) {
+        const live = { ...deps.getLive() };
+        const workspace = currentWorkspaceEnv();
+        const scope = JSON.stringify([workspace, live.workspaceRoot]);
+        if (scope !== cacheScope) {
+          cacheScope = scope;
+          readCache = new Map();
+        }
+        const captured = deps.captureToolContext?.() ?? deps.toolContext;
+        const terminal = captured.getTerminalContext();
+        binding = {
+          userId,
+          live,
+          toolContext: {
+            ...captured,
+            native: createNative(() => workspace),
+            workspace,
+            getCwd: () => live.cwd,
+            getWorkspaceRoot: () => live.workspaceRoot,
+            getTerminalContext: deps.captureToolContext
+              ? captured.getTerminalContext
+              : () => terminal,
+            isActiveTerminalPrivate: deps.captureToolContext
+              ? captured.isActiveTerminalPrivate
+              : () => live.terminalPrivate,
+            readCache,
+          },
+        };
+      }
+      // Approval continuations belong to the original user turn, even after navigation.
+      const { live, toolContext } = binding;
+      const workspace = toolContext.workspace;
+      assertWorkspaceAvailable(workspace);
+      const client = toolContext.native;
+      const contextLimit = resolveContextLimit(
+        deps.getModelId(),
+        deps.getCustomEndpoints?.() ?? [],
+      );
+      // A continuation cannot replace the original project's MCP tools with those
+      // of a newly selected space. Dispatch still rechecks current permissions.
+      const admission = owner.ready;
+      mcpPromise = mcpToolsForRun({
+        root: live.workspaceRoot,
+        workspace,
+        admission,
+        scope: chatId ? { runId: owner.runId, ready: admission } : undefined,
+        signal: options.abortSignal,
+        onWaiting: () => deps.onStep?.("Starting MCP servers"),
+      });
+      await admission;
+      stillWanted();
+      deps.assertReady();
+      const [projectMemory, mcp, skills] = await Promise.all([
+        readAgentsMd(live.workspaceRoot, maxMemoryBytes(contextLimit), client),
+        mcpPromise,
+        deps.getSkills?.(live.workspaceRoot, workspace),
+      ]);
+      // Acquire the continuation's record before releasing the approval pause's.
+      await previous?.close("continued");
+      previousClosed = true;
+      stillWanted();
+      deps.assertReady();
+      const envBlock = formatEnvBlock(live);
+      const messagesForRun = envBlock
+        ? injectEnvIntoLastUser(options.messages, envBlock)
+        : options.messages;
+      const run = await runAgentStream({
+        assertReady: deps.assertReady,
+        keys: deps.getKeys(),
+        modelId: deps.getModelId(),
+        customInstructions: deps.getCustomInstructions(),
+        agentPersona: deps.getAgentPersona(),
+        toolContext,
+        onStep: deps.onStep,
+        onUsage: deps.onUsage,
+        onCompact: deps.onCompact,
+        onFinishMeta: deps.onFinishMeta,
+        lmstudioBaseURL: deps.getLmstudioBaseURL?.(),
+        lmstudioModelId: deps.getLmstudioModelId?.(),
+        mlxBaseURL: deps.getMlxBaseURL?.(),
+        mlxModelId: deps.getMlxModelId?.(),
+        ollamaBaseURL: deps.getOllamaBaseURL?.(),
+        ollamaModelId: deps.getOllamaModelId?.(),
+        openrouterModelId: deps.getOpenrouterModelId?.(),
+        customEndpoints: deps.getCustomEndpoints?.(),
+        customEndpointKeys: deps.getCustomEndpointKeys?.(),
+        planMode: deps.getPlanMode?.(),
+        approvalState: () => ({
+          mode: deps.getApprovalMode?.() ?? "ask",
+          planMode: deps.getPlanMode?.() ?? false,
+        }),
+        reasoningEffort: deps.getReasoningEffort?.(),
+        projectMemory,
+        mcp,
+        skills,
+        uiMessages: messagesForRun,
+        abortSignal: options.abortSignal,
+      });
+      const stream = toUIMessageStream({
+        stream: run.stream,
+        tools: run.tools,
+        originalMessages: options.messages,
+        onError: formatAiError,
+      });
+      transferred = true;
+      return owner.wrapStream(stream, { signal: options.abortSignal });
+    } finally {
+      if (!transferred) {
+        try {
+          await mcpPromise?.catch(() => {});
+          if (previous && !previousClosed && previous.phase === "paused")
+            restorePaused(previous);
+          await owner?.close("error");
+        } finally {
+          owner?.setupDone();
+        }
+      } else owner?.setupDone();
+    }
   };
 
   return {
@@ -151,11 +294,16 @@ function injectEnvIntoLastUser(
   return messages;
 }
 
+/** The run's environment for the model. A path is a folder or file name the
+ *  user did not type, so it may hold a newline or `</env>`: each stays on its
+ *  own line (`pathText`). */
 function formatEnvBlock(live: LiveSnapshot): string | null {
   const lines: string[] = [];
-  if (live.workspaceRoot) lines.push(`workspace_root: ${live.workspaceRoot}`);
-  if (live.cwd) lines.push(`active_terminal_cwd: ${live.cwd}`);
-  if (live.activeFile) lines.push(`active_file: ${live.activeFile}`);
+  if (live.workspaceRoot) {
+    lines.push(`workspace_root: ${pathText(live.workspaceRoot)}`);
+  }
+  if (live.cwd) lines.push(`active_terminal_cwd: ${pathText(live.cwd)}`);
+  if (live.activeFile) lines.push(`active_file: ${pathText(live.activeFile)}`);
   if (live.terminalPrivate) lines.push("active_terminal_mode: private");
   if (lines.length === 0) return null;
   return `<env>\n${lines.join("\n")}\n</env>`;

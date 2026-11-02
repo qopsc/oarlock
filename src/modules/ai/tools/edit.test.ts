@@ -1,3 +1,4 @@
+import { writtenEntry } from "./readCache";
 import type { ToolExecutionOptions } from "ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolContext } from "./context";
@@ -5,7 +6,7 @@ import type { ToolContext } from "./context";
 const nativeMock = vi.hoisted(() => ({
   canonicalize: vi.fn(async (path: string) => path),
   readFile: vi.fn(),
-  writeFile: vi.fn(async () => undefined),
+  writeFile: vi.fn(async () => ({ version: "v2" })),
 }));
 
 vi.mock("../lib/native", () => ({ native: nativeMock }));
@@ -17,16 +18,21 @@ vi.mock("../lib/security", () => ({
   })),
 }));
 
+const planMock = vi.hoisted(() => ({ active: false, enqueue: vi.fn() }));
+
 vi.mock("../store/planStore", () => ({
   newQueuedEditId: () => "queued-edit",
-  usePlanStore: { getState: () => ({ active: false, enqueue: vi.fn() }) },
+  usePlanStore: {
+    getState: () => ({ active: planMock.active, enqueue: planMock.enqueue }),
+  },
 }));
 
 import { buildEditTools } from "./edit";
 
-const toolOptions: ToolExecutionOptions = {
+const toolOptions: ToolExecutionOptions<Record<string, unknown>> = {
   toolCallId: "tool-call",
   messages: [],
+  context: {},
 };
 
 const FILE = "/workspace/a.txt";
@@ -56,10 +62,16 @@ function setFile(content: string) {
     kind: "text",
     content,
     size: content.length,
+    version: "v1",
   });
 }
 
-type EditResult = { error?: string; replacements?: number };
+type EditResult = {
+  error?: string;
+  replacements?: number;
+  bytesWritten?: number;
+  queued_for_plan_review?: boolean;
+};
 
 async function runEdit(
   ctx: ToolContext,
@@ -81,8 +93,9 @@ async function runMultiEdit(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  planMock.active = false;
   nativeMock.canonicalize.mockImplementation(async (p: string) => p);
-  nativeMock.writeFile.mockResolvedValue(undefined);
+  nativeMock.writeFile.mockResolvedValue({ version: "v2" });
 });
 
 describe("edit tool guards", () => {
@@ -174,7 +187,11 @@ describe("edit tool replacement", () => {
       new_string: "there",
     });
     expect(result.replacements).toBe(1);
-    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "hello there");
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(
+      FILE,
+      "hello there",
+      "v1",
+    );
   });
 
   it("replaces every occurrence and counts them with replace_all", async () => {
@@ -186,7 +203,68 @@ describe("edit tool replacement", () => {
       replace_all: true,
     });
     expect(result.replacements).toBe(3);
-    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "z b z b z");
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "z b z b z", "v1");
+  });
+
+  it("counts written bytes in UTF-8, as the next read reports them", async () => {
+    setFile("cafe");
+    const ctx = readContext();
+    const result = await runEdit(ctx, {
+      path: FILE,
+      old_string: "cafe",
+      new_string: "café ✓",
+    });
+    expect(result.bytesWritten).toBe(9);
+    expect(ctx.readCache.get(FILE)?.size).toBe(9);
+  });
+
+  it("reports a plan-mode edit as queued, not written", async () => {
+    planMock.active = true;
+    setFile("hello world");
+    const result = await runEdit(readContext(), {
+      path: FILE,
+      old_string: "world",
+      new_string: "there",
+    });
+    expect(result).toMatchObject({ ok: true, queued_for_plan_review: true });
+    expect(result.bytesWritten).toBeUndefined();
+    expect(nativeMock.writeFile).not.toHaveBeenCalled();
+    expect(planMock.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "edit",
+        proposedContent: "hello there",
+        baseVersion: "v1",
+        edits: [{ old_string: "world", new_string: "there" }],
+      }),
+    );
+  });
+});
+
+describe("edit tool concurrent changes", () => {
+  it("reads the file versioned and records the version it saved", async () => {
+    setFile("hello world");
+    const ctx = readContext();
+    await runEdit(ctx, {
+      path: FILE,
+      old_string: "world",
+      new_string: "there",
+    });
+    expect(nativeMock.readFile).toHaveBeenCalledWith(FILE, {
+      versioned: true,
+    });
+    expect(ctx.readCache.get(FILE)?.version).toBe("v2");
+  });
+
+  it("reports a file changed between the read and the save, and writes nothing", async () => {
+    setFile("hello world");
+    const { StaleFileError } = await import("../lib/staleFile");
+    nativeMock.writeFile.mockRejectedValue(new StaleFileError(FILE));
+    const result = await runEdit(readContext(), {
+      path: FILE,
+      old_string: "world",
+      new_string: "there",
+    });
+    expect(result.error).toContain("changed on disk");
   });
 });
 
@@ -201,7 +279,7 @@ describe("multi_edit atomicity", () => {
       ],
     });
     expect(result.replacements).toBe(2);
-    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "1 2");
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "1 2", "v1");
   });
 
   it("writes nothing when a later edit in the batch fails", async () => {
@@ -229,4 +307,28 @@ describe("multi_edit atomicity", () => {
     expect(result.error).toContain("not unique");
     expect(nativeMock.writeFile).not.toHaveBeenCalled();
   });
+});
+
+it("editing a partial read does not mark unseen contents as fully read", async () => {
+  setFile("hello world");
+  const ctx = makeContext(
+    new Map([[FILE, { ...writtenEntry("hello world"), fullContent: false }]]),
+  );
+  await runEdit(ctx, {
+    path: FILE,
+    old_string: "hello",
+    new_string: "goodbye",
+  });
+  expect(ctx.readCache.get(FILE)?.fullContent).toBe(false);
+});
+
+it("editing a complete unchanged read preserves complete-read knowledge", async () => {
+  setFile("hello world");
+  const ctx = makeContext(new Map([[FILE, writtenEntry("hello world")]]));
+  await runEdit(ctx, {
+    path: FILE,
+    old_string: "hello",
+    new_string: "goodbye",
+  });
+  expect(ctx.readCache.get(FILE)?.fullContent).toBe(true);
 });

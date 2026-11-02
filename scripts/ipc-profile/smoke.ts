@@ -1,4 +1,4 @@
-import { createProxyFetch } from "@/modules/ai/lib/proxyFetch";
+import { proxyFetch } from "@/modules/ai/lib/proxyFetch";
 import {
   saveMessages,
   loadMessages,
@@ -8,13 +8,14 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { profileGrepCancellation, withProfileWatch } from "./fsLifecycle";
 const original = fetch;
-const nativeFetch = createProxyFetch({ allowPrivateNetwork: true });
-declare const __TERAX_IPC_BASE_URL__: string;
-declare const __TERAX_IPC_TREE__: string;
-const base = __TERAX_IPC_BASE_URL__;
-const tree = __TERAX_IPC_TREE__;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const nativeFetch = proxyFetch;
+declare const __OARLOCK_IPC_BASE_URL__: string;
+declare const __OARLOCK_IPC_TREE__: string;
+const base = __OARLOCK_IPC_BASE_URL__;
+const tree = __OARLOCK_IPC_TREE__;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 type Json = Record<string, unknown>;
 
@@ -22,7 +23,7 @@ async function checkMainThread(output: Record<string, unknown>) {
   const heavy = Promise.all([
     invoke("fs_grep", { pattern: "zzzz-no-match-\\d+", root: tree, maxResults: 10 }),
     invoke("fs_list_files", { root: tree, limit: 10000 }),
-    invoke("fs_search", { root: tree, query: "f099", limit: 50 }),
+    invoke("fs_search", { root: tree, query: "f099", limit: 50, requestKey: "ipc-profile-main" }),
   ]);
   let pending = true;
   void heavy.finally(() => {
@@ -62,22 +63,11 @@ async function checkSearch(output: Record<string, unknown>) {
     root: tree,
     query: "brand-new-needle",
     limit: 5,
+    requestKey: "smoke",
   });
   output.searchSeesNewFile = after.hits.some((h) => h.rel.endsWith("brand-new-needle.txt"));
 
-  const first = invoke<{ cancelled: boolean }>("fs_grep_interactive", {
-    pattern: "zzzz-never-matches",
-    root: tree,
-    maxResults: 50,
-  });
-  await sleep(10);
-  const second = invoke<{ cancelled: boolean }>("fs_grep_interactive", {
-    pattern: "zzzz-never-matches-either",
-    root: tree,
-    maxResults: 50,
-  });
-  const [a, b] = await Promise.all([first, second]);
-  output.grepSuperseded = a.cancelled === true && b.cancelled === false;
+  output.grepSuperseded = await profileGrepCancellation(tree, sleep);
 }
 
 async function checkWatch(output: Record<string, unknown>) {
@@ -95,28 +85,31 @@ async function checkWatch(output: Record<string, unknown>) {
     "fs:changed",
     (e) => seen.push(e.payload.paths),
   );
-  await invoke("fs_watch_add", { paths: [dir], files: [file] });
-  await sleep(400);
-  seen.length = 0;
+  try {
+    await withProfileWatch([dir], [file], async () => {
+      await sleep(400);
+      seen.length = 0;
 
-  await invoke("fs_write_file", { path: `${dir}/other.txt`, content: "x" });
-  await sleep(900);
-  output.watchDirectory = seen.some((paths) => paths.includes(canonicalDir));
-  output.watchFileNotSpurious = !seen.some((paths) => paths.includes(canonicalFile));
-  seen.length = 0;
+      await invoke("fs_write_file", { path: `${dir}/other.txt`, content: "x" });
+      await sleep(900);
+      output.watchDirectory = seen.some((paths) => paths.includes(canonicalDir));
+      output.watchFileNotSpurious = !seen.some((paths) => paths.includes(canonicalFile));
+      seen.length = 0;
 
-  await invoke("fs_write_file", { path: file, content: "two, much longer" });
-  await sleep(900);
-  output.watchFile =
-    seen.some((paths) => paths.includes(canonicalFile)) &&
-    output.watchFileNotSpurious === true;
-  seen.length = 0;
+      await invoke("fs_write_file", { path: file, content: "two, much longer" });
+      await sleep(900);
+      output.watchFile =
+        seen.some((paths) => paths.includes(canonicalFile)) &&
+        output.watchFileNotSpurious === true;
+      seen.length = 0;
 
-  await invoke("fs_write_file", { path: `${quiet}/unwatched.txt`, content: "x" });
-  await sleep(700);
-  output.watchQuietOutside = seen.length === 0;
-  await invoke("fs_watch_remove", { paths: [dir], files: [file] });
-  unlisten();
+      await invoke("fs_write_file", { path: `${quiet}/unwatched.txt`, content: "x" });
+      await sleep(700);
+      output.watchQuietOutside = seen.length === 0;
+    });
+  } finally {
+    unlisten();
+  }
 }
 
 async function checkBackdrop(output: Record<string, unknown>) {

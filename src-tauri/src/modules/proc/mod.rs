@@ -1,4 +1,6 @@
 pub mod capture;
+#[cfg(unix)]
+pub mod group;
 pub mod rss;
 
 #[cfg(windows)]

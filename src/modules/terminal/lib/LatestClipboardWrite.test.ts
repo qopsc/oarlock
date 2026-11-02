@@ -35,3 +35,33 @@ it("coalesces a parser burst and recovers from clipboard rejection", async () =>
   await Promise.resolve();
   expect(write).toHaveBeenLastCalledWith("recovered");
 });
+
+it("prepares the latest pending burst while an earlier write is running", async () => {
+  let finish!: () => void;
+  const write = vi
+    .fn<(value: number) => Promise<void>>()
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockResolvedValue(undefined);
+  const prepare = vi.fn();
+  const discard = vi.fn();
+  const queue = new LatestClipboardWrite(write, prepare, discard);
+  queue.enqueue(1);
+  await Promise.resolve();
+  queue.enqueue(2);
+  queue.enqueue(3);
+  await Promise.resolve();
+  expect(prepare.mock.calls).toEqual([[1], [3]]);
+  expect(discard.mock.calls).toEqual([[2]]);
+  expect(write.mock.calls).toEqual([[1]]);
+  queue.enqueue(4);
+  await Promise.resolve();
+  expect(discard).toHaveBeenLastCalledWith(3);
+  finish();
+  await Promise.resolve();
+  expect(write).toHaveBeenLastCalledWith(4);
+});

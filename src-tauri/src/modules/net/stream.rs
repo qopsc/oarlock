@@ -7,7 +7,7 @@
 //! stream buffer the window bounds unconsumed data at 192 KiB per request.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::{AbortHandle, AbortRegistration};
@@ -66,6 +66,17 @@ impl AiStreamState {
         window: &str,
         id: &str,
     ) -> Result<(StreamLease, AbortRegistration), String> {
+        self.start_bounded(window, id, MAX_REQUESTS)
+    }
+
+    /// `start` with a budget of its own: MCP sessions hold an event stream
+    /// each for as long as they live.
+    pub fn start_bounded(
+        &self,
+        window: &str,
+        id: &str,
+        limit: usize,
+    ) -> Result<(StreamLease, AbortRegistration), String> {
         if id.is_empty()
             || id.len() > 64
             || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
@@ -73,12 +84,12 @@ impl AiStreamState {
             return Err("invalid AI request id".into());
         }
         let key = (window.to_owned(), id.to_owned());
-        let mut requests = self.0.lock().unwrap();
+        let mut requests = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if requests.contains_key(&key) {
             return Err("AI request id is already active".into());
         }
-        if requests.len() >= MAX_REQUESTS {
-            return Err("too many active AI requests".into());
+        if requests.len() >= limit {
+            return Err("too many active requests".into());
         }
         let (abort, registration) = AbortHandle::new_pair();
         let control = Arc::new(StreamControl {
@@ -101,7 +112,7 @@ impl AiStreamState {
         let request = self
             .0
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&(window.to_owned(), id.to_owned()))
             .cloned();
         if let Some(request) = request {
@@ -113,7 +124,7 @@ impl AiStreamState {
         let requests: Vec<_> = self
             .0
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|((owner, _), _)| owner == window)
             .map(|(_, request)| request.clone())
@@ -127,7 +138,7 @@ impl AiStreamState {
         let request = self
             .0
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&(window.to_owned(), id.to_owned()))
             .cloned();
         match request {
@@ -138,13 +149,13 @@ impl AiStreamState {
 
     #[cfg(test)]
     fn active(&self) -> usize {
-        self.0.lock().unwrap().len()
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 }
 
 impl Drop for StreamLease {
     fn drop(&mut self) {
-        self.state.0.lock().unwrap().remove(&self.key);
+        self.state.0.lock().unwrap_or_else(PoisonError::into_inner).remove(&self.key);
     }
 }
 
@@ -154,7 +165,7 @@ impl StreamControl {
         if bytes == 0 || bytes > CHUNK_BYTES {
             return Err("invalid AI stream chunk size".into());
         }
-        let mut credit = self.credit.lock().unwrap();
+        let mut credit = self.credit.lock().unwrap_or_else(PoisonError::into_inner);
         if !credit.admits(bytes as u64) {
             return Ok(false);
         }
@@ -191,7 +202,7 @@ impl StreamControl {
     }
 
     fn acknowledge(&self, bytes: u64) -> Result<(), String> {
-        let mut credit = self.credit.lock().unwrap();
+        let mut credit = self.credit.lock().unwrap_or_else(PoisonError::into_inner);
         if bytes <= credit.acknowledged {
             return Ok(());
         }
@@ -400,6 +411,44 @@ mod tests {
         drop(leases);
         assert!(state.start("main", "new").is_ok());
         assert!(state.start("main", "../invalid").is_err());
+
+        let bounded = AiStreamState::default();
+        let leases: Vec<_> = (0..MAX_REQUESTS * 2)
+            .map(|i| bounded.start_bounded("main", &i.to_string(), MAX_REQUESTS * 2))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(bounded
+            .start_bounded("main", "overflow", MAX_REQUESTS * 2)
+            .is_err());
+        drop(leases);
+    }
+
+    #[tokio::test]
+    async fn queued_admission_after_window_cleanup_is_rejected() {
+        let state = AiStreamState::default();
+        let pages = Arc::new(super::super::page::NetworkPages::default());
+        pages.begin("main", || {}).unwrap();
+        let old_page = pages.finish("main").unwrap();
+        let queued_state = state.clone();
+        let queued_pages = pages.clone();
+        let (resume, admitted) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(async move {
+            admitted.await.unwrap();
+            queued_pages.with_page("main", &old_page, || {
+                queued_state.start("main", "old-page-request")
+            })
+        });
+        pages.begin("main", || state.cancel_window("main")).unwrap();
+        let new_page = pages.finish("main").unwrap();
+        resume.send(()).unwrap();
+        assert!(
+            queued.await.unwrap().is_err(),
+            "a retired page admitted new network work"
+        );
+        assert!(pages
+            .with_page("main", &new_page, || state
+                .start("main", "new-page-request"))
+            .is_ok());
     }
 
     #[test]

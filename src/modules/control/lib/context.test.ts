@@ -52,8 +52,6 @@ describe("resolveControlContext", () => {
   });
 
   it("does not trust a stale caller pane id", () => {
-    expect(resolveControlContext(tabs, 20, "active-space", 999).source).toBe(
-      "active",
-    );
+    expect(resolveControlContext(tabs, 20, "active-space", 999)).toBeNull();
   });
 });

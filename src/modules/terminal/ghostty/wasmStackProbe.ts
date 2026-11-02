@@ -1,4 +1,4 @@
-import type { TeraxGhosttyTerminal } from "@terax/ghostty-core/adapted";
+import type { OarlockGhosttyTerminal } from "@oarlock/ghostty-core/adapted";
 
 /**
  * Test support for the WebAssembly shadow stack. The module places its stack
@@ -296,7 +296,7 @@ type StackWorkloadReport = {
  * in the requested render format. Any WebAssembly trap propagates.
  */
 export function runStackWorkloads(
-  terminal: TeraxGhosttyTerminal,
+  terminal: OarlockGhosttyTerminal,
   format: "soa" | "gpu",
 ): StackWorkloadReport {
   if (format === "gpu") terminal.setRenderFormat("gpu");
@@ -312,11 +312,11 @@ export function runStackWorkloads(
   let bytes = 0;
   let inputs = 0;
   for (const input of adversarialInputs()) {
-    for (let offset = 0; offset < input.bytes.byteLength; offset += 96 * 1024) {
-      terminal.write(input.bytes.subarray(offset, offset + 96 * 1024));
+    for (let offset = 0; offset < input.bytes.byteLength; offset += 32 * 1024) {
+      terminal.write(input.bytes.subarray(offset, offset + 32 * 1024));
+      terminal.drainOutputBytes();
     }
     terminal.drainEvents();
-    terminal.drainOutputBytes();
     refresh();
     bytes += input.bytes.byteLength;
     inputs += 1;

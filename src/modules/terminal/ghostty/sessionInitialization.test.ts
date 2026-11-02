@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   initializeSessionGeneration,
+  waitForSessionClose,
   type SessionInitializationState,
 } from "@/modules/terminal/ghostty/sessionInitialization";
 
@@ -47,4 +48,34 @@ describe("Ghostty startup failure handling", () => {
       expect(report).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("terminal restart ownership", () => {
+  it("does not let an older close clear a newer restart", async () => {
+    const state: SessionInitializationState = { generation: 1, disposed: false, initializing: null };
+    let finish!: () => void;
+    const close = new Promise<void>((resolve) => { finish = resolve; });
+    const old = waitForSessionClose(state, 1, () => close, () => true);
+    state.generation = 2;
+    expect(await waitForSessionClose(state, 2, async () => {}, () => true)).toBe(true);
+    finish();
+    expect(await old).toBe(false);
+  });
+
+  it.each(["disposed", "replaced"])("ignores a close failure after the session was %s", async (change) => {
+    const state: SessionInitializationState = { generation: 1, disposed: false, initializing: null };
+    let reject!: (error: Error) => void;
+    let owned = true;
+    const close = new Promise<void>((_resolve, fail) => { reject = fail; });
+    const pending = waitForSessionClose(state, 1, () => close, () => owned);
+    if (change === "disposed") state.disposed = true; else owned = false;
+    reject(new Error("late close failure"));
+    expect(await pending).toBe(false);
+  });
+
+  it("reports a close failure for the current restart", async () => {
+    const state: SessionInitializationState = { generation: 1, disposed: false, initializing: null };
+    await expect(waitForSessionClose(state, 1, async () => { throw new Error("close failed"); }, () => true))
+      .rejects.toThrow("close failed");
+  });
 });

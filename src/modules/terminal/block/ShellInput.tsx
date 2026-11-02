@@ -1,11 +1,19 @@
 import { resolveFontFamily } from "@/lib/fonts";
-import { fmtShortcut, MOD_KEY } from "@/lib/platform";
 import { cn } from "@/lib/utils";
+import { usePreferencesStore } from "@/modules/settings/preferences";
+import { shortcutText } from "@/modules/shortcuts";
 import { useTheme } from "@/modules/theme";
 import { useEffect, useRef } from "react";
+import { toast } from "sonner";
 import { runScopeHandlers } from "@codemirror/view";
+import { useFontFeatureStack } from "../lib/fontFeatures";
 import {
   clearLeafBlockSelection,
+  captureGhosttyCompletionOwner,
+  deferGhosttyInput,
+  holdingGhosttyInput,
+  noteGhosttyUserInput,
+  reserveGhosttyInput,
   getLeafDraft,
   leafGridSelection,
   setLeafDraft,
@@ -13,7 +21,9 @@ import {
   setLeafInputFocus,
   setLeafInputKeyDown,
   setLeafInputPaste,
+  setLeafPathInsertion,
 } from "../lib/terminalSessionApi";
+import { captureDropInsertion } from "../lib/shellDropInsertion";
 import { useTerminalFont } from "../lib/useTerminalFont";
 import {
   historyCommands,
@@ -49,6 +59,10 @@ export default function ShellInput({
   cbRef.current = { onSubmit, onInterrupt, getCwd };
   const leafIdRef = useRef(leafId);
   leafIdRef.current = leafId;
+  const completionLifetime = useRef({ leafId, mode, focused, revision: 0 });
+  if (completionLifetime.current.leafId !== leafId || completionLifetime.current.mode !== mode || completionLifetime.current.focused !== focused) {
+    completionLifetime.current = { leafId, mode, focused, revision: completionLifetime.current.revision + 1 };
+  }
   const atPrompt = mode === "prompt";
   const focusableRef = useRef(false);
   focusableRef.current = focused && atPrompt;
@@ -69,7 +83,12 @@ export default function ShellInput({
     fontWeight,
   } = useTerminalFont();
   const { activeTheme, resolvedMode } = useTheme();
-  const fontFamily = resolveFontFamily(fontFamilyPref);
+  const fontFeatures = usePreferencesStore((s) => s.terminalFontFeatures);
+  // The derived faces carry the features into the editor's DOM text too.
+  const fontFamily = useFontFeatureStack(
+    resolveFontFamily(fontFamilyPref),
+    fontFeatures,
+  );
   const fontRef = useRef({ fontFamily, fontSize, fontWeight });
   fontRef.current = { fontFamily, fontSize, fontWeight };
 
@@ -81,9 +100,40 @@ export default function ShellInput({
       fontFamily: fontRef.current.fontFamily,
       fontSize: fontRef.current.fontSize,
       fontWeight: fontRef.current.fontWeight,
-      placeholderText: `Run a command  -  ↑ history  ${fmtShortcut(MOD_KEY, "U")} switch to AI`,
+      placeholderText: `Run a command  -  ↑ history  ${shortcutText("terminal.toggleInput")} switch to AI`,
       commandNames: () => commandsRef.current,
       getCwd: () => cbRef.current.getCwd(),
+      completionOwner: () => {
+        const leaf = leafIdRef.current;
+        const owner = captureGhosttyCompletionOwner(leaf);
+        const revision = completionLifetime.current.revision;
+        return owner && { ...owner, active: () => completionLifetime.current.revision === revision && leafIdRef.current === leaf && focusableRef.current && owner.active() };
+      },
+      inputGate: {
+        defer: (action, size) => {
+          const leaf = leafIdRef.current;
+          return deferGhosttyInput(leaf, () => {
+            if (leafIdRef.current === leaf && handleRef.current === handle) action();
+            else toast.message("Pending terminal input cancelled", {
+              id: `terminal-input-cancelled-${leaf}`,
+              description: "The terminal changed before the input could be applied.",
+            });
+          }, size);
+        },
+        holding: () => holdingGhosttyInput(leafIdRef.current),
+        reserve: (options) => {
+          const leaf = leafIdRef.current;
+          const finish = reserveGhosttyInput(leaf, options);
+          return finish && ((action, size) => finish(() => {
+            if (leafIdRef.current === leaf && handleRef.current === handle) action();
+            else toast.message("Pending terminal input cancelled", {
+              id: `terminal-input-cancelled-${leaf}`,
+              description: "The terminal changed before the input could be applied.",
+            });
+          }, size));
+        },
+        noteInput: () => noteGhosttyUserInput(leafIdRef.current),
+      },
       onChange: (text) =>
         setLeafInputActivity(leafIdRef.current, text.length > 0),
       suggest: historySuggest,
@@ -130,6 +180,21 @@ export default function ShellInput({
       view.dispatch(view.state.replaceSelection(text));
       view.focus();
     });
+    setLeafPathInsertion(leafId, () => {
+      const view = handleRef.current?.view;
+      if (!view || leafIdRef.current !== leafId || !focusableRef.current)
+        return null;
+      return captureDropInsertion(
+        view.state,
+        () => handleRef.current?.view?.state,
+        view.state.doc.toString(),
+        view.state.selection.ranges,
+        (text) => {
+          view.dispatch(view.state.replaceSelection(text));
+          view.focus();
+        },
+      );
+    });
     handleRef.current?.setValue(getLeafDraft(leafId));
     requestAnimationFrame(() => {
       if (focusableRef.current && leafIdRef.current === leafId) {
@@ -143,6 +208,7 @@ export default function ShellInput({
       setLeafInputFocus(leafId, null);
       setLeafInputKeyDown(leafId, null);
       setLeafInputPaste(leafId, null);
+      setLeafPathInsertion(leafId, null);
     };
   }, [leafId]);
 

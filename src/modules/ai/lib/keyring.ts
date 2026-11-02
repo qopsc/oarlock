@@ -1,3 +1,14 @@
+import {
+  CREDENTIAL_LOADING,
+  credentialUnavailable,
+  type CredentialValue,
+  type CredentialUnavailable,
+  readyKey,
+} from "./credentialState";
+import {
+  decodeEndpointKey,
+  type EndpointCredential,
+} from "./endpointCredentials";
 import { invoke } from "@tauri-apps/api/core";
 import {
   getProvider,
@@ -8,8 +19,11 @@ import {
   type ProviderId,
 } from "../config";
 
-export type ProviderKeys = Record<ProviderId, string | null>;
-export type CustomEndpointKeys = Record<string, string | null>;
+export type ProviderKeys = Record<ProviderId, CredentialValue<string>>;
+export type CustomEndpointKeys = Record<
+  string,
+  CredentialValue<EndpointCredential>
+>;
 
 export const EMPTY_PROVIDER_KEYS: ProviderKeys = {
   openai: null,
@@ -27,14 +41,20 @@ export const EMPTY_PROVIDER_KEYS: ProviderKeys = {
   ollama: null,
 };
 
-export async function getKey(provider: ProviderId): Promise<string | null> {
+/** A missing key is null; a failed lookup rejects so callers can fail closed. */
+export async function readKey(provider: ProviderId): Promise<string | null> {
   if (!providerSupportsKey(provider)) return null;
+  const v = await invoke<string | null>("secrets_get", {
+    service: KEYRING_SERVICE,
+    account: getProvider(provider).keyringAccount,
+    strict: true,
+  });
+  return v && v.length > 0 ? v : null;
+}
+
+export async function getKey(provider: ProviderId): Promise<string | null> {
   try {
-    const v = await invoke<string | null>("secrets_get", {
-      service: KEYRING_SERVICE,
-      account: getProvider(provider).keyringAccount,
-    });
-    return v && v.length > 0 ? v : null;
+    return await readKey(provider);
   } catch {
     return null;
   }
@@ -55,40 +75,86 @@ export async function setKey(provider: ProviderId, key: string): Promise<void> {
 
 export async function clearKey(provider: ProviderId): Promise<void> {
   if (!providerSupportsKey(provider)) return;
+  await invoke("secrets_delete", {
+    service: KEYRING_SERVICE,
+    account: getProvider(provider).keyringAccount,
+  });
+}
+
+type SecretRead =
+  | { status: "ready"; value: string | null }
+  | { status: "failed"; error: string };
+async function readBatch(
+  accounts: string[],
+): Promise<CredentialValue<string>[]> {
+  if (!accounts.length) return [];
   try {
-    await invoke("secrets_delete", {
+    const results = await invoke<SecretRead[]>("secrets_get_all", {
       service: KEYRING_SERVICE,
-      account: getProvider(provider).keyringAccount,
+      accounts,
     });
-  } catch {
-    // already absent — fine
+    return accounts.map((_, i) => {
+      const result = results[i];
+      if (
+        result?.status === "ready" &&
+        (result.value === null ||
+          (typeof result.value === "string" && result.value.length))
+      )
+        return result.value;
+      return {
+        status: "failed",
+        error:
+          result?.status === "failed"
+            ? result.error
+            : "Invalid credential read result",
+      };
+    });
+  } catch (error) {
+    return accounts.map(() => ({ status: "failed", error: String(error) }));
   }
 }
 
+export function pendingProviderKeys(
+  unavailable: CredentialUnavailable = CREDENTIAL_LOADING,
+): ProviderKeys {
+  const out = { ...EMPTY_PROVIDER_KEYS };
+  for (const p of PROVIDERS)
+    if (providerSupportsKey(p.id)) out[p.id] = unavailable;
+  return out;
+}
+export function pendingEndpointKeys(
+  endpoints: readonly CustomEndpoint[],
+  unavailable: CredentialUnavailable = CREDENTIAL_LOADING,
+): CustomEndpointKeys {
+  return Object.fromEntries(endpoints.map((e) => [e.id, unavailable]));
+}
 export async function getAllKeys(): Promise<ProviderKeys> {
   const out = { ...EMPTY_PROVIDER_KEYS };
   const need = PROVIDERS.filter((p) => providerSupportsKey(p.id));
-  try {
-    const results = await invoke<(string | null)[]>("secrets_get_all", {
-      service: KEYRING_SERVICE,
-      accounts: need.map((p) => p.keyringAccount),
-    });
-    need.forEach((p, i) => {
-      const v = results[i];
-      out[p.id] = v && v.length > 0 ? v : null;
-    });
-    return out;
-  } catch {
-    const entries = await Promise.all(
-      need.map(async (p) => [p.id, await getKey(p.id)] as const),
-    );
-    for (const [id, v] of entries) out[id] = v;
-    return out;
-  }
+  const values = await readBatch(need.map((p) => p.keyringAccount));
+  need.forEach((p, i) => {
+    out[p.id] = values[i];
+  });
+  return out;
+}
+
+/** Keep an already-loaded composer available to display blocked credential states. */
+export function hasUnavailableProviderKeys(keys: ProviderKeys): boolean {
+  return PROVIDERS.some(
+    (p) =>
+      p.id !== "openai-compatible" &&
+      providerSupportsKey(p.id) &&
+      credentialUnavailable(keys[p.id]),
+  );
 }
 
 export function hasAnyKey(keys: ProviderKeys): boolean {
-  return PROVIDERS.some((p) => providerSupportsKey(p.id) && !!keys[p.id]);
+  return PROVIDERS.some(
+    (p) =>
+      p.id !== "openai-compatible" &&
+      providerSupportsKey(p.id) &&
+      !!readyKey(keys[p.id]),
+  );
 }
 
 function compatKeyringAccount(endpointId: string): string {
@@ -97,61 +163,61 @@ function compatKeyringAccount(endpointId: string): string {
 
 export async function getCustomEndpointKey(
   endpointId: string,
-): Promise<string | null> {
+): Promise<EndpointCredential | null> {
   try {
-    const v = await invoke<string | null>("secrets_get", {
-      service: KEYRING_SERVICE,
-      account: compatKeyringAccount(endpointId),
-    });
-    return v && v.length > 0 ? v : null;
+    return await readCustomEndpointKey(endpointId);
   } catch {
     return null;
   }
 }
 
-export async function setCustomEndpointKey(
+/** Preserve keychain errors instead of interpreting them as a keyless endpoint. */
+export async function readCustomEndpointKey(
   endpointId: string,
-  key: string,
-): Promise<void> {
-  const trimmed = key.trim();
-  if (!trimmed) throw new Error("API key is empty");
-  await invoke("secrets_set", {
+): Promise<EndpointCredential | null> {
+  const v = await invoke<string | null>("secrets_get", {
     service: KEYRING_SERVICE,
     account: compatKeyringAccount(endpointId),
-    password: trimmed,
+    strict: true,
+  });
+  return decodeEndpointKey(v);
+}
+
+export async function setCustomEndpointKey(
+  endpointId: string,
+  baseURL: string,
+  key: string,
+): Promise<EndpointCredential> {
+  const trimmed = key.trim();
+  if (!trimmed) throw new Error("API key is empty");
+  return invoke<EndpointCredential>("ai_endpoint_credential", {
+    change: { kind: "set", id: endpointId, baseURL, key: trimmed },
   });
 }
 
 export async function clearCustomEndpointKey(
   endpointId: string,
 ): Promise<void> {
-  try {
-    await invoke("secrets_delete", {
-      service: KEYRING_SERVICE,
-      account: compatKeyringAccount(endpointId),
-    });
-  } catch {}
+  await invoke("ai_endpoint_credential", {
+    change: { kind: "clear", id: endpointId },
+  });
 }
 
 export async function getAllCustomEndpointKeys(
   endpoints: readonly CustomEndpoint[],
 ): Promise<CustomEndpointKeys> {
-  if (endpoints.length === 0) return {};
-  const out: CustomEndpointKeys = {};
-  try {
-    const accounts = endpoints.map((e) => compatKeyringAccount(e.id));
-    const results = await invoke<(string | null)[]>("secrets_get_all", {
-      service: KEYRING_SERVICE,
-      accounts,
-    });
-    endpoints.forEach((e, i) => {
-      const v = results[i];
-      out[e.id] = v && v.length > 0 ? v : null;
-    });
-  } catch {
-    for (const e of endpoints) {
-      out[e.id] = await getCustomEndpointKey(e.id);
-    }
-  }
-  return out;
+  const values = await readBatch(
+    endpoints.map((e) => compatKeyringAccount(e.id)),
+  );
+  return Object.fromEntries(
+    endpoints.map((e, i) => {
+      const value = values[i];
+      return [
+        e.id,
+        typeof value === "object" && value !== null
+          ? value
+          : decodeEndpointKey(value),
+      ];
+    }),
+  );
 }

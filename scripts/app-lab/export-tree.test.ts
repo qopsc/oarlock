@@ -1,0 +1,50 @@
+import { execFileSync, spawnSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { expect, it } from "vitest";
+
+it("exports only the requested revision without current edits or dependencies", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const root = mkdtempSync(path.join(tmpdir(), "oarlock-export-test-"));
+  const repo = path.join(root, "repo");
+  const dest = path.join(root, "snapshot");
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "pipe", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  try {
+    mkdirSync(path.join(repo, "scripts/app-lab"), { recursive: true });
+    mkdirSync(path.join(repo, "src/bench"), { recursive: true });
+    mkdirSync(path.join(repo, "src/app"), { recursive: true });
+    mkdirSync(path.join(repo, "src-tauri/src/modules"), { recursive: true });
+    cpSync(path.join(here, "export-tree.sh"), path.join(repo, "scripts/app-lab/export-tree.sh"));
+    writeFileSync(path.join(repo, "src/bench/driver.ts"), "driver\n");
+    writeFileSync(path.join(repo, "src/app/App.tsx"), "committed app\n");
+    writeFileSync(path.join(repo, "src-tauri/src/modules/bench.rs"), "bench\n");
+    writeFileSync(path.join(repo, "src-tauri/Cargo.toml"), "[features]\nbench = []\n");
+    writeFileSync(path.join(repo, "tracked.txt"), "committed\n");
+    git("init", "-q");
+    git("config", "user.name", "Test");
+    git("config", "user.email", "test@example.test");
+    git("add", ".");
+    git("commit", "-qm", "baseline");
+    writeFileSync(path.join(repo, "tracked.txt"), "dirty\n");
+    writeFileSync(path.join(repo, "src/app/App.tsx"), "dirty app\n");
+    mkdirSync(path.join(repo, "node_modules"));
+    mkdirSync(path.join(repo, "src-tauri/binaries"));
+    writeFileSync(path.join(repo, "src-tauri/binaries/oarlock-cli-fake"), "untracked cli\n");
+    execFileSync("bash", [path.join(repo, "scripts/app-lab/export-tree.sh"), dest], { stdio: "pipe" });
+    expect(readFileSync(path.join(dest, "tracked.txt"), "utf8")).toBe("committed\n");
+    expect(readFileSync(path.join(dest, "src/app/App.tsx"), "utf8")).toBe("committed app\n");
+    expect(existsSync(path.join(dest, "node_modules"))).toBe(false);
+    expect(existsSync(path.join(dest, "src-tauri/binaries"))).toBe(false);
+    const missing = path.join(root, "missing-revision");
+    const invalid = spawnSync("bash", [path.join(repo, "scripts/app-lab/export-tree.sh"), missing, "not-a-revision"], { encoding: "utf8" });
+    expect(invalid.status).not.toBe(0);
+    expect(existsSync(missing)).toBe(false);
+    git("rm", "-q", "src/bench/driver.ts");
+    git("commit", "-qm", "remove instrumentation");
+    const older = spawnSync("bash", [path.join(repo, "scripts/app-lab/export-tree.sh"), path.join(root, "uninstrumented")], { encoding: "utf8" });
+    expect(older.status).not.toBe(0);
+    expect(older.stderr).toContain("does not contain app-lab instrumentation");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

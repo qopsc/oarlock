@@ -1,38 +1,100 @@
-import { loadSessionRenderer } from "@/modules/terminal/ghostty/loadSessionRenderer";
+import { toast } from "sonner";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
 import {
-  ensureGhosttyBlocks,
-  ghosttyBlocks,
-  disposeGhosttyBlocks,
-} from "@/modules/terminal/ghostty/ghosttyBlockSessions";
-import { initializeSessionGeneration as startSessionInitialization } from "@/modules/terminal/ghostty/sessionInitialization";
-import { replaceSessionSurface } from "@/modules/terminal/ghostty/replaceSessionSurface";
-import { openExternalUrl } from "@/lib/external-link";
+  currentWorkspaceEnv,
+  type WorkspaceEnv,
+} from "@/modules/workspace/env";
 import { ensureMonoFontsLoaded, resolveFontFamily } from "@/lib/fonts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { currentPlatform } from "@/modules/settings/terminalBehavior";
 import type { TerminalBackendKind } from "@/modules/terminal/backend/contracts";
+import {
+  disposeGhosttyBlocks,
+  ensureGhosttyBlocks,
+  ghosttyBlocks,
+} from "@/modules/terminal/ghostty/ghosttyBlockSessions";
+import { loadSessionRenderer } from "@/modules/terminal/ghostty/loadSessionRenderer";
+import { replaceSessionSurface } from "@/modules/terminal/ghostty/replaceSessionSurface";
+import { initializeSessionGeneration as startSessionInitialization, waitForSessionClose } from "@/modules/terminal/ghostty/sessionInitialization";
+import { BoundedPtyWriter } from "@/modules/terminal/lib/BoundedPtyWriter";
+import { captureCompletionOwner } from "@/modules/terminal/lib/completionOwnership";
+import { captureInputOwner } from "@/modules/terminal/lib/inputOwnership";
+import {
+  reportPendingInputCancellation,
+  reportTerminalInputFailure,
+  reportTerminalInputRefused,
+} from "@/modules/terminal/lib/inputNotices";
+import { scheduleOwnedInput } from "@/modules/terminal/lib/orderedAppInput";
+import { LatestClipboardWrite } from "@/modules/terminal/lib/LatestClipboardWrite";
 import { setLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
 import { PtyResizeDelivery } from "@/modules/terminal/lib/ptyResizeDelivery";
+import {
+  ScrollbackRestoreGate,
+  setScrollbackModelSource,
+  terminalScrollback,
+} from "@/modules/terminal/lib/terminalScrollbackRestore";
 import { useTerminalFont } from "@/modules/terminal/lib/useTerminalFont";
 import type { TerminalSearchController } from "@/modules/terminal/search/TerminalSearchController";
+import { terminalTranslucent } from "@/modules/theme/terminalTranslucency";
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { openPty, type PtySession } from "../lib/pty-bridge";
-import { writeTerminalClipboard } from "../lib/terminalClipboard";
-import { LatestClipboardWrite } from "@/modules/terminal/lib/LatestClipboardWrite";
+import { loadFeatureFamilies, useFontFeatureStack } from "../lib/fontFeatures";
+import { authorizePtyCwd, openPty, type PtySession } from "../lib/pty-bridge";
+import {
+  DROPPED_PATH_MIMES,
+  droppedPathItems,
+  terminalDragPosition,
+} from "../lib/programDrop";
+import {
+  readPrimarySelection,
+  ProgramClipboardWrite,
+  runProgramClipboardWrite,
+  writePrimarySelection,
+  copyTerminalSelection,
+} from "../lib/terminalClipboard";
+import { TerminalCwdReports } from "../lib/terminalCwdReports";
+import { useTerminalFontOffsets } from "../lib/terminalFontOffsets";
+import {
+  openTerminalLink,
+  captureTerminalNavigation,
+  captureTerminalInputNavigation,
+} from "../lib/terminalLinkOpen";
+import { TerminalRequestLifetime } from "../lib/TerminalRequestLifetime";
+import { requestTerminalPrompt } from "../lib/terminalPrompts";
+import { useTerminalStatusStore } from "../lib/terminalStatus";
+import { IS_WINDOWS } from "@/lib/platform";
+import type { DropShell } from "../lib/quoteShellPath";
+import { captureDropOwner } from "../lib/dropOwnership";
+import { cachedShellDialect } from "../lib/shellDialectCache";
+import { foregroundJob, shellPromptConfirmed } from "../lib/shellPromptConfirmed";
+import { launchShellDrop } from "../lib/shellDropLauncher";
 import { GhosttySemanticEventRouter } from "./core/GhosttySemanticEventRouter";
 import { getGhosttyCoreRuntime } from "./GhosttyCoreRuntime";
-import type { GhosttyTerminalModelApi } from "./GhosttyTerminalModel";
+import type {
+  GhosttyDragPosition,
+  GhosttyTerminalModelApi,
+} from "./GhosttyTerminalModel";
 import {
   measureTerminalFont,
   readTerminalGpuTheme,
   rgbToInt,
   type TerminalFontSpec,
 } from "./gpu/terminalVisuals";
-import { getWebGpuTerminalRuntime } from "./gpu/WebGpuTerminalRuntime";
-import { webGpuTerminalRuntimeDiagnostics } from "./gpu/WebGpuTerminalRuntime";
+import {
+  getWebGpuTerminalRuntime,
+  webGpuTerminalRuntimeDiagnostics,
+} from "./gpu/WebGpuTerminalRuntime";
 import { WebGpuTerminalSurface } from "./gpu/WebGpuTerminalSurface";
 import { GhosttyInputController } from "./input/GhosttyInputController";
-import { encodeTerminalSubmission } from "./input/terminalInputEncoding";
+import {
+  encodeTerminalSubmission,
+  supportedKittyKeyboardFlags,
+} from "./input/terminalInputEncoding";
+import {
+  colorSchemeFor,
+  terminalIntegrationCallbacks,
+  terminalVersion,
+} from "./terminalIntegration";
 import type {
   WebGlTerminalSurface,
   WebGlTerminalSurfaceOptions,
@@ -48,8 +110,6 @@ type GhosttySessionFailure = {
 
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
-const MAX_PENDING_INPUT_BYTES = 256 * 1024;
-const MAX_WRITE_BATCH_BYTES = 64 * 1024;
 
 type Callbacks = {
   onModel?: (model: GhosttyTerminalModelApi | null) => void;
@@ -60,10 +120,16 @@ type Callbacks = {
 };
 
 type GhosttySession = {
+  readonly workspace: WorkspaceEnv;
   readonly leafId: number;
   readonly backend: GhosttyBackend;
   initialCwd: string | undefined;
+  /** The folder the shell was last seen in: a report the backend checked. */
   lastCwd: string | null;
+  cwdRevision: number;
+  inputRevision: number;
+  focusRevision: number;
+  cwdReports: TerminalCwdReports;
   model: GhosttyTerminalModelApi | null;
   surface: GhosttySurface | null;
   surfaceOptions: GhosttySurfaceBaseOptions | null;
@@ -80,6 +146,11 @@ type GhosttySession = {
   shellExited: boolean;
   disposed: boolean;
   generation: number;
+  /** The shell's quoting dialect, keyed to the pty it was read for. */
+  dialect: { pty: PtySession; value: DropShell | null } | null;
+  /** Shell integration reported a prompt since this shell started. */
+  promptSeen: boolean;
+  requests: TerminalRequestLifetime;
   initializing: Promise<void> | null;
   startup: GhosttyStartupTimings;
   font: TerminalFontSpec;
@@ -99,8 +170,60 @@ type GhosttyStartupTimings = {
 };
 
 const sessions = new Map<number, GhosttySession>();
+
+// Synchronous invalidation also catches permission changes away and back before
+// React effects run. One subscription for the window, never one per request.
+usePreferencesStore.subscribe((state, previous) => {
+  if (
+    state.terminalBehavior.clipboardRead !==
+    previous.terminalBehavior.clipboardRead
+  ) {
+    for (const session of sessions.values()) session.requests.cancelReads();
+  }
+});
+
+/** The preferences that shape how the renderers draw (`TerminalGpuTheme`). */
+function terminalThemeOptions() {
+  const preferences = usePreferencesStore.getState();
+  return {
+    minimumContrast: preferences.terminalMinimumContrast,
+    customShader: preferences.terminalCustomShader?.source ?? null,
+    translucent: terminalTranslucent(),
+  };
+}
+
+setScrollbackModelSource((leafId) => {
+  const session = sessions.get(leafId);
+  return session && !session.disposed ? session.model : null;
+});
+
+// Bells rung while the window was in the background clear once it is back in
+// front for the panes on screen.
+if (typeof window !== "undefined") {
+  window.addEventListener("focus", () => {
+    const visible: number[] = [];
+    for (const session of sessions.values()) {
+      if (session.visible) visible.push(session.leafId);
+    }
+    useTerminalStatusStore.getState().acknowledgeBell(visible);
+  });
+}
 const textEncoder = new TextEncoder();
-const oscClipboard = new LatestClipboardWrite(writeTerminalClipboard);
+const runClipboardWrite = (write: ProgramClipboardWrite) =>
+  runProgramClipboardWrite(write, (message) =>
+    toast.error("Could not copy terminal image", { description: message }),
+  );
+/** Program clipboard writes (OSC 52, Kitty), the latest of a burst kept. */
+const programClipboard = new LatestClipboardWrite<ProgramClipboardWrite>(
+  runClipboardWrite,
+  (write) => write.prepare(),
+  (write) => write.dispose(),
+);
+const programPrimary = new LatestClipboardWrite<ProgramClipboardWrite>(
+  runClipboardWrite,
+  (write) => write.prepare(),
+  (write) => write.dispose(),
+);
 
 type Options = {
   leafId: number;
@@ -134,21 +257,42 @@ export function useGhosttyTerminalSession({
     (state) => state.terminalLetterSpacing,
   );
   const zoomLevel = usePreferencesStore((state) => state.zoomLevel);
+  const lineHeight = usePreferencesStore((state) => state.terminalLineHeight);
+  const fontFeatures = usePreferencesStore(
+    (state) => state.terminalFontFeatures,
+  );
+  const family = useFontFeatureStack(
+    resolveFontFamily(fontFamily),
+    fontFeatures,
+  );
+  const fontOffset = useTerminalFontOffsets(
+    (state) => state.offsets[leafId] ?? 0,
+  );
   const font = useMemo<TerminalFontSpec>(
     () => ({
-      family: resolveFontFamily(fontFamily),
-      size: Math.max(4, Math.round(fontSize * zoomLevel)),
-      lineHeight: 1.2,
+      family,
+      size: Math.max(4, Math.round((fontSize + fontOffset) * zoomLevel)),
+      lineHeight,
       letterSpacing,
       weight: fontWeight,
     }),
-    [fontFamily, fontSize, fontWeight, letterSpacing, zoomLevel],
+    [
+      family,
+      fontSize,
+      fontOffset,
+      fontWeight,
+      letterSpacing,
+      lineHeight,
+      zoomLevel,
+    ],
   );
   const fontRef = useRef(font);
   fontRef.current = font;
   const callbackRef = useRef({ onSearchReady, onExit, onCwd });
   callbackRef.current = { onSearchReady, onExit, onCwd };
   const initialCwdRef = useRef(initialCwd);
+  const workspace = useOwnedWorkspace();
+  const workspaceRef = useRef(workspace);
 
   useEffect(() => {
     const session = ensureSession(
@@ -156,6 +300,7 @@ export function useGhosttyTerminalSession({
       backend,
       initialCwdRef.current,
       fontRef.current,
+      workspaceRef.current,
     );
     if (blocks) ensureGhosttyBlocks(leafId);
     const node = container.current;
@@ -191,9 +336,14 @@ export function useGhosttyTerminalSession({
 
   useEffect(() => {
     const session = ensureSession(leafId, backend, initialCwdRef.current);
+    if (session.visible !== visible || session.focused !== focused) session.focusRevision++;
     session.visible = visible;
     session.focused = focused;
     setLeafPresentation(leafId, visible, focused);
+    session.model?.setVisible?.(visible);
+    if (visible && document.hasFocus()) {
+      useTerminalStatusStore.getState().acknowledgeBell([leafId]);
+    }
     ghosttyBlocks(leafId)?.setVisible(visible);
     const surface = session.surface;
     if (!surface || session.rendererError) return;
@@ -241,13 +391,14 @@ export function useGhosttyTerminalSession({
   const applyTheme = useCallback(() => {
     const session = sessions.get(leafId);
     if (!session?.model || !session.surface) return;
-    const theme = readTerminalGpuTheme();
+    const theme = readTerminalGpuTheme(terminalThemeOptions());
     session.model.setColors(
       rgbToInt(theme.foreground),
       rgbToInt(theme.background),
       rgbToInt(theme.cursor),
       theme.palette.map(rgbToInt),
     );
+    session.model.setColorScheme?.(colorSchemeFor(theme.background));
     session.surface.setTheme(theme);
     if (session.surfaceOptions)
       session.surfaceOptions = { ...session.surfaceOptions, theme };
@@ -284,9 +435,69 @@ export function hasGhosttySession(leafId: number): boolean {
 }
 
 export function writeToGhosttySession(leafId: number, data: string): boolean {
+  return captureGhosttyInputOwner(leafId)?.write(data) ?? false;
+}
+
+export function captureGhosttyInputOwner(leafId: number) {
   const session = sessions.get(leafId);
-  if (!session || session.shellExited || session.disposed) return false;
-  return session.writer.enqueue(textEncoder.encode(data));
+  const owner = captureInputOwner(session, () => sessions.get(leafId), captureTerminalInputNavigation());
+  if (!session || !owner) return null;
+  const cancelled = () => toast.message("Terminal input cancelled", {
+    description: "The terminal changed before the input could be sent.",
+  });
+  const write = (data: string, valid: () => boolean = () => true) =>
+    session.writer.enqueue(textEncoder.encode(data), false,
+      () => owner.active() && valid(), cancelled);
+  /** Resolves true once the PTY took the bytes; false if refused, cancelled or failed. */
+  const writeDelivered = (data: string, valid: () => boolean = () => true) =>
+    new Promise<boolean>((resolve) => {
+      const queued = session.writer.enqueue(
+        textEncoder.encode(data), false,
+        () => owner.active() && valid(),
+        () => { cancelled(); resolve(false); },
+        resolve,
+      );
+      if (!queued) resolve(false);
+    });
+  return {
+    ...owner,
+    write,
+    writeDelivered,
+    schedule: (prepare: () => Promise<string>, valid: () => boolean = () => true) =>
+      scheduleOwnedInput(session.writer, owner, prepare, valid, write, cancelled,
+        (error) => toast.error("Could not send terminal input", { description: String(error) })),
+  };
+}
+
+export function noteGhosttyUserInput(leafId: number): void {
+  const session = sessions.get(leafId);
+  if (session && !session.disposed) session.inputRevision++;
+}
+
+export function deferGhosttyInput(leafId: number, action: () => void, size = 0): boolean {
+  const session = sessions.get(leafId);
+  if (!session || session.disposed || session.shellExited) return false;
+  const generation = session.generation;
+  return session.writer.deferInput(() => {
+    if (sessions.get(leafId) === session && !session.disposed &&
+        !session.shellExited && session.generation === generation) action();
+  }, size);
+}
+
+export function holdingGhosttyInput(leafId: number): boolean {
+  return sessions.get(leafId)?.writer.holdingInput ?? false;
+}
+
+export function reserveGhosttyInput(leafId: number, options?: { deadline?: boolean }) {
+  const session = sessions.get(leafId);
+  if (!session || session.disposed || session.shellExited) return null;
+  const generation = session.generation;
+  const finish = session.writer.reserveInput(options);
+  if (!finish) return null;
+  return (action: () => void, size = 0) => finish(() => {
+    if (sessions.get(leafId) === session && !session.disposed &&
+        !session.shellExited && session.generation === generation) action();
+  }, size);
 }
 
 export function submitToGhosttySession(leafId: number, text: string): boolean {
@@ -323,16 +534,163 @@ export function clearGhosttySession(leafId: number): boolean {
 }
 
 export function pasteIntoGhosttySession(leafId: number, text: string): boolean {
+  const session = sessions.get(leafId);
+  const owner = captureGhosttyInputOwner(leafId);
+  if (!session || !owner) return false;
   const blocks = ghosttyBlocks(leafId);
   if (blocks?.getMode() === "prompt" && blocks.paste) {
-    blocks.paste(text);
+    const paste = blocks.paste;
+    const deliver = () => {
+      if (owner.active() && blocks.getMode() === "prompt" && blocks.paste === paste)
+        paste(text);
+      else toast.message("Terminal input cancelled", {
+        description: "The terminal changed before the input could be inserted.",
+      });
+    };
+    if (!session.writer.deferInput(deliver, text.length * 2)) deliver();
     return true;
   }
-  const session = sessions.get(leafId);
   if (!session?.input) return false;
-  session.input.paste(text);
+  const input = session.input;
+  const deliver = () => {
+    if (owner.active() && session.input === input) input.paste(text);
+    else toast.message("Terminal input cancelled", {
+      description: "The terminal changed before the input could be inserted.",
+    });
+  };
+  if (!session.writer.deferInput(deliver, text.length * 2)) deliver();
   session.surface?.focus();
   return true;
+}
+
+export function dropPathsIntoGhosttySession(
+  leafId: number,
+  paths: readonly string[],
+  source: WorkspaceEnv,
+): boolean {
+  const session = sessions.get(leafId);
+  if (!session?.pty || session.shellExited || session.disposed) return false;
+  const blocks = ghosttyBlocks(leafId);
+  const commandBar = blocks?.getMode() === "prompt";
+  const capture = blocks?.pathInsertion;
+  const insert = commandBar ? capture?.() : null;
+  if (commandBar && !insert) {
+    toast.error("Cannot insert dropped paths", {
+      description:
+        "Use the command bar with the cursor between arguments. Unfinished quotes, compound commands and raw shell input cannot be verified.",
+    });
+    return true;
+  }
+  const input = session.input;
+  if (!commandBar && !input) return false;
+  const pty = session.pty;
+  const signal = session.requests.signal;
+  const navigation = captureTerminalNavigation();
+  const running = () =>
+    useTerminalStatusStore.getState().leaves[leafId]?.running === true;
+  // Typing and focus changes while the drop is prepared do not cancel it:
+  // input stays ordered behind its reserved slot.
+  const active = captureDropOwner(
+    session,
+    () => sessions.get(leafId),
+    navigation,
+    signal,
+    () =>
+      commandBar
+        ? blocks?.getMode() === "prompt" && blocks.pathInsertion === capture
+        : ghosttyBlocks(leafId)?.getMode() !== "prompt",
+  );
+  const finish = session.writer.reserveInput();
+  if (!finish) return true;
+  const refuse = (description: string) =>
+    toast.error("Cannot insert dropped paths", { description });
+  launchShellDrop({
+    paths,
+    source,
+    target: session.workspace,
+    windows: IS_WINDOWS,
+    finish,
+    atPrompt: commandBar
+      ? async () => true
+      : async () => {
+          if (running()) return false;
+          const job = await ghosttyLeafHasForegroundJob(leafId);
+          return job === null ? null : !job;
+        },
+    dialect: () => shellDialect(session, pty),
+    promptConfirmed: () => commandBar || promptConfirmed(session),
+    active,
+    running,
+    paste: (text) => {
+      if (insert) {
+        if (!insert(text)) refuse("The terminal or command changed. Drop the files again.");
+      } else {
+        input?.paste(text);
+        session.surface?.focus();
+      }
+    },
+    refuse,
+  });
+  return true;
+}
+
+/**
+ * The leaf's terminal and where a drag at a client point is over it, when
+ * its program registered for drops (Kitty OSC 72); null otherwise.
+ */
+function programDropTarget(
+  leafId: number,
+  clientX: number,
+  clientY: number,
+): { model: GhosttyTerminalModelApi; position: GhosttyDragPosition } | null {
+  const session = sessions.get(leafId);
+  const model = session?.model;
+  const surface = session?.surface;
+  if (!model || !surface || model.isDisposed?.() || !model.dropTargetActive?.())
+    return null;
+  const rect = surface.eventTarget().getBoundingClientRect();
+  const position = terminalDragPosition(
+    clientX - rect.left,
+    clientY - rect.top + surface.gridShiftY(),
+    surface.cellSize(),
+    model.cellPixelSize?.() ?? null,
+  );
+  return position && { model, position };
+}
+
+/**
+ * Offers a drag of files over the leaf to its program; false when the
+ * program did not register for drops, so the drag is the app's.
+ */
+export function offerDragToGhosttySession(
+  leafId: number,
+  clientX: number,
+  clientY: number,
+): boolean {
+  const target = programDropTarget(leafId, clientX, clientY);
+  if (!target) return false;
+  target.model.dragMove?.(target.position, DROPPED_PATH_MIMES);
+  return true;
+}
+
+/** Drops files on the leaf's program; false when it takes no drops. */
+export function dropOnGhosttySession(
+  leafId: number,
+  clientX: number,
+  clientY: number,
+  paths: readonly string[],
+): boolean {
+  const target = programDropTarget(leafId, clientX, clientY);
+  if (!target) return false;
+  target.model.drop?.(target.position, droppedPathItems(paths));
+  return true;
+}
+
+/** The drag offered to the leaf's program left without dropping. */
+export function leaveGhosttySessionDrag(leafId: number): void {
+  const model = sessions.get(leafId)?.model;
+  if (model && !model.isDisposed?.() && model.dropTargetActive?.())
+    model.dragLeave?.();
 }
 
 export function ghosttySelectionForLeaf(leafId: number): string | null {
@@ -341,6 +699,45 @@ export function ghosttySelectionForLeaf(leafId: number): string | null {
 
 export function ghosttyCwdForLeaf(leafId: number): string | null {
   return sessions.get(leafId)?.lastCwd ?? null;
+}
+
+/** Capture the terminal identity and its workspace for a completion request. */
+export function captureGhosttyCompletionOwner(leafId: number) {
+  return captureCompletionOwner(
+    sessions.get(leafId),
+    () => sessions.get(leafId),
+    captureTerminalNavigation(),
+    () => ghosttyBlocks(leafId)?.getMode() === "prompt",
+    async (id) => {
+      const session = sessions.get(leafId);
+      const pty = session?.pty;
+      if (!session || !pty || pty.id !== id) throw new Error("Terminal changed");
+      const dialect = await shellDialect(session, pty);
+      if (!dialect) throw new Error("This shell does not support path completion.");
+      return dialect;
+    },
+  );
+}
+
+/**
+ * The quoting dialect of the shell this pty launched, asked once per pty.
+ * A reply that lands after a restart is returned to its caller (whose own
+ * ownership check fails) and never stored for the new shell.
+ */
+async function shellDialect(
+  session: GhosttySession,
+  pty: PtySession,
+): Promise<DropShell | null> {
+  return cachedShellDialect(session, pty, () =>
+    invoke<DropShell | null>("pty_shell_dialect", { id: pty.id }),
+  );
+}
+
+/** The dialect of the leaf's current shell, for the breadcrumb `cd`. */
+export async function ghosttyShellDialect(leafId: number): Promise<DropShell | null> {
+  const session = sessions.get(leafId);
+  const pty = session?.pty;
+  return session && pty ? shellDialect(session, pty) : null;
 }
 
 export function ghosttyFocusedLeaf(): number | null {
@@ -386,7 +783,7 @@ export async function ghosttyLeafHasForegroundProcess(
     });
   } catch (error) {
     console.error(
-      "[terax] Ghostty pty_has_foreground_process failed for leaf",
+      "[oarlock] Ghostty pty_has_foreground_process failed for leaf",
       leafId,
       error,
     );
@@ -394,21 +791,110 @@ export async function ghosttyLeafHasForegroundProcess(
   }
 }
 
+function promptState(session: GhosttySession) {
+  return {
+    promptSeen: session.promptSeen,
+    alternateScreen: session.model?.modes().alternateScreen,
+  };
+}
+
+function promptConfirmed(session: GhosttySession): boolean {
+  return shellPromptConfirmed(session.workspace, promptState(session));
+}
+
+/**
+ * A job owns the pane's terminal (Unix), or its shell has a console program
+ * as a child (Windows; a GUI app it started does not count); null when that
+ * cannot be told. A WSL pane, which the process check cannot see into, counts
+ * as having one until shell integration reported a prompt (`foregroundJob`).
+ */
+export async function ghosttyLeafHasForegroundJob(
+  leafId: number,
+): Promise<boolean | null> {
+  const session = sessions.get(leafId);
+  if (!session?.pty || session.shellExited) return null;
+  const id = session.pty.id;
+  return foregroundJob(session.workspace, promptState(session), () =>
+    invoke<boolean>("pty_has_foreground_job", { id }).catch(() => null),
+  );
+}
+
 export function disposeGhosttySession(leafId: number): boolean {
   const session = sessions.get(leafId);
   if (!session) return false;
   session.disposed = true;
   session.generation += 1;
+  session.requests.dispose();
   session.input?.dispose();
   session.surface?.dispose();
   disposeGhosttyBlocks(leafId);
   session.model?.dispose();
   session.ptyResize.reset();
+  reportPendingInputCancellation(session.writer, "closed");
   session.writer.dispose();
+  toast.dismiss(`terminal-input-${leafId}`);
   void session.pty?.close();
   session.pty = null;
   sessions.delete(leafId);
+  useTerminalStatusStore.getState().clear(leafId);
+  useTerminalFontOffsets.getState().clear(leafId);
   return true;
+}
+
+export type GhosttyScrollAction =
+  | "page-up"
+  | "page-down"
+  | "top"
+  | "bottom"
+  | "prompt-previous"
+  | "prompt-next";
+
+/** Scrolls a pane's viewport; false when there is nothing to scroll. */
+export function scrollGhosttySession(
+  leafId: number,
+  action: GhosttyScrollAction,
+): boolean {
+  const model = sessions.get(leafId)?.model;
+  if (!model || model.isDisposed?.()) return false;
+  const page = Math.max(1, model.rows - 1);
+  switch (action) {
+    case "page-up":
+      return model.scrollBy(-page);
+    case "page-down":
+      return model.scrollBy(page);
+    case "top":
+      return model.scrollTo(model.scrollPosition().history);
+    case "bottom":
+      return model.scrollToBottom();
+    case "prompt-previous":
+      return model.scrollToPrompt?.(-1) ?? false;
+    case "prompt-next":
+      return model.scrollToPrompt?.(1) ?? false;
+  }
+}
+
+/** The pane runs a full-screen program (alternate screen). */
+export function ghosttySessionInAlternateScreen(leafId: number): boolean {
+  return sessions.get(leafId)?.model?.modes().alternateScreen ?? false;
+}
+
+/**
+ * Ends the pane's shell and whatever runs in it and starts a new one in the
+ * folder it was last in. False when the pane has no session.
+ */
+export function restartGhosttySession(leafId: number): Promise<boolean> {
+  const session = sessions.get(leafId);
+  if (!session || session.disposed) return Promise.resolve(false);
+  useTerminalStatusStore.getState().clear(leafId);
+  return respawnGhosttySession(leafId, session.lastCwd ?? undefined).catch(
+    (error: unknown) => {
+      session.callbacks.onError?.({
+        kind: "startup",
+        message: toError(error).message,
+      });
+      return false;
+    },
+  );
 }
 
 async function respawnGhosttySession(
@@ -417,9 +903,13 @@ async function respawnGhosttySession(
 ): Promise<boolean> {
   const session = sessions.get(leafId);
   if (!session || session.disposed) return false;
-  session.generation += 1;
+  reportPendingInputCancellation(session.writer, "restarted");
+  toast.dismiss(`terminal-input-${leafId}`);
+  const generation = ++session.generation;
+  session.requests.dispose();
   session.input?.dispose();
   session.input = null;
+  session.requests = new TerminalRequestLifetime();
   session.surface?.dispose();
   session.surface = null;
   session.surfaceOptions = null;
@@ -430,10 +920,17 @@ async function respawnGhosttySession(
   session.ptyResize.reset();
   session.writer.detach();
   session.writer.clear();
-  await session.pty?.close();
+  const closingPty = session.pty;
+  if (!(await waitForSessionClose(
+    session, generation, () => closingPty?.close() ?? Promise.resolve(),
+    () => sessions.get(leafId) === session,
+  ))) return false;
   session.pty = null;
+  session.dialect = null;
+  session.promptSeen = false;
   session.shellExited = false;
   session.lastCwd = null;
+  session.cwdReports.reset();
   session.initialCwd = cwd ?? session.initialCwd;
   session.startupError = null;
   session.rendererError = null;
@@ -515,6 +1012,7 @@ function ensureSession(
   backend: GhosttyBackend,
   initialCwd?: string,
   font?: TerminalFontSpec,
+  workspace: WorkspaceEnv = currentWorkspaceEnv(),
 ): GhosttySession {
   const existing = sessions.get(leafId);
   if (existing) {
@@ -532,19 +1030,36 @@ function ensureSession(
     return true;
   });
   const session: GhosttySession = {
+    workspace,
     leafId,
     backend,
     initialCwd,
     lastCwd: null,
+    cwdRevision: 0,
+    inputRevision: 0,
+    focusRevision: 0,
+    cwdReports: new TerminalCwdReports(
+      (cwd) =>
+        session.pty && !session.disposed
+          ? authorizePtyCwd(session.pty.id, cwd, session.workspace)
+          : Promise.resolve(false),
+      (cwd) => {
+        if (session.disposed) return;
+        if (session.lastCwd !== cwd) session.cwdRevision++;
+        session.lastCwd = cwd;
+        session.callbacks.onCwd?.(cwd);
+      },
+    ),
     model: null,
     surface: null,
     surfaceOptions: null,
     input: null,
     pty: null,
     ptyResize,
-    writer: new BoundedPtyWriter((error) => {
-      console.error("[terax] Ghostty PTY write failed:", error);
-    }),
+    writer: new BoundedPtyWriter(
+      (error) => reportTerminalInputFailure(leafId, error),
+      (reason) => reportTerminalInputRefused(leafId, reason),
+    ),
     container: null,
     callbacks: {},
     visible: false,
@@ -554,6 +1069,9 @@ function ensureSession(
     shellExited: false,
     disposed: false,
     generation: 0,
+    dialect: null,
+    promptSeen: false,
+    requests: new TerminalRequestLifetime(),
     initializing: null,
     startup: createStartupTimings(),
     font:
@@ -589,7 +1107,7 @@ function initializeSession(session: GhosttySession): Promise<void> {
         session.ptyResize.reset();
       }
       session.startupError = toError(error).message;
-      console.error("[terax] Ghostty session initialization failed:", error);
+      console.error("[oarlock] Ghostty session initialization failed:", error);
       session.callbacks.onError?.(sessionFailure(session));
     },
   );
@@ -599,6 +1117,10 @@ async function initializeSessionGeneration(
   session: GhosttySession,
   generation: number,
 ): Promise<void> {
+  // Starts loading saved history now; it is written before any shell output.
+  const scrollback = new ScrollbackRestoreGate(
+    terminalScrollback.takeRestore(session.leafId),
+  );
   const preferences = usePreferencesStore.getState();
   const startup = createStartupTimings();
   session.startup = startup;
@@ -608,10 +1130,11 @@ async function initializeSessionGeneration(
       startup[key] = performance.now() - startup.startedAt;
     }
   };
-  const theme = readTerminalGpuTheme();
+  const theme = readTerminalGpuTheme(terminalThemeOptions());
   const coreRuntime = getGhosttyCoreRuntime();
   const metricsPromise = (async () => {
     await ensureMonoFontsLoaded();
+    await loadFeatureFamilies(session.font.family);
     await document.fonts.ready;
     const initialFont = session.font;
     let metrics = await measureTerminalFont(initialFont);
@@ -638,22 +1161,52 @@ async function initializeSessionGeneration(
   ]);
   if (!alive()) return;
 
+  const requests = session.requests;
+  // Events name reads of this model; a later model must not answer them.
+  let eventModel: GhosttyTerminalModelApi | null = null;
   const semanticEvents = new GhosttySemanticEventRouter({
-    onCwd: (cwd) => {
-      if (session.lastCwd === cwd) return;
-      session.lastCwd = cwd;
-      session.callbacks.onCwd?.(cwd);
-    },
+    ...terminalIntegrationCallbacks({
+      leafId: session.leafId,
+      clipboardSignal: () => requests.clipboardSignal,
+      userIsLooking: () => session.visible && document.hasFocus(),
+      reply: (bytes) => {
+        if (alive()) session.writer.enqueue(bytes, true);
+      },
+      answerKittyClipboardRead: (id, answer) => {
+        if (alive() && eventModel && !eventModel.isDisposed?.())
+          eventModel.answerClipboardRead?.(id, answer);
+      },
+      pointerTarget: () => session.surface?.eventTarget() ?? null,
+    }),
+    // Taken once the backend has seen the shell there (`TerminalCwdReports`).
+    onCwd: (cwd) => session.cwdReports.report(cwd),
     onClipboard: (text) => {
-      oscClipboard.enqueue(text);
+      if (!alive()) return;
+      programClipboard.enqueue(
+        new ProgramClipboardWrite(text, requests.programSignal),
+      );
+    },
+    onKittyClipboardWrite: (content, primary) => {
+      if (!alive()) return;
+      if (!primary)
+        programClipboard.enqueue(
+          new ProgramClipboardWrite(content, requests.programSignal),
+        );
+      else if (typeof content === "string" && content)
+        programPrimary.enqueue(
+          new ProgramClipboardWrite(content, requests.programSignal, true),
+        );
     },
     onOverflow: (dropped) => {
       console.warn(
-        `[terax] Ghostty semantic event queue dropped ${dropped} event(s)`,
+        `[oarlock] Ghostty semantic event queue dropped ${dropped} event(s)`,
       );
     },
     onCommandState: (running) => {
       if (!running) mark("firstPromptMs");
+    },
+    onPromptEnd: () => {
+      if (alive()) session.promptSeen = true;
     },
   });
   const model = await coreRuntime.createModel({
@@ -670,7 +1223,8 @@ async function initializeSessionGeneration(
       cursorStyle: preferences.terminalCursorStyle,
       cursorBlink: preferences.terminalCursorBlink,
     },
-    onReply: (bytes) => session.writer.enqueue(bytes),
+    kittyKeyboardFlags: supportedKittyKeyboardFlags(currentPlatform()),
+    onReply: (bytes) => session.writer.enqueue(bytes, true),
     onEvent: (event) => {
       semanticEvents.handle(event);
       ghosttyBlocks(session.leafId)?.controller?.handle(
@@ -679,11 +1233,24 @@ async function initializeSessionGeneration(
       );
     },
   });
+  eventModel = model;
   if (session.disposed || generation !== session.generation) {
     model.dispose();
     return;
   }
   mark("modelReadyMs");
+  model.setColorScheme?.(colorSchemeFor(theme.background));
+  model.setVisible?.(session.visible);
+  model.setTerminalVersion?.(await terminalVersion());
+  if (!alive()) {
+    model.dispose();
+    return;
+  }
+  scrollback.connect((bytes) => {
+    if (!alive() || model.isDisposed?.()) return;
+    model.write(bytes);
+    ghosttyBlocks(session.leafId)?.changed();
+  });
   session.model = model;
   session.callbacks.onModel?.(model);
   const blockSession = ghosttyBlocks(session.leafId);
@@ -714,7 +1281,14 @@ async function initializeSessionGeneration(
     onFrame: () => ghosttyBlocks(session.leafId)?.present(),
     onRequestFocus: () => focusGhosttySession(session.leafId),
     onOpenLink: (uri: string) => {
-      void openExternalUrl(uri, () => focusGhosttySession(session.leafId));
+      void openTerminalLink(
+        uri,
+        session.lastCwd ?? session.initialCwd ?? null,
+        () => focusGhosttySession(session.leafId),
+        { workspace: session.workspace, active: alive },
+      ).catch((error) =>
+        console.warn("[oarlock] Terminal link failed:", error),
+      );
     },
   };
   session.surfaceOptions = surfaceBaseOptions;
@@ -755,7 +1329,7 @@ async function initializeSessionGeneration(
   }
   if (webGpuPreload.error) {
     console.warn(
-      "[terax] WebGPU initialization failed; preserving the Ghostty session with WebGL:",
+      "[oarlock] WebGPU initialization failed; preserving the Ghostty session with WebGL:",
       webGpuPreload.error.message,
     );
   }
@@ -787,7 +1361,7 @@ async function initializeSessionGeneration(
       if (!surface) return;
       webGpuFallbackStarted = true;
       console.warn(
-        "[terax] WebGPU surface attachment failed; preserved the Ghostty session with WebGL:",
+        "[oarlock] WebGPU surface attachment failed; preserved the Ghostty session with WebGL:",
         toError(error).message,
       );
     }
@@ -803,13 +1377,13 @@ async function initializeSessionGeneration(
       onData: (bytes) => {
         if (!session.disposed && generation === session.generation) {
           mark("firstOutputMs");
-          model.write(bytes);
-          ghosttyBlocks(session.leafId)?.changed();
+          scrollback.write(bytes);
         }
       },
       onExit: (code) => {
         if (session.disposed || generation !== session.generation) return;
         session.shellExited = true;
+        requests.endInput();
         session.writer.detach();
         session.pty = null;
         session.callbacks.onExit?.(code);
@@ -819,6 +1393,7 @@ async function initializeSessionGeneration(
     !!ghosttyBlocks(session.leafId),
     preferences.terminalShell || undefined,
     session.leafId,
+    session.workspace,
   );
   if (session.disposed || generation !== session.generation) {
     await pty.close();
@@ -841,6 +1416,7 @@ function createGhosttyInput(
   model: GhosttyTerminalModelApi,
   surface: GhosttySurface,
 ): GhosttyInputController {
+  const requests = session.requests;
   const insertPromptText = (text: string): boolean => {
     const blocks = ghosttyBlocks(session.leafId);
     if (blocks?.getMode() !== "prompt" || !blocks.paste) return false;
@@ -856,6 +1432,9 @@ function createGhosttyInput(
       height: surface.cellSize().height,
     }),
     gridShiftY: () => surface.gridShiftY(),
+    onInput: () => noteGhosttyUserInput(session.leafId),
+    reserveInput: (options) => session.writer.reserveInput(options),
+    deferInput: (action, size, repeat) => session.writer.deferInput(action, size, repeat),
     onData: (bytes) => {
       if (
         ghosttyBlocks(session.leafId)?.getMode() === "prompt" &&
@@ -872,13 +1451,57 @@ function createGhosttyInput(
     },
     onText: insertPromptText,
     onPaste: insertPromptText,
-    getSelection: () => surface.getSelection(),
-    onCopy: () => {
-      const text = surface.getSelection();
-      if (!text) return false;
-      void writeTerminalClipboard(text).catch(() => {});
+    optionAsAlt: () =>
+      usePreferencesStore.getState().terminalBehavior.optionAsAlt,
+    scrollMultiplier: () =>
+      usePreferencesStore.getState().terminalBehavior.scrollMultiplier,
+    confirmPaste: async (text) =>
+      !usePreferencesStore.getState().terminalBehavior.pasteProtection ||
+      (await requestTerminalPrompt(
+        { kind: "paste", text },
+        requests.signal,
+      )) === "allow",
+    onSelectionFinished: () => {
+      const mode = usePreferencesStore.getState().terminalBehavior.copyOnSelect;
+      const text = mode === "off" ? null : surface.getSelection();
+      if (!text) return;
+      void writePrimarySelection(text);
+      if (mode === "clipboard")
+        void copyTerminalSelection(text);
+    },
+    onMiddleClick: () => {
+      if (
+        !/Linux|X11/.test(navigator.userAgent) ||
+        /Android/.test(navigator.userAgent)
+      )
+        return false;
+      const input = session.input;
+      const finish = session.writer.reserveInput();
+      if (!finish) return true;
+      void readPrimarySelection().then(
+        (text) => finish(() => {
+          if (text && !requests.signal.aborted && session.input === input)
+            input?.pasteFromClipboard(text, true);
+        }, (text?.length ?? 0) * 2),
+        (error) => finish(() => {
+          if (!requests.signal.aborted)
+            toast.error("Could not paste clipboard", { description: String(error) });
+        }),
+      );
       return true;
     },
+    onClipboardError: (error) =>
+      toast.error("Could not paste clipboard", { description: String(error) }),
+    getSelection: () => surface.getSelection(),
+    onCopy: (clearSelection) => {
+      const text = surface.getSelection();
+      if (!text) return false;
+      void copyTerminalSelection(text);
+      if (clearSelection) surface.clearSelection();
+      return true;
+    },
+    smartCopyPaste: () =>
+      usePreferencesStore.getState().terminalBehavior.smartCopyPaste,
   });
 }
 
@@ -905,9 +1528,9 @@ function applyBlockInputMode(
   if (!input || !blocks) return;
   const prompt = blocks.getMode() === "prompt";
   const changed =
-    input.getAttribute("data-terax-block-prompt") !== String(prompt);
+    input.getAttribute("data-oarlock-block-prompt") !== String(prompt);
   if (!changed) return;
-  input.setAttribute("data-terax-block-prompt", String(prompt));
+  input.setAttribute("data-oarlock-block-prompt", String(prompt));
   surface?.setCursorEnabled(!prompt);
   if (session.visible && session.focused) focusSessionSurface(session, surface);
 }
@@ -1006,7 +1629,7 @@ async function fallbackWebGpuSurface(
     return;
   }
   console.warn(
-    "[terax] WebGPU renderer failed; preserved the live Ghostty model, PTY, and scrollback with WebGL:",
+    "[oarlock] WebGPU renderer failed; preserved the live Ghostty model, PTY, and scrollback with WebGL:",
     cause.message,
   );
 }
@@ -1081,7 +1704,7 @@ function sessionFailure(session: GhosttySession): GhosttySessionFailure | null {
 
 function logSurfaceError(backend: GhosttyBackend, error: Error): void {
   console.error(
-    `[terax] ${backend} surface failed:`,
+    `[oarlock] ${backend} surface failed:`,
     error.message,
     error.stack ?? error,
   );
@@ -1129,6 +1752,7 @@ async function updateSessionFont(
   if (!session.surface || session.disposed) return;
 
   await ensureMonoFontsLoaded();
+  await loadFeatureFamilies(font.family);
   await document.fonts.ready;
   const metrics = await measureTerminalFont(font);
   if (
@@ -1152,103 +1776,6 @@ function fontSpecKey(font: TerminalFontSpec): string {
     font.letterSpacing,
     font.weight,
   ].join("|");
-}
-
-class BoundedPtyWriter {
-  private readonly queue: Uint8Array[] = [];
-  private pty: PtySession | null = null;
-  private flushing = false;
-  private disposed = false;
-  pendingBytes = 0;
-
-  constructor(private readonly onError: (error: unknown) => void) {}
-
-  attach(pty: PtySession): void {
-    if (this.disposed) return;
-    this.pty = pty;
-    void this.flush();
-  }
-
-  detach(): void {
-    this.pty = null;
-  }
-
-  clear(): void {
-    this.queue.length = 0;
-    this.pendingBytes = 0;
-  }
-
-  enqueue(bytes: Uint8Array): boolean {
-    if (
-      this.disposed ||
-      bytes.byteLength === 0 ||
-      this.pendingBytes + bytes.byteLength > MAX_PENDING_INPUT_BYTES
-    ) {
-      return false;
-    }
-    this.queue.push(bytes);
-    this.pendingBytes += bytes.byteLength;
-    void this.flush();
-    return true;
-  }
-
-  dispose(): void {
-    this.disposed = true;
-    this.pty = null;
-    this.queue.length = 0;
-    this.pendingBytes = 0;
-  }
-
-  private async flush(): Promise<void> {
-    if (this.flushing || this.disposed || !this.pty) return;
-    this.flushing = true;
-    try {
-      while (!this.disposed && this.pty && this.queue.length > 0) {
-        const pty = this.pty;
-        const batch = this.takeBatch();
-        try {
-          await pty.write(batch);
-        } catch (error) {
-          this.onError(error);
-          return;
-        }
-      }
-    } finally {
-      this.flushing = false;
-      if (!this.disposed && this.pty && this.queue.length > 0) {
-        queueMicrotask(() => void this.flush());
-      }
-    }
-  }
-
-  private takeBatch(): Uint8Array {
-    let length = 0;
-    let count = 0;
-    while (count < this.queue.length) {
-      const nextLength = this.queue[count].byteLength;
-      if (count > 0 && length + nextLength > MAX_WRITE_BATCH_BYTES) break;
-      length += nextLength;
-      count += 1;
-      if (length >= MAX_WRITE_BATCH_BYTES) break;
-    }
-
-    if (count === 1) {
-      const single = this.queue.shift();
-      if (!single) return new Uint8Array(0);
-      this.pendingBytes -= single.byteLength;
-      return single;
-    }
-    const batch = new Uint8Array(length);
-    let offset = 0;
-    for (let index = 0; index < count; index += 1) {
-      const chunk = this.queue[index];
-      batch.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    this.queue.splice(0, count);
-    this.pendingBytes -= length;
-    return batch;
-  }
 }
 
 if (import.meta.hot) {

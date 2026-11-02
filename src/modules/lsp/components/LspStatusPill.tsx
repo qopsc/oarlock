@@ -1,3 +1,5 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
+import { IS_MAC } from "@/lib/platform";
 import {
   Popover,
   PopoverContent,
@@ -16,19 +18,20 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useState } from "react";
 import { redetectBinary } from "../lib/detect";
-import type { LspPreset } from "../lib/presets";
+import { installCommandForPlatform, type LspPreset, rootMarkersOf } from "../lib/presets";
 import { restartPresetSessions } from "../lib/sessionManager";
 import { useLspHint } from "../lib/useLspHint";
 
 type Props = {
   filePath: string | null;
+  overrideLanguage?: string | null;
 };
 
 const PILL_CLASS =
-  "terax-pill-in ml-1.5 flex h-6 shrink-0 cursor-pointer [&_button]:cursor-pointer items-center gap-1 rounded-full border border-border/50 bg-accent/50 px-2 text-[10.5px] font-medium text-muted-foreground transition-colors duration-200 hover:bg-accent hover:text-foreground";
+  "oarlock-pill-in ml-1.5 flex h-6 shrink-0 cursor-pointer [&_button]:cursor-pointer items-center gap-1 rounded-full border border-border/50 bg-accent/50 px-2 text-[10.5px] font-medium text-muted-foreground transition-colors duration-200 hover:bg-accent hover:text-foreground";
 
-export function LspStatusPill({ filePath }: Props) {
-  const hint = useLspHint(filePath);
+export function LspStatusPill({ filePath, overrideLanguage }: Props) {
+  const hint = useLspHint(filePath, overrideLanguage);
   if (!hint) return null;
 
   if (hint.kind === "enable") {
@@ -51,6 +54,12 @@ export function LspStatusPill({ filePath }: Props) {
   if (hint.kind === "install") {
     return (
       <InstallPill key={`install-${hint.preset.id}`} preset={hint.preset} />
+    );
+  }
+
+  if (hint.kind === "no-root") {
+    return (
+      <NoRootPill key={`no-root-${hint.preset.id}`} preset={hint.preset} />
     );
   }
 
@@ -117,6 +126,52 @@ function ErrorPill({ preset, reason }: { preset: LspPreset; reason: string }) {
   );
 }
 
+function NoRootPill({ preset }: { preset: LspPreset }) {
+  const markers = rootMarkersOf(preset);
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={PILL_CLASS}
+          title="No project found for this file"
+        >
+          <span className="size-1.5 rounded-full bg-muted-foreground/60" />
+          <span>{preset.name} LSP</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="start"
+        className="w-72 p-3 text-xs [&_button]:cursor-pointer"
+      >
+        <div className="mb-1 font-medium text-foreground">
+          No {preset.name} project for this file
+        </div>
+        <p className="mb-2 text-muted-foreground">
+          The language server starts in the nearest folder above this file,
+          below your home folder, that contains{" "}
+          {markers.length > 1 ? "one of " : ""}
+          {markers.map((marker, i) => (
+            <span key={marker}>
+              {i > 0 ? ", " : ""}
+              <code className="text-foreground">{marker}</code>
+            </span>
+          ))}
+          . There is none, so it is not running here.
+        </p>
+        <button
+          type="button"
+          className="rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+          onClick={() => void setLspActivation(preset.id, "dismissed")}
+        >
+          Disable
+        </button>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function DismissButton({ preset }: { preset: LspPreset }) {
   return (
     <button
@@ -134,10 +189,11 @@ function InstallPill({ preset }: { preset: LspPreset }) {
   const [copied, setCopied] = useState(false);
   const [checking, setChecking] = useState(false);
   const install = preset.install;
+  const installCommand = installCommandForPlatform(preset, IS_MAC);
 
   const copy = () => {
-    if (!install) return;
-    void navigator.clipboard.writeText(install.command).then(() => {
+    if (!installCommand) return;
+    void writeClipboardText(installCommand).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     });
@@ -168,14 +224,14 @@ function InstallPill({ preset }: { preset: LspPreset }) {
           {preset.name} language server
         </div>
         <p className="mb-2 text-muted-foreground">
-          Terax found no{" "}
+          Oarlock found no{" "}
           <code className="text-foreground">{preset.command}</code> on your
           PATH. Install it, then check again:
         </p>
-        {install ? (
+        {installCommand ? (
           <div className="mb-2 flex items-center gap-1 rounded-md border border-border bg-muted/40 px-2 py-1.5 font-mono text-[11px]">
             <span className="min-w-0 flex-1 truncate select-text">
-              {install.command}
+              {installCommand}
             </span>
             <button
               type="button"
@@ -190,7 +246,7 @@ function InstallPill({ preset }: { preset: LspPreset }) {
               />
             </button>
           </div>
-        ) : null}
+        ) : install ? <p className="mb-2 text-muted-foreground">See the documentation for installation on this system.</p> : null}
         <div className="flex items-center justify-between">
           {install ? (
             <button

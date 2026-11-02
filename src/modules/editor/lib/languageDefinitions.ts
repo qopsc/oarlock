@@ -351,10 +351,7 @@ export const LANGUAGES: LanguageDefinition[] = [
       "props",
       "targets",
     ],
-    loader: () =>
-      defineLanguage(
-        import("@codemirror/legacy-modes/mode/xml").then((m) => m.xml),
-      ),
+    loader: () => import("@codemirror/lang-xml").then((m) => m.xml()),
     userSelectable: true,
   },
   {
@@ -464,8 +461,8 @@ export const LANGUAGES: LanguageDefinition[] = [
       ),
   },
   {
-    name: "Terax Theme",
-    extensions: ["terax-theme"],
+    name: "Oarlock Theme",
+    extensions: ["oarlock-theme"],
     loader: async () => {
       const [{ json }, { colorSwatches }] = await Promise.all([
         import("@codemirror/lang-json"),

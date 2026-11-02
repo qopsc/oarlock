@@ -1,0 +1,485 @@
+//! Copy files and supported symbolic links using handles with atomic,
+//! no-replace publication. Unsupported filesystems and entries fail safely.
+#[cfg(target_os = "macos")]
+use super::copy::{copy_name, MAX_COPY_SUFFIX};
+use super::{
+    attachment::handle_path,
+    copy::{copy_destination, CopyFailure, CopyResult, MAX_COPY_SOURCES},
+    index::FileIndexState,
+    mutate::note_dir_changed,
+    to_canon,
+};
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
+use cap_std::fs::Dir;
+use std::{
+    ffi::OsString,
+    fs, io,
+    path::{Path, PathBuf},
+};
+type CopyGuard<'a> = dyn Fn(&Path) -> Result<(), String> + 'a;
+
+#[cfg(test)]
+fn copy_batch(
+    sources: Vec<String>,
+    dest_dir: &str,
+    root: &str,
+    workspace: &WorkspaceEnv,
+    registry: &WorkspaceRegistry,
+    index: &FileIndexState,
+    rename_on_conflict: bool,
+) -> Result<CopyResult, String> {
+    copy_batch_guarded(
+        sources,
+        dest_dir,
+        root,
+        workspace,
+        registry,
+        index,
+        (rename_on_conflict, None),
+    )
+}
+
+pub(super) fn copy_batch_guarded(
+    sources: Vec<String>, dest_dir: &str, root: &str, workspace: &WorkspaceEnv,
+    registry: &WorkspaceRegistry, index: &FileIndexState,
+    options: (bool, Option<&CopyGuard<'_>>),
+) -> Result<CopyResult, String> {
+    super::require_owned_entry_operation()?;
+    copy_batch_impl_guarded(sources, dest_dir, root, workspace, registry, index, options)
+}
+
+// Workspace checks reject static escapes; unrelated same-user races are best effort.
+#[cfg(test)]
+fn copy_batch_impl(
+    sources: Vec<String>,
+    dest_dir: &str,
+    root: &str,
+    workspace: &WorkspaceEnv,
+    registry: &WorkspaceRegistry,
+    index: &FileIndexState,
+    rename_on_conflict: bool,
+) -> Result<CopyResult, String> {
+    copy_batch_impl_guarded(sources, dest_dir, root, workspace, registry, index, (rename_on_conflict, None))
+}
+
+fn copy_batch_impl_guarded(
+    sources: Vec<String>, dest_dir: &str, root: &str, workspace: &WorkspaceEnv,
+    registry: &WorkspaceRegistry, index: &FileIndexState,
+    options: (bool, Option<&CopyGuard<'_>>),
+) -> Result<CopyResult, String> {
+    let (rename_on_conflict, guard) = options;
+    if sources.len() > MAX_COPY_SOURCES {
+        return Err(format!("copy at most {MAX_COPY_SOURCES} items at a time"));
+    }
+    let destination = copy_destination(dest_dir, root, workspace, registry)?;
+    let root = fs::canonicalize(resolve_path(root, workspace)?).map_err(|e| e.to_string())?;
+    let dir = Dir::open_ambient_dir(&destination, cap_std::ambient_authority())
+        .map_err(|e| e.to_string())?;
+    let context = CopyContext {
+        dir: &dir,
+        destination: &destination,
+        root: &root,
+        registry,
+        rename_on_conflict,
+        guard,
+    };
+    context.validate()?;
+    let mut result = CopyResult::default();
+    for source in sources {
+        let copied = registry
+            .gates(Origin::App)
+            .authorized_entry(Path::new(&source))
+            .and_then(|entry| copy_file(&entry, &context, || {}, || {}).map_err(|e| e.to_string()));
+        match copied {
+            Ok(name) => result
+                .created
+                .push(to_canon(Path::new(dest_dir).join(name))),
+            Err(message) => result.failed.push(CopyFailure { source, message }),
+        }
+    }
+    if !result.created.is_empty() {
+        note_dir_changed(index, &destination);
+    }
+    Ok(result)
+}
+
+struct CopyContext<'a> {
+    dir: &'a Dir,
+    destination: &'a Path,
+    root: &'a Path,
+    registry: &'a WorkspaceRegistry,
+    rename_on_conflict: bool,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    guard: Option<&'a CopyGuard<'a>>,
+}
+impl CopyContext<'_> {
+    fn validate(&self) -> Result<(), String> {
+        let actual = handle_path(
+            &self
+                .dir
+                .try_clone()
+                .map_err(|e| e.to_string())?
+                .into_std_file(),
+        )?;
+        if actual != self.destination
+            || !actual.starts_with(self.root)
+            || !self.registry.gates(Origin::App).reaches(&actual)
+        {
+            return Err("Copy destination changed or is outside the authorized workspace".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_regular(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_regular(path: &Path) -> io::Result<fs::File> {
+    super::linux_copy::open_source(path)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn open_regular(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_regular(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Safe file copying is unavailable on this platform",
+    ))
+}
+
+/// Lexical resolution: `..` pops a component, `.` is dropped, nothing touches disk.
+pub(super) fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push(component);
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The longest existing prefix of `path`, resolved, followed by the rest as written.
+fn resolve_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+    let mut rest = Vec::new();
+    let mut prefix = path;
+    loop {
+        match fs::canonicalize(prefix) {
+            Ok(real) => return Ok(rest.iter().rev().fold(real, |acc, part| acc.join(part))),
+            Err(_) => {
+                let (Some(parent), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+                    return Err(io::Error::other(
+                        "Cannot verify a symbolic link in the copied folder",
+                    ));
+                };
+                rest.push(name.to_os_string());
+                prefix = parent;
+            }
+        }
+    }
+}
+
+/// A `..` after a named component is not a lexical step on disk: when that name is
+/// a link, `..` follows the link's target. Such targets are refused outright.
+fn parent_after_name(written: &Path) -> bool {
+    use std::path::Component;
+    let mut named = false;
+    for component in written.components() {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a relative target, walked from the link's folder, never rises above the
+/// copied item's root. Judged by depth, never by comparing names: the item may be
+/// published under a conflict name that differs from the one assumed here.
+fn stays_inside_item(written: &Path, link_dest_dir: &Path, item_dest: &Path) -> bool {
+    use std::path::Component;
+    let Ok(below) = link_dest_dir.strip_prefix(item_dest) else {
+        return false;
+    };
+    let mut depth = below.components().count() as isize;
+    for component in written.components() {
+        match component {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            _ => return false,
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// A link inside a copied folder is kept only if it stays within the authorized
+/// folders both where it is now and where the copy will put it: a relative
+/// target such as `../../x` resolves differently after the move.
+pub(super) fn nested_link_allowed(
+    source_link: &Path,
+    link_dest_dir: &Path,
+    item_dest: &Path,
+    registry: &WorkspaceRegistry,
+) -> io::Result<()> {
+    let escapes =
+        || io::Error::other("A symbolic link in the copied folder escapes authorized folders");
+    let target = fs::canonicalize(source_link)
+        .map_err(|_| io::Error::other("Cannot verify a symbolic link in the copied folder"))?;
+    if !registry.gates(Origin::App).reaches(&target) {
+        return Err(escapes());
+    }
+    let written = fs::read_link(source_link)?;
+    if written.is_absolute() {
+        return Ok(());
+    }
+    if parent_after_name(&written) {
+        return Err(escapes());
+    }
+    if stays_inside_item(&written, link_dest_dir, item_dest) {
+        return Ok(());
+    }
+    let lexical = lexical_normalize(&link_dest_dir.join(&written));
+    if !registry
+        .gates(Origin::App)
+        .reaches(&resolve_existing_prefix(&lexical)?)
+    {
+        return Err(escapes());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_tree(
+    path: &Path,
+    depth: usize,
+    context: &CopyContext<'_>,
+    item_dest: &Path,
+    rel: &Path,
+) -> io::Result<()> {
+    if depth > 128 {
+        return Err(io::Error::other("Copy folder exceeds maximum depth"));
+    }
+    ensure_supported_mode(path)?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = fs::symlink_metadata(&path)?.file_type();
+        if !kind.is_symlink() {
+            ensure_supported_mode(&path)?;
+        }
+        if kind.is_symlink() {
+            nested_link_allowed(&path, &item_dest.join(rel), item_dest, context.registry)?;
+        } else if kind.is_dir() {
+            check_tree(
+                &path,
+                depth + 1,
+                context,
+                item_dest,
+                &rel.join(entry.file_name()),
+            )?;
+        } else if !kind.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Copy folder contains an unsupported file type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_supported_mode(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if fs::symlink_metadata(path)?.permissions().mode() & 0o6000 != 0 {
+        return Err(io::Error::new(io::ErrorKind::Unsupported,
+            "Copying files with setuid or setgid permissions is unsupported because macOS cannot preserve them"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stage_copy(source: &Path, dest: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            state: *mut libc::c_void,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+    let from = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let to = std::ffi::CString::new(dest.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // COPYFILE_ALL includes ACLs, mode, extended attributes and data. Do not
+    // follow symlinks, and never replace an existing staging entry.
+    const FLAGS: u32 = 0xf | (1 << 15) | (1 << 17) | (1 << 18) | (1 << 19);
+    if unsafe { copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), FLAGS) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct StagedCopy(super::private_staging::PrivateDirectory);
+#[cfg(target_os = "macos")]
+impl Drop for StagedCopy {
+    fn drop(&mut self) {
+        self.0.cleanup_content();
+    }
+}
+
+fn copy_file(
+    source: &Path,
+    context: &CopyContext<'_>,
+    after_open: impl FnOnce(),
+    before_publish: impl FnOnce(),
+) -> io::Result<OsString> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| io::Error::other("Copy source has no name"))?;
+    let file = open_regular(source).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Copying symbolic links is not yet supported safely",
+            );
+        }
+        error
+    })?;
+    after_open();
+    let actual = handle_path(&file).map_err(io::Error::other)?;
+    if actual != source || !context.registry.gates(Origin::App).reaches(&actual) {
+        return Err(io::Error::other(
+            "Copy source changed or is outside the authorized folders",
+        ));
+    }
+    let kind = file.metadata()?.file_type();
+    #[cfg(target_os = "macos")]
+    {
+        if kind.is_dir() {
+            if context.destination.starts_with(source) {
+                return Err(io::Error::other("Cannot copy a folder into itself"));
+            }
+            check_tree(
+                source,
+                0,
+                context,
+                &context.destination.join(name),
+                Path::new(""),
+            )?;
+        } else if kind.is_file() {
+            ensure_supported_mode(source)?;
+        } else if !kind.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported copy source",
+            ));
+        }
+        let staged = StagedCopy(super::private_staging::PrivateDirectory::for_destination(
+            context.dir,
+        )?);
+        let staged_path = staged.0.content_path()?;
+        stage_copy(source, &staged_path)?;
+        before_publish();
+        for n in 0..=MAX_COPY_SUFFIX {
+            let target = if n == 0 {
+                name.to_os_string()
+            } else {
+                copy_name(name, n, kind.is_dir())
+            };
+            context.validate().map_err(io::Error::other)?;
+            if let Some(guard) = context.guard {
+                guard(&context.destination.join(&target)).map_err(io::Error::other)?;
+            }
+            staged.0.verify()?;
+            match super::mutate::rename_no_replace(&staged_path, &context.destination.join(&target))
+            {
+                Ok(()) => return Ok(target),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && context.rename_on_conflict =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if kind.is_dir() && context.destination.starts_with(source) {
+            return Err(io::Error::other("Cannot copy a folder into itself"));
+        }
+        let validate = || context.validate().map_err(io::Error::other);
+        let guard = |target: &Path| match context.guard {
+            Some(guard) => guard(target).map_err(io::Error::other),
+            None => Ok(()),
+        };
+        let link_ok = |link: &Path, folder: &Path, item: &Path| {
+            nested_link_allowed(link, folder, item, context.registry)
+        };
+        let env = super::linux_copy::Env {
+            dir: context.dir,
+            destination: context.destination,
+            rename_on_conflict: context.rename_on_conflict,
+            validate: &validate,
+            guard: &guard,
+            link_ok: &link_ok,
+        };
+        super::linux_copy::copy_item(
+            source,
+            &file,
+            name,
+            &env,
+            &super::linux_copy::REAL,
+            dirs::cache_dir(),
+            before_publish,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (kind, before_publish, name);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Metadata-preserving copying is unavailable on this platform",
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "No free copy name",
+    ))
+}
+
+#[cfg(test)]
+#[path = "copy_owned_tests.rs"]
+mod tests;

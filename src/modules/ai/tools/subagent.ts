@@ -1,8 +1,13 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { runSubagent } from "../agents/runSubagent";
+import { runTrackedSubagent } from "../agents/trackedSubagent";
 import { SUBAGENTS, type SubagentType } from "../agents/registry";
-import { useChatStore } from "../store/chatStore";
+import {
+  countConversationUsage,
+  patchConversationMeta,
+  useChatStore,
+} from "../store/chatStore";
+import { liveModelConfig } from "../store/modelConfig";
 import type { ToolContext } from "./context";
 
 const TYPE_KEYS = Object.keys(SUBAGENTS) as [SubagentType, ...SubagentType[]];
@@ -28,17 +33,31 @@ Auto-executes (no approval) — subagents are read-only by design.`,
           .optional()
           .describe("Short label shown in the chat UI for the spawn card."),
       }),
-      execute: async ({ type, prompt, description }) => {
-        const { apiKeys, selectedModelId, patchAgentMeta } =
-          useChatStore.getState();
+      execute: async ({ type, prompt, description }, { abortSignal }) => {
+        const { apiKeys, selectedModelId } = useChatStore.getState();
+        const sessionId = ctx.getSessionId();
         try {
-          const r = await runSubagent({
+          abortSignal?.throwIfAborted();
+          if (!sessionId)
+            throw new Error("A conversation is required to start a subagent");
+          const r = await runTrackedSubagent({
+            sessionId,
+            title: description || type,
+            abortSignal,
             type,
             prompt,
             keys: apiKeys,
             modelId: selectedModelId,
+            config: liveModelConfig(),
             toolContext: ctx,
-            onStep: (label) => patchAgentMeta({ step: label }),
+            // Its steps and tokens are the conversation's, shown and counted
+            // like the agent's own: only while it is the open one.
+            onStep: (label) => {
+              if (sessionId) patchConversationMeta(sessionId, { step: label });
+            },
+            onUsage: (modelId, usage) => {
+              if (sessionId) countConversationUsage(sessionId, modelId, usage);
+            },
           });
           return {
             type,
@@ -46,6 +65,7 @@ Auto-executes (no approval) — subagents are read-only by design.`,
             summary: r.summary,
             stepCount: r.stepCount,
             durationMs: r.durationMs,
+            taskId: r.taskId,
           };
         } catch (e) {
           return { error: String(e), type };

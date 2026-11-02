@@ -1,3 +1,4 @@
+import { networkPage } from "@/lib/networkPage";
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -10,35 +11,67 @@ const ACK_BYTES = 64 * 1024;
 const ACK_PACKETS = 128;
 const decoder = new TextDecoder();
 
-export function createProxyFetch(
-  opts: { allowPrivateNetwork?: boolean } = {},
-): typeof fetch {
-  return (input, init) =>
-    proxyFetchImpl(input, init, opts.allowPrivateNetwork === true);
-}
+/** The native commands one kind of request goes through, and what its
+ *  metadata carries besides the request itself. */
+type Route = {
+  label: string;
+  stream: string;
+  cancel: string;
+  ack: string;
+  metadataHeader: string;
+  extra: Record<string, unknown>;
+};
+
+/** Whether a request may reach the user's own network is decided natively from the
+ *  host, so a route carries no such flag. */
+const AI_ROUTE: Route = {
+  label: "AI",
+  stream: "ai_http_stream",
+  cancel: "ai_http_cancel",
+  ack: "ai_http_ack",
+  metadataHeader: "x-oarlock-ai-request",
+  extra: {},
+};
 
 export const proxyFetch: typeof fetch = (input, init) =>
-  proxyFetchImpl(input, init, false);
+  proxyFetchImpl(input, init, AI_ROUTE);
 
-async function readBody(request: Request): Promise<Uint8Array> {
+/**
+ * A fetch for one remote MCP server's session (`mcp_http_open`): the same
+ * native transport, through the backend's MCP gate, which allows only that
+ * server's origin and adds its configured headers.
+ */
+export function createMcpFetch(session: number): typeof fetch {
+  const route: Route = {
+    label: "MCP",
+    stream: "mcp_http_stream",
+    cancel: "mcp_http_cancel",
+    ack: "mcp_http_ack",
+    metadataHeader: "x-oarlock-mcp-request",
+    extra: { session },
+  };
+  return (input, init) => proxyFetchImpl(input, init, route);
+}
+
+async function readBody(request: Request, label: string): Promise<Uint8Array> {
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
   const cancel = () => {
-    void reader.cancel().catch(() => {});
+    void reader.cancel(request.signal.reason).catch(() => {});
   };
   request.signal.addEventListener("abort", cancel, { once: true });
   const chunks: Uint8Array[] = [];
   let length = 0;
   try {
     while (true) {
-      if (request.signal.aborted) throw makeAbortError();
+      request.signal.throwIfAborted();
       const next = await reader.read();
-      if (request.signal.aborted) throw makeAbortError();
+      request.signal.throwIfAborted();
       if (next.done) break;
       length += next.value.byteLength;
       if (length > MAX_REQUEST_BYTES) {
         cancel();
-        throw new Error("AI request body exceeds 64 MiB");
+        throw new Error(`${label} request body exceeds 64 MiB`);
       }
       chunks.push(next.value);
     }
@@ -59,12 +92,22 @@ async function readBody(request: Request): Promise<Uint8Array> {
 async function proxyFetchImpl(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
-  allowPrivateNetwork: boolean,
+  route: Route,
 ): Promise<Response> {
+  const { label } = route;
   const request = new Request(input, init);
-  if (request.signal.aborted) throw makeAbortError();
-  const body = await readBody(request);
-  if (request.signal.aborted) throw makeAbortError();
+  let pageGeneration: string;
+  try {
+    request.signal.throwIfAborted();
+    pageGeneration = await networkPage(request.signal);
+    request.signal.throwIfAborted();
+  } catch (error) {
+    // No reader owns the upload yet while native page initialization is pending.
+    void request.body?.cancel(error).catch(() => {});
+    throw error;
+  }
+  const body = await readBody(request, label);
+  request.signal.throwIfAborted();
   const requestId = Array.from(
     crypto.getRandomValues(new Uint32Array(4)),
     (word) => word.toString(16).padStart(8, "0"),
@@ -82,12 +125,12 @@ async function proxyFetchImpl(
     let controller: ReadableStreamDefaultController<Uint8Array>;
     const channel = new Channel<ArrayBuffer>();
     const cancelNative = () =>
-      invoke<void>("ai_http_cancel", { requestId }).catch(() => {});
+      invoke<void>(route.cancel, { requestId, pageGeneration }).catch(() => {});
     const cleanup = () => {
       request.signal.removeEventListener("abort", onAbort);
       channel.onmessage = () => {};
     };
-    const fail = (error: Error, cancel = true) => {
+    const fail = (error: unknown, cancel = true) => {
       if (closed) return;
       closed = true;
       cancelled = cancel;
@@ -96,7 +139,7 @@ async function proxyFetchImpl(
       if (!resolved) reject(error);
       if (cancel) void cancelNative();
     };
-    const onAbort = () => fail(makeAbortError());
+    const onAbort = () => fail(request.signal.reason);
     const acknowledge = () => {
       if (
         closed ||
@@ -110,7 +153,7 @@ async function proxyFetchImpl(
       const bytes = received;
       const count = packets;
       ackInFlight = true;
-      void invoke("ai_http_ack", { requestId, bytes }).then(
+      void invoke(route.ack, { requestId, pageGeneration, bytes }).then(
         () => {
           acknowledged = Math.max(acknowledged, bytes);
           acknowledgedPackets = Math.max(acknowledgedPackets, count);
@@ -146,16 +189,19 @@ async function proxyFetchImpl(
         const bytes = packet.subarray(1);
         switch (packet[0]) {
           case 0: {
-            if (resolved) throw new Error("Duplicate AI response headers");
+            if (resolved)
+              throw new Error(`Duplicate ${label} response headers`);
             const metadata = JSON.parse(decoder.decode(bytes)) as {
               status: number;
-              headers: Record<string, string>;
+              statusText?: string;
+              headers: HeadersInit;
             };
             const empty =
               request.method === "HEAD" ||
               [204, 205, 304].includes(metadata.status);
             const response = new Response(empty ? null : stream, {
               status: metadata.status,
+              statusText: metadata.statusText,
               headers: metadata.headers,
             });
             resolved = true;
@@ -175,24 +221,24 @@ async function proxyFetchImpl(
               bytes.length === 0 ||
               bytes.length > STREAM_BUFFER_BYTES
             )
-              throw new Error("Invalid AI stream chunk");
+              throw new Error(`Invalid ${label} stream chunk`);
             received += bytes.length;
             packets += 1;
             if (!Number.isSafeInteger(received))
-              throw new Error("AI stream byte offset overflow");
+              throw new Error(`${label} stream byte offset overflow`);
             if (
               STREAM_BUFFER_BYTES -
                 (controller.desiredSize ?? 0) +
                 bytes.length >
               STREAM_BUFFER_BYTES * 3
             )
-              throw new Error("AI stream exceeded its consumer buffer");
+              throw new Error(`${label} stream exceeded its consumer buffer`);
             controller.enqueue(bytes);
             acknowledge();
             break;
           case 2:
             if (!resolved)
-              throw new Error("AI stream ended before response headers");
+              throw new Error(`${label} stream ended before response headers`);
             closed = true;
             cleanup();
             controller.close();
@@ -201,7 +247,7 @@ async function proxyFetchImpl(
             fail(new Error(decoder.decode(bytes)), false);
             break;
           default:
-            throw new Error("Invalid AI stream packet");
+            throw new Error(`Invalid ${label} stream packet`);
         }
       } catch (error) {
         fail(asError(error));
@@ -214,10 +260,11 @@ async function proxyFetchImpl(
     }
     const metadata = JSON.stringify({
       requestId,
+      pageGeneration,
       url: request.url,
       method: request.method,
       headers: Object.fromEntries(request.headers),
-      allowPrivateNetwork,
+      ...route.extra,
       onEvent: channel,
     }).replace(
       /[^\x20-\x7e]/g,
@@ -225,11 +272,11 @@ async function proxyFetchImpl(
         `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
     );
     if (metadata.length > 64 * 1024) {
-      fail(new Error("AI request metadata exceeds 64 KiB"));
+      fail(new Error(`${label} request metadata exceeds 64 KiB`));
       return;
     }
-    void invoke("ai_http_stream", body, {
-      headers: { "x-terax-ai-request": metadata },
+    void invoke(route.stream, body, {
+      headers: { [route.metadataHeader]: metadata },
     }).then(
       () => {
         if (cancelled) void cancelNative();
@@ -241,8 +288,4 @@ async function proxyFetchImpl(
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function makeAbortError(): DOMException {
-  return new DOMException("Request aborted", "AbortError");
 }

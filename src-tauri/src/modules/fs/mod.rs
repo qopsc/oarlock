@@ -1,9 +1,27 @@
+pub(crate) mod access_control;
+pub mod attachment;
 pub mod clipboard;
 pub mod copy;
+mod copy_owned;
+mod destination;
+pub(crate) mod document_save;
 pub mod file;
+pub(crate) mod file_identity;
+pub mod formatter;
 pub mod grep;
 pub mod index;
+pub mod interactive;
+pub mod launch;
+#[cfg(target_os = "linux")]
+mod linux_copy;
+#[cfg(target_os = "linux")]
+mod linux_staging;
 pub mod mutate;
+pub mod mutation_events;
+pub(crate) mod native_store;
+pub(crate) mod private_staging;
+pub mod reconcile;
+mod run_prompt;
 pub mod search;
 pub mod supersede;
 pub mod tree;
@@ -11,7 +29,64 @@ pub mod watch;
 
 use std::path::Path;
 
-use crate::modules::workspace::WorkspaceEnv;
+use tauri::Manager;
+
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
+
+/// Open a store entry relative to a retained parent and verify the opened identity.
+pub(crate) fn store_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("Store has no parent"))?;
+    if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        return Err(std::io::Error::other("Store directory is a symbolic link"));
+    }
+    Ok(std::fs::canonicalize(parent)?.join(path.file_name().ok_or_else(|| std::io::Error::other("Store has no name"))?))
+}
+
+pub(crate) fn open_store_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let expected = store_target(path)?;
+    destination::Destination::pin(path, false, &|actual| {
+        if actual == expected { Ok(()) } else { Err("Store directory changed".into()) }
+    })?.open_current()
+}
+
+#[cfg(all(test, unix))]
+mod native_store_read_tests {
+    use super::open_store_file;
+    use std::{fs, io::Read, os::unix::fs::symlink};
+
+    #[test]
+    fn reads_regular_store_and_refuses_symbolic_link() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store.json");
+        let alias = root.path().join("alias.json");
+        fs::write(&store, "{\"normal\":true}").unwrap();
+        symlink(&store, &alias).unwrap();
+        let mut value = String::new();
+        open_store_file(&store).unwrap().read_to_string(&mut value).unwrap();
+        assert_eq!(value, "{\"normal\":true}");
+        assert!(open_store_file(&alias).is_err());
+        let linked_parent = root.path().join("linked-parent");
+        symlink(root.path(), &linked_parent).unwrap();
+        assert!(open_store_file(&linked_parent.join("store.json")).is_err());
+    }
+}
+
+/// The remaining final-entry race with noncooperating local programs is
+/// best effort on supported platforms; static authorization still applies.
+pub(crate) fn require_owned_entry_operation() -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("This file operation is unavailable because its target cannot be safely verified. Use a terminal or your system file manager instead.".into())
+    }
+}
+
+#[cfg(test)]
+#[path = "entry_operation_guard_tests.rs"]
+mod entry_operation_guard_tests;
 
 /// Runs blocking filesystem work off the async workers and the main thread.
 /// Tauri runs a non-async command inline in the IPC handler (the main thread on
@@ -25,6 +100,34 @@ where
     tauri::async_runtime::spawn_blocking(work)
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Refuses a folder (or file) to list or search outside every folder `origin` may reach. The
+/// work then goes through the spelling the page used, which the paths it reports follow.
+pub(crate) fn authorized_root(
+    app: &tauri::AppHandle,
+    path: &str,
+    workspace: Option<&WorkspaceEnv>,
+    origin: Origin,
+) -> Result<(), String> {
+    let workspace = workspace.cloned().unwrap_or_default();
+    app.state::<WorkspaceRegistry>()
+        .gates(origin)
+        .authorized_existing(&resolve_path(path, &workspace)?)
+        .map(drop)
+}
+
+/// A search walk skips a folder it cannot list, so a root that macOS privacy
+/// controls refuse would read as "nothing found". The interactive searches report
+/// that refusal instead, for the page to explain; elsewhere nothing changes.
+#[cfg(target_os = "macos")]
+pub(crate) fn privacy_refused_root(root: &str) -> Result<(), String> {
+    crate::modules::mac_privacy::refused(std::fs::read_dir(root))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn privacy_refused_root(_root: &str) -> Result<(), String> {
+    Ok(())
 }
 
 /// How a path under a search root is shown to the frontend. WSL roots keep the

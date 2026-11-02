@@ -1,18 +1,28 @@
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
+import { toast } from "sonner";
+import { canMoveBetweenSpaces } from "./environmentMove";
+import { pathKey } from "@/lib/pathKey";
 import { isMarkdownPath } from "@/lib/utils";
 import {
   type AgentInstanceCount,
   createAgentPanePlan,
 } from "@/modules/agents/lib/launcher";
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
+  canSplitPane,
   findLeafCwd,
+  findLeafNode,
   hasLeaf,
+  insertLeafAt,
   leafIds,
+  leafInDirection,
   nextLeafId,
   type PaneBounds,
   type PaneDirection,
   type PaneNode,
   removeLeaf,
   type SplitDir,
+  type SplitPosition,
   setLeafCwd as setLeafCwdInTree,
   siblingLeafOf,
   splitLeaf,
@@ -22,13 +32,11 @@ import { disposeSession } from "@/modules/terminal/lib/terminalSessionApi";
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
+  type SetStateAction,
 } from "react";
-
-// Matches the renderer slot pool size — over this we'd evict an active leaf.
-export const MAX_PANES_PER_TAB = 4;
+import { appendTab, newTabInserter, type TabInserter } from "./newTabPosition";
 
 type TabBase = {
   spaceId: string;
@@ -48,6 +56,8 @@ export type TerminalTab = TabBase & {
   private?: boolean;
   /** User-set label that overrides the cwd-derived name. Survives cd. */
   customTitle?: string;
+  /** The pane shown alone (pane zoom); others keep running hidden. */
+  zoomedLeafId?: number;
 };
 
 export type EditorTab = TabBase & {
@@ -56,6 +66,7 @@ export type EditorTab = TabBase & {
   title: string;
   path: string;
   dirty: boolean;
+  detached?: boolean;
   /**
    * True while the tab is in the transient "preview" state — opened by a
    * single-click in the explorer and not yet pinned by the user. A preview tab
@@ -140,6 +151,7 @@ export type TabPatch = Partial<{
   cwd: string;
   path: string;
   dirty: boolean;
+  detached: boolean;
   url: string;
   /** Empty string resets a terminal tab to its cwd-derived name. */
   customTitle: string;
@@ -176,28 +188,26 @@ export function planMarkdownTabOpen(
   path: string,
   spaceId: string,
   allocId: () => number,
+  insert: TabInserter = appendTab,
 ): { tabs: Tab[]; tabId: number } {
-  const pathKey = path.replace(/\\/g, "/");
+  const key = pathKey(path);
   const existing = tabs.find(
     (tab) =>
       tab.kind === "markdown" &&
       tab.spaceId === spaceId &&
-      tab.path.replace(/\\/g, "/") === pathKey,
+      pathKey(tab.path) === key,
   );
   if (existing) return { tabs, tabId: existing.id };
 
   const tabId = allocId();
   return {
-    tabs: [
-      ...tabs,
-      {
-        id: tabId,
-        kind: "markdown",
-        spaceId,
-        title: basename(path),
-        path,
-      },
-    ],
+    tabs: insert(tabs, {
+      id: tabId,
+      kind: "markdown",
+      spaceId,
+      title: basename(path),
+      path,
+    }),
     tabId,
   };
 }
@@ -208,11 +218,18 @@ export function planFileTabOpen(
   pin: boolean,
   spaceId: string,
   allocId: () => number,
+  insert: TabInserter = appendTab,
 ): { tabs: Tab[]; tabId: number } {
+  // One file, one tab: paths from language servers, git and the OS spell
+  // separators and the drive letter differently.
+  const key = pathKey(path);
   if (pin) {
     const existing = tabs.find(
       (tab) =>
-        tab.kind === "editor" && tab.spaceId === spaceId && tab.path === path,
+        tab.kind === "editor" &&
+        !tab.detached &&
+        tab.spaceId === spaceId &&
+        pathKey(tab.path) === key,
     );
     if (existing?.kind === "editor") {
       return {
@@ -227,18 +244,15 @@ export function planFileTabOpen(
 
     const tabId = allocId();
     return {
-      tabs: [
-        ...tabs,
-        {
-          id: tabId,
-          kind: "editor",
-          spaceId,
-          title: basename(path),
-          path,
-          dirty: false,
-          preview: false,
-        },
-      ],
+      tabs: insert(tabs, {
+        id: tabId,
+        kind: "editor",
+        spaceId,
+        title: basename(path),
+        path,
+        dirty: false,
+        preview: false,
+      }),
       tabId,
     };
   }
@@ -246,8 +260,9 @@ export function planFileTabOpen(
   const persistent = tabs.find(
     (tab) =>
       tab.kind === "editor" &&
+      !tab.detached &&
       tab.spaceId === spaceId &&
-      tab.path === path &&
+      pathKey(tab.path) === key &&
       !tab.preview,
   );
   if (persistent) return { tabs, tabId: persistent.id };
@@ -255,14 +270,20 @@ export function planFileTabOpen(
   const existingPreview = tabs.find(
     (tab) =>
       tab.kind === "editor" &&
+      !tab.detached &&
       tab.spaceId === spaceId &&
-      tab.path === path &&
+      pathKey(tab.path) === key &&
       tab.preview,
   );
   if (existingPreview) return { tabs, tabId: existingPreview.id };
 
   const previewIndex = tabs.findIndex(
-    (tab) => tab.kind === "editor" && tab.spaceId === spaceId && tab.preview,
+    (tab) =>
+      tab.kind === "editor" &&
+      !tab.detached &&
+      tab.spaceId === spaceId &&
+      tab.preview &&
+      !tab.dirty,
   );
   const tabId = allocId();
   const tab: EditorTab = {
@@ -274,7 +295,7 @@ export function planFileTabOpen(
     dirty: false,
     preview: true,
   };
-  if (previewIndex === -1) return { tabs: [...tabs, tab], tabId };
+  if (previewIndex === -1) return { tabs: insert(tabs, tab), tabId };
 
   const next = [...tabs];
   next[previewIndex] = tab;
@@ -422,6 +443,7 @@ export function planGitDiffOpen(
   spaceId: string,
   pin: boolean,
   allocId: () => number,
+  insert: TabInserter = appendTab,
 ): { tabs: Tab[]; targetId: number } {
   const title = input.title ?? `${basename(input.path)} (${input.mode})`;
   const originalPath = input.originalPath ?? null;
@@ -466,7 +488,7 @@ export function planGitDiffOpen(
     preview: !pin,
   } satisfies GitDiffTab;
 
-  if (pin) return { tabs: [...tabs, tab], targetId: id };
+  if (pin) return { tabs: insert(tabs, tab), targetId: id };
 
   const previewIndex = tabs.findIndex(
     (candidate) =>
@@ -474,7 +496,7 @@ export function planGitDiffOpen(
       candidate.spaceId === spaceId &&
       candidate.preview,
   );
-  if (previewIndex === -1) return { tabs: [...tabs, tab], targetId: id };
+  if (previewIndex === -1) return { tabs: insert(tabs, tab), targetId: id };
 
   const next = [...tabs];
   next[previewIndex] = tab;
@@ -486,6 +508,7 @@ export function planCommitHistoryOpen(
   input: { repoRoot: string; branch?: string | null },
   spaceId: string,
   allocId: () => number,
+  insert: TabInserter = appendTab,
 ): { tabs: Tab[]; targetId: number } {
   const existing = tabs.find(
     (tab) =>
@@ -506,18 +529,30 @@ export function planCommitHistoryOpen(
 
   const id = allocId();
   return {
-    tabs: [
-      ...tabs,
-      {
-        id,
-        kind: "git-history",
-        spaceId,
-        title,
-        repoRoot: input.repoRoot,
-      } satisfies GitHistoryTab,
-    ],
+    tabs: insert(tabs, {
+      id,
+      kind: "git-history",
+      spaceId,
+      title,
+      repoRoot: input.repoRoot,
+    } satisfies GitHistoryTab),
     targetId: id,
   };
+}
+
+export function findCommitFileDiffTab(
+  tabs: readonly Tab[],
+  input: { repoRoot: string; sha: string; path: string },
+  spaceId: string,
+): GitCommitFileDiffTab | undefined {
+  return tabs.find(
+    (tab): tab is GitCommitFileDiffTab =>
+      tab.kind === "git-commit-file" &&
+      tab.spaceId === spaceId &&
+      tab.repoRoot === input.repoRoot &&
+      tab.sha === input.sha &&
+      tab.path === input.path,
+  );
 }
 
 function coldTerminalTab(
@@ -570,8 +605,211 @@ export function planSpaceRemoval(
   return { tabs: next, disposeLeafIds, activeId };
 }
 
+type LeafNode = Extract<PaneNode, { kind: "leaf" }>;
+
+type MoveTabIntoSplitRejection =
+  | "same-tab"
+  | "source-missing"
+  | "destination-missing"
+  | "source-not-terminal"
+  | "destination-not-terminal"
+  | "source-multi-pane"
+  | "different-space"
+  | "blocks"
+  | "private-mismatch"
+  | "pane-limit";
+
+export type MoveTabIntoSplitPlan =
+  | {
+      ok: true;
+      source: TerminalTab;
+      destination: TerminalTab;
+      leaf: LeafNode;
+    }
+  | { ok: false; reason: MoveTabIntoSplitRejection };
+
+/**
+ * Whether a single-pane terminal tab can join another terminal tab's split:
+ * same space, same privacy, no block tabs (they never split), within the
+ * pane limit.
+ */
+export function planMoveTabIntoSplit(
+  tabs: readonly Tab[],
+  sourceTabId: number,
+  destinationTabId: number,
+  paneLimit: number,
+): MoveTabIntoSplitPlan {
+  const reject = (reason: MoveTabIntoSplitRejection) =>
+    ({ ok: false, reason }) as const;
+  if (sourceTabId === destinationTabId) return reject("same-tab");
+  const source = tabs.find((t) => t.id === sourceTabId);
+  const destination = tabs.find((t) => t.id === destinationTabId);
+  if (!source) return reject("source-missing");
+  if (!destination) return reject("destination-missing");
+  if (source.kind !== "terminal") return reject("source-not-terminal");
+  if (destination.kind !== "terminal") {
+    return reject("destination-not-terminal");
+  }
+  if (source.paneTree.kind !== "leaf") return reject("source-multi-pane");
+  if (source.spaceId !== destination.spaceId) return reject("different-space");
+  if (source.blocks || destination.blocks) return reject("blocks");
+  if (!!source.private !== !!destination.private) {
+    return reject("private-mismatch");
+  }
+  if (!canSplitPane(destination.paneTree, paneLimit)) {
+    return reject("pane-limit");
+  }
+  return { ok: true, source, destination, leaf: source.paneTree };
+}
+
+/** The tabs a single-pane terminal tab can be moved into. */
+export function moveToSplitTargets(
+  tabs: readonly Tab[],
+  sourceTabId: number,
+  paneLimit: number,
+): TerminalTab[] {
+  return tabs.filter(
+    (t): t is TerminalTab =>
+      planMoveTabIntoSplit(tabs, sourceTabId, t.id, paneLimit).ok,
+  );
+}
+
+/**
+ * Removes the source tab and grafts its leaf beside the destination's active
+ * pane in one pass, so the leaf (and its shell) never leaves the live pane
+ * trees. The moved pane becomes the active one.
+ */
+export function applyMoveTabIntoSplit(
+  tabs: readonly Tab[],
+  sourceTabId: number,
+  destinationTabId: number,
+  position: SplitPosition,
+  newSplitId: number,
+  paneLimit: number,
+): Tab[] | null {
+  const plan = planMoveTabIntoSplit(
+    tabs,
+    sourceTabId,
+    destinationTabId,
+    paneLimit,
+  );
+  if (!plan.ok) return null;
+  const { source, destination, leaf } = plan;
+  const paneTree = insertLeafAt(
+    destination.paneTree,
+    destination.activeLeafId,
+    leaf,
+    position,
+    newSplitId,
+  );
+  if (paneTree === destination.paneTree) return null;
+  const moved: TerminalTab = {
+    ...destination,
+    paneTree,
+    activeLeafId: leaf.id,
+    cwd: leaf.cwd ?? source.cwd ?? destination.cwd,
+    zoomedLeafId: undefined,
+  };
+  return tabs.flatMap((t) =>
+    t.id === sourceTabId ? [] : t.id === destinationTabId ? [moved] : [t],
+  );
+}
+
+type MovePaneToNewTabRejection =
+  | "tab-missing"
+  | "tab-not-terminal"
+  | "leaf-missing"
+  | "single-pane";
+
+export type MovePaneToNewTabPlan =
+  | { ok: true; source: TerminalTab; leaf: LeafNode; remaining: PaneNode }
+  | { ok: false; reason: MovePaneToNewTabRejection };
+
+/** Whether a pane of a split terminal tab can become a tab of its own. */
+export function planMovePaneToNewTab(
+  tabs: readonly Tab[],
+  tabId: number,
+  leafId: number,
+): MovePaneToNewTabPlan {
+  const reject = (reason: MovePaneToNewTabRejection) =>
+    ({ ok: false, reason }) as const;
+  const source = tabs.find((t) => t.id === tabId);
+  if (!source) return reject("tab-missing");
+  if (source.kind !== "terminal") return reject("tab-not-terminal");
+  const leaf = findLeafNode(source.paneTree, leafId);
+  if (!leaf) return reject("leaf-missing");
+  const remaining = removeLeaf(source.paneTree, leafId);
+  if (!remaining) return reject("single-pane");
+  return { ok: true, source, leaf, remaining };
+}
+
+/**
+ * Detaches the pane and wraps the same leaf node in a new tab right after its
+ * tab, in one pass, so its shell keeps running. The leaf keeps its slot id,
+ * which stays unique across leaves.
+ */
+export function applyMovePaneToNewTab(
+  tabs: readonly Tab[],
+  tabId: number,
+  leafId: number,
+  newTabId: number,
+): Tab[] | null {
+  const plan = planMovePaneToNewTab(tabs, tabId, leafId);
+  if (!plan.ok) return null;
+  const { source, leaf, remaining } = plan;
+  let { activeLeafId, cwd } = source;
+  if (activeLeafId === leaf.id) {
+    const ids = leafIds(remaining);
+    const sibling = siblingLeafOf(source.paneTree, leaf.id);
+    activeLeafId = sibling !== null && ids.includes(sibling) ? sibling : ids[0];
+    cwd = findLeafCwd(remaining, activeLeafId) ?? cwd;
+  }
+  const rest: TerminalTab = {
+    ...source,
+    paneTree: remaining,
+    activeLeafId,
+    cwd,
+    zoomedLeafId: undefined,
+  };
+  const moved: TerminalTab = {
+    id: newTabId,
+    kind: "terminal",
+    spaceId: source.spaceId,
+    title: source.private ? "private" : "shell",
+    cwd: leaf.cwd ?? source.cwd,
+    paneTree: leaf,
+    activeLeafId: leaf.id,
+    ...(source.blocks && { blocks: true }),
+    ...(source.private && { private: true }),
+  };
+  return tabs.flatMap((t) => (t.id === tabId ? [rest, moved] : [t]));
+}
+
+/** The pane limit in force now (Settings); read when a pane is added. */
+function paneLimit(): number {
+  return usePreferencesStore.getState().terminalPaneLimit;
+}
+
+/** Places a tab the user opens now, as Settings says (read at the time). */
+function placeNew(activeId: number, activates = true): TabInserter {
+  return newTabInserter(
+    usePreferencesStore.getState().newTabPosition,
+    activeId,
+    activates,
+  );
+}
+
+function allowEnvironmentMove(from: string, to: string): boolean {
+  if (canMoveBetweenSpaces(useSpaces.getState().spaces, from, to)) return true;
+  toast.error("Tabs cannot move between environments", {
+    description:
+      "Open a new tab in the destination space instead. The existing tab keeps its environment.",
+  });
+  return false;
+}
+
 export function useTabs(initial?: Partial<TerminalTab>) {
-  const [tabs, setTabs] = useState<Tab[]>(() => {
+  const [tabs, publishTabs] = useState<Tab[]>(() => {
     const tabId = 1;
     const leafId = 2;
     return [
@@ -587,7 +825,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       },
     ];
   });
-  const [activeId, setActiveId] = useState(1);
+  const [activeId, publishActiveId] = useState(1);
   // Gates warming until boot resolves the restore, so no shell spawns before it.
   const [booted, setBooted] = useState(false);
   const nextIdRef = useRef(3);
@@ -595,13 +833,19 @@ export function useTabs(initial?: Partial<TerminalTab>) {
   const tabsRef = useRef(tabs);
   const activeIdRef = useRef(activeId);
 
-  useLayoutEffect(() => {
-    tabsRef.current = tabs;
-  }, [tabs]);
-
-  useLayoutEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
+  // Every mutation uses the same synchronous owner. React can defer rendering,
+  // but callers that return a pane ID or dispose a session must see the update
+  // and all earlier updates before they return.
+  const setTabs = useCallback((change: SetStateAction<Tab[]>) => {
+    const next = typeof change === "function" ? change(tabsRef.current) : change;
+    tabsRef.current = next;
+    publishTabs(next);
+  }, []);
+  const setActiveId = useCallback((change: SetStateAction<number>) => {
+    const next = typeof change === "function" ? change(activeIdRef.current) : change;
+    activeIdRef.current = next;
+    publishActiveId(next);
+  }, []);
 
   // Activating a cold tab warms it: one choke point for every activation path.
   useEffect(() => {
@@ -611,7 +855,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       if (!t?.cold) return curr;
       return curr.map((x) => (x.id === activeId ? { ...x, cold: false } : x));
     });
-  }, [activeId, booted]);
+  }, [activeId, booted, setTabs]);
 
   const allocId = useCallback(() => nextIdRef.current++, []);
 
@@ -627,7 +871,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     activeIdRef.current = nextActiveId;
     setTabs(next);
     setActiveId(nextActiveId);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   // Appends a cold terminal tab to a space without stealing focus, so the
   // overview can populate a space in place; it spawns when first opened.
@@ -648,7 +892,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       },
     ]);
     return tabId;
-  }, []);
+  }, [setTabs]);
 
   // Reassigns a tab to another space. Returns true when the moved tab was active
   // and emptied its source space, so the caller should follow it into the target.
@@ -657,6 +901,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       const curr = tabsRef.current;
       const tab = curr.find((t) => t.id === tabId);
       if (!tab || tab.spaceId === targetSpaceId) return false;
+      if (!allowEnvironmentMove(tab.spaceId, targetSpaceId)) return false;
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId ? ({ ...t, spaceId: targetSpaceId } as Tab) : t,
@@ -670,7 +915,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       }
       return true;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   // Positions a tab next to a target tab, inheriting the target's space. Returns
@@ -683,6 +928,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       const moved = curr.find((t) => t.id === tabId);
       const target = curr.find((t) => t.id === targetTabId);
       if (!moved || !target) return false;
+      if (!allowEnvironmentMove(moved.spaceId, target.spaceId)) return false;
       const crossSpace = moved.spaceId !== target.spaceId;
       setTabs((prev) => {
         const without = prev.filter((t) => t.id !== tabId);
@@ -703,7 +949,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       }
       return true;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const removeTabsForSpace = useCallback(
@@ -725,15 +971,15 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       });
       for (const lid of toDispose) disposeSession(lid);
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const newTab = useCallback((cwd?: string) => {
     const tabId = nextIdRef.current++;
     const leafId = nextIdRef.current++;
-    setTabs((t) => [
-      ...t,
-      {
+    const insert = placeNew(activeIdRef.current);
+    setTabs((t) =>
+      insert(t, {
         id: tabId,
         kind: "terminal",
         spaceId: activeSpaceIdRef.current,
@@ -741,18 +987,18 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         cwd,
         paneTree: { kind: "leaf", id: leafId, cwd },
         activeLeafId: leafId,
-      },
-    ]);
+      }),
+    );
     setActiveId(tabId);
     return tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const newBlockTab = useCallback((cwd?: string) => {
     const tabId = nextIdRef.current++;
     const leafId = nextIdRef.current++;
-    setTabs((t) => [
-      ...t,
-      {
+    const insert = placeNew(activeIdRef.current);
+    setTabs((t) =>
+      insert(t, {
         id: tabId,
         kind: "terminal",
         spaceId: activeSpaceIdRef.current,
@@ -761,30 +1007,30 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         paneTree: { kind: "leaf", id: leafId, cwd },
         activeLeafId: leafId,
         blocks: true,
-      },
-    ]);
+      }),
+    );
     setActiveId(tabId);
     return tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   useEffect(() => {
     if (!import.meta.env?.DEV || typeof window === "undefined") return;
     (
-      window as unknown as { __teraxNewBlockTab?: (cwd?: string) => number }
-    ).__teraxNewBlockTab = newBlockTab;
+      window as unknown as { __oarlockNewBlockTab?: (cwd?: string) => number }
+    ).__oarlockNewBlockTab = newBlockTab;
   }, [newBlockTab]);
 
   const newAgentGroupTab = useCallback(
     (cwd: string | undefined, title: string, instances: AgentInstanceCount) => {
       const tabId = nextIdRef.current++;
       const { paneTree, leafIds: agentLeafIds } = createAgentPanePlan(
-        instances,
+        Math.min(instances, paneLimit()) as AgentInstanceCount,
         () => nextIdRef.current++,
         cwd,
       );
-      setTabs((t) => [
-        ...t,
-        {
+      const insert = placeNew(activeIdRef.current);
+      setTabs((t) =>
+        insert(t, {
           id: tabId,
           kind: "terminal",
           spaceId: activeSpaceIdRef.current,
@@ -793,12 +1039,12 @@ export function useTabs(initial?: Partial<TerminalTab>) {
           cwd,
           paneTree,
           activeLeafId: agentLeafIds[0],
-        },
-      ]);
+        }),
+      );
       setActiveId(tabId);
       return { tabId, leafIds: agentLeafIds };
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const newAgentTab = useCallback(
@@ -812,9 +1058,9 @@ export function useTabs(initial?: Partial<TerminalTab>) {
   const newPrivateTab = useCallback((cwd?: string) => {
     const tabId = nextIdRef.current++;
     const leafId = nextIdRef.current++;
-    setTabs((t) => [
-      ...t,
-      {
+    const insert = placeNew(activeIdRef.current);
+    setTabs((t) =>
+      insert(t, {
         id: tabId,
         kind: "terminal",
         spaceId: activeSpaceIdRef.current,
@@ -823,11 +1069,11 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         paneTree: { kind: "leaf", id: leafId, cwd },
         activeLeafId: leafId,
         private: true,
-      },
-    ]);
+      }),
+    );
     setActiveId(tabId);
     return tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   /**
    * Opens a file in an editor tab.
@@ -849,13 +1095,14 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         pin,
         targetSpaceId,
         () => nextIdRef.current++,
+        placeNew(activeIdRef.current, activate),
       );
       tabsRef.current = plan.tabs;
       setTabs(plan.tabs);
       if (activate) setActiveId(plan.tabId);
       return plan.tabId;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   /**
@@ -872,7 +1119,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         return t;
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const openAiDiffTab = useCallback(
     (input: {
@@ -883,6 +1130,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       isNewFile: boolean;
     }) => {
       let targetId: number | null = null;
+      const insert = placeNew(activeIdRef.current);
       setTabs((curr) => {
         const existing = curr.find(
           (t) => t.kind === "ai-diff" && t.approvalId === input.approvalId,
@@ -894,26 +1142,23 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         const id = nextIdRef.current++;
         targetId = id;
         const title = `${basename(input.path)} (AI diff)`;
-        return [
-          ...curr,
-          {
-            id,
-            kind: "ai-diff",
-            spaceId: activeSpaceIdRef.current,
-            title,
-            path: input.path,
-            originalContent: input.originalContent,
-            proposedContent: input.proposedContent,
-            approvalId: input.approvalId,
-            status: "pending",
-            isNewFile: input.isNewFile,
-          },
-        ];
+        return insert(curr, {
+          id,
+          kind: "ai-diff",
+          spaceId: activeSpaceIdRef.current,
+          title,
+          path: input.path,
+          originalContent: input.originalContent,
+          proposedContent: input.proposedContent,
+          approvalId: input.approvalId,
+          status: "pending",
+          isNewFile: input.isNewFile,
+        });
       });
       if (targetId !== null) setActiveId(targetId);
       return targetId as number | null;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const setAiDiffStatus = useCallback(
@@ -926,7 +1171,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         ),
       );
     },
-    [],
+    [setTabs],
   );
 
   const closeAiDiffTab = useCallback((approvalId: string) => {
@@ -947,23 +1192,23 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId((active) => (target.id === active ? fallback : active));
       return next;
     });
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const newPreviewTab = useCallback((url: string) => {
     const id = nextIdRef.current++;
-    setTabs((t) => [
-      ...t,
-      {
+    const insert = placeNew(activeIdRef.current);
+    setTabs((t) =>
+      insert(t, {
         id,
         kind: "preview",
         spaceId: activeSpaceIdRef.current,
         title: titleFromUrl(url),
         url,
-      },
-    ]);
+      }),
+    );
     setActiveId(id);
     return id;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   // Mirrors tabsRef like openFileTab instead of using a functional update: a
   // batch that opens a markdown file before a regular one (multi-file "Open
@@ -976,6 +1221,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       path,
       activeSpaceIdRef.current,
       () => nextIdRef.current++,
+      placeNew(activeIdRef.current),
     );
     if (plan.tabs !== curr) {
       tabsRef.current = plan.tabs;
@@ -983,7 +1229,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     }
     setActiveId(plan.tabId);
     return plan.tabId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const setOverrideLanguage = useCallback((id: number, lang: string | null) => {
     setTabs((curr) =>
@@ -995,7 +1241,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const setMarkdownView = useCallback(
     (id: number, mode: "rendered" | "raw") => {
@@ -1033,7 +1279,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         }),
       );
     },
-    [],
+    [setTabs],
   );
 
   const openGitDiffTab = useCallback((input: GitDiffOpenInput, pin = false) => {
@@ -1044,6 +1290,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       activeSpaceIdRef.current,
       pin,
       () => nextIdRef.current++,
+      placeNew(activeIdRef.current),
     );
     if (plan.tabs !== curr) {
       tabsRef.current = plan.tabs;
@@ -1051,7 +1298,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     }
     setActiveId(plan.targetId);
     return plan.targetId;
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const openCommitHistoryTab = useCallback(
     (input: { repoRoot: string; branch?: string | null }) => {
@@ -1061,6 +1308,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         input,
         activeSpaceIdRef.current,
         () => nextIdRef.current++,
+        placeNew(activeIdRef.current),
       );
       if (plan.tabs !== curr) {
         tabsRef.current = plan.tabs;
@@ -1069,7 +1317,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setActiveId(plan.targetId);
       return plan.targetId;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const openCommitFileDiffTab = useCallback(
@@ -1082,13 +1330,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       originalPath: string | null;
     }) => {
       const curr = tabsRef.current;
-      const existing = curr.find(
-        (t) =>
-          t.kind === "git-commit-file" &&
-          t.repoRoot === input.repoRoot &&
-          t.sha === input.sha &&
-          t.path === input.path,
-      );
+      const existing = findCommitFileDiffTab(curr, input, activeSpaceIdRef.current);
       const title = `${basename(input.path)} @ ${input.shortSha}`;
       if (existing) {
         const nextTabs = curr.map((t) =>
@@ -1107,27 +1349,24 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         return existing.id;
       }
       const id = nextIdRef.current++;
-      const nextTabs = [
-        ...curr,
-        {
-          id,
-          kind: "git-commit-file",
-          spaceId: activeSpaceIdRef.current,
-          title,
-          repoRoot: input.repoRoot,
-          sha: input.sha,
-          shortSha: input.shortSha,
-          subject: input.subject,
-          path: input.path,
-          originalPath: input.originalPath,
-        } satisfies GitCommitFileDiffTab,
-      ];
+      const nextTabs = placeNew(activeIdRef.current)(curr, {
+        id,
+        kind: "git-commit-file",
+        spaceId: activeSpaceIdRef.current,
+        title,
+        repoRoot: input.repoRoot,
+        sha: input.sha,
+        shortSha: input.shortSha,
+        subject: input.subject,
+        path: input.path,
+        originalPath: input.originalPath,
+      } satisfies GitCommitFileDiffTab);
       tabsRef.current = nextTabs;
       setTabs(nextTabs);
       setActiveId(id);
       return id;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const closeTab = useCallback((id: number) => {
@@ -1144,7 +1383,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       return next;
     });
     for (const lid of toDispose) disposeSession(lid);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const closeTabs = useCallback(
     (anchorId: number, plan: CloseTabsPlan): number[] => {
@@ -1157,7 +1396,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       for (const leafId of result.disposeLeafIds) disposeSession(leafId);
       return result.closeIds;
     },
-    [],
+    [setTabs, setActiveId],
   );
 
   const updateTab = useCallback((id: number, patch: TabPatch) => {
@@ -1202,6 +1441,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
           ...autoPin,
           ...(patch.title !== undefined && { title: patch.title }),
           ...(patch.dirty !== undefined && { dirty: patch.dirty }),
+          ...(patch.detached !== undefined && { detached: patch.detached }),
           ...(patch.path !== undefined && { path: patch.path }),
           ...(patch.overrideLanguage !== undefined && {
             overrideLanguage: patch.overrideLanguage,
@@ -1209,14 +1449,14 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const selectByIndex = useCallback(
     (idx: number, spaceId?: string) => {
       const t = spaceId ? pickTabBySpaceIndex(tabs, idx, spaceId) : tabs[idx];
       if (t) setActiveId(t.id);
     },
-    [tabs],
+    [tabs, setActiveId],
   );
 
   /** Update a leaf's cwd; mirror to the tab's `cwd` when the leaf is active.
@@ -1238,7 +1478,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       });
       return changed ? next : curr;
     });
-  }, []);
+  }, [setTabs]);
 
   const focusPane = useCallback((tabId: number, leafId: number) => {
     setTabs((curr) =>
@@ -1250,11 +1490,12 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         return {
           ...t,
           activeLeafId: leafId,
+          zoomedLeafId: undefined,
           ...(cwd !== undefined && { cwd }),
         };
       }),
     );
-  }, []);
+  }, [setTabs]);
 
   const focusNextPaneInTab = useCallback((tabId: number, delta: 1 | -1) => {
     setTabs((curr) =>
@@ -1263,10 +1504,54 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         const next = nextLeafId(t.paneTree, t.activeLeafId, delta);
         if (next === t.activeLeafId) return t;
         const cwd = findLeafCwd(t.paneTree, next);
-        return { ...t, activeLeafId: next, ...(cwd !== undefined && { cwd }) };
+        return {
+          ...t,
+          activeLeafId: next,
+          zoomedLeafId: undefined,
+          ...(cwd !== undefined && { cwd }),
+        };
       }),
     );
-  }, []);
+  }, [setTabs]);
+
+  /** Focus the pane next to the active one in a direction (live layout). */
+  const focusPaneInDirection = useCallback(
+    (tabId: number, direction: PaneDirection, bounds?: PaneBounds[]) => {
+      setTabs((curr) =>
+        curr.map((t) => {
+          if (t.id !== tabId || t.kind !== "terminal") return t;
+          const next = leafInDirection(
+            t.paneTree,
+            t.activeLeafId,
+            direction,
+            bounds,
+          );
+          if (next === null || next === t.activeLeafId) return t;
+          const cwd = findLeafCwd(t.paneTree, next);
+          return {
+            ...t,
+            activeLeafId: next,
+            zoomedLeafId: undefined,
+            ...(cwd !== undefined && { cwd }),
+          };
+        }),
+      );
+    },
+    [setTabs],
+  );
+
+  /** Shows the active pane alone, or the whole split again. */
+  const togglePaneZoom = useCallback((tabId: number) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.id !== tabId || t.kind !== "terminal") return t;
+        if (t.zoomedLeafId !== undefined)
+          return { ...t, zoomedLeafId: undefined };
+        if (leafIds(t.paneTree).length < 2) return t;
+        return { ...t, zoomedLeafId: t.activeLeafId };
+      }),
+    );
+  }, [setTabs]);
 
   const swapActivePaneInDirection = useCallback(
     (tabId: number, direction: PaneDirection, bounds?: PaneBounds[]) => {
@@ -1283,7 +1568,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
         }),
       );
     },
-    [],
+    [setTabs],
   );
 
   /** Split the active leaf of `tabId` along `dir`. Returns the new leaf id. */
@@ -1293,7 +1578,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       setTabs((curr) =>
         curr.map((t) => {
           if (t.id !== tabId || t.kind !== "terminal" || t.blocks) return t;
-          if (leafIds(t.paneTree).length >= MAX_PANES_PER_TAB) return t;
+          if (!canSplitPane(t.paneTree, paneLimit())) return t;
           const splitId = nextIdRef.current++;
           const leafId = nextIdRef.current++;
           newLeafId = leafId;
@@ -1305,12 +1590,93 @@ export function useTabs(initial?: Partial<TerminalTab>) {
             dir,
             t.cwd,
           );
-          return { ...t, paneTree, activeLeafId: leafId };
+          return {
+            ...t,
+            paneTree,
+            activeLeafId: leafId,
+            zoomedLeafId: undefined,
+          };
         }),
       );
       return newLeafId;
     },
-    [],
+    [setTabs],
+  );
+
+  /**
+   * Moves a single-pane terminal tab into another tab's split, keeping its
+   * session. Returns the moved leaf, or null when the move is not allowed.
+   */
+  const moveTabIntoSplit = useCallback(
+    (
+      sourceTabId: number,
+      destinationTabId: number,
+      position: SplitPosition,
+    ): number | null => {
+      const source = tabsRef.current.find((tab) => tab.id === sourceTabId);
+      const destination = tabsRef.current.find(
+        (tab) => tab.id === destinationTabId,
+      );
+      if (
+        !source ||
+        !destination ||
+        !allowEnvironmentMove(source.spaceId, destination.spaceId)
+      )
+        return null;
+      const limit = paneLimit();
+      const plan = planMoveTabIntoSplit(
+        tabsRef.current,
+        sourceTabId,
+        destinationTabId,
+        limit,
+      );
+      if (!plan.ok) return null;
+      const next = applyMoveTabIntoSplit(
+        tabsRef.current,
+        sourceTabId,
+        destinationTabId,
+        position,
+        nextIdRef.current++,
+        limit,
+      );
+      if (!next) return null;
+      tabsRef.current = next;
+      activeIdRef.current = destinationTabId;
+      setTabs(next);
+      setActiveId(destinationTabId);
+      return plan.leaf.id;
+    },
+    [setTabs, setActiveId],
+  );
+
+  /**
+   * Moves a pane of a split terminal tab (by default the active tab's active
+   * pane) into a new tab right after it, keeping its session.
+   */
+  const movePaneToNewTab = useCallback(
+    (
+      tabId?: number,
+      leafId?: number,
+    ): { tabId: number; leafId: number } | null => {
+      const sourceId = tabId ?? activeIdRef.current;
+      const source = tabsRef.current.find((t) => t.id === sourceId);
+      if (source?.kind !== "terminal") return null;
+      const moved = leafId ?? source.activeLeafId;
+      const newTabId = nextIdRef.current++;
+      const next = applyMovePaneToNewTab(
+        tabsRef.current,
+        sourceId,
+        moved,
+        newTabId,
+      );
+      if (!next) return null;
+      tabsRef.current = next;
+      activeIdRef.current = newTabId;
+      setTabs(next);
+      setActiveId(newTabId);
+      return { tabId: newTabId, leafId: moved };
+    },
+    [setTabs, setActiveId],
   );
 
   const closePaneByLeaf = useCallback((leafId: number): void => {
@@ -1338,12 +1704,17 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       didRemove = true;
       return curr.map((x) =>
         x.id === tab.id
-          ? { ...x, paneTree: newTree, activeLeafId: newActive }
+          ? {
+              ...x,
+              paneTree: newTree,
+              activeLeafId: newActive,
+              zoomedLeafId: undefined,
+            }
           : x,
       );
     });
     if (didRemove) disposeSession(leafId);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const closeActivePane = useCallback((tabId: number): boolean => {
     let closedTab = false;
@@ -1368,41 +1739,22 @@ export function useTabs(initial?: Partial<TerminalTab>) {
       removedLeaf = target;
       return curr.map((x) =>
         x.id === tabId
-          ? { ...x, paneTree: newTree, activeLeafId: newActive }
+          ? {
+              ...x,
+              paneTree: newTree,
+              activeLeafId: newActive,
+              zoomedLeafId: undefined,
+            }
           : x,
       );
     });
     if (removedLeaf !== null) disposeSession(removedLeaf);
     return closedTab;
-  }, []);
-
-  const resetWorkspace = useCallback((cwd?: string) => {
-    const tabId = nextIdRef.current++;
-    const leafId = nextIdRef.current++;
-    let toDispose: number[] = [];
-    setTabs((curr) => {
-      toDispose = curr.flatMap((t) =>
-        t.kind === "terminal" ? leafIds(t.paneTree) : [],
-      );
-      return [
-        {
-          id: tabId,
-          kind: "terminal",
-          spaceId: activeSpaceIdRef.current,
-          title: "shell",
-          cwd,
-          paneTree: { kind: "leaf", id: leafId, cwd },
-          activeLeafId: leafId,
-        },
-      ];
-    });
-    setActiveId(tabId);
-    for (const lid of toDispose) disposeSession(lid);
-  }, []);
+  }, [setTabs, setActiveId]);
 
   const reorderTabByGap = useCallback((fromId: number, toGapIndex: number) => {
     setTabs((prev) => reorderTabsByGap(prev, fromId, toGapIndex));
-  }, []);
+  }, [setTabs]);
 
   return {
     tabs,
@@ -1442,10 +1794,13 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     setLeafCwd,
     focusPane,
     focusNextPaneInTab,
+    focusPaneInDirection,
+    togglePaneZoom,
     swapActivePaneInDirection,
     splitActivePane,
+    moveTabIntoSplit,
+    movePaneToNewTab,
     closeActivePane,
     closePaneByLeaf,
-    resetWorkspace,
   };
 }

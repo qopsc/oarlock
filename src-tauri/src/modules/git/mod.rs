@@ -1,8 +1,17 @@
+pub mod ai_diff;
+mod branches;
+pub mod candidate_policy;
 pub mod commands;
+mod commit_files;
+mod commit_guard;
+pub mod discard;
 pub mod errors;
 pub mod operations;
+pub(crate) mod ownership;
 pub mod parser;
-mod process;
+pub(crate) mod process;
+mod remote_guard;
 pub mod types;
 mod untracked;
 pub mod utils;
+mod worktree;

@@ -1,23 +1,49 @@
 import type { Extension } from "@codemirror/state";
 import { type EditorView, ViewPlugin } from "@codemirror/view";
-import { Vim } from "@replit/codemirror-vim";
+import { getCM, Vim } from "@replit/codemirror-vim";
 
-export type VimHandlers = { save: () => void; close: () => void };
+export type VimHandlers = {
+  save: () => Promise<boolean>;
+  identity: () => unknown;
+  canClose: () => boolean;
+  close: () => void;
+  filetype?: { get: () => string; set: (value: string) => void };
+};
 
-const handlers = new WeakMap<EditorView, VimHandlers>();
+const handlers = new WeakMap<EditorView, { current: VimHandlers }>();
 
 /** A CodeMirror extension that binds :w / :q handlers to this view. */
 export function vimHandlersExtension(
   getHandlers: () => VimHandlers,
 ): Extension {
   return ViewPlugin.define((view) => {
-    handlers.set(view, getHandlers());
+    const registration = { current: getHandlers() };
+    handlers.set(view, registration);
+    let identity = registration.current.identity();
+    const bindFiletype = () => {
+      const cm = getCM(view);
+      if (cm) cm.vimFiletype = registration.current.filetype;
+    };
+    bindFiletype();
+    const cancel = () => {
+      const cm = getCM(view);
+      if (cm) Vim.cancelPending(cm);
+    };
     return {
       update() {
         // Keep handlers fresh in case the closure captured stale refs.
-        handlers.set(view, getHandlers());
+        registration.current = getHandlers();
+        bindFiletype();
+        const nextIdentity = registration.current.identity();
+        if (identity !== nextIdentity) {
+          identity = nextIdentity;
+          cancel();
+        }
       },
       destroy() {
+        cancel();
+        const cm = getCM(view);
+        if (cm) cm.vimFiletype = undefined;
         handlers.delete(view);
       },
     };
@@ -35,29 +61,37 @@ export function initVimGlobals(): void {
 
   Vim.defineEx("write", "w", (cm: CmAdapter) => {
     const view = getView(cm);
-    if (view) handlers.get(view)?.save();
+    if (view) return handlers.get(view)?.current.save();
   });
 
   Vim.defineEx("quit", "q", (cm: CmAdapter) => {
     const view = getView(cm);
-    if (view) handlers.get(view)?.close();
+    if (view) handlers.get(view)?.current.close();
   });
 
-  Vim.defineEx("wq", "wq", (cm: CmAdapter) => {
+  const writeAndQuit = (cm: CmAdapter) => {
     const view = getView(cm);
     if (!view) return;
     const h = handlers.get(view);
-    h?.save();
-    h?.close();
-  });
-
-  Vim.defineEx("xit", "x", (cm: CmAdapter) => {
-    const view = getView(cm);
-    if (!view) return;
-    const h = handlers.get(view);
-    h?.save();
-    h?.close();
-  });
+    if (!h) return;
+    const identity = h.current.identity();
+    return h.current.save().then(
+      (saved) => {
+        if (
+          saved &&
+          handlers.get(view) === h &&
+          h.current.identity() === identity &&
+          h.current.canClose()
+        )
+          h.current.close();
+      },
+      () => {
+        /* Save failures are reported by the editor; keep the tab. */
+      },
+    );
+  };
+  Vim.defineEx("wq", "wq", writeAndQuit);
+  Vim.defineEx("xit", "x", writeAndQuit);
 
   // Arrow keys are forwarded by the plugin to the editor scope handlers,
   // which breaks operator-pending (d<Up>) and counts (15<Up>). Remap to

@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,13 +16,16 @@ use super::queue::{OutputQueue, QueueDiagnostics};
 use super::shell_init;
 use crate::modules::workspace::WorkspaceEnv;
 
-const AGENT_EVENT: &str = "terax:agent-signal";
+const AGENT_EVENT: &str = "oarlock:agent-signal";
 
 const READ_BUF: usize = 16 * 1024;
 const EXIT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Writes queued ahead of the writer thread; a full queue applies async
 /// backpressure to `pty_write` instead of growing without bound.
 const INPUT_QUEUE: usize = 64;
+const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_INPUT_BYTES: usize = MAX_INPUT_BYTES + 256 * 1024;
+const MAX_PENDING_INPUT_REQUESTS: usize = INPUT_QUEUE + 1;
 // Three small threads per PTY: keep their stacks small. The reader calls
 // Tauri's event emit, so it keeps a little more than the others.
 const READER_STACK: usize = 256 * 1024;
@@ -31,8 +34,59 @@ const WAITER_STACK: usize = 256 * 1024;
 
 struct InputMessage {
     bytes: Vec<u8>,
+    permit: Option<InputPermit>,
     /// Receives the write result; absent for fire-and-forget terminal replies.
     done: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Default)]
+struct InputBudget {
+    bytes: AtomicUsize,
+    requests: AtomicUsize,
+}
+
+struct InputPermit {
+    budget: Arc<InputBudget>,
+    bytes: usize,
+}
+
+fn try_add(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+impl InputBudget {
+    fn admit(self: &Arc<Self>, bytes: usize) -> Result<InputPermit, String> {
+        if bytes > MAX_INPUT_BYTES {
+            return Err("Terminal input exceeds 64 MiB".into());
+        }
+        if !try_add(&self.requests, 1, MAX_PENDING_INPUT_REQUESTS) {
+            return Err("Terminal input queue is full".into());
+        }
+        if !try_add(&self.bytes, bytes, MAX_PENDING_INPUT_BYTES) {
+            self.requests.fetch_sub(1, Ordering::AcqRel);
+            return Err("Terminal input queue is full".into());
+        }
+        Ok(InputPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for InputPermit {
+    fn drop(&mut self) {
+        self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.requests.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -54,10 +108,12 @@ pub struct Session {
     pub shell_pid: u32,
     /// Label of the webview that opened this PTY and receives its output.
     pub owner: Arc<str>,
+    pub(super) dialect: Option<super::shell_dialect::Dialect>,
     pub killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Feeds the per-session writer thread, which keeps input ordered and off
     /// every async worker.
     input: mpsc::Sender<InputMessage>,
+    input_budget: Arc<InputBudget>,
     pub master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     output: Arc<OutputQueue>,
     // Set only after output drains, so registration cannot reap a live queue.
@@ -99,7 +155,7 @@ impl Session {
     }
 
     pub(super) fn resize(&self, size: PtySize) -> Result<(), String> {
-        let master = self.master.lock().unwrap();
+        let master = super::unpoisoned(self.master.lock());
         master
             .as_ref()
             .ok_or("PTY has exited")?
@@ -109,11 +165,13 @@ impl Session {
 
     /// Queues `bytes` for the writer thread and resolves with the result of
     /// the actual pipe write, so callers still see real I/O errors in order.
-    pub(super) async fn write(&self, bytes: Vec<u8>) -> Result<(), String> {
+    pub(super) async fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        let permit = self.input_budget.admit(bytes.len())?;
         let (done, result) = oneshot::channel();
         self.input
             .send(InputMessage {
-                bytes,
+                bytes: bytes.to_vec(),
+                permit: Some(permit),
                 done: Some(done),
             })
             .await
@@ -264,6 +322,7 @@ pub(super) fn spawn_with(
     let pair = pty_system.openpty(size).map_err(|e| e.to_string())?;
 
     let cmd = build_command()?;
+    let dialect = super::shell_dialect::from_command(&cmd);
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -318,8 +377,10 @@ pub(super) fn spawn_with(
         _job: job,
         shell_pid,
         owner,
+        dialect,
         killer: Mutex::new(killer),
         input: input.clone(),
+        input_budget: Arc::new(InputBudget::default()),
         master: Arc::new(Mutex::new(Some(pair.master))),
         output: output.clone(),
         finished: finished.clone(),
@@ -330,15 +391,22 @@ pub(super) fn spawn_with(
     let spawn_error =
         |what: &str, e: std::io::Error| format!("could not start PTY {what} thread: {e}");
     thread::Builder::new()
-        .name("terax-pty-writer".into())
+        .name("oarlock-pty-writer".into())
         .stack_size(WRITER_STACK)
         .spawn(move || {
             while let Some(message) = input_rx.blocking_recv() {
-                let result = writer.write_all(&message.bytes).map_err(|e| {
+                let InputMessage {
+                    bytes,
+                    permit,
+                    done,
+                } = message;
+                let result = writer.write_all(&bytes).map_err(|e| {
                     log::debug!("pty write failed: {e}");
                     e.to_string()
                 });
-                if let Some(done) = message.done {
+                drop(bytes);
+                drop(permit);
+                if let Some(done) = done {
                     let _ = done.send(result);
                 }
             }
@@ -348,9 +416,10 @@ pub(super) fn spawn_with(
     let spawn_at = Instant::now();
     let output_r = output.clone();
     let reader_thread = thread::Builder::new()
-        .name("terax-pty-reader".into())
+        .name("oarlock-pty-reader".into())
         .stack_size(READER_STACK)
         .spawn(move || {
+            let _failed_on_panic = FailOnPanic(&output_r);
             let mut buf = [0u8; READ_BUF];
             // Reused for every filtered read: no per-chunk allocation.
             let mut filtered: Vec<u8> = Vec::with_capacity(READ_BUF);
@@ -386,6 +455,7 @@ pub(super) fn spawn_with(
                                 if input
                                     .try_send(InputMessage {
                                         bytes: reply.to_vec(),
+                                        permit: None,
                                         done: None,
                                     })
                                     .is_err()
@@ -427,7 +497,7 @@ pub(super) fn spawn_with(
     #[cfg(windows)]
     let master_e = session.master.clone();
     thread::Builder::new()
-        .name("terax-pty-waiter".into())
+        .name("oarlock-pty-waiter".into())
         .stack_size(WAITER_STACK)
         .spawn(move || {
             let code = match child.wait() {
@@ -444,7 +514,7 @@ pub(super) fn spawn_with(
             #[cfg(windows)]
             {
                 // Closing ConPTY can emit a final frame. Keep the reader alive until EOF.
-                let master = master_e.lock().unwrap().take();
+                let master = super::unpoisoned(master_e.lock()).take();
                 close_pseudoconsole(&output_e, &CONPTY_LIFECYCLE_LOCK, move || drop(master));
             }
             if let Err(e) = reader_thread.join() {
@@ -486,6 +556,19 @@ impl Drop for Registration {
     }
 }
 
+/// The waiter joins the reader only once the shell exits, so a reader panic
+/// fails its terminal right away instead of leaving it frozen until then.
+struct FailOnPanic<'a>(&'a OutputQueue);
+
+impl Drop for FailOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.0.fail_reading();
+            self.0.finish_reading();
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -510,6 +593,7 @@ mod tests {
         received: Vec<u8>,
         acked: u64,
         exit: Option<i32>,
+        failed: Option<String>,
         max_in_flight: u64,
         frames_after_exit: usize,
     }
@@ -529,6 +613,7 @@ mod tests {
                 received: Vec::new(),
                 acked: 0,
                 exit: None,
+                failed: None,
                 max_in_flight: 0,
                 frames_after_exit: 0,
             }
@@ -563,6 +648,9 @@ mod tests {
                         payloads.push(payload.to_vec());
                     }
                     Frame::Exit { id: i, code } if i == id => self.exit = Some(code),
+                    Frame::Failed { id: i, reason } if i == id => {
+                        self.failed = Some(reason.to_string())
+                    }
                     Frame::Sync { .. } => {}
                     other => panic!("unexpected frame {other:?}"),
                 }
@@ -653,6 +741,29 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_in_the_reader_fails_the_terminal_while_the_shell_lives() {
+        let hub = Hub::new();
+        let mut frontend = Frontend::open(&hub, "main");
+        let (mut host, reaped) = host(1, &hub);
+        host.signal = Arc::new(|_| panic!("agent signal sink failed"));
+        // An agent start marker makes the reader call the panicking sink.
+        let script = r"printf '\033]133;C;claude\033\\'; exec sleep 30";
+        let session = spawn_with(host, PtySize::default(), || Ok(sh(script))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut acks = vec![Ack { id: 1, bytes: 0 }];
+        while frontend.failed.is_none() {
+            assert!(Instant::now() < deadline, "no failed frame");
+            frontend.poll_once(1, std::mem::take(&mut acks));
+        }
+        assert_eq!(frontend.failed.as_deref(), Some("PTY reader failed"));
+        assert_eq!(frontend.exit, None, "reported before the shell exits");
+        session.close_output();
+        let _ = session.killer.lock().unwrap().kill();
+        drop(session);
+        reaped.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
     fn output_before_the_receiver_attaches_is_held_not_dropped() {
         let (_hub, session, mut frontend, reaped) = start("printf early; exit 0");
         // The shell is long gone before the frontend announces itself.
@@ -711,7 +822,7 @@ mod tests {
         // thread applies them in submission order.
         runtime.block_on(async {
             for chunk in [&b"one "[..], b"two ", b"three"] {
-                session.write(chunk.to_vec()).await.unwrap();
+                session.write(chunk).await.unwrap();
             }
         });
         while frontend.received.len() < "readyone two three".len() && Instant::now() < deadline {
@@ -724,6 +835,52 @@ mod tests {
         session.close_output();
         let _ = session.killer.lock().unwrap().kill();
         reaped.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn oversized_terminal_input_is_refused_before_a_stalled_writer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (_hub, session, _frontend, reaped) = start("sleep 30");
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                session.write(&vec![0; 64 * 1024 * 1024 + 1]),
+            )
+            .await
+        });
+        session.close_output();
+        let _ = session.killer.lock().unwrap().kill();
+        drop(session);
+        reaped.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(result, Ok(Err(message)) if message.contains("input exceeds")));
+    }
+
+    #[test]
+    fn terminal_input_budget_bounds_bytes_and_releases_permits() {
+        let budget = Arc::new(InputBudget::default());
+        assert!(budget.admit(MAX_INPUT_BYTES + 1).is_err());
+        let large = budget.admit(MAX_INPUT_BYTES).unwrap();
+        let small = budget.admit(256 * 1024).unwrap();
+        assert!(budget.admit(1).is_err());
+        drop(large);
+        assert!(budget.admit(MAX_INPUT_BYTES).is_ok());
+        drop(small);
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(budget.requests.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn terminal_input_budget_bounds_even_empty_pending_requests() {
+        let budget = Arc::new(InputBudget::default());
+        let permits: Vec<_> = (0..MAX_PENDING_INPUT_REQUESTS)
+            .map(|_| budget.admit(0).unwrap())
+            .collect();
+        assert!(budget.admit(0).is_err());
+        drop(permits);
+        assert!(budget.admit(0).is_ok());
     }
 
     #[test]

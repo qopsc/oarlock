@@ -1,6 +1,17 @@
+import {
+  type WatchHealth,
+  watchHealth,
+} from "@/modules/explorer/lib/watchHealth";
+import { createLiveDiff } from "./lib/liveDiff";
+import { watchWorkingDiff } from "./lib/watchWorkingDiff";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
+import { cn } from "@/lib/utils";
+import { usePreferencesStore } from "@/modules/settings/preferences";
+import { type DiffViewMode, setDiffViewMode } from "@/modules/settings/store";
 import { unifiedMergeView } from "@codemirror/merge";
 import { EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -11,8 +22,11 @@ import {
   fetchCommitDiff,
   fetchWorkingDiff,
   getCachedDiff,
+  invalidateWorkingDiff,
+  onDiffInvalidated,
   workingDiffKey,
 } from "./lib/diffCache";
+import { UNIFIED_DIFF_THEME } from "./lib/diffTheme";
 import {
   buildSharedExtensions,
   DEFAULT_INDENT,
@@ -20,6 +34,7 @@ import {
 } from "./lib/extensions";
 import { resolveLanguage, resolveLanguageSync } from "./lib/languageResolver";
 import { useEditorThemeExt } from "./lib/useEditorThemeExt";
+import { SplitDiffView } from "./SplitDiffView";
 
 type WorkingSource = {
   kind: "working";
@@ -50,44 +65,6 @@ const READONLY_EXT = [
   EditorState.readOnly.of(true),
   EditorView.editable.of(false),
 ];
-const DIFF_THEME = EditorView.theme({
-  "&.cm-merge-b .cm-changedText, .cm-changedText": {
-    background: "rgba(110, 200, 120, 0.20) !important",
-    borderRadius: "3px",
-    padding: "0 1px",
-  },
-  ".cm-deletedChunk .cm-deletedText, &.cm-merge-b .cm-deletedText": {
-    background: "rgba(220, 90, 90, 0.22) !important",
-    borderRadius: "3px",
-    padding: "0 1px",
-  },
-  "&.cm-merge-b .cm-changedLine, .cm-changedLine, .cm-inlineChangedLine": {
-    backgroundColor: "rgba(110, 200, 120, 0.05) !important",
-  },
-  ".cm-deletedChunk": {
-    backgroundColor: "rgba(220, 90, 90, 0.05) !important",
-    paddingTop: "1px",
-    paddingBottom: "1px",
-  },
-  "&.cm-merge-b .cm-changedLineGutter, .cm-changedLineGutter": {
-    background: "rgba(110, 200, 120, 0.55) !important",
-  },
-  ".cm-deletedLineGutter, &.cm-merge-a .cm-changedLineGutter": {
-    background: "rgba(220, 90, 90, 0.5) !important",
-  },
-  ".cm-changeGutter": {
-    width: "2px !important",
-    paddingLeft: "0 !important",
-  },
-  ".cm-collapsedLines": {
-    backgroundColor: "transparent",
-    color: "var(--muted-foreground, #9ca3af)",
-    fontSize: "10.5px",
-    padding: "2px 8px",
-    opacity: 0.7,
-  },
-});
-
 function countDiffLines(patch: string): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
@@ -114,17 +91,36 @@ type LoadState =
       /** Resolved before mount: a late compartment reconfigure would leave
        * the merge view's deleted-chunk widgets unhighlighted. */
       langExt: Extension | null;
+      refreshing?: boolean;
     }
   | { kind: "error"; message: string };
 
-function cacheKey(source: WorkingSource | CommitSource): string {
+function cacheKey(
+  source: WorkingSource | CommitSource,
+  workspace: WorkspaceEnv,
+): string {
   return source.kind === "working"
-    ? workingDiffKey(source.repoRoot, source.path, source.mode)
-    : commitDiffKey(source.repoRoot, source.sha, source.path);
+    ? workingDiffKey(
+        source.repoRoot,
+        source.path,
+        source.mode,
+        workspace,
+        source.originalPath,
+      )
+    : commitDiffKey(
+        source.repoRoot,
+        source.sha,
+        source.path,
+        workspace,
+        source.originalPath,
+      );
 }
 
-function loadStateFromCache(source: WorkingSource | CommitSource): LoadState {
-  const hit = getCachedDiff(cacheKey(source));
+function loadStateFromCache(
+  source: WorkingSource | CommitSource,
+  workspace: WorkspaceEnv,
+): LoadState {
+  const hit = getCachedDiff(cacheKey(source, workspace));
   if (!hit) return { kind: "idle" };
   return {
     kind: "loaded",
@@ -137,37 +133,121 @@ function loadStateFromCache(source: WorkingSource | CommitSource): LoadState {
 }
 
 export function GitDiffPane({ source, chipLabel, active }: Props) {
+  const workspace = useOwnedWorkspace();
   const cmRef = useRef<ReactCodeMirrorRef>(null);
   const themeExt = useEditorThemeExt();
+  const diffViewMode = usePreferencesStore((s) => s.diffViewMode);
   const [state, setState] = useState<LoadState>(() =>
-    active ? loadStateFromCache(source) : { kind: "idle" },
+    active && source.kind === "commit"
+      ? loadStateFromCache(source, workspace)
+      : { kind: "idle" },
   );
 
-  const key = cacheKey(source);
+  const key = cacheKey(source, workspace);
+  const [retry, setRetry] = useState(0);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: key captures source/workspace; Retry deliberately restarts the owner
   useEffect(() => {
     if (!active) return;
-    const cached = loadStateFromCache(source);
+    if (source.kind === "working") {
+      setState({ kind: "loading" });
+      // A hidden/unmounted working view has no watches, so never trust its old cache.
+      invalidateWorkingDiff(
+        source.repoRoot,
+        source.path,
+        source.mode,
+        workspace,
+      );
+      const reader = createLiveDiff({
+        read: () =>
+          Promise.all([
+            fetchWorkingDiff(
+              source.repoRoot,
+              source.path,
+              source.mode,
+              source.originalPath,
+              workspace,
+            ),
+            resolveLanguage(source.path).catch(() => null),
+          ]),
+        loading: () =>
+          setState((current) =>
+            current.kind === "loaded"
+              ? current.refreshing
+                ? current
+                : { ...current, refreshing: true }
+              : { kind: "loading" },
+          ),
+        loaded: ([res, lang]) =>
+          setState({ kind: "loaded", ...res, langExt: lang?.ext ?? null }),
+        failed: (error) =>
+          setState({
+            kind: "error",
+            message: `Could not refresh diff: ${String(error)}`,
+          }),
+      });
+      const unsubscribe = onDiffInvalidated(key, () => reader.invalidate());
+      let healthy = false;
+      const applyHealth = (status: WatchHealth) => {
+        if (status.error) {
+          healthy = false;
+          reader.fail(status.error);
+        } else if (!healthy) {
+          healthy = true;
+          invalidateWorkingDiff(
+            source.repoRoot,
+            source.path,
+            source.mode,
+            workspace,
+          );
+          reader.start();
+        }
+      };
+      const watch = watchWorkingDiff(
+        source.repoRoot,
+        source.path,
+        workspace,
+        () =>
+          invalidateWorkingDiff(
+            source.repoRoot,
+            source.path,
+            source.mode,
+            workspace,
+          ),
+        applyHealth,
+      );
+      void watch.ready
+        .then(() => applyHealth(watch.health()))
+        .catch((error) => {
+          watch.dispose();
+          reader.fail(error);
+        });
+      return () => {
+        reader.dispose();
+        unsubscribe();
+        watch.dispose();
+        invalidateWorkingDiff(
+          source.repoRoot,
+          source.path,
+          source.mode,
+          workspace,
+        );
+      };
+    }
+    const cached = loadStateFromCache(source, workspace);
     if (cached.kind === "loaded") {
       setState(cached);
       return;
     }
     let cancelled = false;
     setState({ kind: "loading" });
-    const promise =
-      source.kind === "working"
-        ? fetchWorkingDiff(
-            source.repoRoot,
-            source.path,
-            source.mode,
-            source.originalPath,
-          )
-        : fetchCommitDiff(
-            source.repoRoot,
-            source.sha,
-            source.path,
-            source.originalPath,
-          );
+    const promise = fetchCommitDiff(
+      source.repoRoot,
+      source.sha,
+      source.path,
+      source.originalPath,
+      workspace,
+    );
     Promise.all([promise, resolveLanguage(source.path).catch(() => null)])
       .then(([res, lang]) => {
         if (cancelled) return;
@@ -193,7 +273,7 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [active, key, source]);
+  }, [active, key, retry]);
 
   const path = source.path;
   const repoRoot = source.repoRoot;
@@ -224,7 +304,7 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
         syntaxHighlightDeletions: true,
         collapseUnchanged: { margin: 3, minSize: 6 },
       }),
-      DIFF_THEME,
+      UNIFIED_DIFF_THEME,
     ],
     [originalContent, langExt],
   );
@@ -236,9 +316,7 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
     let cancelled = false;
     resolveLanguage(path).then((res) => {
       if (cancelled || !res) return;
-      setState((s) =>
-        s.kind === "loaded" ? { ...s, langExt: res.ext } : s,
-      );
+      setState((s) => (s.kind === "loaded" ? { ...s, langExt: res.ext } : s));
     });
     return () => {
       cancelled = true;
@@ -278,7 +356,18 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-3 text-[10.5px] tabular-nums text-muted-foreground">
+          {loaded?.refreshing && (
+            <span
+              role="status"
+              aria-label="Refreshing diff"
+              className="flex items-center gap-1"
+            >
+              <Spinner className="size-3" />
+              Refreshing…
+            </span>
+          )}
           <span className="truncate max-w-80 font-mono">{repoRoot}</span>
+          {!useFallback && <DiffViewToggle mode={diffViewMode} />}
           {useFallback ? (
             <>
               <span className="text-emerald-600 dark:text-emerald-400">
@@ -300,7 +389,18 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
           </div>
         ) : state.kind === "error" ? (
           <div className="flex h-full items-center justify-center px-6 text-center text-[11.5px] text-destructive">
-            {state.message}
+            <div>
+              <p>{state.message}</p>
+              <button
+                type="button"
+                className="mt-3 cursor-pointer underline"
+                onClick={() => {
+                  void watchHealth.retry().then(() => setRetry((n) => n + 1));
+                }}
+              >
+                Retry
+              </button>
+            </div>
           </div>
         ) : useFallback ? (
           <ScrollArea className="h-full">
@@ -308,6 +408,12 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
               {fallbackPatch || "Diff preview is not available for this file."}
             </pre>
           </ScrollArea>
+        ) : diffViewMode === "split" ? (
+          <SplitDiffView
+            original={originalContent}
+            modified={modifiedContent}
+            langExt={langExt}
+          />
         ) : (
           <CodeMirror
             ref={cmRef}
@@ -316,7 +422,7 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
             extensions={extensions}
             editable={false}
             height="100%"
-            className="h-full"
+            className="oarlock-code-editor h-full"
             basicSetup={{
               lineNumbers: true,
               foldGutter: true,
@@ -327,6 +433,34 @@ export function GitDiffPane({ source, chipLabel, active }: Props) {
           />
         )}
       </div>
+    </div>
+  );
+}
+
+const DIFF_VIEW_MODES: { mode: DiffViewMode; label: string }[] = [
+  { mode: "inline", label: "Inline" },
+  { mode: "split", label: "Side by side" },
+];
+
+function DiffViewToggle({ mode }: { mode: DiffViewMode }) {
+  return (
+    <div className="flex items-center rounded-md border border-border/60 p-0.5">
+      {DIFF_VIEW_MODES.map((option) => (
+        <button
+          key={option.mode}
+          type="button"
+          aria-pressed={mode === option.mode}
+          onClick={() => void setDiffViewMode(option.mode)}
+          className={cn(
+            "rounded px-1.5 py-0.5 text-[10.5px] transition-colors",
+            mode === option.mode
+              ? "bg-accent text-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
     </div>
   );
 }

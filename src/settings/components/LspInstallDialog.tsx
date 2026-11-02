@@ -1,3 +1,5 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
+import { IS_MAC } from "@/lib/platform";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -7,7 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { redetectBinary, type LspPreset } from "@/modules/lsp";
+import { installCommandForPlatform, redetectBinary, type LspPreset } from "@/modules/lsp";
 import { setLspActivation } from "@/modules/settings/store";
 import {
   Copy01Icon,
@@ -16,7 +18,8 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { recheckLspInstall } from "./lspInstallRecheck";
 
 type Props = {
   server: LspPreset | null;
@@ -27,6 +30,17 @@ export function LspInstallDialog({ server, onClose }: Props) {
   const [copied, setCopied] = useState(false);
   const [checking, setChecking] = useState(false);
   const [notFound, setNotFound] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const attempt = useRef(0);
+  const savingRef = useRef(false);
+  const serverId = useRef(server?.id);
+  if (serverId.current !== server?.id) {
+    serverId.current = server?.id;
+    attempt.current++;
+  }
+
+  useEffect(() => () => { attempt.current++; }, []);
 
   useEffect(() => {
     if (!copied) return;
@@ -35,11 +49,12 @@ export function LspInstallDialog({ server, onClose }: Props) {
   }, [copied]);
 
   if (!server) return null;
+  const installCommand = installCommandForPlatform(server, IS_MAC);
 
   const copyInstallCommand = async () => {
-    if (!server.install) return;
+    if (!installCommand) return;
     try {
-      await navigator.clipboard.writeText(server.install.command);
+      await writeClipboardText(installCommand);
       setCopied(true);
     } catch {
       setCopied(false);
@@ -47,35 +62,46 @@ export function LspInstallDialog({ server, onClose }: Props) {
   };
 
   const checkAgain = async () => {
+    const owner = ++attempt.current;
+    const current = () => attempt.current === owner && serverId.current === server.id;
     setChecking(true);
     setNotFound(false);
-    const path = await redetectBinary(server.command);
-    if (path) {
-      await setLspActivation(server.id, "enabled");
-      onClose();
-      return;
+    setError(null);
+    try {
+      const result = await recheckLspInstall(current, () => redetectBinary(server.command), () => {
+        savingRef.current = true;
+        setSaving(true);
+      }, () => setLspActivation(server.id, "enabled"));
+      if (result === "saved") onClose();
+      else if (result === "missing") setNotFound(true);
+    } catch (error) {
+      if (current()) setError(`Could not enable the language server: ${String(error)}`);
+    } finally {
+      if (current()) {
+        savingRef.current = false;
+        setSaving(false);
+        setChecking(false);
+      }
     }
-    setChecking(false);
-    setNotFound(true);
   };
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-md">
+    <Dialog open onOpenChange={(open) => { if (!open && !savingRef.current) { attempt.current++; onClose(); } }}>
+      <DialogContent className="max-w-md" showCloseButton={!saving}>
         <DialogHeader>
           <DialogTitle>Install {server.name} language server</DialogTitle>
           <DialogDescription>
-            Terax could not find{" "}
+            Oarlock could not find{" "}
             <code className="font-mono text-foreground">{server.command}</code>{" "}
             on your PATH. Install it, then check again to enable this language
             server.
           </DialogDescription>
         </DialogHeader>
 
-        {server.install ? (
+        {installCommand ? (
           <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 font-mono text-[11px]">
             <span className="min-w-0 flex-1 select-text break-all">
-              {server.install.command}
+              {installCommand}
             </span>
             <button
               type="button"
@@ -92,8 +118,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
           </div>
         ) : (
           <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            Install this custom server manually and make sure its command is
-            available on PATH.
+            {server.install ? "See the documentation for installation on this system." : "Install this custom server manually and make sure its command is available on PATH."}
           </p>
         )}
 
@@ -103,6 +128,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
             is available on PATH.
           </p>
         ) : null}
+        {error ? <p role="alert" className="text-xs text-destructive">{error}</p> : null}
 
         <DialogFooter className="items-center sm:justify-between">
           {server.install ? (
@@ -130,7 +156,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
               strokeWidth={1.9}
               className={checking ? "animate-spin" : undefined}
             />
-            {checking ? "Checking..." : "Check again"}
+            {saving ? "Saving…" : checking ? "Checking..." : "Check again"}
           </Button>
         </DialogFooter>
       </DialogContent>

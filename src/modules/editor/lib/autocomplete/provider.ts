@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   type AutocompleteProviderId,
   DEFAULT_AUTOCOMPLETE_MODEL,
@@ -8,16 +9,17 @@ import {
 import { buildLanguageModel } from "@/modules/ai/lib/agent";
 import { EMPTY_PROVIDER_KEYS } from "@/modules/ai/lib/keyring";
 import { generateText } from "ai";
+import type { CompletionAccess } from "./credential";
+import { hasCompletionProvider } from "./configuration";
 import {
   buildUserPrompt,
   COMPLETION_SYSTEM_PROMPT,
   type CompletionRequest,
 } from "./prompt";
 
-export type CompletionDeps = {
+export type CompletionDeps = CompletionAccess & {
   provider: AutocompleteProviderId;
   modelId: string;
-  apiKey: string | null;
   lmstudioBaseURL: string;
   mlxBaseURL?: string;
   ollamaBaseURL?: string;
@@ -35,18 +37,31 @@ export async function requestCompletion(
   deps: CompletionDeps,
   signal: AbortSignal,
 ): Promise<string> {
+  signal.throwIfAborted();
+  if (!hasCompletionProvider(deps))
+    throw new Error(
+      "Autocomplete credentials or server configuration are not ready.",
+    );
+  if (!req.filename || req.document?.allowed !== true)
+    throw new Error("Autocomplete document is not validated.");
   const modelId =
     deps.modelId.trim() || DEFAULT_AUTOCOMPLETE_MODEL[deps.provider] || "";
   if (!modelId) {
     throw new Error(`No autocomplete model id set for ${deps.provider}.`);
   }
   const keys = { ...EMPTY_PROVIDER_KEYS, [deps.provider]: deps.apiKey };
-  const model = await buildLanguageModel(deps.provider, keys, modelId, {
-    lmstudioBaseURL: deps.lmstudioBaseURL || LMSTUDIO_DEFAULT_BASE_URL,
-    mlxBaseURL: deps.mlxBaseURL,
-    ollamaBaseURL: deps.ollamaBaseURL,
-    openaiCompatibleBaseURL: deps.openaiCompatibleBaseURL,
-  });
+  const model = await buildLanguageModel(
+    deps.provider,
+    keys,
+    modelId,
+    {
+      lmstudioBaseURL: deps.lmstudioBaseURL || LMSTUDIO_DEFAULT_BASE_URL,
+      mlxBaseURL: deps.mlxBaseURL,
+      ollamaBaseURL: deps.ollamaBaseURL,
+      openaiCompatibleBaseURL: deps.openaiCompatibleBaseURL,
+    },
+    deps.provider === "openai-compatible" ? deps.apiKey : undefined,
+  );
 
   const isReasoning = modelUsesReasoningTokens(deps.provider, modelId);
   const providerOptions = isReasoning
@@ -54,14 +69,22 @@ export async function requestCompletion(
         anthropic: { effort: "low" },
         cerebras: { reasoningEffort: "low" },
         groq: { reasoningEffort: "low" },
-        openai: { reasoningEffort: "low" },
+        // v7 turns on detailed reasoning summaries whenever an effort is
+        // set; a completion never shows them, so keep them off.
+        openai: { reasoningEffort: "low", reasoningSummary: null },
         xai: { reasoningEffort: "low" },
       }
     : undefined;
 
+  signal.throwIfAborted();
+  await invoke("ai_validate_document", {
+    path: req.filename,
+    workspace: req.document.workspace,
+  });
+  signal.throwIfAborted();
   const { text } = await generateText({
     model,
-    system: COMPLETION_SYSTEM_PROMPT,
+    instructions: COMPLETION_SYSTEM_PROMPT,
     prompt: buildUserPrompt(req),
     maxOutputTokens: isReasoning
       ? MAX_OUTPUT_TOKENS_REASONING

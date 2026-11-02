@@ -1,16 +1,25 @@
-import type { TerminalSearchController } from "@/modules/terminal/search/TerminalSearchController";
+import { type MatchCount, sameMatchCount } from "@/lib/matchCount";
+import type {
+  TerminalSearchController,
+  TerminalSearchOptions,
+} from "@/modules/terminal/search/TerminalSearchController";
 import type {
   GhosttySearchStatus,
   GhosttyTerminalModelApi,
 } from "../GhosttyTerminalModel";
+import { MAX_REGEX_MATCHES, RegexTerminalSearch } from "./RegexTerminalSearch";
 
 const SEARCH_STEP_BUDGET = 256;
+/** Buffer lines a regex search scans per frame. */
+const REGEX_STEP_LINES = 128;
 
 type Direction = "next" | "previous";
 
 export type GhosttySearchSnapshot = {
   readonly query: string;
+  readonly regex?: boolean;
   readonly pendingDirection: Direction | null;
+  readonly regexError?: string;
 };
 
 type Scheduler = {
@@ -20,6 +29,8 @@ type Scheduler = {
 
 export class GhosttySearchController implements TerminalSearchController {
   private query = "";
+  private regex = false;
+  private regexSearch: RegexTerminalSearch | null = null;
   private status: GhosttySearchStatus = emptyStatus();
   private viewportMask: Uint8Array = new Uint8Array(0);
   private scratchMask: Uint8Array = new Uint8Array(0);
@@ -29,6 +40,8 @@ export class GhosttySearchController implements TerminalSearchController {
   private scheduledStep: number | null = null;
   private disposed = false;
   private suspended = false;
+  private count: MatchCount | null = null;
+  private readonly countListeners = new Set<() => void>();
 
   constructor(
     private readonly model: GhosttyTerminalModelApi,
@@ -36,16 +49,33 @@ export class GhosttySearchController implements TerminalSearchController {
     private readonly scheduler: Scheduler = browserScheduler(),
   ) {}
 
-  findNext(query: string): boolean {
-    return this.find(query, "next");
+  findNext(query: string, options?: TerminalSearchOptions): boolean {
+    return this.find(
+      query,
+      "next",
+      options?.regex === true,
+      options?.incremental !== true,
+    );
   }
 
-  findPrevious(query: string): boolean {
-    return this.find(query, "previous");
+  findPrevious(query: string, options?: TerminalSearchOptions): boolean {
+    return this.find(
+      query,
+      "previous",
+      options?.regex === true,
+      options?.incremental !== true,
+    );
   }
 
   snapshot(): GhosttySearchSnapshot {
-    return { query: this.query, pendingDirection: this.pendingDirection };
+    return {
+      query: this.query,
+      regex: this.regex,
+      pendingDirection: this.pendingDirection,
+      ...(this.regexSearch?.failure()
+        ? { regexError: this.regexSearch.failure() }
+        : {}),
+    };
   }
 
   restore(snapshot: GhosttySearchSnapshot): void {
@@ -53,16 +83,24 @@ export class GhosttySearchController implements TerminalSearchController {
     this.cancelStep();
     this.query = snapshot.query;
     this.pendingDirection = snapshot.pendingDirection;
+    this.setMode(snapshot.regex === true);
+    if (this.regex && this.query) {
+      this.status = this.regexEngine().setQuery(this.query);
+      if (snapshot.regexError)
+        this.regexEngine().restoreFailure(snapshot.regexError);
+    }
     this.refresh();
   }
 
   suspend(): void {
     this.suspended = true;
     this.cancelStep();
+    this.regexSearch?.suspend();
   }
 
   resume(): void {
     this.suspended = false;
+    this.regexSearch?.resume();
     this.refresh();
   }
 
@@ -72,9 +110,23 @@ export class GhosttySearchController implements TerminalSearchController {
     this.query = "";
     this.pendingDirection = null;
     this.model.clearSearch();
+    this.regexSearch?.clear();
+    this.regex = false;
     this.status = emptyStatus();
     this.commitMask(new Uint8Array(0), 0);
+    this.publishCount();
     this.onChange();
+  }
+
+  matchCount(): MatchCount | null {
+    return this.count;
+  }
+
+  subscribeMatchCount(listener: () => void): () => void {
+    this.countListeners.add(listener);
+    return () => {
+      this.countListeners.delete(listener);
+    };
   }
 
   refreshOverlay(): void {
@@ -106,7 +158,10 @@ export class GhosttySearchController implements TerminalSearchController {
   }
 
   invalidate(): void {
-    if (!this.disposed && !this.suspended && this.query) this.scheduleStep();
+    if (!this.disposed && !this.suspended && this.query) {
+      if (this.regex) this.regexSearch?.invalidate();
+      this.scheduleStep();
+    }
   }
 
   matchAt(row: number, column: number): 0 | 1 | 2 {
@@ -128,18 +183,30 @@ export class GhosttySearchController implements TerminalSearchController {
     if (this.disposed) return;
     this.disposed = true;
     this.cancelStep();
+    this.regexSearch?.dispose();
+    this.countListeners.clear();
     this.viewportMask = new Uint8Array(0);
     this.scratchMask = new Uint8Array(0);
     this.maskCells = 0;
     this.maskRevisionValue += 1;
   }
 
-  private find(query: string, direction: Direction): boolean {
+  private find(
+    query: string,
+    direction: Direction,
+    regex: boolean,
+    retry: boolean,
+  ): boolean {
     if (this.disposed || this.suspended || query.length === 0) return false;
-    if (query !== this.query) {
+    if (query !== this.query || regex !== this.regex) {
       this.cancelStep();
       this.query = query;
-      this.status = this.model.setSearchQuery(query);
+      this.setMode(regex);
+      this.status = regex
+        ? this.regexEngine().setQuery(query)
+        : this.model.setSearchQuery(query);
+    } else if (regex && retry && this.regexSearch?.failure()) {
+      this.regexSearch.retry();
     }
     this.pendingDirection = direction;
     this.step();
@@ -148,7 +215,9 @@ export class GhosttySearchController implements TerminalSearchController {
 
   private step(): void {
     if (this.disposed || this.suspended || !this.query) return;
-    this.status = this.model.stepSearch(SEARCH_STEP_BUDGET);
+    this.status = this.regex
+      ? this.regexEngine().step(REGEX_STEP_LINES)
+      : this.model.stepSearch(SEARCH_STEP_BUDGET);
     if (
       this.status.complete &&
       this.status.totalMatches > 0 &&
@@ -156,12 +225,25 @@ export class GhosttySearchController implements TerminalSearchController {
     ) {
       const direction = this.pendingDirection;
       this.pendingDirection = null;
-      this.status = this.model.selectSearchMatch(direction);
+      this.status = this.regex
+        ? this.regexEngine().select(direction)
+        : this.model.selectSearchMatch(direction);
     }
     this.rebuildViewportMask();
+    this.publishCount();
     this.onChange();
-    if (!this.status.complete) this.scheduleStep();
+    if (!this.status.complete && !this.regex) this.scheduleStep();
     else this.cancelStep();
+  }
+
+  /** Steps run often while output streams: listeners hear only real changes. */
+  private publishCount(): void {
+    const base = this.query ? searchMatchCount(this.status, this.regex) : null;
+    const error = this.regex ? this.regexSearch?.failure() : undefined;
+    const next = base && error ? { ...base, error } : base;
+    if (sameMatchCount(this.count, next)) return;
+    this.count = next;
+    for (const listener of [...this.countListeners]) listener();
   }
 
   private rebuildViewportMask(): void {
@@ -172,7 +254,10 @@ export class GhosttySearchController implements TerminalSearchController {
       this.scratchMask.fill(0);
     }
     let cells = 0;
-    for (const match of this.model.searchViewportMatches()) {
+    const matches = this.regex
+      ? this.regexEngine().viewportMatches()
+      : this.model.searchViewportMatches();
+    for (const match of matches) {
       if (match.row < 0 || match.row >= this.model.rows) continue;
       const start = Math.max(0, Math.min(this.model.cols, match.startColumn));
       const end = Math.max(start, Math.min(this.model.cols, match.endColumn));
@@ -201,7 +286,23 @@ export class GhosttySearchController implements TerminalSearchController {
     return true;
   }
 
+  /** Switches between the core's literal search and the regex engine. */
+  private setMode(regex: boolean): void {
+    if (regex === this.regex) return;
+    if (regex) this.model.clearSearch();
+    else this.regexSearch?.clear();
+    this.regex = regex;
+  }
+
+  private regexEngine(): RegexTerminalSearch {
+    this.regexSearch ??= new RegexTerminalSearch(this.model, () =>
+      this.scheduleStep(),
+    );
+    return this.regexSearch;
+  }
+
   private scheduleStep(): void {
+    if (this.disposed || this.suspended) return;
     if (this.scheduledStep !== null) return;
     this.scheduledStep = this.scheduler.request(() => {
       this.scheduledStep = null;
@@ -215,6 +316,23 @@ export class GhosttySearchController implements TerminalSearchController {
     }
     this.scheduledStep = null;
   }
+}
+
+/**
+ * The count a search status stands for. The selected index counts in the
+ * engine's own order, as Ghostty's search shows it; the regex engine stops
+ * counting at its cap.
+ */
+export function searchMatchCount(
+  status: GhosttySearchStatus,
+  regex: boolean,
+): MatchCount {
+  return {
+    current: status.selectedIndex >= 0 ? status.selectedIndex + 1 : 0,
+    total: status.totalMatches,
+    capped: regex && status.totalMatches >= MAX_REGEX_MATCHES,
+    pending: !status.complete,
+  };
 }
 
 function emptyStatus(): GhosttySearchStatus {

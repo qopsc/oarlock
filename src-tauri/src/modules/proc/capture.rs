@@ -6,7 +6,7 @@
 
 use std::io::{self, Read};
 use std::process::Command;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +19,9 @@ const READ_CHUNK: usize = 16 * 1024;
 /// pin the caller until it exits.
 const EXITED_DRAIN_GRACE: Duration = Duration::from_millis(750);
 const KILLED_DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// How long a process group may take to exit after SIGTERM before SIGKILL.
+#[cfg(unix)]
+pub(crate) const TERM_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -29,35 +32,282 @@ pub struct Limits {
     pub stop_on_stdout_cap: bool,
 }
 
+/// How a child that outlives its timeout is stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnTimeout {
+    /// Kill the child alone.
+    Kill,
+    /// On Unix the child leads its own process group, which gets SIGTERM and,
+    /// after `TERM_GRACE`, SIGKILL: the child can clean up (git removes its
+    /// lock files) and whatever it started (hooks) ends with it. Elsewhere
+    /// the same as `Kill`.
+    TerminateGroup,
+}
+
 #[derive(Debug, Default)]
 pub struct Captured {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
+    pub stdout_incomplete: bool,
     pub stderr_truncated: bool,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+}
+
+/// A shell session's lifetime. Closing it wins even while a command is spawning.
+#[derive(Default)]
+pub struct Cancellation {
+    requested: std::sync::atomic::AtomicBool,
+    state: Mutex<CancelState>,
+}
+#[derive(Default)]
+struct CancelState {
+    children: Vec<Weak<RunningChild>>,
+}
+impl Cancellation {
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Prevent future spawns without waiting for process teardown on the UI thread.
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn cancel(&self) {
+        self.request();
+        let children = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep weak references until cleanup ends. A concurrent Stop/shutdown
+            // must also wait for each child's serialized stop, not return early.
+            state.children.clone()
+        };
+        for child in children.into_iter().filter_map(|child| child.upgrade()) {
+            child.stop();
+        }
+    }
+    fn spawn(
+        &self,
+        cmd: &mut Command,
+        how: OnTimeout,
+        stdin_control: bool,
+    ) -> io::Result<Arc<RunningChild>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shell command cancelled",
+            ));
+        }
+        let child = Arc::new(RunningChild::spawn(cmd, how, stdin_control, true)?);
+        state.children.retain(|child| child.strong_count() > 0);
+        state.children.push(Arc::downgrade(&child));
+        Ok(child)
+    }
+}
+
+struct RunningChild {
+    child: Arc<SharedChild>,
+    #[cfg(unix)]
+    tree: Option<super::group::ProcessTree>,
+    how: OnTimeout,
+    stdin_control: bool,
+    control: Mutex<Option<std::process::ChildStdin>>,
+    // Serialize completion against cancellation: never signal a completed pid.
+    stopped: Mutex<bool>,
+    #[cfg(windows)]
+    job: Mutex<Option<crate::modules::proc::job::ProcessJob>>,
+}
+impl RunningChild {
+    fn spawn(
+        cmd: &mut Command,
+        how: OnTimeout,
+        stdin_control: bool,
+        #[cfg_attr(not(windows), allow(unused_variables))] owned: bool,
+    ) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        let child = Arc::new(SharedChild::spawn(cmd)?);
+        #[cfg(windows)]
+        let (child, job) = if owned && how == OnTimeout::TerminateGroup && !stdin_control {
+            let (child, job) = crate::modules::proc::job::spawn_tree(cmd)?;
+            (Arc::new(child), Some(job))
+        } else {
+            (Arc::new(SharedChild::spawn(cmd)?), None)
+        };
+        let control = if stdin_control {
+            child.take_stdin()
+        } else {
+            None
+        };
+        Ok(Self {
+            #[cfg(unix)]
+            tree: (owned && how == OnTimeout::TerminateGroup && !stdin_control)
+                .then(|| super::group::ProcessTree::new(child.clone())),
+            child,
+            how,
+            stdin_control,
+            control: Mutex::new(control),
+            stopped: Mutex::new(false),
+            #[cfg(windows)]
+            job: Mutex::new(job),
+        })
+    }
+    fn stop(&self) {
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        if *stopped {
+            return;
+        }
+        *stopped = true;
+        if self.stdin_control {
+            // EOF tells the WSL supervisor to kill its Linux process group.
+            drop(
+                self.control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
+            // EOF requests termination; the supervisor's exit confirms it.
+            // Keep the cancellation lock held so concurrent cleanup also waits.
+            let _ = self.child.wait();
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(tree) = &self.tree {
+            tree.stop();
+            return;
+        }
+        #[cfg(windows)]
+        drop(self.job.lock().unwrap_or_else(|e| e.into_inner()).take());
+        stop(&self.child, self.how);
+    }
+    fn wait(&self, timeout: Duration) -> io::Result<(Option<i32>, bool)> {
+        #[cfg(unix)]
+        if let Some(tree) = &self.tree {
+            return tree.foreground(timeout).map(|(status, timed_out)| {
+                (if timed_out { None } else { status.code() }, timed_out)
+            });
+        }
+        match self.child.wait_timeout(timeout)? {
+            Some(status) => Ok((status.code(), false)),
+            None => {
+                self.stop();
+                let _ = self.child.wait();
+                Ok((None, true))
+            }
+        }
+    }
+    fn finish(&self) {
+        #[cfg(windows)]
+        drop(self.job.lock().unwrap_or_else(|e| e.into_inner()).take());
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+}
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[derive(Default)]
 struct Drained {
     bytes: Vec<u8>,
     truncated: bool,
+    incomplete: bool,
 }
 
 struct Reader {
     shared: Arc<Mutex<Drained>>,
     done: mpsc::Receiver<()>,
+    #[cfg(unix)]
+    wake: Option<std::os::unix::net::UnixStream>,
+}
+
+#[cfg(unix)]
+trait CaptureInput: Read + Send + std::os::fd::AsRawFd + 'static {}
+#[cfg(unix)]
+impl<T: Read + Send + std::os::fd::AsRawFd + 'static> CaptureInput for T {}
+#[cfg(not(unix))]
+trait CaptureInput: Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: Read + Send + 'static> CaptureInput for T {}
+
+#[cfg(unix)]
+pub(crate) struct InterruptibleReader<R> {
+    input: R,
+    wake: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+impl<R> InterruptibleReader<R> {
+    pub(crate) fn new(input: R) -> io::Result<(Self, std::os::unix::net::UnixStream)> {
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        Ok((Self { input, wake: read }, write))
+    }
+}
+
+#[cfg(unix)]
+impl<R: Read + std::os::fd::AsRawFd> Read for InterruptibleReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.input.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if fds[1].revents != 0 {
+                return Ok(0);
+            }
+            if fds[0].revents != 0 {
+                return self.input.read(output);
+            }
+        }
+    }
 }
 
 /// Keeps reading past the cap so the child never blocks on a full pipe, unless
 /// `on_cap` is given, which is called once when the cap is first exceeded.
-fn drain<R: Read>(mut reader: R, cap: usize, shared: &Mutex<Drained>, on_cap: Option<&dyn Fn()>) {
+pub type OutputObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+fn drain<R: Read>(
+    mut reader: R,
+    cap: usize,
+    shared: &Mutex<Drained>,
+    on_cap: Option<&dyn Fn()>,
+    observer: Option<&OutputObserver>,
+) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                shared.lock().unwrap_or_else(|e| e.into_inner()).incomplete = true;
+                break;
+            }
             Ok(n) => {
+                if let Some(observer) = observer {
+                    observer(&buf[..n]);
+                }
                 let mut out = shared.lock().unwrap_or_else(|e| e.into_inner());
                 let take = cap.saturating_sub(out.bytes.len()).min(n);
                 out.bytes.extend_from_slice(&buf[..take]);
@@ -74,12 +324,18 @@ fn drain<R: Read>(mut reader: R, cap: usize, shared: &Mutex<Drained>, on_cap: Op
     }
 }
 
-fn spawn_reader<R: Read + Send + 'static>(
+fn spawn_reader<R: CaptureInput>(
     name: &'static str,
     reader: R,
     cap: usize,
     on_cap: Option<Arc<SharedChild>>,
+    observer: Option<OutputObserver>,
 ) -> io::Result<Reader> {
+    #[cfg(unix)]
+    let (reader, wake) = {
+        let (reader, write) = InterruptibleReader::new(reader)?;
+        (reader, Some(write))
+    };
     let shared = Arc::new(Mutex::new(Drained::default()));
     let (tx, done) = mpsc::channel();
     let writer = shared.clone();
@@ -92,25 +348,92 @@ fn spawn_reader<R: Read + Send + 'static>(
                     let _ = child.kill();
                 }
             });
-            drain(reader, cap, &writer, stop.as_ref().map(|f| f as &dyn Fn()));
+            drain(
+                reader,
+                cap,
+                &writer,
+                stop.as_ref().map(|f| f as &dyn Fn()),
+                observer.as_ref(),
+            );
             let _ = tx.send(());
         })?;
-    Ok(Reader { shared, done })
+    Ok(Reader {
+        shared,
+        done,
+        #[cfg(unix)]
+        wake,
+    })
 }
 
-/// Waits for EOF up to `grace`, then returns whatever has arrived. The reader
-/// stays bounded by `cap` and exits on its own when the pipe finally closes.
+/// Waits for EOF up to `grace`, then interrupts a Unix reader still waiting on a pipe.
 fn collect(reader: &Reader, grace: Duration) -> Drained {
-    let _ = reader.done.recv_timeout(grace);
-    std::mem::take(&mut *reader.shared.lock().unwrap_or_else(|e| e.into_inner()))
+    let complete = reader.done.recv_timeout(grace).is_ok();
+    #[cfg(unix)]
+    if !complete {
+        if let Some(wake) = &reader.wake {
+            let _ = wake.shutdown(std::net::Shutdown::Write);
+        }
+    }
+    let mut out = std::mem::take(&mut *reader.shared.lock().unwrap_or_else(|e| e.into_inner()));
+    out.incomplete |= !complete;
+    out
 }
 
 /// `cmd` must already pipe stdout and stderr. Blocks the calling thread, so run
 /// it on the blocking pool.
 pub fn run(cmd: &mut Command, timeout: Duration, limits: Limits) -> io::Result<Captured> {
-    let child = Arc::new(SharedChild::spawn(cmd)?);
+    run_with(cmd, timeout, limits, OnTimeout::Kill)
+}
+
+pub fn run_with(
+    cmd: &mut Command,
+    timeout: Duration,
+    limits: Limits,
+    on_timeout: OnTimeout,
+) -> io::Result<Captured> {
+    run_cancellable(cmd, timeout, limits, on_timeout, None, false)
+}
+
+pub fn run_cancellable(
+    cmd: &mut Command,
+    timeout: Duration,
+    limits: Limits,
+    on_timeout: OnTimeout,
+    cancellation: Option<&Cancellation>,
+    stdin_control: bool,
+) -> io::Result<Captured> {
+    run_observed(
+        cmd,
+        timeout,
+        limits,
+        on_timeout,
+        cancellation,
+        stdin_control,
+        None,
+    )
+}
+
+pub fn run_observed(
+    cmd: &mut Command,
+    timeout: Duration,
+    limits: Limits,
+    on_timeout: OnTimeout,
+    cancellation: Option<&Cancellation>,
+    stdin_control: bool,
+    stdout_observer: Option<OutputObserver>,
+) -> io::Result<Captured> {
+    #[cfg(unix)]
+    if on_timeout == OnTimeout::TerminateGroup {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let running = match cancellation {
+        Some(cancel) => cancel.spawn(cmd, on_timeout, stdin_control)?,
+        None => Arc::new(RunningChild::spawn(cmd, on_timeout, stdin_control, false)?),
+    };
+    let child = running.child.clone();
     let fail = |error: io::Error| {
-        let _ = child.kill();
+        running.stop();
         let _ = child.wait();
         error
     };
@@ -121,23 +444,19 @@ pub fn run(cmd: &mut Command, timeout: Duration, limits: Limits) -> io::Result<C
         .take_stderr()
         .ok_or_else(|| fail(io::Error::other("no stderr pipe")))?;
     let stdout_reader = spawn_reader(
-        "terax-cap-out",
+        "oarlock-cap-out",
         stdout,
         limits.stdout,
         limits.stop_on_stdout_cap.then(|| child.clone()),
+        stdout_observer,
     )
     .map_err(fail)?;
-    let stderr_reader = spawn_reader("terax-cap-err", stderr, limits.stderr, None).map_err(fail)?;
+    let stderr_reader =
+        spawn_reader("oarlock-cap-err", stderr, limits.stderr, None, None).map_err(fail)?;
 
-    let (exit_code, timed_out) = match child.wait_timeout(timeout)? {
-        Some(status) => (status.code(), false),
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            (None, true)
-        }
-    };
+    let (exit_code, timed_out) = running.wait(timeout)?;
 
+    running.finish();
     let grace = if timed_out {
         KILLED_DRAIN_GRACE
     } else {
@@ -149,10 +468,31 @@ pub fn run(cmd: &mut Command, timeout: Duration, limits: Limits) -> io::Result<C
         stdout: out.bytes,
         stderr: err.bytes,
         stdout_truncated: out.truncated,
+        stdout_incomplete: out.incomplete,
         stderr_truncated: err.truncated,
         exit_code,
         timed_out,
     })
+}
+
+fn stop(child: &SharedChild, how: OnTimeout) {
+    #[cfg(unix)]
+    if how == OnTimeout::TerminateGroup {
+        let group = child.id() as libc::pid_t;
+        // SAFETY: plain syscalls on the process group this call created. A
+        // group id is not reused while any member lives, so SIGKILL after the
+        // leader is reaped still reaches only what it left behind.
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        let exited = matches!(child.wait_timeout(TERM_GRACE), Ok(Some(_)));
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        if exited {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = how;
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(all(test, unix))]
@@ -176,6 +516,123 @@ mod tests {
         stderr: 1024,
         stop_on_stdout_cap: false,
     };
+
+    #[test]
+    fn control_pipe_cancellation_waits_for_supervisor_exit() {
+        // Emulate the interval between WSL receiving EOF and the supervisor
+        // actually exiting. Stop must not release a chat/window in that gap.
+        let cancel = Cancellation::default();
+        let mut cmd = sh("read signal; sleep 0.2; exit 0");
+        cmd.stdin(Stdio::piped());
+        let child = cancel.spawn(&mut cmd, OnTimeout::Kill, true).unwrap();
+        cancel.cancel();
+        let exited_when_cancel_returned = child.child.try_wait().unwrap().is_some();
+        child.child.wait().unwrap();
+        assert!(
+            exited_when_cancel_returned,
+            "Stop returned with the supervisor still running"
+        );
+    }
+    #[test]
+    fn cancellation_request_rejects_spawns_before_cleanup_runs() {
+        let cancel = Cancellation::default();
+        cancel.request();
+        let error = run_cancellable(
+            &mut sh("exit 0"),
+            Duration::from_secs(5),
+            LIMITS,
+            OnTimeout::TerminateGroup,
+            Some(&cancel),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+    #[test]
+    fn concurrent_cancellers_both_wait_for_process_cleanup() {
+        use std::os::unix::process::CommandExt;
+        let cancel = Arc::new(Cancellation::default());
+        let mut cmd = sh("sleep 30");
+        cmd.process_group(0);
+        let child = cancel
+            .spawn(&mut cmd, OnTimeout::TerminateGroup, false)
+            .unwrap();
+        // Hold the real cleanup lock to reproduce a close/shutdown overlap
+        // deterministically; neither caller may report cancellation finished yet.
+        let held = child.stopped.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let first_cancel = cancel.clone();
+        let first_send = send.clone();
+        let first = thread::spawn(move || {
+            first_cancel.cancel();
+            first_send.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cancel.requested.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let second = thread::spawn(move || {
+            cancel.cancel();
+            send.send(()).unwrap();
+        });
+        assert!(receive.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(held);
+        receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        child.child.wait().unwrap();
+    }
+
+    #[test]
+    fn cancellation_before_spawn_never_starts_the_command() {
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let error = run_cancellable(
+            &mut sh("exit 0"),
+            Duration::from_secs(5),
+            LIMITS,
+            OnTimeout::TerminateGroup,
+            Some(&cancel),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancellation_stops_command_and_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let survived = dir.path().join("survived");
+        let cancel = Arc::new(Cancellation::default());
+        let worker_cancel = cancel.clone();
+        let script = format!(
+            "(trap '' TERM; sleep 1; touch '{}') & touch '{}'; wait",
+            survived.display(),
+            ready.display()
+        );
+        let worker = thread::spawn(move || {
+            run_cancellable(
+                &mut sh(&script),
+                Duration::from_secs(30),
+                LIMITS,
+                OnTimeout::TerminateGroup,
+                Some(&worker_cancel),
+                false,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel.cancel();
+        assert!(!worker.join().unwrap().unwrap().timed_out);
+        thread::sleep(Duration::from_millis(1200));
+        assert!(!survived.exists(), "grandchild survived cancellation");
+    }
 
     #[test]
     fn captures_both_streams_and_the_exit_code() {
@@ -235,6 +692,41 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_group_gets_sigterm_first_so_it_can_clean_up() {
+        let out = run_with(
+            &mut sh("trap 'printf cleaned; exit 1' TERM; sleep 30 & wait"),
+            Duration::from_millis(300),
+            LIMITS,
+            OnTimeout::TerminateGroup,
+        )
+        .unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.stdout, b"cleaned");
+    }
+
+    #[test]
+    fn a_timed_out_group_takes_what_the_child_started_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let script = format!(
+            "(trap '' TERM; sleep 1; touch '{}') & wait",
+            marker.display()
+        );
+        let started = Instant::now();
+        let out = run_with(
+            &mut sh(&script),
+            Duration::from_millis(200),
+            LIMITS,
+            OnTimeout::TerminateGroup,
+        )
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "a grandchild outlived the timeout");
+    }
+
+    #[test]
     fn a_backgrounded_grandchild_holding_the_pipes_does_not_pin_the_caller() {
         let started = Instant::now();
         let out = run(
@@ -254,9 +746,45 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_blocked_by_an_inherited_pipe_exits_after_the_drain_deadline() {
+        let (read, _held_open) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader = spawn_reader("capture-deadline-test", read, 1024, None, None).unwrap();
+        assert!(collect(&reader, Duration::from_millis(20)).incomplete);
+        assert!(
+            reader.done.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "reader thread survived its drain deadline while the pipe remained open"
+        );
+    }
+
+    #[test]
     fn spawn_failure_is_an_error() {
         let mut cmd = Command::new("/definitely/not/a/binary");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         assert!(run(&mut cmd, Duration::from_secs(1), LIMITS).is_err());
+    }
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+    #[test]
+    fn read_errors_and_missing_eof_are_not_complete_output() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken stream"))
+            }
+        }
+        let shared = Mutex::new(Drained::default());
+        drain(Broken, 10, &shared, None, None);
+        assert!(shared.lock().unwrap().incomplete);
+        let (_send, done) = mpsc::channel();
+        let reader = Reader {
+            shared: Arc::new(Mutex::new(Drained::default())),
+            done,
+            #[cfg(unix)]
+            wake: None,
+        };
+        assert!(collect(&reader, Duration::ZERO).incomplete);
     }
 }

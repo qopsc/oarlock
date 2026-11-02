@@ -1,11 +1,42 @@
 import { describe, expect, it } from "vitest";
 import {
   beginSourceControlRefresh,
+  commandTouchesRepository,
   planContextRefresh,
   repositoryContainsContext,
 } from "./useSourceControl";
 
+describe("commandTouchesRepository", () => {
+  it("counts commands run anywhere inside the repository", () => {
+    expect(commandTouchesRepository("/repo", "/repo", null)).toBe(true);
+    expect(commandTouchesRepository("/repo/src", "/repo", "/elsewhere")).toBe(
+      true,
+    );
+  });
+
+  it("counts the context spelled through a link the canonical root misses", () => {
+    expect(
+      commandTouchesRepository(
+        "/tmp/repo/src",
+        "/private/tmp/repo",
+        "/tmp/repo",
+      ),
+    ).toBe(true);
+  });
+
+  it("ignores commands elsewhere", () => {
+    expect(commandTouchesRepository("/other", "/repo", "/repo/src")).toBe(
+      false,
+    );
+    expect(commandTouchesRepository("/repo-two", "/repo", null)).toBe(false);
+  });
+});
+
 describe("repositoryContainsContext", () => {
+  it("does not confuse a Unix backslash with a directory separator", () => {
+    expect(repositoryContainsContext("/repo\\name", "/repo\\name/src")).toBe(true);
+    expect(repositoryContainsContext("/repo\\name", "/repo/name/src")).toBe(false);
+  });
   it("matches a repository root and its descendants", () => {
     expect(repositoryContainsContext("/repo", "/repo")).toBe(true);
     expect(repositoryContainsContext("/repo", "/repo/packages/app")).toBe(
@@ -47,6 +78,7 @@ describe("beginSourceControlRefresh", () => {
       branch: "main",
       upstream: null,
       isDetached: false,
+      linkedWorktree: null,
     },
     status: {
       repoRoot: "/old/repo",

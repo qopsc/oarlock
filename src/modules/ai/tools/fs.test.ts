@@ -1,0 +1,406 @@
+import type { ToolExecutionOptions } from "ai";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ToolContext } from "./context";
+
+const nativeMock = vi.hoisted(() => ({
+  canonicalize: vi.fn(async (path: string) => path),
+  readFile: vi.fn(),
+  writeFile: vi.fn(async () => ({ version: "v2" })),
+  readDir: vi.fn(),
+  createDir: vi.fn(async () => undefined),
+}));
+
+type SafetyCheck =
+  | { ok: true; canonical: string }
+  | { ok: false; reason: string };
+
+const securityMock = vi.hoisted(() => ({
+  checkReadableCanonical: vi.fn<(path: string) => Promise<SafetyCheck>>(
+    async (path) => ({ ok: true, canonical: path }),
+  ),
+  checkWritableCanonical: vi.fn<(path: string) => Promise<SafetyCheck>>(
+    async (path) => ({ ok: true, canonical: path }),
+  ),
+}));
+
+const planMock = vi.hoisted(() => ({
+  active: false,
+  enqueue: vi.fn(),
+}));
+
+vi.mock("../lib/native", () => ({ native: nativeMock }));
+vi.mock("../lib/security", () => securityMock);
+vi.mock("../store/planStore", () => ({
+  newQueuedEditId: () => "queued-id",
+  usePlanStore: {
+    getState: () => ({ active: planMock.active, enqueue: planMock.enqueue }),
+  },
+}));
+
+import { buildFsTools } from "./fs";
+
+const toolOptions: ToolExecutionOptions<Record<string, unknown>> = {
+  toolCallId: "tool-call",
+  messages: [],
+  context: {},
+};
+
+const FILE = "/workspace/a.txt";
+
+function makeContext(
+  readCache = new Map<
+    string,
+    { size: number; hash: number; version?: string | null }
+  >(),
+): ToolContext {
+  return {
+    getCwd: () => "/workspace",
+    getWorkspaceRoot: () => "/workspace",
+    getTerminalContext: () => null,
+    isActiveTerminalPrivate: () => false,
+    injectIntoActivePty: () => false,
+    openPreview: () => false,
+    spawnAgent: () => null,
+    readAgentOutput: () => null,
+    readCache,
+    getSessionId: () => "session",
+  } as unknown as ToolContext;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: tool results are heterogeneous.
+type Result = Record<string, any>;
+
+async function run(
+  toolName: "read_file" | "list_directory" | "write_file" | "create_directory",
+  ctx: ToolContext,
+  input: Record<string, unknown>,
+): Promise<Result> {
+  const execute = buildFsTools(ctx)[toolName].execute;
+  if (!execute) throw new Error(`${toolName} has no execute`);
+  return (await execute(input as never, toolOptions)) as unknown as Result;
+}
+
+// fs_read_file reports the size on disk, in bytes.
+function textFile(content: string) {
+  nativeMock.readFile.mockResolvedValue({
+    kind: "text",
+    content,
+    size: new TextEncoder().encode(content).length,
+    version: "v1",
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  planMock.active = false;
+  nativeMock.canonicalize.mockImplementation(async (p: string) => p);
+  securityMock.checkReadableCanonical.mockImplementation(async (p: string) => ({
+    ok: true as const,
+    canonical: p,
+  }));
+  securityMock.checkWritableCanonical.mockImplementation(async (p: string) => ({
+    ok: true as const,
+    canonical: p,
+  }));
+  nativeMock.readFile.mockReset().mockRejectedValue(new Error("No such file"));
+  nativeMock.writeFile.mockReset().mockResolvedValue({ version: "v2" });
+});
+
+describe("read_file", () => {
+  it("returns file content and the line total", async () => {
+    textFile("one\ntwo\nthree");
+    const r = await run("read_file", makeContext(), { path: FILE });
+    expect(r.content).toBe("one\ntwo\nthree");
+    expect(r.total_lines).toBe(3);
+  });
+
+  it("refuses binary and oversized files", async () => {
+    nativeMock.readFile.mockResolvedValue({ kind: "binary", size: 5 });
+    expect(
+      (await run("read_file", makeContext(), { path: FILE })).error,
+    ).toContain("binary");
+
+    nativeMock.readFile.mockResolvedValue({
+      kind: "toolarge",
+      size: 9,
+      limit: 1,
+    });
+    expect(
+      (await run("read_file", makeContext(), { path: FILE })).error,
+    ).toContain("too large");
+  });
+
+  it("propagates a security refusal without reading", async () => {
+    securityMock.checkReadableCanonical.mockResolvedValue({
+      ok: false,
+      reason: "path is not readable",
+    });
+    const r = await run("read_file", makeContext(), { path: FILE });
+    expect(r.error).toContain("not readable");
+    expect(nativeMock.readFile).not.toHaveBeenCalled();
+  });
+
+  it("reports unchanged on a second identical full read", async () => {
+    textFile("stable");
+    const ctx = makeContext();
+    const first = await run("read_file", ctx, { path: FILE });
+    expect(first.content).toBe("stable");
+    const second = await run("read_file", ctx, { path: FILE });
+    expect(second.unchanged).toBe(true);
+    expect(second.content).toBeUndefined();
+  });
+
+  it("does not hide unread content after a partial read", async () => {
+    textFile("first\nsecond\nthird");
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE, offset: 1, limit: 1 });
+    expect(ctx.readCache.has(FILE)).toBe(true); // Partial reads still permit contextual edits.
+    const full = await run("read_file", ctx, { path: FILE });
+    expect(full.content).toBe("first\nsecond\nthird");
+    expect(full.unchanged).toBeUndefined();
+  });
+
+  it("does not treat a truncated response as a complete file read", async () => {
+    textFile("x".repeat(30 * 1024));
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE });
+    const again = await run("read_file", ctx, { path: FILE });
+    expect(again.content).toBeDefined();
+    expect(again.truncated).toBe(true);
+  });
+
+  it("preserves complete-read knowledge across windows of unchanged content", async () => {
+    textFile("first\nsecond");
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE });
+    await run("read_file", ctx, { path: FILE, offset: 1, limit: 1 });
+    expect((await run("read_file", ctx, { path: FILE })).unchanged).toBe(true);
+    textFile("first\nchanged");
+    await run("read_file", ctx, { path: FILE, offset: 1, limit: 1 });
+    expect((await run("read_file", ctx, { path: FILE })).content).toBe(
+      "first\nchanged",
+    );
+  });
+
+  it("truncates a full read past the 2000-line cap", async () => {
+    textFile(Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n"));
+    const r = await run("read_file", makeContext(), { path: FILE });
+    expect(r.truncated).toBe(true);
+    expect(r.total_lines).toBe(2500);
+    expect(r.content.split("\n").length).toBeLessThanOrEqual(2000);
+  });
+
+  it("windows by offset and limit", async () => {
+    textFile("l0\nl1\nl2\nl3\nl4");
+    const r = await run("read_file", makeContext(), {
+      path: FILE,
+      offset: 1,
+      limit: 2,
+    });
+    expect(r.content).toBe("l1\nl2");
+    expect(r.start_line).toBe(1);
+    expect(r.end_line).toBe(3);
+  });
+});
+
+describe("list_directory", () => {
+  it("maps entries to name and kind", async () => {
+    nativeMock.readDir.mockResolvedValue([
+      { name: "a.txt", kind: "file", size: 1, mtime: 0 },
+      { name: "sub", kind: "dir", size: 0, mtime: 0 },
+    ]);
+    const r = await run("list_directory", makeContext(), {
+      path: "/workspace",
+    });
+    expect(r.entries).toEqual([
+      { name: "a.txt", kind: "file" },
+      { name: "sub", kind: "dir" },
+    ]);
+  });
+
+  it("propagates a security refusal", async () => {
+    securityMock.checkReadableCanonical.mockResolvedValue({
+      ok: false,
+      reason: "denied",
+    });
+    expect(
+      (await run("list_directory", makeContext(), { path: "/x" })).error,
+    ).toContain("denied");
+    expect(nativeMock.readDir).not.toHaveBeenCalled();
+  });
+});
+
+describe("read_file versions", () => {
+  it("reads versioned and keeps the version for a later write", async () => {
+    textFile("one");
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE });
+    expect(nativeMock.readFile).toHaveBeenCalledWith(FILE, { versioned: true });
+    expect(ctx.readCache.get(FILE)?.version).toBe("v1");
+  });
+});
+
+describe("write_file", () => {
+  it("creates a new file only if it still does not exist", async () => {
+    const r = await run("write_file", makeContext(), {
+      path: FILE,
+      content: "café",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.bytesWritten).toBe(5);
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "café", null);
+  });
+
+  it("overwrites over the version the model read, without another read", async () => {
+    const ctx = makeContext(
+      new Map([[FILE, { size: 1, hash: 1, version: "v5" }]]),
+    );
+    const r = await run("write_file", ctx, { path: FILE, content: "new" });
+    expect(r.ok).toBe(true);
+    expect(nativeMock.readFile).not.toHaveBeenCalled();
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "new", "v5");
+    expect(ctx.readCache.get(FILE)?.version).toBe("v2");
+  });
+
+  it("overwrites an unread file over the version it has now", async () => {
+    textFile("existing");
+    await run("write_file", makeContext(), { path: FILE, content: "new" });
+    expect(nativeMock.readFile).toHaveBeenCalledWith(FILE, {
+      versioned: true,
+    });
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "new", "v1");
+  });
+
+  it("reports a file changed since the model read it and writes nothing", async () => {
+    const { StaleFileError } = await import("../lib/staleFile");
+    nativeMock.writeFile.mockRejectedValue(new StaleFileError(FILE));
+    const r = await run(
+      "write_file",
+      makeContext(new Map([[FILE, { size: 1, hash: 1, version: "v5" }]])),
+      { path: FILE, content: "new" },
+    );
+    expect(r.error).toContain("changed on disk");
+    expect(r.ok).toBeUndefined();
+  });
+
+  it("refuses to overwrite a binary or oversized file", async () => {
+    nativeMock.readFile.mockResolvedValue({ kind: "binary", size: 5 });
+    const r = await run("write_file", makeContext(), {
+      path: FILE,
+      content: "x",
+    });
+    expect(r.error).toContain("binary");
+    expect(nativeMock.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("lets the next read of non-ASCII content it wrote dedup", async () => {
+    const ctx = makeContext();
+    await run("write_file", ctx, { path: FILE, content: "naïve café ✓" });
+    textFile("naïve café ✓");
+
+    const r = await run("read_file", ctx, { path: FILE });
+
+    expect(r).toEqual({ path: FILE, unchanged: true, size: 16 });
+  });
+
+  it("queues instead of writing when plan mode is active", async () => {
+    planMock.active = true;
+    nativeMock.readFile.mockResolvedValue({
+      kind: "text",
+      content: "",
+      size: 0,
+      version: "v1",
+    });
+    const r = await run("write_file", makeContext(), {
+      path: FILE,
+      content: "hello",
+    });
+    expect(r.queued_for_plan_review).toBe(true);
+    expect(nativeMock.writeFile).not.toHaveBeenCalled();
+    expect(planMock.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "write_file",
+        path: FILE,
+        originalContent: "",
+        proposedContent: "hello",
+        baseVersion: "v1",
+        isNewFile: false,
+      }),
+    );
+  });
+
+  it("shows the plan review the file as it is, keeping the version the model read", async () => {
+    planMock.active = true;
+    nativeMock.readFile.mockResolvedValue({
+      kind: "text",
+      content: "line one\nline two",
+      size: 17,
+      version: "v7",
+    });
+    await run(
+      "write_file",
+      makeContext(new Map([[FILE, { size: 1, hash: 1, version: "v5" }]])),
+      { path: FILE, content: "line one" },
+    );
+    expect(planMock.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        originalContent: "line one\nline two",
+        proposedContent: "line one",
+        baseVersion: "v5",
+        isNewFile: false,
+      }),
+    );
+  });
+
+  it("propagates a security refusal without writing", async () => {
+    securityMock.checkWritableCanonical.mockResolvedValue({
+      ok: false,
+      reason: "read-only path",
+    });
+    const r = await run("write_file", makeContext(), {
+      path: FILE,
+      content: "x",
+    });
+    expect(r.error).toContain("read-only");
+    expect(nativeMock.writeFile).not.toHaveBeenCalled();
+  });
+});
+
+describe("create_directory", () => {
+  it("creates the directory", async () => {
+    const r = await run("create_directory", makeContext(), {
+      path: "/workspace/new",
+    });
+    expect(r.ok).toBe(true);
+    expect(nativeMock.createDir).toHaveBeenCalledWith("/workspace/new");
+  });
+
+  it("queues instead of creating when plan mode is active", async () => {
+    planMock.active = true;
+    const r = await run("create_directory", makeContext(), {
+      path: "/workspace/new",
+    });
+    expect(r.queued_for_plan_review).toBe(true);
+    expect(nativeMock.createDir).not.toHaveBeenCalled();
+    expect(planMock.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "create_directory",
+        path: "/workspace/new",
+        isNewFile: true,
+        description: "Create directory",
+      }),
+    );
+  });
+
+  it("propagates a security refusal without creating", async () => {
+    securityMock.checkWritableCanonical.mockResolvedValue({
+      ok: false,
+      reason: "protected directory",
+    });
+    const r = await run("create_directory", makeContext(), {
+      path: "/etc/new-dir",
+    });
+    expect(r.error).toContain("protected");
+    expect(nativeMock.createDir).not.toHaveBeenCalled();
+  });
+});

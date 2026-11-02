@@ -1,3 +1,5 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -8,7 +10,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
-  native,
+  createNative,
   type GitCommitFileChange,
   type GitLogEntry,
 } from "@/modules/ai/lib/native";
@@ -17,6 +19,7 @@ import {
   Copy01Icon,
   File02Icon,
   LinkSquare02Icon,
+  Undo02Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -33,12 +36,16 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { GraphRail, MAX_VISIBLE_LANES, railWidth } from "./GraphRail";
+import { RefChips } from "./RefChips";
+import { UndoCommitDialog } from "./UndoCommitDialog";
 import {
   EMPTY_GRAPH_STATE,
   layoutGraph,
   type GraphRow,
   type GraphState,
 } from "./lib/graph";
+import { nextHistoryPage } from "./lib/historyPaging";
+import { refsMatch, undoableBranch } from "./lib/refs";
 import {
   commitWebUrl,
   hostLabel,
@@ -194,6 +201,8 @@ export function GitHistoryPane({
   onOpenCommitFile,
   onSearchHandle,
 }: Props) {
+  const workspace = useOwnedWorkspace();
+  const native = useMemo(() => createNative(() => workspace), [workspace]);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
   const [loadStatus, setLoadStatus] = useState<LoadStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -224,6 +233,14 @@ export function GitHistoryPane({
   const bumpFiles = useCallback(() => setFilesTick((n) => n + 1), []);
 
   const requestIdRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestIdRef.current += 1;
+    };
+  }, []);
   const inflightMoreRef = useRef(false);
   const filesInflightRef = useRef(new Set<string>());
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -301,7 +318,8 @@ export function GitHistoryPane({
         subject.includes(q) ||
         author.includes(q) ||
         email.includes(q) ||
-        c.shortSha.includes(q)
+        c.shortSha.includes(q) ||
+        refsMatch(c.refs, q)
       );
     });
   }, [commits, activeSearch]);
@@ -315,6 +333,11 @@ export function GitHistoryPane({
   });
 
   const loadInitial = useCallback(async () => {
+    if (!mountedRef.current) return;
+    inflightMoreRef.current = false;
+    filesInflightRef.current.clear();
+    filesCacheRef.current.clear();
+    bumpFiles();
     const requestId = ++requestIdRef.current;
     setLoadStatus("initial");
     setError(null);
@@ -330,20 +353,23 @@ export function GitHistoryPane({
       setError(normalizeError(err));
       setLoadStatus("error");
     }
-  }, [repoRoot]);
+  }, [bumpFiles, native, repoRoot]);
 
   const loadMore = useCallback(async () => {
+    if (!mountedRef.current) return;
     if (inflightMoreRef.current || endReached) return;
     if (loadStatus !== "idle") return;
-    const last = commits[commits.length - 1];
-    if (!last) return;
+    const page = nextHistoryPage(commits);
+    if (!page) return;
+    const requestId = requestIdRef.current;
     inflightMoreRef.current = true;
     setLoadStatus("more");
     try {
       const entries = await native.gitLog(repoRoot, {
         limit: PAGE_SIZE,
-        beforeSha: last.sha,
+        ...page,
       });
+      if (requestId !== requestIdRef.current) return;
       setCommits((prev) => {
         const seen = new Set(prev.map((c) => c.sha));
         const merged = [...prev];
@@ -353,21 +379,19 @@ export function GitHistoryPane({
       if (entries.length < PAGE_SIZE) setEndReached(true);
       setLoadStatus("idle");
     } catch (err) {
+      if (requestId !== requestIdRef.current) return;
       setError(normalizeError(err));
       setLoadStatus("error");
     } finally {
-      inflightMoreRef.current = false;
+      if (requestId === requestIdRef.current) inflightMoreRef.current = false;
     }
-  }, [commits, endReached, loadStatus, repoRoot]);
+  }, [commits, endReached, loadStatus, native, repoRoot]);
 
   useEffect(() => {
-    filesInflightRef.current.clear();
-    filesCacheRef.current.clear();
-    bumpFiles();
     setCommits([]);
     setOpenAnchor(null);
     void loadInitial();
-  }, [bumpFiles, loadInitial]);
+  }, [loadInitial]);
 
   useEffect(() => {
     let cancelled = false;
@@ -384,7 +408,7 @@ export function GitHistoryPane({
     return () => {
       cancelled = true;
     };
-  }, [repoRoot]);
+  }, [native, repoRoot]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -416,14 +440,13 @@ export function GitHistoryPane({
   }, [commits.length, activeSearch, endReached, loadMore, loadStatus]);
 
   const handleRefresh = useCallback(() => {
-    filesInflightRef.current.clear();
-    filesCacheRef.current.clear();
-    bumpFiles();
     void loadInitial();
-  }, [bumpFiles, loadInitial]);
+  }, [loadInitial]);
 
   const fetchFiles = useCallback(
     async (sha: string) => {
+      if (!mountedRef.current) return;
+      const requestId = requestIdRef.current;
       if (filesInflightRef.current.has(sha)) return;
       const cache = filesCacheRef.current;
       const existing = cache.get(sha);
@@ -433,6 +456,7 @@ export function GitHistoryPane({
       bumpFiles();
       try {
         const files = await native.gitCommitFiles(repoRoot, sha);
+        if (requestId !== requestIdRef.current) return;
         cache.set(sha, { state: "loaded", files });
         while (cache.size > FILES_CACHE_LIMIT) {
           const oldest = cache.keys().next().value;
@@ -441,13 +465,15 @@ export function GitHistoryPane({
         }
         bumpFiles();
       } catch (err) {
+        if (requestId !== requestIdRef.current) return;
         cache.set(sha, { state: "error", error: normalizeError(err) });
         bumpFiles();
       } finally {
-        filesInflightRef.current.delete(sha);
+        if (requestId === requestIdRef.current)
+          filesInflightRef.current.delete(sha);
       }
     },
-    [repoRoot],
+    [bumpFiles, native, repoRoot],
   );
 
   const handleRowClick = useCallback(
@@ -475,6 +501,10 @@ export function GitHistoryPane({
   );
 
   const closePopover = useCallback(() => setOpenAnchor(null), []);
+  const [undoTarget, setUndoTarget] = useState<{
+    commit: GitLogEntry;
+    branch: string;
+  } | null>(null);
 
   const openFilesEntry = useMemo(() => {
     if (!openAnchor) return null;
@@ -498,7 +528,7 @@ export function GitHistoryPane({
 
   const copyToClipboard = useCallback(async (value: string) => {
     try {
-      await navigator.clipboard.writeText(value);
+      await writeClipboardText(value);
     } catch {
       /* noop */
     }
@@ -665,12 +695,22 @@ export function GitHistoryPane({
                       onCopySha={copyToClipboard}
                       onOpenFile={handleFileOpen}
                       onRetryFiles={() => void fetchFiles(openAnchor.sha)}
+                      onUndo={(branch) => {
+                        closePopover();
+                        setUndoTarget({ commit, branch });
+                      }}
                     />
                   );
                 })()
               : null}
           </PopoverContent>
         </Popover>
+        <UndoCommitDialog
+          repoRoot={repoRoot}
+          target={undoTarget}
+          onClose={() => setUndoTarget(null)}
+          onUndone={() => void loadInitial()}
+        />
       </div>
     </TooltipProvider>
   );
@@ -731,17 +771,20 @@ const CommitRow = memo(function CommitRow({
       </span>
       <span
         className={cn(
-          "min-w-0 truncate text-[12px] leading-tight",
+          "flex min-w-0 items-center gap-1.5 text-[12px] leading-tight",
           active
             ? "font-semibold text-foreground"
             : "font-medium text-foreground/95",
         )}
       >
-        {commit.subject ? (
-          highlight(commit.subject, query)
-        ) : (
-          <span className="text-muted-foreground">(no subject)</span>
-        )}
+        <RefChips refs={commit.refs} max={2} className="shrink-0" />
+        <span className="min-w-0 truncate">
+          {commit.subject ? (
+            highlight(commit.subject, query)
+          ) : (
+            <span className="text-muted-foreground">(no subject)</span>
+          )}
+        </span>
       </span>
       <span aria-hidden />
       <span
@@ -815,6 +858,8 @@ type CommitDetailProps = {
     file: GitCommitFileChange,
   ) => Promise<void> | void;
   onRetryFiles: () => void;
+  /** Undo the commit on `branch`; offered only on the commit HEAD's branch points at. */
+  onUndo: (branch: string) => void;
 };
 
 function CommitDetail({
@@ -824,8 +869,10 @@ function CommitDetail({
   onCopySha,
   onOpenFile,
   onRetryFiles,
+  onUndo,
 }: CommitDetailProps) {
   const absolute = absoluteTime(commit.timestampSecs);
+  const branch = undoableBranch(commit);
   const webUrl = remoteWeb ? commitWebUrl(remoteWeb, commit.sha) : null;
   const [copied, setCopied] = useState(false);
 
@@ -848,6 +895,7 @@ function CommitDetail({
             )}
           </div>
         </div>
+        <RefChips refs={commit.refs} className="mt-2 flex-wrap" />
         <div className="mt-2 flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-foreground">
           <span className="truncate">{commit.author || "Unknown"}</span>
           {commit.authorEmail ? (
@@ -888,6 +936,17 @@ function CommitDetail({
                 strokeWidth={1.9}
               />
               {hostLabel(remoteWeb!)}
+            </Button>
+          ) : null}
+          {branch ? (
+            <Button
+              size="xs"
+              variant="ghost"
+              className="ml-auto h-6 cursor-pointer gap-1.5 px-1.5 text-[11px] text-muted-foreground hover:text-foreground"
+              onClick={() => onUndo(branch)}
+            >
+              <HugeiconsIcon icon={Undo02Icon} size={11} strokeWidth={1.9} />
+              Undo Commit
             </Button>
           ) : null}
         </div>

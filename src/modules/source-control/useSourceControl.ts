@@ -1,10 +1,24 @@
+import { workspaceUnavailableReason } from "@/modules/workspace/availability";
 import {
-  native,
+  createNative,
   type GitRepoInfo,
   type GitStatusSnapshot,
 } from "@/modules/ai/lib/native";
-import { useWorkspaceEnvStore, workspaceScopeKey } from "@/modules/workspace";
+import { notifyHeadMoved } from "@/modules/editor/lib/gitSignals";
+import { showPrivacyRefusal } from "@/modules/mac-privacy";
+import { useTerminalStatusStore } from "@/modules/terminal/lib/terminalStatus";
+import {
+  currentWorkspaceEnv,
+  useWorkspaceEnvStore,
+  workspaceScopeKey,
+} from "@/modules/workspace";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { gitWatchAdd, listenGitChanged } from "./gitWatch";
+import {
+  createRefreshCoalescer,
+  finishedCommandLeaves,
+} from "./refreshSignals";
+import { normalizeSourceControlPath } from "./repositoryTarget";
 
 const AUTO_FETCH_THROTTLE_MS = 5 * 60_000;
 const AUTO_FETCH_LRU_LIMIT = 16;
@@ -12,18 +26,24 @@ const FOCUS_REFRESH_MIN_INTERVAL_MS = 1500;
 // Skip the context-change refetch when the data is this fresh and the new path
 // is still inside the loaded repo (cd-within-repo produces identical status).
 const SC_STATUS_TTL_MS = 2000;
+// Change signals (git:changed, a finished command) settle into one refresh.
+const SIGNAL_QUIET_MS = 300;
+const SIGNAL_MAX_WAIT_MS = 1500;
+
+/** A fresh status is authoritative for branch and upstream metadata. */
+export function repositoryWithStatus(repo: GitRepoInfo, status: GitStatusSnapshot): GitRepoInfo {
+  return { ...repo, branch: status.branch, upstream: status.upstream, isDetached: status.isDetached };
+}
 
 type SourceControlRefreshMode = "auto" | "always" | "never";
 type SourceControlRemoteAction = "fetch" | "pull" | "push";
-type SourceControlRemoteActionMode =
-  | "contextual"
-  | SourceControlRemoteAction;
+type SourceControlRemoteActionMode = "contextual" | SourceControlRemoteAction;
 
 type SourceControlRemoteActionResult = {
   ok: boolean;
   action: SourceControlRemoteAction | null;
   error?: string;
-  blocked?: "diverged" | "missing-upstream" | "no-repo";
+  blocked?: "diverged" | "missing-upstream" | "no-repo" | "busy";
 };
 
 export type SourceControlSummary = {
@@ -42,9 +62,7 @@ export type SourceControlSummary = {
   applyStatus: (
     updater: (status: GitStatusSnapshot) => GitStatusSnapshot,
   ) => void;
-  refresh: (options?: {
-    remote?: SourceControlRefreshMode;
-  }) => Promise<void>;
+  refresh: (options?: { remote?: SourceControlRefreshMode }) => Promise<void>;
   runRemoteAction: (
     mode?: SourceControlRemoteActionMode,
   ) => Promise<SourceControlRemoteActionResult>;
@@ -97,7 +115,7 @@ function sourceControlContextKey(
 }
 
 function normalizedContextPath(path: string): string {
-  const normalized = path.replace(/\\/g, "/");
+  const normalized = normalizeSourceControlPath(path);
   if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) {
     return normalized;
   }
@@ -120,6 +138,22 @@ export function repositoryContainsContext(
   }
   const prefix = root.endsWith("/") ? root : `${root}/`;
   return context === root || context.startsWith(prefix);
+}
+
+/**
+ * Whether a command that finished in `cwd` may have changed the repository:
+ * it ran inside the repository, or inside the context the view follows (the
+ * same directory spelled through a link, which the canonical root misses).
+ */
+export function commandTouchesRepository(
+  cwd: string,
+  repoRoot: string,
+  contextPath: string | null,
+): boolean {
+  return (
+    repositoryContainsContext(repoRoot, cwd) ||
+    repositoryContainsContext(contextPath, cwd)
+  );
 }
 
 type ContextRefreshPlan =
@@ -215,15 +249,22 @@ export type UseSourceControlOptions = {
    * the context changes; it refreshes once a consumer appears. Default true.
    */
   live?: boolean;
+  /** The directory a terminal pane is in, to tell which finished commands matter. */
+  leafCwd?: (leafId: number) => string | null;
 };
 
 export function useSourceControl(
   contextPath: string | null,
   enabled: boolean = true,
-  { live = true }: UseSourceControlOptions = {},
+  { live = true, leafCwd }: UseSourceControlOptions = {},
 ): SourceControlSummary {
   const workspaceEnv = useWorkspaceEnvStore((s) => s.env);
+  enabled = enabled && !workspaceUnavailableReason(workspaceEnv);
   const workspaceKey = workspaceScopeKey(workspaceEnv);
+  const native = useMemo(
+    () => createNative(() => workspaceEnv),
+    [workspaceEnv],
+  );
   const [state, setState] = useState<SourceControlSummaryState>({
     contextPath: null,
     repo: null,
@@ -237,6 +278,7 @@ export function useSourceControl(
   const stateRef = useRef(state);
   const requestIdRef = useRef(0);
   const inflightRef = useRef<InflightRefresh | null>(null);
+  const remoteActionsRef = useRef(new Set<string>());
   const autoFetchByRepoRef = useRef(new Map<string, number>());
   const enabledRef = useRef(enabled);
   const lastRefreshAtRef = useRef(0);
@@ -286,10 +328,7 @@ export function useSourceControl(
   const doRefresh = useCallback(
     async (remoteMode: SourceControlRefreshMode): Promise<void> => {
       const refreshContextKey = contextKey;
-      if (
-        !enabledRef.current ||
-        refreshContextKey !== contextKeyRef.current
-      ) {
+      if (!enabledRef.current || refreshContextKey !== contextKeyRef.current) {
         return;
       }
       const requestId = ++requestIdRef.current;
@@ -336,6 +375,8 @@ export function useSourceControl(
                 branch: status.branch,
                 upstream: status.upstream,
                 isDetached: status.isDetached,
+                // Only a snapshot tells; the next one restores it.
+                linkedWorktree: null,
               };
             }
           } catch {
@@ -385,13 +426,14 @@ export function useSourceControl(
           return;
         }
 
+        if (status) repo = repositoryWithStatus(repo, status);
+
         let nextRemoteError = stateRef.current.lastRemoteError;
         const shouldAutoFetch =
           repo.upstream &&
           remoteMode !== "never" &&
           (remoteMode === "always" ||
-            Date.now() -
-              (autoFetchByRepoRef.current.get(repo.repoRoot) ?? 0) >=
+            Date.now() - (autoFetchByRepoRef.current.get(repo.repoRoot) ?? 0) >=
               AUTO_FETCH_THROTTLE_MS);
 
         if (shouldAutoFetch) {
@@ -402,6 +444,7 @@ export function useSourceControl(
             if (!isCurrentRequest()) return;
             status = await native.gitStatus(repo.repoRoot);
             if (!isCurrentRequest()) return;
+            repo = repositoryWithStatus(repo, status);
           } catch (error) {
             nextRemoteError = normalizeError(error);
           }
@@ -433,7 +476,7 @@ export function useSourceControl(
         }
       }
     },
-    [contextKey, contextPath],
+    [contextKey, contextPath, native],
   );
 
   const refresh = useCallback(
@@ -474,11 +517,15 @@ export function useSourceControl(
       if (!action) {
         return { ok: false, action: null, blocked: "diverged" };
       }
+      const actionKey = JSON.stringify([workspaceKey, repo.repoRoot]);
+      if (remoteActionsRef.current.has(actionKey)) {
+        return { ok: false, action: null, blocked: "busy" };
+      }
+      remoteActionsRef.current.add(actionKey);
 
       setState((current) => ({ ...current, busyAction: action }));
       const actionContextKey = contextKeyRef.current;
-      const isCurrentContext = () =>
-        actionContextKey === contextKeyRef.current;
+      const isCurrentContext = () => actionContextKey === contextKeyRef.current;
 
       try {
         if (action === "fetch") {
@@ -488,6 +535,7 @@ export function useSourceControl(
           await native.gitFetch(repo.repoRoot);
           touchAutoFetch(autoFetchByRepoRef.current, repo.repoRoot);
           await native.gitPullFfOnly(repo.repoRoot);
+          notifyHeadMoved();
         } else {
           await native.gitPush(repo.repoRoot);
         }
@@ -498,16 +546,22 @@ export function useSourceControl(
         return { ok: true, action };
       } catch (error) {
         const message = normalizeError(error);
+        showPrivacyRefusal(`Could not ${action}`, {
+          path: repo.repoRoot,
+          error,
+        });
         if (isCurrentContext()) {
           setState((current) => ({ ...current, lastRemoteError: message }));
           await refresh({ remote: "never" }).catch(() => {});
         }
         return { ok: false, action, error: message };
       } finally {
-        setState((current) => ({ ...current, busyAction: null }));
+        remoteActionsRef.current.delete(actionKey);
+        if (isCurrentContext())
+          setState((current) => ({ ...current, busyAction: null }));
       }
     },
-    [refresh],
+    [refresh, native, workspaceKey],
   );
 
   useEffect(() => {
@@ -569,6 +623,64 @@ export function useSourceControl(
       }
     };
   }, [refresh, contextPath, enabled, live]);
+
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+  const leafCwdRef = useRef(leafCwd);
+  leafCwdRef.current = leafCwd;
+  const contextPathRef = useRef(contextPath);
+  contextPathRef.current = contextPath;
+  const repoRoot = state.repo?.repoRoot ?? null;
+
+  // While a live consumer shows a repository, follow it without waiting for
+  // focus: git activity in it or in a watched folder of its work tree (any
+  // process, a TUI included), a file Oarlock wrote into it, and commands that
+  // finish in a terminal inside it. Nothing is watched otherwise.
+  useEffect(() => {
+    if (!enabled || !live || !repoRoot) return;
+    const workspace = currentWorkspaceEnv();
+    const coalescer = createRefreshCoalescer({
+      quietMs: SIGNAL_QUIET_MS,
+      maxWaitMs: SIGNAL_MAX_WAIT_MS,
+      run: async () => {
+        // A refresh already under way may have read the repository before the
+        // change, so wait for it and run a new one.
+        await inflightRef.current?.promise.catch(() => {});
+        await refreshRef.current({ remote: "never" });
+      },
+    });
+    const releaseWatch = gitWatchAdd(repoRoot, workspace);
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+    void listenGitChanged((roots) => {
+      if (roots.includes(repoRoot)) coalescer.signal();
+    }).then((un) => {
+      if (alive) unlisten = un;
+      else un();
+    });
+    const unsubscribe = useTerminalStatusStore.subscribe((next, previous) => {
+      for (const leafId of finishedCommandLeaves(
+        previous.leaves,
+        next.leaves,
+      )) {
+        const cwd = leafCwdRef.current?.(leafId);
+        if (
+          cwd &&
+          commandTouchesRepository(cwd, repoRoot, contextPathRef.current)
+        ) {
+          coalescer.signal();
+          return;
+        }
+      }
+    });
+    return () => {
+      alive = false;
+      unlisten?.();
+      unsubscribe();
+      coalescer.dispose();
+      releaseWatch();
+    };
+  }, [enabled, live, repoRoot]);
 
   useEffect(() => {
     if (!enabled || !live) return;

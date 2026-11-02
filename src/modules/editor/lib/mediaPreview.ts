@@ -1,5 +1,11 @@
 export type MediaPreviewKind = "image" | "video" | "audio" | "pdf";
 
+export const MAX_IMAGE_PREVIEW_BYTES = 50 * 1024 * 1024;
+
+export function isPreviewTooLarge(kind: MediaPreviewKind, size: number): boolean {
+  return (kind === "image" || kind === "pdf") && size > MAX_IMAGE_PREVIEW_BYTES;
+}
+
 const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
 const VIDEO_EXT = ["mp4", "webm", "ogg", "mov"];
 const AUDIO_EXT = ["mp3", "wav", "flac", "aac", "m4a"];

@@ -1,0 +1,16 @@
+{
+  "name": "@replit/codemirror-vim-core",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "vim.js",
+  "types": "main.d.ts",
+  "exports": {
+    ".": {
+      "types": "./main.d.ts",
+      "default": "./vim.js"
+    },
+    "./resumable": "./resumable.js"
+  }
+}

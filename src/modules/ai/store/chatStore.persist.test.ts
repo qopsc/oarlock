@@ -10,7 +10,12 @@ const sessions = vi.hoisted(() => ({
       _options?: { durable?: boolean },
     ) => {},
   ),
-  loadAll: vi.fn(async () => ({ sessions: [], activeId: null })),
+  loadAll: vi.fn(async () => ({
+    sessions: [],
+    activeId: null,
+    activeElsewhere: new Set<string>(),
+  })),
+  onSessionsChanged: vi.fn(async () => () => {}),
   loadMessages: vi.fn(),
   saveSessionsList: vi.fn(async () => {}),
   saveActiveId: vi.fn(async () => {}),
@@ -26,6 +31,14 @@ const messages = (n: number) =>
 
 beforeEach(() => {
   vi.useFakeTimers();
+  useChatStore.setState({
+    sessions: ["s-1", "s-2", "s-3", "a", "b"].map((id) => ({
+      id,
+      title: "New chat",
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+  });
   sessions.saveMessages.mockClear();
 });
 afterEach(() => {

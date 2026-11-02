@@ -1,3 +1,4 @@
+import { spacesStorePath } from "@/lib/appWindow";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type { WorkspaceEnv } from "@/modules/workspace";
 import type { SerializedTab } from "./serialize";
@@ -18,7 +19,8 @@ export type SpaceState = {
   activeTabIndex: number;
 };
 
-const STORE_PATH = "terax-spaces.json";
+/** Each window keeps its own spaces (`appWindow.ts`). */
+const STORE_PATH = spacesStorePath();
 const KEY_SPACES = "spaces";
 const KEY_ACTIVE = "activeId";
 const STATE_PREFIX = "state:";
@@ -57,6 +59,11 @@ export async function saveActiveId(id: string | null): Promise<void> {
 
 export async function saveState(id: string, state: SpaceState): Promise<void> {
   await store.set(stateKey(id), state);
+}
+
+/** Flush pending space and layout changes before reporting persistence. */
+export async function saveSpacesStore(): Promise<void> {
+  await store.save();
 }
 
 export async function deleteSpaceData(id: string): Promise<void> {

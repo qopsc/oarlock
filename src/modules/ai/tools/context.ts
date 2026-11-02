@@ -1,4 +1,11 @@
+import type { ReadCacheEntry } from "./readCache";
+import type { native } from "../lib/native";
+import type { WorkspaceEnv } from "@/modules/workspace/env";
 export type ToolContext = {
+  native?: typeof native;
+  workspace?: WorkspaceEnv;
+  /** Owning space captured when the user turn starts. */
+  spaceId?: string;
   /** Active terminal tab cwd, used to resolve relative paths. Null = home. */
   getCwd: () => string | null;
   /** Workspace root (explorer root). Used by tools that operate over the project. */
@@ -17,14 +24,14 @@ export type ToolContext = {
   spawnAgent: (prompt: string) => { tabId: number; leafId: number } | null;
   /** Read the terminal scrollback tail of a managed agent's leaf. */
   readAgentOutput: (leafId: number) => string | null;
-  readCache: Map<string, { size: number; hash: number }>;
+  readCache: Map<string, ReadCacheEntry>;
   /** Active chat session id — used by tools that persist per-session state (todos). */
   getSessionId: () => string | null;
 };
 
 export function resolvePath(rawPath: string, cwd: string | null): string {
-  if (rawPath.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(rawPath))
-    return rawPath;
+  if (rawPath.startsWith("/") || rawPath.startsWith("\\\\")) return rawPath;
+  if (/^[a-zA-Z]:[\\/]/.test(rawPath)) return rawPath;
   if (!cwd)
     throw new Error(
       `cannot resolve relative path "${rawPath}": no active terminal cwd. Pass an absolute path.`,

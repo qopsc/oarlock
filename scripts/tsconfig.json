@@ -1,0 +1,34 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node", "@webgpu/types"]
+  },
+  "include": [
+    "../src/vite-env.d.ts",
+    "lib",
+    "eager-graph.test.ts",
+    "symbols-font",
+    "nerd-font-constraints",
+    "jetbrains-mono",
+    "pty-smoke/run.ts",
+    "terminal-search",
+    "editor-search",
+    "vim-review",
+    "ipc-profile/run.ts",
+    "ipc-profile/smoke.ts",
+    "ipc-profile/fsLifecycle.ts",
+    "ipc-profile/fsLifecycle.test.ts",
+    "renderer-profile/lab_report.ts",
+    "renderer-profile/lab_report.test.ts",
+    "renderer-profile/libproc.ts",
+    "renderer-profile/procstats.ts",
+    "renderer-profile/procstats.test.ts",
+    "renderer-profile/run.ts",
+    "renderer-profile/run.test.ts",
+    "app-lab/app_report.ts",
+    "app-lab/app_report.test.ts",
+    "app-lab/run.ts",
+    "app-lab/run.test.ts"
+  ]
+}

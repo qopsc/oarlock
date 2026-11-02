@@ -1,0 +1,671 @@
+use super::*;
+
+fn fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    WorkspaceRegistry,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let src = root.join("source");
+    let dest = root.join("destination");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dest).unwrap();
+    let registry = WorkspaceRegistry::default();
+    registry.authorize(&root).unwrap();
+    (tmp, src, dest, registry)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn batch_copies_regular_files_without_replacing_conflicts() {
+    let (_tmp, src, dest, registry) = fixture();
+    fs::write(src.join("a.txt"), "new").unwrap();
+    fs::write(dest.join("a.txt"), "old").unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&src.join("a.txt"))],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        true,
+    )
+    .unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "old");
+    assert_eq!(fs::read_to_string(dest.join("a copy.txt")).unwrap(), "new");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn copy_checks_the_actual_chosen_destination_before_publication() {
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("protected.json");
+    fs::write(&source, b"payload").unwrap();
+    let as_string = |path: &Path| path.to_string_lossy().into_owned();
+    let result = copy_batch_impl_guarded(
+        vec![as_string(&source)], &as_string(&dest), &as_string(&dest),
+        &WorkspaceEnv::Local, &registry, &FileIndexState::default(),
+        (false, Some(&|_| Err("Protected native store".into()))),
+    ).unwrap();
+    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed[0].message.contains("Protected native store"));
+    assert!(!dest.join("protected.json").exists());
+    assert_eq!(fs::read(source).unwrap(), b"payload");
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_source_after_open_never_copies_the_replacement() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("a");
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(&source, "authorized").unwrap();
+    fs::write(outside.path().join("secret"), "secret").unwrap();
+    let dir = Dir::open_ambient_dir(&dest, cap_std::ambient_authority()).unwrap();
+    let ctx = CopyContext {
+        dir: &dir,
+        destination: &dest,
+        root: &dest,
+        registry: &registry,
+        rename_on_conflict: false,
+        guard: None,
+    };
+    let outcome = copy_file(
+        &source,
+        &ctx,
+        || {
+            fs::rename(&source, src.join("original")).unwrap();
+            symlink(outside.path().join("secret"), &source).unwrap();
+        },
+        || {},
+    );
+    assert!(outcome.is_err());
+    assert!(!dest.join("a").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_source_parent_before_open_cannot_read_outside_file() {
+    use std::os::unix::fs::symlink;
+    let (tmp, src, dest, registry) = fixture();
+    let source = src.join("a");
+    fs::write(&source, "authorized").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("a"), "private").unwrap();
+    let dir = Dir::open_ambient_dir(&dest, cap_std::ambient_authority()).unwrap();
+    let ctx = CopyContext {
+        dir: &dir,
+        destination: &dest,
+        root: &dest,
+        registry: &registry,
+        rename_on_conflict: false,
+        guard: None,
+    };
+    fs::rename(&src, tmp.path().join("original")).unwrap();
+    symlink(outside.path(), &src).unwrap();
+    assert!(copy_file(&source, &ctx, || {}, || {}).is_err());
+    assert!(!dest.join("a").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_destination_parent_does_not_write_to_new_target() {
+    use std::os::unix::fs::symlink;
+    let (tmp, src, dest, registry) = fixture();
+    let source = src.join("a");
+    fs::write(&source, "data").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let dir = Dir::open_ambient_dir(&dest, cap_std::ambient_authority()).unwrap();
+    let ctx = CopyContext {
+        dir: &dir,
+        destination: &dest,
+        root: &dest,
+        registry: &registry,
+        rename_on_conflict: false,
+        guard: None,
+    };
+    let outcome = copy_file(
+        &source,
+        &ctx,
+        || {},
+        || {
+            fs::rename(&dest, tmp.path().join("moved")).unwrap();
+            symlink(outside.path(), &dest).unwrap();
+        },
+    );
+    assert!(outcome.is_err());
+    assert!(!outside.path().join("a").exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn final_destination_symlink_is_not_overwritten_or_followed() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("a");
+    fs::write(&source, "data").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    fs::write(&victim, "untouched").unwrap();
+    let dir = Dir::open_ambient_dir(&dest, cap_std::ambient_authority()).unwrap();
+    let ctx = CopyContext {
+        dir: &dir,
+        destination: &dest,
+        root: &dest,
+        registry: &registry,
+        rename_on_conflict: false,
+        guard: None,
+    };
+    let result = copy_file(
+        &source,
+        &ctx,
+        || {},
+        || symlink(&victim, dest.join("a")).unwrap(),
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read_to_string(victim).unwrap(), "untouched");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn copies_links_as_entries_without_following_targets() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("private"), "secret").unwrap();
+    symlink(outside.path().join("private"), src.join("file-link")).unwrap();
+    symlink("missing", src.join("dangling")).unwrap();
+    symlink(outside.path(), src.join("directory-link")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        ["file-link", "dangling", "directory-link"]
+            .iter()
+            .map(|name| path(&src.join(name)))
+            .collect(),
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(
+        fs::read_link(dest.join("file-link")).unwrap(),
+        outside.path().join("private")
+    );
+    assert_eq!(
+        fs::read_link(dest.join("dangling")).unwrap(),
+        Path::new("missing")
+    );
+    assert_eq!(
+        fs::read_link(dest.join("directory-link")).unwrap(),
+        outside.path()
+    );
+    assert_eq!(
+        fs::read_to_string(outside.path().join("private")).unwrap(),
+        "secret"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_replaced_source_link_is_never_copied_from_its_new_entry() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("link");
+    symlink("original-target", &source).unwrap();
+    let dir = Dir::open_ambient_dir(&dest, cap_std::ambient_authority()).unwrap();
+    let ctx = CopyContext {
+        dir: &dir,
+        destination: &dest,
+        root: &dest,
+        registry: &registry,
+        rename_on_conflict: false,
+        guard: None,
+    };
+    let result = copy_file(
+        &source,
+        &ctx,
+        || {},
+        || {
+            fs::remove_file(&source).unwrap();
+            symlink("replacement-target", &source).unwrap();
+        },
+    );
+    if result.is_ok() {
+        assert_eq!(
+            fs::read_link(dest.join("link")).unwrap(),
+            Path::new("original-target")
+        );
+    } else {
+        assert!(fs::symlink_metadata(dest.join("link")).is_err());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn folders_are_copied_without_partial_publication() {
+    let (_tmp, src, dest, registry) = fixture();
+    fs::create_dir(src.join("folder")).unwrap();
+    fs::write(src.join("folder/file"), "nested").unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&src.join("folder"))],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(
+        fs::read_to_string(dest.join("folder/file")).unwrap(),
+        "nested"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn folder_replaced_after_open_cannot_copy_its_new_target() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let folder = src.join("folder");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("public"), "public").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("private"), "private").unwrap();
+    let dir = Dir::open_ambient_dir(&dest, cap_std::ambient_authority()).unwrap();
+    let context = CopyContext {
+        dir: &dir,
+        destination: &dest,
+        root: &dest,
+        registry: &registry,
+        rename_on_conflict: false,
+        guard: None,
+    };
+    let result = copy_file(
+        &folder,
+        &context,
+        || {
+            fs::rename(&folder, src.join("original")).unwrap();
+            symlink(outside.path(), &folder).unwrap();
+        },
+        || {},
+    );
+    assert!(result.is_err());
+    assert!(fs::symlink_metadata(dest.join("folder")).is_err());
+    assert_eq!(
+        fs::read_to_string(outside.path().join("private")).unwrap(),
+        "private"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn folder_with_nested_outside_link_leaves_no_partial_copy() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let folder = src.join("folder");
+    fs::create_dir(&folder).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("private"), "private").unwrap();
+    symlink(outside.path(), folder.join("link")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&folder)],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(fs::read_dir(dest).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_to_string(outside.path().join("private")).unwrap(),
+        "private"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn simultaneous_copies_choose_distinct_names() {
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("file.txt");
+    fs::write(&source, "data").unwrap();
+    let barrier = std::sync::Barrier::new(3);
+    std::thread::scope(|threads| {
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                threads.spawn(|| {
+                    let path = |p: &Path| p.to_string_lossy().into_owned();
+                    barrier.wait();
+                    copy_batch_impl(
+                        vec![path(&source)],
+                        &path(&dest),
+                        &path(&dest),
+                        &WorkspaceEnv::Local,
+                        &registry,
+                        &FileIndexState::default(),
+                        true,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let mut names = std::collections::HashSet::new();
+        for handle in handles {
+            let result = handle.join().unwrap();
+            assert!(result.failed.is_empty(), "{:?}", result.failed);
+            assert!(names.insert(result.created[0].clone()));
+            assert_eq!(fs::read_to_string(&result.created[0]).unwrap(), "data");
+        }
+    });
+}
+
+#[test]
+fn unauthorized_source_fails_without_publishing_anything() {
+    let (_tmp, _src, dest, registry) = fixture();
+    let outside = tempfile::tempdir().unwrap();
+    let source = outside.path().join("private");
+    fs::write(&source, "private").unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&source)],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(fs::read_dir(dest).unwrap().count(), 0);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn unsupported_platform_does_not_publish_a_file() {
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("a");
+    fs::write(&source, "data").unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&source)],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert!(!dest.join("a").exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn guarded_batch_copies_to_authorized_destination() {
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("file.txt");
+    fs::write(&source, "source").unwrap();
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch(
+        vec![text(&source)],
+        &text(&dest),
+        &text(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    );
+    let result = result.unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(fs::read_to_string(source).unwrap(), "source");
+    assert_eq!(fs::read_to_string(dest.join("file.txt")).unwrap(), "source");
+}
+
+#[cfg(unix)]
+#[test]
+fn guarded_batch_does_not_write_when_destination_has_moved_outside() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("file.txt");
+    fs::write(&source, "source").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let moved = outside.path().join("moved");
+    fs::rename(&dest, &moved).unwrap();
+    symlink(outside.path(), &dest).unwrap();
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch(
+        vec![text(&source)],
+        &text(&dest),
+        &text(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    );
+    assert!(result.is_err());
+    assert!(!outside.path().join("file.txt").exists());
+    assert!(!moved.join("file.txt").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn copies_acl_and_extended_attributes() {
+    use crate::modules::fs::access_control::tests::{acl_text, add_acl};
+    use std::os::unix::ffi::OsStrExt;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("file");
+    fs::write(&source, "metadata").unwrap();
+    add_acl(&source, "group:everyone deny write");
+    let path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+    let key = c"com.oarlock.test";
+    let value = b"preserve";
+    assert_eq!(
+        unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        },
+        0
+    );
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch(
+        vec![text(&source)],
+        &text(&dest),
+        &text(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let copied = dest.join("file");
+    assert_eq!(acl_text(&source), acl_text(&copied));
+    let copied_path = std::ffi::CString::new(copied.as_os_str().as_bytes()).unwrap();
+    let mut read = [0u8; 32];
+    let size = unsafe {
+        libc::getxattr(
+            copied_path.as_ptr(),
+            key.as_ptr(),
+            read.as_mut_ptr().cast(),
+            read.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(&read[..size as usize], value);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn refuses_a_copy_whose_privileged_mode_cannot_be_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, src, dest, registry) = fixture();
+    let source = src.join("privileged");
+    fs::write(&source, "data").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o4755)).unwrap();
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch(
+        vec![text(&source)],
+        &text(&dest),
+        &text(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed[0].message.contains("setuid"));
+    assert!(!dest.join("privileged").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn lexical_resolution_pops_parents_and_drops_dots() {
+    assert_eq!(lexical_normalize(Path::new("/a/b/../c/./d")), Path::new("/a/c/d"));
+    assert_eq!(lexical_normalize(Path::new("/a/../../x")), Path::new("/x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_link_is_judged_where_the_copy_will_put_it() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dest, registry) = fixture();
+    let deep = src.join("a/b/c/dir");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(src.join("a/x"), "inside").unwrap();
+    // Three levels up from `a/b/c/dir` is `a/x`; the same text from
+    // `destination/dir` leaves the authorized folder.
+    symlink("../../../x", deep.join("link")).unwrap();
+    let item_dest = dest.join("dir");
+    assert!(nested_link_allowed(&deep.join("link"), &item_dest, &item_dest, &registry).is_err());
+    // Staying inside the copied item is fine wherever it goes.
+    fs::write(deep.join("sibling"), "s").unwrap();
+    symlink("sibling", deep.join("near")).unwrap();
+    assert!(nested_link_allowed(&deep.join("near"), &item_dest, &item_dest, &registry).is_ok());
+    // A copy beside the original resolves the same text to the same authorized place.
+    let beside = deep.parent().unwrap().join("dir2");
+    assert!(nested_link_allowed(&deep.join("link"), &beside, &beside, &registry).is_ok());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_nested_relative_link_that_escapes_only_at_the_destination_refuses_the_folder() {
+    use std::os::unix::fs::symlink;
+    let (tmp, src, dest, registry) = fixture();
+    let deep = src.join("a/b/c/dir");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(src.join("a/x"), "inside").unwrap();
+    symlink("../../../x", deep.join("link")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&deep)],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty(), "{result:?}");
+    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed[0].message.contains("escapes"), "{result:?}");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    drop(tmp);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_relative_link_cannot_reach_through_an_entry_that_forces_a_conflict_name() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let (src, dest, outside) = (root.join("source"), root.join("destination"), root.join("out"));
+    for dir in [&src, &dest, &outside] {
+        fs::create_dir(dir).unwrap();
+    }
+    let registry = WorkspaceRegistry::default();
+    registry.authorize(&src).unwrap();
+    registry.authorize(&dest).unwrap();
+    fs::create_dir(src.join("tree")).unwrap();
+    fs::write(src.join("tree/x"), "inside").unwrap();
+    fs::write(outside.join("x"), "secret").unwrap();
+    symlink("../tree/x", src.join("tree/link")).unwrap();
+    symlink(&outside, dest.join("tree")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&src.join("tree"))],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        true,
+    )
+    .unwrap();
+    assert!(result.created.is_empty(), "{result:?}");
+    assert_eq!(result.failed.len(), 1, "{result:?}");
+    assert!(result.failed[0].message.contains("escapes"), "{result:?}");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_relative_link_with_dot_dot_after_a_name_is_refused_because_it_may_follow_a_link() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let (a, b) = (root.join("A"), root.join("B"));
+    fs::create_dir_all(a.join("proj/tree")).unwrap();
+    fs::create_dir(&b).unwrap();
+    let registry = WorkspaceRegistry::default();
+    registry.authorize(&a).unwrap();
+    registry.authorize(&b).unwrap();
+    fs::write(a.join("x"), "inside A").unwrap();
+    fs::write(root.join("x"), "OUTSIDE").unwrap();
+    let tree = a.join("proj/tree");
+    symlink(".", tree.join("sub")).unwrap();
+    symlink("sub/../../x", tree.join("link")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&tree)],
+        &path(&b),
+        &path(&b),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        false,
+    )
+    .unwrap();
+    assert!(result.created.is_empty(), "{result:?}");
+    assert_eq!(result.failed.len(), 1, "{result:?}");
+    assert!(result.failed[0].message.contains("escapes"), "{result:?}");
+    assert_eq!(fs::read_dir(&b).unwrap().count(), 0);
+}

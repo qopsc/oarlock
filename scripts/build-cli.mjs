@@ -47,7 +47,8 @@ function requireArtifact(path, label) {
 }
 
 const target =
-  process.env.TERAX_CLI_TARGET?.trim() ||
+  process.env.TAURI_ENV_TARGET_TRIPLE?.trim() ||
+  process.env.OARLOCK_CLI_TARGET?.trim() ||
   process.env.CARGO_BUILD_TARGET?.trim() ||
   hostTriple();
 const cargoArgs = [
@@ -56,9 +57,9 @@ const cargoArgs = [
   "--manifest-path",
   join(tauriDir, "Cargo.toml"),
   "--package",
-  "terax-cli",
+  "oarlock-cli",
   "--bin",
-  "terax-cli",
+  "oarlock-cli",
   "--target",
   target,
 ];
@@ -66,19 +67,40 @@ if (release) cargoArgs.push("--release");
 
 run("cargo", cargoArgs);
 
+const metadata = JSON.parse(
+  run(
+    "cargo",
+    [
+      "metadata",
+      "--locked",
+      "--no-deps",
+      "--format-version",
+      "1",
+      "--manifest-path",
+      join(tauriDir, "Cargo.toml"),
+    ],
+    { capture: true },
+  ),
+);
+if (
+  typeof metadata.target_directory !== "string" ||
+  !metadata.target_directory
+) {
+  throw new Error("Cargo did not report its artifact directory");
+}
+
 const extension = target.includes("windows") ? ".exe" : "";
 const profile = release ? "release" : "debug";
 const source = join(
-  tauriDir,
-  "target",
+  metadata.target_directory,
   target,
   profile,
-  `terax-cli${extension}`,
+  `oarlock-cli${extension}`,
 );
 const destination = join(
   tauriDir,
   "binaries",
-  `terax-cli-${target}${extension}`,
+  `oarlock-cli-${target}${extension}`,
 );
 requireArtifact(source, "Built CLI artifact");
 mkdirSync(dirname(destination), { recursive: true });

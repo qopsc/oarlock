@@ -92,7 +92,7 @@ async function respond(
     response,
   });
   if (!delivered) {
-    console.warn(`[terax] control response expired: ${requestId}`);
+    console.warn(`[oarlock] control response expired: ${requestId}`);
   }
 }
 
@@ -107,15 +107,25 @@ export function useControlBridge({
     if (!ready) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    const requireLiveBridge = () => {
+      if (disposed)
+        throw new RequestError(
+          "frontend_unavailable",
+          "Oarlock UI context closed; retry the request",
+        );
+    };
 
     const handleRequest = async (request: ControlRequest) => {
       try {
+        requireLiveBridge();
         const context = resolveControlContext(
           tabsRef.current ?? [],
           activeTabIdRef.current ?? 0,
           activeSpaceIdRef.current ?? DEFAULT_SPACE_ID,
           request.caller.pane_id,
         );
+        if (!context)
+          throw new RequestError("caller_unavailable", "The calling terminal pane is no longer available");
         if (request.method === "identify") {
           await respond(request.id, { ok: true, result: context });
           return;
@@ -127,22 +137,32 @@ export function useControlBridge({
             const window = getCurrentWindow();
             try {
               await window.show();
+              requireLiveBridge();
               await window.setFocus();
               focused = true;
             } catch (error) {
-              console.warn("[terax] could not focus control target:", error);
+              console.warn("[oarlock] could not focus control target:", error);
             }
+          }
+          requireLiveBridge();
+          if (request.caller.pane_id != null) {
+            const current = resolveControlContext(
+              tabsRef.current ?? [], activeTabIdRef.current ?? 0,
+              activeSpaceIdRef.current ?? DEFAULT_SPACE_ID, request.caller.pane_id,
+            );
+            if (!current || current.space_id !== context.space_id || current.tab_id !== context.tab_id)
+              throw new RequestError("caller_unavailable", "The calling terminal pane changed before the request completed");
           }
           const tabId = onOpen({ ...open, spaceId: context.space_id });
           if (tabId === null) {
             throw new RequestError(
               "open_failed",
-              "Terax could not create an editor tab",
+              "Oarlock could not create an editor tab",
             );
           }
-          await new Promise<void>((resolve) =>
-            requestAnimationFrame(() => resolve()),
-          );
+          // onOpen has accepted the tab and queued any editor navigation. A
+          // background window may never paint; protocol completion cannot wait
+          // for a presentation frame.
           await respond(request.id, {
             ok: true,
             result: {
@@ -167,13 +187,13 @@ export function useControlBridge({
             : { code: "frontend_error", message: String(error) };
         await respond(request.id, { ok: false, error: responseError }).catch(
           (responseError) => {
-            console.error("[terax] control response failed:", responseError);
+            console.error("[oarlock] control response failed:", responseError);
           },
         );
       }
     };
 
-    void listen<ControlRequest>("terax:control-request", (event) => {
+    void listen<ControlRequest>("oarlock:control-request", (event) => {
       void handleRequest(event.payload);
     })
       .then((stop) => {
@@ -185,14 +205,14 @@ export function useControlBridge({
         return setFrontendReady(true);
       })
       .catch((error) => {
-        console.error("[terax] control bridge setup failed:", error);
+        console.error("[oarlock] control bridge setup failed:", error);
       });
 
     return () => {
       disposed = true;
       unlisten?.();
       void setFrontendReady(false).catch((error) => {
-        console.error("[terax] control bridge cleanup failed:", error);
+        console.error("[oarlock] control bridge cleanup failed:", error);
       });
     };
   }, [ready, tabsRef, activeTabIdRef, activeSpaceIdRef, onOpen]);

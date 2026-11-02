@@ -1,3 +1,4 @@
+import { writeClipboardText } from "@/lib/clipboardWrite";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -9,24 +10,12 @@ import {
 } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { arch } from "@tauri-apps/plugin-os";
 import { useState } from "react";
-import { useUpdater } from "./useUpdater";
-
-type DistroKey = "arch" | "debian" | "fedora";
-
-function distroCommand(key: DistroKey, version: string): string {
-  switch (key) {
-    case "arch":
-      return "yay -S terax-bin";
-    case "debian":
-      return `sudo apt install ./Terax_${version}_amd64.deb`;
-    case "fedora":
-      return `sudo dnf install ./Terax-${version}-1.x86_64.rpm`;
-  }
-}
+import { linuxInstallCommand, type DistroKey } from "./linuxInstallCommand";
+import { UPDATES_ENABLED, useUpdater } from "./useUpdater";
 
 const DISTROS: { key: DistroKey; label: string }[] = [
-  { key: "arch", label: "Arch" },
   { key: "debian", label: "Debian / Ubuntu" },
   { key: "fedora", label: "Fedora / RHEL" },
 ];
@@ -37,13 +26,28 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Offers an update when one is found; nothing while updates are off. */
 export function UpdaterDialog() {
+  return UPDATES_ENABLED ? <UpdatePrompt /> : null;
+}
+
+function UpdatePrompt() {
   const { status, install, dismiss } = useUpdater();
   const [copied, setCopied] = useState(false);
-  const [distro, setDistro] = useState<DistroKey>("arch");
+  const [distro, setDistro] = useState<DistroKey>("debian");
   const manualVersion =
     status.kind === "manual-available" ? status.info.version : "";
-  const activeCommand = distroCommand(distro, manualVersion);
+  let architecture: string | null = null;
+  try {
+    architecture = arch();
+  } catch {
+    // Offer the release download instead of guessing an architecture.
+  }
+  const activeCommand = linuxInstallCommand(
+    distro,
+    manualVersion,
+    architecture,
+  );
 
   const open =
     status.kind === "available" ||
@@ -59,9 +63,9 @@ export function UpdaterDialog() {
   const ready = status.kind === "ready";
 
   const copyCommand = async () => {
-    if (!navigator?.clipboard?.writeText) return;
+    if (!activeCommand) return;
     try {
-      await navigator.clipboard.writeText(activeCommand);
+      await writeClipboardText(activeCommand);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -92,18 +96,20 @@ export function UpdaterDialog() {
               : downloading
                 ? "Downloading update…"
                 : manual
-                  ? `Terax v${manual.version} is available`
-                  : `Terax v${update?.version} is available`}
+                  ? `Oarlock v${manual.version} is available`
+                  : `Oarlock v${update?.version} is available`}
           </DialogTitle>
           <DialogDescription>
             {ready
-              ? "Restart Terax to finish installing."
+              ? "Restart Oarlock to finish installing."
               : downloading
                 ? progress !== null
                   ? `${progress.toFixed(0)}% — ${formatBytes(status.downloaded)}`
                   : formatBytes(status.downloaded)
                 : manual
-                  ? `You're on v${manual.currentVersion}. Pick your distro and run the command, or grab the package from GitHub.`
+                  ? activeCommand
+                    ? `You're on v${manual.currentVersion}. Pick your distro and run the command, or grab the package from GitHub.`
+                    : `You're on v${manual.currentVersion}. Download the package for your system from GitHub.`
                   : update?.body || "A new version is ready to install."}
           </DialogDescription>
         </DialogHeader>
@@ -115,7 +121,7 @@ export function UpdaterDialog() {
           <Progress value={undefined} className="mt-2 animate-pulse" />
         )}
 
-        {manual && (
+        {manual && activeCommand && (
           <div className="mt-2 flex flex-col gap-2">
             <div className="flex gap-1 rounded-md bg-muted/40 p-1">
               {DISTROS.map((d) => (
@@ -163,10 +169,7 @@ export function UpdaterDialog() {
               <Button variant="ghost" size="sm" onClick={dismiss}>
                 Later
               </Button>
-              <Button
-                size="sm"
-                onClick={() => void openUrl(manual.releaseUrl)}
-              >
+              <Button size="sm" onClick={() => void openUrl(manual.releaseUrl)}>
                 Download package
               </Button>
             </>

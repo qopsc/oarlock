@@ -3,9 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use oarlock_lib::modules::fs::to_canon;
+use oarlock_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
 use tempfile::TempDir;
-use terax_lib::modules::fs::to_canon;
-use terax_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
 
 pub struct GitRepoFixture {
     pub registry: WorkspaceRegistry,
@@ -14,8 +14,23 @@ pub struct GitRepoFixture {
     _tmp: TempDir,
 }
 
+static ISOLATED_HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+
+/// Production Git launches read `$HOME/.gitconfig`; point the test process at an
+/// empty home so a developer's LFS, signing or fsmonitor setup cannot leak in.
+pub fn isolate_home() {
+    ISOLATED_HOME.get_or_init(|| {
+        let home = TempDir::new().expect("isolated home");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+        std::env::set_var("USERPROFILE", home.path());
+        home
+    });
+}
+
 impl GitRepoFixture {
     pub fn new() -> Self {
+        isolate_home();
         let tmp = TempDir::new().expect("tempdir");
         let canonical = std::fs::canonicalize(tmp.path()).expect("canonicalize");
         let registry = WorkspaceRegistry::default();
@@ -23,8 +38,8 @@ impl GitRepoFixture {
 
         run_git_in(&canonical, &["init", "-q"]);
         run_git_in(&canonical, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        run_git_in(&canonical, &["config", "user.email", "test@terax.local"]);
-        run_git_in(&canonical, &["config", "user.name", "Terax Test"]);
+        run_git_in(&canonical, &["config", "user.email", "test@oarlock.local"]);
+        run_git_in(&canonical, &["config", "user.name", "Oarlock Test"]);
         run_git_in(&canonical, &["config", "commit.gpgsign", "false"]);
         run_git_in(&canonical, &["config", "core.autocrlf", "false"]);
 
@@ -54,15 +69,35 @@ impl GitRepoFixture {
 }
 
 fn run_git_in(cwd: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("git on PATH");
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    isolate_git_environment(&mut command);
+    let out = command.output().expect("git on PATH");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Test fixtures must never inherit a repository or configuration override.
+pub fn isolate_git_environment(command: &mut Command) {
+    let names: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_owned()))
+        .filter(|key| {
+            key.to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+        })
+        .collect();
+    for name in names {
+        command.env_remove(name);
+    }
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
     );
 }
 
@@ -81,6 +116,7 @@ pub struct FsFixture {
 
 impl FsFixture {
     pub fn new() -> Self {
+        isolate_home();
         let tmp = TempDir::new().expect("tempdir");
         let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
         Self { root, _tmp: tmp }

@@ -56,6 +56,22 @@ describe("resolveExplorerMoveTarget", () => {
     ).toBeNull();
   });
 
+  it("drops onto a file at a drive root into the root itself", () => {
+    const noDirs = () => false;
+    expect(
+      resolveExplorerMoveTarget(
+        ["D:/src/a.ts"],
+        "D:/",
+        "D:/b.ts",
+        true,
+        noDirs,
+      ),
+    ).toBe("D:/");
+    expect(
+      resolveExplorerMoveTarget(["D:/a.ts"], "D:/", "D:/b.ts", true, noDirs),
+    ).toBeNull();
+  });
+
   it("rejects no-op and recursive directory moves", () => {
     expect(
       resolveExplorerMoveTarget(
@@ -143,12 +159,16 @@ describe("finishExplorerDrag", () => {
       null,
       pathDropTarget,
       onMove,
+      isDir,
     );
 
+    // The target learns which paths are folders (the AI composer names them).
     expect(pathDropTarget.dropPath).toHaveBeenCalledWith(
       ["/repo/file.ts"],
       100,
       200,
+      isDir,
+      undefined,
     );
     expect(pathDropTarget.clearTarget).toHaveBeenCalledOnce();
     expect(onMove).not.toHaveBeenCalled();
@@ -165,6 +185,9 @@ describe("finishExplorerDrag", () => {
       undefined,
       onMove,
     );
-    expect(onMove).toHaveBeenCalledWith(["/repo/a.ts", "/repo/b.ts"], "/repo/dest");
+    expect(onMove).toHaveBeenCalledWith(
+      ["/repo/a.ts", "/repo/b.ts"],
+      "/repo/dest",
+    );
   });
 });

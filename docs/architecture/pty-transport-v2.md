@@ -24,11 +24,11 @@ terminal, and hidden tabs pay the same as the visible one. Ten agent tabs at
 
 ### Pull stream
 
-- An asynchronous custom URI scheme, `terax-pty`, registered with
+- An asynchronous custom URI scheme, `oarlock-pty`, registered with
   `register_asynchronous_uri_scheme_protocol`. The frontend keeps exactly one
   outstanding `POST poll` request per webview. The URL is built with Tauri's
-  `convertFileSrc(path, "terax-pty")`: `terax-pty://localhost/poll`, or
-  `http://terax-pty.localhost/poll` on Windows. CSP `connect-src` allows both.
+  `convertFileSrc(path, "oarlock-pty")`: `oarlock-pty://localhost/poll`, or
+  `http://oarlock-pty.localhost/poll` on Windows. CSP `connect-src` allows both.
 - **Credential.** `pty_stream_open` (an ordinary command, so only the page's own
   frame can call it) returns a random 64-bit token from OS entropy (no fallback:
   if entropy is unavailable the command fails). Every request carries it. The
@@ -152,6 +152,22 @@ terminals.
 - Thread stacks are 128–256 KiB.
 - `pty_has_foreground_process` uses `proc_listchildpids` on macOS and
   `/proc/<pid>/task/*/children` on Linux instead of forking `pgrep`.
+
+## Input budget and reply overflow
+
+User input and the terminal's own replies share the per-session writer thread but not a policy,
+and neither stops the pane on overflow. In the page, `BoundedPtyWriter` holds a 256 KiB input
+budget: one paste may exceed it, up to 8 MiB, while nothing beyond the budget is queued. Input
+past the budget, a reserved input slot beyond 256 waiting, and a slot idle for 60 s are dropped
+with a notice (a slot that waits for the user, such as a paste confirmation or the command bar's
+composition, has no deadline); held-key repeats past 32 waiting actions and replies that do not
+fit are dropped silently, `enqueue` returns false for a refused reply, and the writer stays
+alive. Only a failed `pty_write` stops the writer, until the shell is restarted. In the core, a
+reply that does not fit the 256 KiB reply queue is dropped whole and logged once; the replies
+already queued stay whole, a Kitty clipboard answer too large for the answer queue is dropped
+the same way, and the terminal keeps running (the old `reply_overflow` flag and the
+`restty_write` error are gone). `pty_write` itself still refuses a single write above 64 MiB
+(`MAX_INPUT_BYTES`) before it reaches the writer.
 
 ## Differences from the first draft
 

@@ -113,6 +113,14 @@ describe("repository targets", () => {
 });
 
 describe("activeRepositoryContextPath", () => {
+  it("preserves backslashes in a Unix editor's parent path", () => {
+    expect(activeRepositoryContextPath({
+      activeTab: { ...editorTab, path: "/repo\\name/file.ts" },
+      activeTerminalLeafCwd: null,
+      explorerRoot: null,
+      workspaceFallbackPath: null,
+    })).toBe("/repo\\name");
+  });
   it("prefers the focused terminal leaf cwd", () => {
     expect(
       activeRepositoryContextPath({

@@ -1,3 +1,6 @@
+import { WorkspaceOwner } from "@/modules/workspace/owner";
+import { LOCAL_WORKSPACE } from "@/modules/workspace/env";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
 import { cn } from "@/lib/utils";
 import type { MarkdownTab, Tab } from "@/modules/tabs";
 import { MarkdownPreviewPane } from "./MarkdownPreviewPane";
@@ -9,6 +12,7 @@ type Props = {
 };
 
 export function MarkdownStack({ tabs, activeId, onSetMarkdownView }: Props) {
+  const spaces = useSpaces((s) => s.spaces);
   const markdowns = tabs.filter(
     (t): t is MarkdownTab => t.kind === "markdown" && !t.cold,
   );
@@ -26,11 +30,17 @@ export function MarkdownStack({ tabs, activeId, onSetMarkdownView }: Props) {
             )}
             aria-hidden={!visible}
           >
-            <MarkdownPreviewPane
-              path={t.path}
-              visible={visible}
-              onSetView={(mode) => onSetMarkdownView(t.id, mode)}
-            />
+            <WorkspaceOwner
+              env={
+                spaces.find((s) => s.id === t.spaceId)?.env ?? LOCAL_WORKSPACE
+              }
+            >
+              <MarkdownPreviewPane
+                path={t.path}
+                visible={visible}
+                onSetView={(mode) => onSetMarkdownView(t.id, mode)}
+              />
+            </WorkspaceOwner>
           </div>
         );
       })}

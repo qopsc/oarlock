@@ -7,20 +7,28 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use ignore::{WalkBuilder, WalkState};
-use serde::Serialize;
-use tauri::State;
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
-use super::supersede::Supersede;
-use super::{blocking, display_path, to_canon};
-use crate::modules::workspace::{resolve_path, WorkspaceEnv};
+use super::{authorized_root, blocking, display_path, to_canon};
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv};
 
 const FILE_SIZE_CAP: u64 = 5 * 1024 * 1024;
 const DEFAULT_MAX_RESULTS: usize = 200;
 const HARD_MAX_RESULTS: usize = 2000;
+const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
-/// Supersession key for the command palette's live content search: each new
-/// query cancels the previous walk on its worker threads.
-const INTERACTIVE_KEY: &str = "grep-interactive";
+/// Who runs a live content search. Each caller's new query cancels its own
+/// previous walk on its worker threads, never another caller's: typing in the
+/// palette must not cut the sidebar's results short.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GrepChannel {
+    #[default]
+    Palette,
+    Sidebar,
+}
+
 /// Walker threads per search. The default is one per core, which for a burst of
 /// keystrokes spawned a dozen threads per query.
 const WALK_THREADS: usize = 4;
@@ -40,6 +48,12 @@ pub struct GrepResponse {
     pub files_scanned: usize,
     /// Stopped early because a newer query replaced this one.
     pub cancelled: bool,
+}
+
+#[derive(Default)]
+struct CollectedHits {
+    hits: Vec<GrepHit>,
+    bytes: usize,
 }
 
 fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>, String> {
@@ -74,6 +88,7 @@ fn search_tree(
     matcher: &RegexMatcher,
     globs: &Option<GlobSet>,
     cap: usize,
+    protect_secrets: bool,
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> GrepResponse {
     let walker = WalkBuilder::new(root_path)
@@ -87,7 +102,7 @@ fn search_tree(
         .threads(WALK_THREADS)
         .build_parallel();
 
-    let hits: Arc<Mutex<Vec<GrepHit>>> = Arc::new(Mutex::new(Vec::new()));
+    let hits = Arc::new(Mutex::new(CollectedHits::default()));
     let scanned = Arc::new(AtomicUsize::new(0));
     let truncated = Arc::new(AtomicBool::new(false));
 
@@ -113,6 +128,9 @@ fn search_tree(
                 return WalkState::Continue;
             }
             let path = dent.path();
+            if protect_secrets && !crate::modules::secret_paths::readable(path) {
+                return WalkState::Continue;
+            }
             let rel = match path.strip_prefix(&root_path) {
                 Ok(r) => to_canon(r),
                 Err(_) => return WalkState::Continue,
@@ -141,17 +159,27 @@ fn search_tree(
                 &matcher,
                 path,
                 UTF8(|line_num, text| {
-                    let line_text = text.trim_end_matches('\n').to_string();
+                    if cancel() {
+                        return Ok(false);
+                    }
+                    let line_text = text.trim_end_matches('\n');
                     let mut guard = hits.lock().unwrap();
-                    if guard.len() >= cap {
+                    let size = line_text
+                        .len()
+                        .saturating_add(abs.len())
+                        .saturating_add(rel_clone.len());
+                    if guard.hits.len() >= cap
+                        || size > MAX_RESULT_BYTES.saturating_sub(guard.bytes)
+                    {
                         truncated.store(true, Ordering::Relaxed);
                         return Ok(false);
                     }
-                    guard.push(GrepHit {
+                    guard.bytes += size;
+                    guard.hits.push(GrepHit {
                         path: abs.clone(),
                         rel: rel_clone.clone(),
                         line: line_num,
-                        text: line_text,
+                        text: line_text.to_string(),
                     });
                     Ok(true)
                 }),
@@ -166,7 +194,7 @@ fn search_tree(
         .unwrap_or_default();
 
     GrepResponse {
-        hits: final_hits,
+        hits: final_hits.hits,
         truncated: truncated.load(Ordering::Relaxed),
         files_scanned: scanned.load(Ordering::Relaxed),
         cancelled: cancel(),
@@ -174,15 +202,19 @@ fn search_tree(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn fs_grep(
+    app: AppHandle,
     pattern: String,
     root: String,
     glob: Option<Vec<String>>,
     case_insensitive: Option<bool>,
     max_results: Option<usize>,
     workspace: Option<WorkspaceEnv>,
+    origin: Option<Origin>,
 ) -> Result<GrepResponse, String> {
     blocking(move || {
+        authorized_root(&app, &root, workspace.as_ref(), origin.unwrap_or_default())?;
         run_grep(
             pattern,
             root,
@@ -190,6 +222,7 @@ pub async fn fs_grep(
             case_insensitive,
             max_results,
             workspace,
+            origin.unwrap_or_default() == Origin::Ai,
         )
     })
     .await
@@ -202,12 +235,13 @@ pub fn run_grep(
     case_insensitive: Option<bool>,
     max_results: Option<usize>,
     workspace: Option<WorkspaceEnv>,
+    protect_secrets: bool,
 ) -> Result<GrepResponse, String> {
     if pattern.is_empty() {
         return Err("empty pattern".into());
     }
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -230,29 +264,9 @@ pub fn run_grep(
         &matcher,
         &globs,
         cap,
+        protect_secrets,
         &|| false,
     ))
-}
-
-/// Interactive content search for the command palette. Treats the query as a
-/// literal (smart-case), and self-cancels when a newer query arrives. The
-/// generation is bumped when the command is dispatched, so the previous walk
-/// stops even though it is still occupying a blocking thread.
-#[tauri::command]
-pub async fn fs_grep_interactive(
-    supersede: State<'_, Supersede>,
-    pattern: String,
-    root: String,
-    max_results: Option<usize>,
-    workspace: Option<WorkspaceEnv>,
-) -> Result<GrepResponse, String> {
-    let ticket = supersede.begin(INTERACTIVE_KEY);
-    blocking(move || {
-        run_grep_interactive(pattern, root, max_results, workspace, &|| {
-            ticket.is_superseded()
-        })
-    })
-    .await
 }
 
 pub fn run_grep_interactive(
@@ -266,7 +280,7 @@ pub fn run_grep_interactive(
         return Err("empty pattern".into());
     }
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -281,7 +295,7 @@ pub fn run_grep_interactive(
         .map_err(|e| format!("bad pattern: {e}"))?;
 
     Ok(search_tree(
-        &root_path, &root, &workspace, &matcher, &None, cap, cancel,
+        &root_path, &root, &workspace, &matcher, &None, cap, false, cancel,
     ))
 }
 
@@ -299,12 +313,24 @@ pub struct GlobResponse {
 
 #[tauri::command]
 pub async fn fs_glob(
+    app: AppHandle,
     pattern: String,
     root: String,
     max_results: Option<usize>,
     workspace: Option<WorkspaceEnv>,
+    origin: Option<Origin>,
 ) -> Result<GlobResponse, String> {
-    blocking(move || run_glob(pattern, root, max_results, workspace)).await
+    blocking(move || {
+        authorized_root(&app, &root, workspace.as_ref(), origin.unwrap_or_default())?;
+        run_glob(
+            pattern,
+            root,
+            max_results,
+            workspace,
+            origin.unwrap_or_default() == Origin::Ai,
+        )
+    })
+    .await
 }
 
 pub fn run_glob(
@@ -312,12 +338,13 @@ pub fn run_glob(
     root: String,
     max_results: Option<usize>,
     workspace: Option<WorkspaceEnv>,
+    protect_secrets: bool,
 ) -> Result<GlobResponse, String> {
     if pattern.is_empty() {
         return Err("empty pattern".into());
     }
     let workspace = WorkspaceEnv::from_option(workspace);
-    let root_path = resolve_path(&root, &workspace);
+    let root_path = resolve_path(&root, &workspace)?;
     if !root_path.is_dir() {
         return Err(format!("not a directory: {root}"));
     }
@@ -349,6 +376,9 @@ pub fn run_glob(
             continue;
         }
         let path = dent.path();
+        if protect_secrets && !crate::modules::secret_paths::readable(path) {
+            continue;
+        }
         let rel = match path.strip_prefix(&root_path) {
             Ok(r) => to_canon(r),
             Err(_) => continue,
@@ -370,9 +400,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_missing_or_named_channel_deserializes() {
+        assert_eq!(GrepChannel::default(), GrepChannel::Palette);
+        let sidebar: GrepChannel = serde_json::from_str("\"sidebar\"").unwrap();
+        assert_eq!(sidebar, GrepChannel::Sidebar);
+        assert!(serde_json::from_str::<GrepChannel>("\"other\"").is_err());
+    }
+
+    #[test]
     fn escape_literal_escapes_regex_meta() {
         assert_eq!(escape_literal("a.b(c)"), "a\\.b\\(c\\)");
         assert_eq!(escape_literal("plain text"), "plain text");
+    }
+
+    #[test]
+    fn search_results_are_bounded_by_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("needle{}", "x".repeat(3 * 1024 * 1024));
+        for index in 0..3 {
+            std::fs::write(dir.path().join(format!("{index}.txt")), &line).unwrap();
+        }
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let workspace = WorkspaceEnv::from_option(None);
+        let root = dir.path().to_string_lossy().to_string();
+        let result = search_tree(dir.path(), &root, &workspace, &matcher, &None, 100, false, &|| {
+            false
+        });
+        assert!(result.truncated);
+        assert!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.text.len() + hit.path.len() + hit.rel.len())
+                .sum::<usize>()
+                <= 8 * 1024 * 1024
+        );
+        assert_eq!(result.hits.len(), 2);
     }
 
     #[test]
@@ -390,6 +453,7 @@ mod tests {
             &matcher,
             &None,
             100,
+            false,
             &|| false,
         );
         assert_eq!(live.hits.len(), 1, "uncancelled search finds the match");
@@ -401,9 +465,32 @@ mod tests {
             &matcher,
             &None,
             100,
+            false,
             &|| true,
         );
         assert!(stopped.hits.is_empty(), "cancelled search yields nothing");
+    }
+
+    #[test]
+    fn the_ais_searches_skip_secret_files_and_the_apps_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("notes.txt"), "TOKEN in notes\n").unwrap();
+        std::fs::write(root.join("server.pem"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(root.join("credentials"), "TOKEN key\n").unwrap();
+        let text = root.to_string_lossy().into_owned();
+
+        let ai = run_grep("TOKEN".into(), text.clone(), None, None, None, None, true).unwrap();
+        let hits: Vec<&str> = ai.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert_eq!(hits, ["notes.txt"]);
+
+        let app = run_grep("TOKEN".into(), text.clone(), None, None, None, None, false).unwrap();
+        let seen: Vec<&str> = app.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert!(seen.contains(&"notes.txt") && seen.contains(&"server.pem"));
+
+        let all = run_glob("**/*".into(), text.clone(), None, None, true).unwrap();
+        let listed: Vec<&str> = all.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert_eq!(listed, ["notes.txt"]);
     }
 
     #[test]
@@ -425,6 +512,7 @@ mod tests {
             &matcher,
             &None,
             2000,
+            false,
             &cancel,
         );
         assert!(out.cancelled);
