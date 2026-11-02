@@ -1,4 +1,9 @@
 //! Inspect background images before the webview allocates decoded pixels.
+mod platform;
+
+use platform::inspect;
+#[cfg(all(test, target_os = "linux"))]
+use platform::png_is_animated;
 use std::sync::{Arc, OnceLock};
 use tauri::{ipc::Request, Manager};
 use tokio::sync::Semaphore;
@@ -12,78 +17,159 @@ const MAX_FRAMES: u64 = 1024;
 
 fn encoded_canvas(bytes: &[u8]) -> Option<(u64, u64)> {
     if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
-        return Some((u32::from_be_bytes(bytes[16..20].try_into().ok()?) as u64, u32::from_be_bytes(bytes[20..24].try_into().ok()?) as u64));
+        return Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?) as u64,
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?) as u64,
+        ));
     }
     if bytes.len() >= 10 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return Some((u16::from_le_bytes([bytes[6], bytes[7]]) as u64, u16::from_le_bytes([bytes[8], bytes[9]]) as u64));
+        return Some((
+            u16::from_le_bytes([bytes[6], bytes[7]]) as u64,
+            u16::from_le_bytes([bytes[8], bytes[9]]) as u64,
+        ));
     }
     if bytes.len() >= 30 && bytes.starts_with(b"RIFF") && &bytes[8..16] == b"WEBPVP8X" {
-        let number = |start: usize| u32::from_le_bytes([bytes[start], bytes[start + 1], bytes[start + 2], 0]) as u64 + 1;
+        let number = |start: usize| {
+            u32::from_le_bytes([bytes[start], bytes[start + 1], bytes[start + 2], 0]) as u64 + 1
+        };
         return Some((number(24), number(27)));
     }
-    if bytes.len() >= 30 && bytes.starts_with(b"RIFF") && &bytes[8..16] == b"WEBPVP8 " && &bytes[23..26] == b"\x9d\x01\x2a" {
+    if bytes.len() >= 30
+        && bytes.starts_with(b"RIFF")
+        && &bytes[8..16] == b"WEBPVP8 "
+        && &bytes[23..26] == b"\x9d\x01\x2a"
+    {
         let width = u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff;
         let height = u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff;
         return Some((width as u64, height as u64));
     }
-    if bytes.len() >= 25 && bytes.starts_with(b"RIFF") && &bytes[8..16] == b"WEBPVP8L" && bytes[20] == 0x2f {
+    if bytes.len() >= 25
+        && bytes.starts_with(b"RIFF")
+        && &bytes[8..16] == b"WEBPVP8L"
+        && bytes[20] == 0x2f
+    {
         let bits = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
-        return Some(((bits & 0x3fff) as u64 + 1, ((bits >> 14) & 0x3fff) as u64 + 1));
+        return Some((
+            (bits & 0x3fff) as u64 + 1,
+            ((bits >> 14) & 0x3fff) as u64 + 1,
+        ));
     }
     None
 }
 
 fn webp_canvas(bytes: &[u8]) -> Result<Option<(u64, u64)>, String> {
-    if bytes.len() < 12 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" { return Ok(None); }
+    if bytes.len() < 12 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return Ok(None);
+    }
     let mut offset = 12usize;
     let mut largest = (0, 0);
     let mut chunks = 0usize;
     while let Some(header) = bytes.get(offset..offset.saturating_add(8)) {
         chunks += 1;
-        if chunks > 4096 { return Err("WebP metadata is too complex".into()); }
-        let length = u32::from_le_bytes(header[4..8].try_into().map_err(|_| "Invalid WebP metadata")?) as usize;
-        let end = offset.checked_add(8).and_then(|start| start.checked_add(length)).ok_or("Invalid WebP metadata")?;
-        if end > bytes.len() { return Err("Invalid WebP metadata".into()); }
+        if chunks > 4096 {
+            return Err("WebP metadata is too complex".into());
+        }
+        let length = u32::from_le_bytes(
+            header[4..8]
+                .try_into()
+                .map_err(|_| "Invalid WebP metadata")?,
+        ) as usize;
+        let end = offset
+            .checked_add(8)
+            .and_then(|start| start.checked_add(length))
+            .ok_or("Invalid WebP metadata")?;
+        if end > bytes.len() {
+            return Err("Invalid WebP metadata".into());
+        }
         let payload = &bytes[offset + 8..end];
         let size = if &header[..4] == b"VP8X" && payload.len() >= 10 {
-            let number = |start: usize| u32::from_le_bytes([payload[start], payload[start + 1], payload[start + 2], 0]) as u64 + 1;
+            let number = |start: usize| {
+                u32::from_le_bytes([payload[start], payload[start + 1], payload[start + 2], 0])
+                    as u64
+                    + 1
+            };
             Some((number(4), number(7)))
-        } else if &header[..4] == b"VP8 " && payload.len() >= 10 && &payload[3..6] == b"\x9d\x01\x2a" {
-            Some(((u16::from_le_bytes([payload[6], payload[7]]) & 0x3fff) as u64, (u16::from_le_bytes([payload[8], payload[9]]) & 0x3fff) as u64))
+        } else if &header[..4] == b"VP8 "
+            && payload.len() >= 10
+            && &payload[3..6] == b"\x9d\x01\x2a"
+        {
+            Some((
+                (u16::from_le_bytes([payload[6], payload[7]]) & 0x3fff) as u64,
+                (u16::from_le_bytes([payload[8], payload[9]]) & 0x3fff) as u64,
+            ))
         } else if &header[..4] == b"VP8L" && payload.len() >= 5 && payload[0] == 0x2f {
-            let bits = u32::from_le_bytes(payload[1..5].try_into().map_err(|_| "Invalid WebP frame")?);
-            Some(((bits & 0x3fff) as u64 + 1, ((bits >> 14) & 0x3fff) as u64 + 1))
-        } else { None };
-        if let Some((width, height)) = size { largest.0 = largest.0.max(width); largest.1 = largest.1.max(height); }
+            let bits =
+                u32::from_le_bytes(payload[1..5].try_into().map_err(|_| "Invalid WebP frame")?);
+            Some((
+                (bits & 0x3fff) as u64 + 1,
+                ((bits >> 14) & 0x3fff) as u64 + 1,
+            ))
+        } else {
+            None
+        };
+        if let Some((width, height)) = size {
+            largest.0 = largest.0.max(width);
+            largest.1 = largest.1.max(height);
+        }
         offset = end.checked_add(length % 2).ok_or("Invalid WebP metadata")?;
     }
-    if largest.0 == 0 || largest.1 == 0 { return Err("WebP dimensions are unavailable".into()); }
+    if largest.0 == 0 || largest.1 == 0 {
+        return Err("WebP dimensions are unavailable".into());
+    }
     Ok(Some(largest))
 }
 
 // JPEG stores its frame dimensions before the first scan. Reject malformed
 // headers rather than asking an image decoder to discover their size.
 fn jpeg_canvas(bytes: &[u8]) -> Result<Option<(u64, u64)>, String> {
-    if !bytes.starts_with(&[0xff, 0xd8]) { return Ok(None); }
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return Ok(None);
+    }
     let mut offset = 2usize;
     let mut dimensions: Option<(u64, u64)> = None;
     let mut segments = 0usize;
     while offset < bytes.len() {
         segments += 1;
-        if segments > 4096 { return Err("JPEG metadata is too complex".into()); }
-        if bytes[offset] != 0xff { return Err("Invalid JPEG metadata".into()); }
-        while bytes.get(offset) == Some(&0xff) { offset += 1; }
+        if segments > 4096 {
+            return Err("JPEG metadata is too complex".into());
+        }
+        if bytes[offset] != 0xff {
+            return Err("Invalid JPEG metadata".into());
+        }
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
         let marker = *bytes.get(offset).ok_or("Invalid JPEG metadata")?;
         offset += 1;
-        if marker == 0xda { return dimensions.map(Some).ok_or_else(|| "JPEG dimensions are unavailable".into()); }
-        if marker == 0xd9 || marker == 0xd8 || marker == 0x00 { return Err("Invalid JPEG metadata".into()); }
-        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) { continue; }
-        let length = u16::from_be_bytes(bytes.get(offset..offset + 2).ok_or("Invalid JPEG metadata")?.try_into().map_err(|_| "Invalid JPEG metadata")?) as usize;
-        if length < 2 { return Err("Invalid JPEG metadata".into()); }
+        if marker == 0xda {
+            return dimensions
+                .map(Some)
+                .ok_or_else(|| "JPEG dimensions are unavailable".into());
+        }
+        if marker == 0xd9 || marker == 0xd8 || marker == 0x00 {
+            return Err("Invalid JPEG metadata".into());
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = u16::from_be_bytes(
+            bytes
+                .get(offset..offset + 2)
+                .ok_or("Invalid JPEG metadata")?
+                .try_into()
+                .map_err(|_| "Invalid JPEG metadata")?,
+        ) as usize;
+        if length < 2 {
+            return Err("Invalid JPEG metadata".into());
+        }
         let end = offset.checked_add(length).ok_or("Invalid JPEG metadata")?;
-        if end > bytes.len() { return Err("Invalid JPEG metadata".into()); }
+        if end > bytes.len() {
+            return Err("Invalid JPEG metadata".into());
+        }
         if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
-            if length < 8 { return Err("Invalid JPEG frame".into()); }
+            if length < 8 {
+                return Err("Invalid JPEG frame".into());
+            }
             let height = u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]) as u64;
             let width = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]) as u64;
             let (old_width, old_height) = dimensions.unwrap_or((0, 0));
@@ -98,7 +184,9 @@ fn validate(width: u64, height: u64, frames: u64) -> Result<(), String> {
     if width == 0 || height == 0 || frames == 0 || frames > MAX_FRAMES {
         return Err("Image dimensions or frame count are unavailable".into());
     }
-    if width.checked_mul(height).and_then(|pixels| pixels.checked_mul(frames))
+    if width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(frames))
         .is_none_or(|pixels| pixels > MAX_TOTAL_PIXELS)
     {
         return Err("Image dimensions or animation exceed the decoded image limit".into());
@@ -109,10 +197,16 @@ fn validate(width: u64, height: u64, frames: u64) -> Result<(), String> {
 fn inspect_checked(bytes: &[u8]) -> Result<(), String> {
     let webp = webp_canvas(bytes)?;
     let canvas = webp.or(encoded_canvas(bytes)).or(jpeg_canvas(bytes)?);
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" && canvas.is_none() {
+    if bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && &bytes[8..12] == b"WEBP"
+        && canvas.is_none()
+    {
         return Err("WebP dimensions are unavailable".into());
     }
-    if let Some((width, height)) = canvas { validate(width, height, 1)?; }
+    if let Some((width, height)) = canvas {
+        validate(width, height, 1)?;
+    }
     let (width, height, frames) = inspect(bytes)?;
     validate(width, height, frames)
 }
@@ -133,20 +227,34 @@ pub async fn background_image_inspect(
     window: tauri::WebviewWindow,
     request: Request<'_>,
 ) -> Result<(), String> {
-    let page = request.headers().get("x-page-generation")
-        .and_then(|value| value.to_str().ok()).ok_or("Missing image inspection ownership")?.to_owned();
+    let page = request
+        .headers()
+        .get("x-page-generation")
+        .and_then(|value| value.to_str().ok())
+        .ok_or("Missing image inspection ownership")?
+        .to_owned();
     let label = window.label().to_owned();
-    app.state::<NetworkPages>().with_page(&label, &page, || Ok(()))?;
-    let waiter = waiters().clone().try_acquire_owned().map_err(|_| "Image inspection is busy. Try again.")?;
-    let permit = tokio::time::timeout(std::time::Duration::from_secs(15), budget().clone().acquire_owned()).await
-        .map_err(|_| "Image inspection is busy. Try again.")?
-        .map_err(|_| "Image inspection is unavailable")?;
+    app.state::<NetworkPages>()
+        .with_page(&label, &page, || Ok(()))?;
+    let waiter = waiters()
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "Image inspection is busy. Try again.")?;
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        budget().clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| "Image inspection is busy. Try again.")?
+    .map_err(|_| "Image inspection is unavailable")?;
     drop(waiter);
-    app.state::<NetworkPages>().with_page(&label, &page, || Ok(()))?;
+    app.state::<NetworkPages>()
+        .with_page(&label, &page, || Ok(()))?;
     let bytes = ipc_body::bytes_of(request.body(), MAX_ENCODED, MAX_JSON_FALLBACK)?.into_owned();
     let task = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
-        app.state::<NetworkPages>().with_page(&label, &page, || Ok(()))?;
+        app.state::<NetworkPages>()
+            .with_page(&label, &page, || Ok(()))?;
         inspect_checked(&bytes)
     });
     match tokio::time::timeout(std::time::Duration::from_secs(15), task).await {
@@ -154,144 +262,6 @@ pub async fn background_image_inspect(
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("Image inspection timed out. Try a different image.".into()),
     }
-}
-
-#[cfg(target_os = "macos")]
-fn inspect(bytes: &[u8]) -> Result<(u64, u64, u64), String> {
-    use std::ffi::c_void;
-    use std::ptr;
-    #[link(name = "ImageIO", kind = "framework")]
-    extern "C" {
-        fn CGImageSourceCreateWithData(data: *const c_void, options: *const c_void) -> *const c_void;
-        fn CGImageSourceCopyPropertiesAtIndex(source: *const c_void, index: usize, options: *const c_void) -> *const c_void;
-        fn CGImageSourceGetCount(source: *const c_void) -> usize;
-        static kCGImagePropertyPixelWidth: *const c_void;
-        static kCGImagePropertyPixelHeight: *const c_void;
-    }
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
-        fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
-        fn CFGetTypeID(value: *const c_void) -> usize;
-        fn CFNumberGetTypeID() -> usize;
-        fn CFNumberGetValue(number: *const c_void, kind: isize, output: *mut c_void) -> u8;
-        fn CFRelease(value: *const c_void);
-    }
-    struct Owned(*const c_void);
-    impl Drop for Owned { fn drop(&mut self) { unsafe { CFRelease(self.0) } } }
-    fn owned(value: *const c_void) -> Result<Owned, String> {
-        if value.is_null() { Err("Image metadata is unavailable or unsupported".into()) } else { Ok(Owned(value)) }
-    }
-    unsafe fn number(properties: *const c_void, key: *const c_void) -> Result<u64, String> {
-        let value = CFDictionaryGetValue(properties, key);
-        if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() { return Err("Image dimensions are unavailable".into()); }
-        let mut number: i64 = 0;
-        if CFNumberGetValue(value, 4, (&mut number as *mut i64).cast()) == 0 || number <= 0 {
-            return Err("Invalid image dimensions".into());
-        }
-        Ok(number as u64)
-    }
-    unsafe {
-        let data = owned(CFDataCreate(ptr::null(), bytes.as_ptr(), bytes.len() as isize))?;
-        let source = owned(CGImageSourceCreateWithData(data.0, ptr::null()))?;
-        let count = CGImageSourceGetCount(source.0) as u64;
-        if count == 0 || count > MAX_FRAMES { return Err("Image frame count exceeds the limit".into()); }
-        // An animated frame may be only a patch of a much larger canvas.
-        let (mut width, mut height) = encoded_canvas(bytes).unwrap_or((0, 0));
-        for index in 0..count {
-            let properties = owned(CGImageSourceCopyPropertiesAtIndex(source.0, index as usize, ptr::null()))?;
-            width = width.max(number(properties.0, kCGImagePropertyPixelWidth)?);
-            height = height.max(number(properties.0, kCGImagePropertyPixelHeight)?);
-            validate(width, height, count)?;
-        }
-        Ok((width, height, count))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn png_is_animated(bytes: &[u8]) -> Result<bool, String> {
-    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return Ok(false); }
-    let mut offset = 8usize;
-    let mut chunks = 0usize;
-    while let Some(header) = bytes.get(offset..offset.saturating_add(8)) {
-        chunks += 1;
-        if chunks > 1024 { return Err("PNG metadata is too complex".into()); }
-        let len = u32::from_be_bytes(header[..4].try_into().map_err(|_| "Invalid PNG chunk")?) as usize;
-        let end = offset.checked_add(12).and_then(|start| start.checked_add(len)).ok_or("Invalid PNG chunk")?;
-        if end > bytes.len() { return Err("Invalid PNG chunk".into()); }
-        if &header[4..8] == b"acTL" { return Ok(true); }
-        if &header[4..8] == b"IDAT" { return Ok(false); }
-        offset = end;
-    }
-    Err("Invalid PNG metadata".into())
-}
-
-#[cfg(target_os = "linux")]
-fn webp_is_animated(bytes: &[u8]) -> Result<bool, String> {
-    if bytes.len() < 12 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" { return Ok(false); }
-    let mut offset = 12usize;
-    let mut chunks = 0usize;
-    while let Some(header) = bytes.get(offset..offset.saturating_add(8)) {
-        chunks += 1;
-        if chunks > 4096 { return Err("WebP metadata is too complex".into()); }
-        let len = u32::from_le_bytes(header[4..8].try_into().map_err(|_| "Invalid WebP chunk")?) as usize;
-        let end = offset.checked_add(8).and_then(|start| start.checked_add(len)).ok_or("Invalid WebP chunk")?;
-        if end > bytes.len() { return Err("Invalid WebP chunk".into()); }
-        if &header[..4] == b"ANIM" || &header[..4] == b"ANMF" { return Ok(true); }
-        if &header[..4] == b"VP8X" && len >= 1 && bytes[offset + 8] & 2 != 0 { return Ok(true); }
-        offset = end.checked_add(len % 2).ok_or("Invalid WebP chunk")?;
-    }
-    Ok(false)
-}
-
-#[cfg(target_os = "linux")]
-fn inspect(bytes: &[u8]) -> Result<(u64, u64, u64), String> {
-    use gtk::gdk_pixbuf::prelude::*;
-    use std::{cell::Cell, rc::Rc};
-    // Linux's available image loaders do not expose frame counts before decoding.
-    // Refuse animated formats rather than accepting an unbounded frame sequence.
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
-        || png_is_animated(bytes)?
-        || webp_is_animated(bytes)?
-    { return Err("Animated background images are not supported on Linux".into()); }
-    // Only formats with pixel dimensions reported before GdkPixbuf allocation.
-    let format = image::guess_format(bytes).map_err(|_| "Image format is unavailable or unsupported")?;
-    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP) {
-        return Err("Only PNG, JPEG and static WebP backgrounds are supported on Linux".into());
-    }
-    if format == image::ImageFormat::WebP {
-        let (width, height) = webp_canvas(bytes)?.ok_or("WebP dimensions are unavailable")?;
-        return Ok((width, height, 1));
-    }
-    let dimensions = Rc::new(Cell::new(None));
-    let reported = dimensions.clone();
-    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
-    loader.connect_size_prepared(move |loader, width, height| {
-        reported.set(Some((width, height)));
-        loader.set_size(1, 1);
-    });
-    let mut write_error = None;
-    for chunk in bytes.chunks(8192) {
-        if let Err(error) = loader.write(chunk) {
-            write_error = Some(format!("Image metadata: {error}"));
-            break;
-        }
-        if dimensions.get().is_some() { break; }
-    }
-    // Small images may not be identified until the stream is closed. Closing
-    // is also required when we stopped early after size-prepared.
-    let closed = loader.close();
-    if let Some(error) = write_error { return Err(error); }
-    if dimensions.get().is_none() { closed.map_err(|error| format!("Image metadata: {error}"))?; }
-    let (width, height) = dimensions.get().ok_or("Image dimensions are unavailable")?;
-    if width <= 0 || height <= 0 { return Err("Invalid image dimensions".into()); }
-    let (canvas_width, canvas_height) = encoded_canvas(bytes).unwrap_or((0, 0));
-    Ok(((width as u64).max(canvas_width), (height as u64).max(canvas_height), 1))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn inspect(_bytes: &[u8]) -> Result<(u64, u64, u64), String> {
-    Err("Background image inspection is not supported on this platform".into())
 }
 
 #[cfg(test)]
