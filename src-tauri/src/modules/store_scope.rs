@@ -366,6 +366,17 @@ mod tests {
     }
 
     #[test]
+    fn the_two_secure_file_modules_are_the_same_file() {
+        let store = include_bytes!("../../vendor/tauri-plugin-store/src/secure_file.rs");
+        let window_state =
+            include_bytes!("../../vendor/tauri-plugin-window-state/src/secure_file.rs");
+        assert!(
+            store == window_state,
+            "keep the store and window-state secure_file.rs byte-identical"
+        );
+    }
+
+    #[test]
     fn the_wrapped_plugin_has_no_script_to_forward() {
         let inner = tauri_plugin_store::Builder::new().build::<tauri::Wry>();
         assert_eq!(inner.name(), "store");
