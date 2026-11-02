@@ -64,6 +64,7 @@ import { requestTerminalPrompt } from "../lib/terminalPrompts";
 import { useTerminalStatusStore } from "../lib/terminalStatus";
 import { IS_WINDOWS } from "@/lib/platform";
 import type { DropShell } from "../lib/quoteShellPath";
+import { captureDropOwner } from "../lib/dropOwnership";
 import { cachedShellDialect } from "../lib/shellDialectCache";
 import { launchShellDrop } from "../lib/shellDropLauncher";
 import { GhosttySemanticEventRouter } from "./core/GhosttySemanticEventRouter";
@@ -582,24 +583,22 @@ export function dropPathsIntoGhosttySession(
   const input = session.input;
   if (!commandBar && !input) return false;
   const pty = session.pty;
-  const generation = session.generation;
   const signal = session.requests.signal;
   const navigation = captureTerminalNavigation();
   const running = () =>
     useTerminalStatusStore.getState().leaves[leafId]?.running === true;
   // Typing and focus changes while the drop is prepared do not cancel it:
   // input stays ordered behind its reserved slot.
-  const active = () =>
-    navigation() &&
-    !signal.aborted &&
-    sessions.get(leafId) === session &&
-    session.generation === generation &&
-    session.pty === pty &&
-    !session.shellExited &&
-    !session.disposed &&
-    (commandBar
-      ? blocks?.getMode() === "prompt" && blocks.pathInsertion === capture
-      : session.input === input && ghosttyBlocks(leafId)?.getMode() !== "prompt");
+  const active = captureDropOwner(
+    session,
+    () => sessions.get(leafId),
+    navigation,
+    signal,
+    () =>
+      commandBar
+        ? blocks?.getMode() === "prompt" && blocks.pathInsertion === capture
+        : ghosttyBlocks(leafId)?.getMode() !== "prompt",
+  );
   const finish = session.writer.reserveInput();
   if (!finish) return true;
   const refuse = (description: string) =>
