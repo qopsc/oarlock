@@ -106,7 +106,56 @@ jobs:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
+      # macOS builds and signs without publishing: nothing reaches the draft
+      # release until the packaged helper and app signatures verify. A failed
+      # check therefore leaves no unverified .app or .dmg attached to it.
+      - id: tauri-mac
+        if: startsWith(matrix.platform, 'macos')
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OARLOCK_CLI_TARGET: ${{ matrix.rust-target }}
+          OARLOCK_DISTRIBUTION_BUILD: "1"
+
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        with:
+          tauriScript: bun run tauri
+          args: ${{ matrix.args }}
+
+      - name: Verify packaged Git helper sandbox and signatures
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          OARLOCK_RELEASE_TARGET: ${{ matrix.rust-target }}
+        run: bun scripts/git-worker/verify-app.mjs "src-tauri/target/$OARLOCK_RELEASE_TARGET/release/bundle/macos"
+
+      - name: Upload the verified macOS bundle to the draft release
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_PATHS: ${{ steps.tauri-mac.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --repo "$GITHUB_REPOSITORY" \
+                 --title "Oarlock ${TAG}" --notes "See the assets to download and install." \
+            || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          printf '%s' "$ARTIFACT_PATHS" | jq -r '.[]' | while IFS= read -r artifact; do
+            gh release upload "$TAG" "$artifact" --clobber --repo "$GITHUB_REPOSITORY"
+          done
+
       - id: tauri
+        if: "!startsWith(matrix.platform, 'macos')"
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -130,13 +179,6 @@ jobs:
           prerelease: false
           tauriScript: bun run tauri
           args: ${{ matrix.args }}
-
-      - name: Verify packaged Git helper sandbox and signatures
-        if: startsWith(matrix.platform, 'macos')
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          OARLOCK_RELEASE_TARGET: ${{ matrix.rust-target }}
-        run: bun scripts/git-worker/verify-app.mjs "src-tauri/target/$OARLOCK_RELEASE_TARGET/release/bundle/macos"
 
       # Strip the bundled libwayland-* libs from the AppImage so it loads the
       # host copies at runtime. The Ubuntu 22.04 build host ships libwayland
