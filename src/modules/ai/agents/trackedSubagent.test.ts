@@ -17,7 +17,8 @@ vi.mock("@/modules/settings/preferences", () => ({
     }),
   },
 }));
-vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { error: toastError } }));
 vi.mock("./runSubagent", () => ({ runSubagent: state.run }));
 vi.mock("../store/subagentTasks", () => ({
   initializeTasks: async () => {},
@@ -175,4 +176,51 @@ it("refuses to start a tracked subagent before preferences recover", async () =>
   await expect(runTrackedSubagent(args)).rejects.toThrow("Preferences");
   expect(state.commands).toEqual([]);
   expect(state.run).not.toHaveBeenCalled();
+});
+it("retries a final result that could not be saved, so Stop is not left waiting on a running record", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout"] });
+  try {
+    toastError.mockClear();
+    let failures = 2;
+    state.command.mockImplementation(async (r) => {
+      if (r.status === "completed" && failures-- > 0) throw new Error("ipc");
+    });
+    state.run.mockResolvedValue({
+      summary: "done",
+      stepCount: 1,
+      durationMs: 1,
+    });
+    const running = runTrackedSubagent(args);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await running;
+    expect(state.commands.filter((r) => r.status === "completed")).toHaveLength(
+      3,
+    );
+    expect(toastError).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+it("reports a final result that still cannot be saved after the retries", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout"] });
+  try {
+    toastError.mockClear();
+    state.command.mockImplementation(async (r) => {
+      if (r.status === "completed") throw new Error("ipc down");
+    });
+    state.run.mockResolvedValue({
+      summary: "done",
+      stepCount: 1,
+      durationMs: 1,
+    });
+    const running = runTrackedSubagent(args);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await running;
+    expect(state.commands.filter((r) => r.status === "completed")).toHaveLength(
+      3,
+    );
+    expect(toastError).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
 });

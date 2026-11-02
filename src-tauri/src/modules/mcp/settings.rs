@@ -385,6 +385,32 @@ fn authorize(label: &str, changes: &[Change]) -> Result<(), String> {
     }
 }
 
+/// How long a Settings save waits for a server's token refresh before it gives way. The save
+/// holds the app-wide settings lock meanwhile, so a refresh stuck on the network (up to 30 s)
+/// must not block every other save, spawn and open.
+const REFRESH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Every lock in `locks`, or an error once `wait` has passed for one of them (the ones held so
+/// far are released).
+async fn hold_all(
+    locks: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    wait: std::time::Duration,
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, String> {
+    let mut held = Vec::with_capacity(locks.len());
+    for lock in locks {
+        match tokio::time::timeout(wait, lock.lock_owned()).await {
+            Ok(guard) => held.push(guard),
+            Err(_) => {
+                return Err(
+                    "mcp: a server's sign-in is being refreshed; try the change again in a moment"
+                        .into(),
+                )
+            }
+        }
+    }
+    Ok(held)
+}
+
 #[tauri::command]
 pub async fn mcp_settings_mutate(
     app: tauri::AppHandle,
@@ -426,14 +452,14 @@ pub async fn mcp_settings_mutate(
         .collect();
     let plans = super::credentials::plan(&old, &mut servers, edits)?;
     // Serialize against refresh and sign-in preparation, but not the browser callback wait.
-    let mut held = Vec::new();
-    for plan in &plans {
-        held.push(
-            super::oauth::refresh_lock(&app, &plan.id)
-                .lock_owned()
-                .await,
-        );
-    }
+    let _held = hold_all(
+        plans
+            .iter()
+            .map(|plan| super::oauth::refresh_lock(&app, &plan.id))
+            .collect(),
+        REFRESH_WAIT,
+    )
+    .await?;
     let mut snapshot = store.entries();
     snapshot.insert("servers".into(), json!(servers));
     snapshot.insert("projectServers".into(), json!(records));
@@ -557,6 +583,24 @@ fn write_snapshot_with(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_save_gives_way_to_a_stuck_refresh_instead_of_holding_the_settings_lock() {
+        use std::{sync::Arc, time::Duration};
+        let free = Arc::new(tokio::sync::Mutex::new(()));
+        let busy = Arc::new(tokio::sync::Mutex::new(()));
+        let refresh = busy.clone().lock_owned().await;
+        let error = hold_all(vec![free.clone(), busy.clone()], Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert!(error.contains("refreshed"));
+        assert!(free.try_lock().is_ok(), "locks taken so far are released");
+        drop(refresh);
+        let held = hold_all(vec![free, busy], Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 2);
+    }
+
     use super::*;
     fn server(id: &str) -> Value {
         json!({"id":id,"name":id,"source":"settings","enabled":true,"trusted":false,"transport":{"type":"stdio","command":"server","args":[],"env":[],"cwd":null},"tools":{},"secretsRevision":0})
