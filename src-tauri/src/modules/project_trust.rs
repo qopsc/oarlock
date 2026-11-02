@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::modules::fs::{blocking, to_canon};
-use crate::modules::workspace::{resolve_path, WorkspaceEnv};
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv};
 
 /// Sent to every window when a decision is made or revoked, or a window opens or leaves a
 /// project.
@@ -774,8 +774,11 @@ fn own_change_lock() -> MutexGuard<'static, ()> {
 /// again. Decided here from the disk and the bytes written, never on the page's word: no command
 /// marks content allowed, and a change made any other way (git, another editor, a shell command,
 /// an MCP server, a coding agent, the explorer's rename, move, copy, paste or delete) asks again.
+/// So does a change the AI made (`Origin::Ai`): model output must never author what the trust
+/// prompt exists to confirm, such as an MCP server's command line.
 pub fn keeping_trust<T, E>(
     app: &AppHandle,
+    origin: Origin,
     change: OwnChange<'_>,
     apply: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
@@ -783,6 +786,7 @@ pub fn keeping_trust<T, E>(
         return apply();
     }
     keep_through(
+        origin,
         &open_projects(app),
         change,
         apply,
@@ -802,11 +806,15 @@ pub fn keeping_trust<T, E>(
 /// new hash of each item `change` landed in, with the hash the user must have allowed before
 /// (None: the item held nothing).
 fn keep_through<T, E>(
+    origin: Origin,
     open: &[OpenProject],
     change: OwnChange<'_>,
     apply: impl FnOnce() -> Result<T, E>,
     mut allow: impl FnMut(&OpenProject, ItemKind, Option<&str>, &str),
 ) -> Result<T, E> {
+    if origin == Origin::Ai {
+        return apply();
+    }
     let landed: Vec<(&OpenProject, ItemKind, PathBuf, Vec<String>)> = open
         .iter()
         .filter(|project| change.target().starts_with(&project.real))
@@ -1597,6 +1605,7 @@ mod tests {
         project: OpenProject,
         file: TrustFile,
         at: u64,
+        origin: Origin,
     }
 
     impl Own {
@@ -1615,6 +1624,7 @@ mod tests {
                 root,
                 file: TrustFile::default(),
                 at: 0,
+                origin: Origin::App,
             }
         }
 
@@ -1633,6 +1643,7 @@ mod tests {
             self.at += 1;
             let (file, at) = (&mut self.file, self.at);
             keep_through(
+                self.origin,
                 std::slice::from_ref(&self.project),
                 change,
                 apply,
@@ -1785,6 +1796,32 @@ mod tests {
         assert!(empty.allowed(mcp));
     }
 
+    #[test]
+    fn the_ais_own_writes_ask_again_where_the_editors_keep_the_answer() {
+        let servers = r#"{"mcpServers": {"x": {"command": "curl"}}}"#;
+        for (name, path, content, kind) in [
+            ("mcp", ".mcp.json", servers, ItemKind::McpJson),
+            ("memory", "AGENTS.md", "# Rules", ItemKind::AgentsMd),
+            (
+                "skill",
+                ".claude/skills/review/SKILL.md",
+                SKILL,
+                ItemKind::ClaudeSkills,
+            ),
+        ] {
+            let mut own = Own::new();
+            std::fs::create_dir_all(own.path(".claude/skills/review")).unwrap();
+            own.origin = Origin::Ai;
+            own.write(path, content);
+            assert!(!own.allowed(kind), "{name}: model output is not consent");
+            assert!(own.current(kind).is_some(), "{name}: it is written");
+            let mut editor = Own::new();
+            std::fs::create_dir_all(editor.path(".claude/skills/review")).unwrap();
+            editor.write(path, content);
+            assert!(editor.allowed(kind), "{name}: the editor's save is kept");
+        }
+    }
+
     const SKILL: &str = "---\nname: review\ndescription: Reviews a change.\n---\nCheck it.\n";
 
     #[test]
@@ -1891,6 +1928,7 @@ mod tests {
         assert_eq!(failed.file, TrustFile::default());
         let mut asked = 0;
         keep_through(
+            Origin::App,
             &[],
             change,
             || std::fs::write(&target, "# Rules"),
