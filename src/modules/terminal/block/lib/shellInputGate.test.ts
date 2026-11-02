@@ -10,7 +10,7 @@ function setup() {
   writer.attach({ id: 1, write: async () => {}, close: async () => {}, resize: async () => {} } as PtySession);
   const submitted: string[] = [];
   const owner = { defer: (action: () => void, size?: number) => writer.deferInput(action, size),
-    reserve: () => writer.reserveInput(), holding: () => writer.holdingInput, noteInput: vi.fn() };
+    reserve: (options?: { deadline?: boolean }) => writer.reserveInput(options), holding: () => writer.holdingInput, noteInput: vi.fn() };
   const gate = shellInputGate(owner);
   const extensions = gate.extensions;
   let state = EditorState.create({ extensions: [extensions, keymap.of([{
@@ -67,4 +67,24 @@ it("releases a pending composition when the command editor retargets", async () 
   first(() => {});
   await vi.waitFor(() => expect(writer.hasPendingInput).toBe(false));
   writer.dispose();
+});
+
+it("keeps a composition slot past the system deadline while the user is composing", async () => {
+  vi.useFakeTimers();
+  try {
+    const { writer, view, handlers } = setup();
+    const finish = writer.reserveInput({ deadline: false });
+    if (!finish) throw new Error("Could not reserve input");
+    const reserve = vi.spyOn(writer, "reserveInput");
+    handlers.compositionstart();
+    expect(reserve).toHaveBeenCalledWith({ deadline: false });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(writer.pendingActions).toBe(2);
+    handlers.compositionend({ data: "你" } as CompositionEvent, view);
+    finish(() => view.dispatch(view.state.replaceSelection("paste ")));
+    expect(view.state.doc.toString()).toBe("paste 你");
+    writer.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
 });

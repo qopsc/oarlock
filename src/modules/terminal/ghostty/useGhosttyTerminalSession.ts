@@ -478,11 +478,11 @@ export function holdingGhosttyInput(leafId: number): boolean {
   return sessions.get(leafId)?.writer.holdingInput ?? false;
 }
 
-export function reserveGhosttyInput(leafId: number) {
+export function reserveGhosttyInput(leafId: number, options?: { deadline?: boolean }) {
   const session = sessions.get(leafId);
   if (!session || session.disposed || session.shellExited) return null;
   const generation = session.generation;
-  const finish = session.writer.reserveInput();
+  const finish = session.writer.reserveInput(options);
   if (!finish) return null;
   return (action: () => void, size = 0) => finish(() => {
     if (sessions.get(leafId) === session && !session.disposed &&
