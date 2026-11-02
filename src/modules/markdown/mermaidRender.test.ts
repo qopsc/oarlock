@@ -10,6 +10,8 @@ import {
   observeDiagramVisibility,
   serialized,
   scheduleDiagramRender,
+  diagramRenderDelay,
+  settleDiagramRender,
   stripSvgLinks,
 } from "./mermaidRender";
 import { diagramError } from "./MermaidViews";
@@ -253,5 +255,25 @@ describe("serialized", () => {
     await expect(b).rejects.toThrow("b failed");
     await expect(c).resolves.toBe("c");
     expect(events).toEqual(["start a", "end a", "start b", "start c", "end c"]);
+  });
+});
+
+describe("render timing", () => {
+  it("debounces only an edit to a diagram that is already drawn", () => {
+    expect(diagramRenderDelay(null, "graph TD")).toBe(0);
+    expect(diagramRenderDelay("graph TD", "graph TD")).toBe(0);
+    expect(diagramRenderDelay("graph TD", "graph LR")).toBe(MERMAID_DEBOUNCE_MS);
+  });
+
+  it("keeps a drawing that finished after its view was hidden", () => {
+    const cache = new Map<string, string>();
+    const controller = new AbortController();
+    controller.abort();
+    const apply = vi.fn();
+    settleDiagramRender(cache, "light:a", controller.signal, "<svg/>", apply);
+    expect(cache.get("light:a")).toBe("<svg/>");
+    expect(apply).not.toHaveBeenCalled();
+    settleDiagramRender(cache, "light:b", new AbortController().signal, "<svg/>", apply);
+    expect(apply).toHaveBeenCalledWith("<svg/>");
   });
 });

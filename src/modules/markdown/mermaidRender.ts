@@ -34,10 +34,37 @@ export function diagramLimitError(error: unknown): unknown {
     : error;
 }
 
+/** Only an edit to a diagram already on screen waits for typing to pause; a first draw
+ * or a theme switch of unchanged source starts at once. */
+export function diagramRenderDelay(
+  previousCode: string | null,
+  code: string,
+): number {
+  return previousCode !== null && previousCode !== code
+    ? MERMAID_DEBOUNCE_MS
+    : 0;
+}
+
 /** Cancel pending work whenever the source, theme, or visibility changes. */
-export function scheduleDiagramRender(run: () => void): () => void {
-  const timer = setTimeout(run, MERMAID_DEBOUNCE_MS);
+export function scheduleDiagramRender(
+  run: () => void,
+  delay = MERMAID_DEBOUNCE_MS,
+): () => void {
+  const timer = setTimeout(run, delay);
   return () => clearTimeout(timer);
+}
+
+/** A finished drawing is kept even when its view was hidden meanwhile, so coming back
+ * does not lay it out again; only a view still waiting for it is updated. */
+export function settleDiagramRender(
+  cache: { set: (key: string, svg: string) => void },
+  key: string,
+  signal: AbortSignal,
+  svg: string,
+  apply: (svg: string) => void,
+): void {
+  cache.set(key, svg);
+  if (!signal.aborted) apply(svg);
 }
 
 /**

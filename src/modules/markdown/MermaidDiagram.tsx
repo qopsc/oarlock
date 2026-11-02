@@ -13,10 +13,12 @@ import {
   DiagramCache,
   MERMAID_MAX_TEXT,
   diagramLimitError,
+  diagramRenderDelay,
   mermaidConfig,
   observeDiagramVisibility,
   scheduleDiagramRender,
   serialized,
+  settleDiagramRender,
   stripSvgLinks,
 } from "./mermaidRender";
 
@@ -77,6 +79,7 @@ export function MermaidDiagram({ code, pending, failed }: Props) {
     return svg === undefined ? null : { key, svg };
   });
   const ref = useRef<HTMLDivElement>(null);
+  const drawnCode = useRef<string | null>(null);
   const near = useNearViewport(ref);
   const current = drawn?.key === key;
   const tooLarge = code.length > MERMAID_MAX_TEXT;
@@ -85,24 +88,24 @@ export function MermaidDiagram({ code, pending, failed }: Props) {
     if (!near || current || tooLarge) return;
     const cached = cache.get(key);
     if (cached !== undefined) {
+      drawnCode.current = code;
       setDrawn({ key, svg: cached });
       return;
     }
     const render = new AbortController();
     const cancelTimer = scheduleDiagramRender(() => {
       void renderDiagram(code, mode, render.signal).then(
-        (svg) => {
-          if (!render.signal.aborted) {
-            cache.set(key, svg);
-            setDrawn({ key, svg });
-          }
-        },
+        (svg) =>
+          settleDiagramRender(cache, key, render.signal, svg, (done) => {
+            drawnCode.current = code;
+            setDrawn({ key, svg: done });
+          }),
         (error: unknown) => {
           if (!render.signal.aborted)
             setDrawn({ key, error: diagramLimitError(error) });
         },
       );
-    });
+    }, diagramRenderDelay(drawnCode.current, code));
     return () => {
       cancelTimer();
       render.abort();
