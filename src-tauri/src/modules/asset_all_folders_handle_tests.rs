@@ -652,3 +652,49 @@ fn a_granted_font_face_is_served_as_a_font_and_nothing_beside_it() {
         StatusCode::FORBIDDEN
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_link_to_an_outside_target_is_refused_before_anything_is_opened() {
+    use crate::modules::asset_scope::Access;
+    use std::cell::Cell;
+    let tmp = tempfile::Builder::new()
+        .prefix("oarlock-out-")
+        .tempdir()
+        .unwrap();
+    let real = std::fs::canonicalize(tmp.path()).unwrap();
+    let project = real.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(real.join("outside")).unwrap();
+    std::fs::write(real.join("outside").join("x.png"), PNG).unwrap();
+    std::fs::write(project.join("pic.png"), PNG).unwrap();
+    let missing = project.join("mount.png");
+    std::os::unix::fs::symlink(real.join("not-there").join("share"), &missing).unwrap();
+    let existing = project.join("leak.png");
+    std::os::unix::fs::symlink(real.join("outside").join("x.png"), &existing).unwrap();
+    let inside = project.join("alias.png");
+    std::os::unix::fs::symlink(project.join("pic.png"), &inside).unwrap();
+    let access = Access::new(vec![], true);
+    access.grant_root(&project);
+    let opened = Cell::new(false);
+    let ask = |path: &Path| {
+        respond_with(
+            &request(path, Method::GET),
+            "tauri://localhost",
+            |named| may_open(Some(&access), named, false),
+            |real| {
+                opened.set(true);
+                serves_opened(Some(&access), real, false)
+            },
+        )
+    };
+    assert_eq!(ask(&missing).status(), StatusCode::FORBIDDEN);
+    assert_eq!(ask(&existing).status(), StatusCode::FORBIDDEN);
+    assert!(!opened.get(), "no file was opened for either link");
+    assert_eq!(
+        ask(&inside).status(),
+        StatusCode::OK,
+        "a link that stays inside is served"
+    );
+    assert!(opened.get());
+}

@@ -48,6 +48,12 @@ Branch `worktree-agent-af13c8f00acabbe47`, based on `review/codex-fixes` at fe14
 - S-01: `forbid_directory("/", true)` stores `/**`, and the scope's `requireLiteralLeadingDot` keeps `**` out of any part starting with a dot, so a folder the dialog plugin allows at or below one (`~/.config/proj`, `~/.dotfiles`, `~/.local/src/app`) was still served by `asset:`. `install` now listens on Tauri's asset scope and, for every `Event::PathAllowed(path)`, calls `forbid_directory(path, true)` and `forbid_file(path)`; the pattern made from the allowed path names the dot part literally, so it matches. The root forbids stay. `on_scope_event` is the handler, tested on its own: `tauris_asset_scope_matches_nothing_whatever_the_dialog_grants` now shows the root forbids alone miss the three dot-named folders, that the handler forbids exactly the allowed path, that the resulting pattern matches files and subfolders under it with Tauri's match options, and that `PathForbidden` events do nothing. Limitation: a Tauri `Scope` cannot be built in a unit test, so the `listen` registration itself and a real `Scope::is_allowed` call are not exercised.
 - Deferred, unverified: the Windows forbid list (drive letters, `\\?\X:\`, `\\`) has not been run on Windows; the listener covers whatever the dialog plugin allows there.
 
+## 2d. Links inside a workspace (Mythos round 1, S-05 residual)
+
+- A link in a workspace can point anywhere (`logo.png -> /net/attacker.example/share/x`), and `open_preview` follows it before the opened file can be judged. `Access::may_open_following` now walks the requested name's prefixes with `read_link` alone (no stat, no open), composes each link's target text with the rest of the name, folds `.` and `..` by name (`flatten`), and requires the composed name to pass `may_open` too, repeating for links in the composed name. A link that composes outside every root or `..` past the start, a loop, more than 40 links, and an unreadable link (permission denied) are refused before any open; a link that composes inside a root, a link-spelled root (`/tmp` to `/private/tmp`) and the canonical spelling are still served. `may_open` in `asset_all_folders.rs` uses it with `std::fs::read_link`. With "access all folders" on, any non-dot name passes by design, so a link to a share is allowed there.
+- Tests: `a_link_is_followed_by_name_and_must_stay_inside_a_root` (injected link reader: inside, back-into-root, climbing out, network share, folder link out, loop; names outside the root are never read), `flattening_folds_dots_and_refuses_to_climb_past_the_start`, and `a_workspace_link_to_an_outside_target_is_refused_before_anything_is_opened` (real links, one to a missing outside folder and one to an existing outside file, through `respond_with`; the post-open closure records that nothing was opened, and a link staying inside is served).
+- Limit: the walk reads each prefix once per pass, so a hostile directory can race a link into place between the read and the open; the post-open handle check still catches what it resolves to, but the side effect of that open is not prevented against a concurrent writer.
+
 ## 3. AGENTS.md edits
 
 0. Anchor: "Two-process model", `workspace::*` bullet and "Frontend" Editor bullet, "The asset protocol serves nothing by configuration (`assetProtocol.scope` allows nothing): `asset_scope.rs` grants each root the workspace registry authorizes, recursively". Replace with: "The asset protocol serves nothing by configuration and is granted only the installed font faces `system_font_faces` returns; every preview (editor media, PDFs, Markdown images) loads through `oarlock-asset`, which serves the registry's authorized roots (`asset_scope::Access`, same dot-name rule, never the app's own data, config and local data folders), so a workspace file is never in Tauri's scope and `asset:` is not in `frame-src`."
@@ -64,10 +70,8 @@ Branch `worktree-agent-af13c8f00acabbe47`, based on `review/codex-fixes` at fe14
 
 ## 5. Checks run
 
-After the final round (head: the commit after d876478a, plus this note). No `HOME` override was needed.
+After the link round (head: the commit after 331706e8, plus this note).
 
-- `cargo test --locked --lib -- asset_`: `test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 1574 filtered out; finished in 0.03s`
-- `cargo test --locked --lib -- system_fonts`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1617 filtered out; finished in 0.00s`
-- `cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 4.21s`
-- `bun run test -- src/app/contentSecurityPolicy src/modules/workspace`: `Test Files  6 passed (6)` / `Tests  25 passed (25)`
-- The full gate from the previous round (lint, check-types, 6133 frontend tests, 1615 Rust tests, check:dist) ran at d876478a; this round changed only `asset_scope.rs`. `bun run size` is over its limits as it is at fe147a5 (see 2b); no budget edited.
+- `cargo test --locked --lib -- asset_`: `test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 1574 filtered out; finished in 0.03s`
+- `cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 34.00s`
+- This round changed only `asset_scope.rs`, `asset_all_folders.rs` and its test file; the frontend and the full Rust suite last ran at d876478a (see 2b, 2c).
