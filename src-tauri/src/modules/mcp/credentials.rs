@@ -3,7 +3,7 @@
 use super::names::{self, OauthItem, SecretKind, SECRET_SERVICE};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Deserialize)]
@@ -43,9 +43,19 @@ pub fn server(app: &AppHandle, id: &str) -> Result<Value, String> {
     Ok(value)
 }
 
+fn revision_account(account: String, revision: u64) -> String {
+    if revision == 0 {
+        account
+    } else {
+        format!("{account}@r{revision}")
+    }
+}
+
+/// The keychain account holding `account` for this saved configuration. A legacy
+/// `credentialVersion` is read until the server's next credential save drops it.
 pub fn account_at(server: &Value, account: String) -> Result<String, String> {
     match server.get("credentialVersion") {
-        None => Ok(account), // Existing installations and not-yet-imported credentials.
+        None => Ok(revision_account(account, revision(server))),
         Some(Value::String(version))
             if version.len() == 32 && version.bytes().all(|b| b.is_ascii_hexdigit()) =>
         {
@@ -57,7 +67,7 @@ pub fn account_at(server: &Value, account: String) -> Result<String, String> {
 #[derive(Clone)]
 pub struct Version {
     revision: u64,
-    namespace: Option<Value>,
+    legacy: Option<Value>,
 }
 fn versions(servers: &[Value]) -> std::collections::HashMap<String, Version> {
     servers
@@ -67,7 +77,7 @@ fn versions(servers: &[Value]) -> std::collections::HashMap<String, Version> {
                 s["id"].as_str()?.to_owned(),
                 Version {
                     revision: revision(s),
-                    namespace: s.get("credentialVersion").cloned(),
+                    legacy: s.get("credentialVersion").cloned(),
                 },
             ))
         })
@@ -119,9 +129,9 @@ pub fn account(app: &AppHandle, id: &str, account: String) -> Result<String, Str
         return Ok(account);
     }
     let version = current(app, id)?;
-    match version.namespace {
-        None => Ok(account),
-        Some(namespace) => account_at(&json!({"credentialVersion":namespace}), account),
+    match version.legacy {
+        None => Ok(revision_account(account, version.revision)),
+        Some(legacy) => account_at(&json!({"credentialVersion":legacy}), account),
     }
 }
 
@@ -172,6 +182,8 @@ pub struct Plan {
     pub id: String,
     // destination, optional previous account, optional replacement value
     writes: Vec<(String, Option<String>, Option<String>)>,
+    // Accounts at the new revision that a crashed earlier attempt may have left behind.
+    clean: Vec<String>,
     retire: Vec<String>,
 }
 
@@ -196,11 +208,14 @@ pub fn plan(
         if before.is_some_and(|s| revision(s) == revision(after)) {
             continue;
         }
-        let mut nonce = [0u8; 16];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| format!("mcp: could not create credential version: {e}"))?;
-        after["credentialVersion"] =
-            json!(nonce.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        if before.is_none() && revision(after) == 0 {
+            // Created servers start at 1, so the bare accounts where imported and entered
+            // values wait are only copy sources, never the destination that gets retired.
+            after["secretsRevision"] = json!(1);
+        }
+        if let Some(fields) = after.as_object_mut() {
+            fields.remove("credentialVersion");
+        }
         let wanted = refs(after)?;
         let mut replacements = BTreeMap::new();
         for write in values.remove(&id).unwrap_or_default() {
@@ -232,13 +247,30 @@ pub fn plan(
             ));
         }
         let retire = retired(before.unwrap_or(&json!({"id":id,"transport":after["transport"]})))?;
-        plans.push(Plan { id, writes, retire });
+        let mut clean = BTreeSet::new();
+        for key in refs(after)?.into_iter().chain(previous_refs.iter().cloned()) {
+            clean.insert(account_at(after, key)?);
+        }
+        clean.insert(account_at(after, names::oauth_account(&id, OauthItem::Tokens)?)?);
+        clean.insert(account_at(after, names::oauth_account(&id, OauthItem::Client)?)?);
+        for (destination, _, replacement) in &writes {
+            if replacement.is_some() {
+                clean.remove(destination);
+            }
+        }
+        plans.push(Plan {
+            id,
+            writes,
+            clean: clean.into_iter().collect(),
+            retire,
+        });
     }
     for before in old {
         if !next.iter().any(|s| s["id"] == before["id"]) {
             plans.push(Plan {
                 id: before["id"].as_str().unwrap().to_owned(),
                 writes: vec![],
+                clean: vec![],
                 retire: retired(before)?,
             });
         }
@@ -285,6 +317,13 @@ pub async fn commit<F: std::future::Future<Output = Result<(), String>>>(
 ) -> Result<(), String> {
     let mut staged = Vec::new();
     let result = async {
+        let clean: Vec<String> = plans.iter().flat_map(|p| p.clean.clone()).collect();
+        if !clean.is_empty() {
+            vault
+                .delete(clean)
+                .await
+                .map_err(|e| format!("mcp: could not clear stale credential accounts: {e}"))?;
+        }
         for plan in plans {
             for (destination, source, replacement) in &plan.writes {
                 let value = match replacement {
@@ -361,7 +400,10 @@ mod tests {
     struct FakeVault {
         values: Mutex<BTreeMap<String, String>>,
         fail_set: bool,
+        // Fails every delete after the first one (the pre-clean), i.e. the retire or cleanup.
         fail_delete: bool,
+        deletes: Mutex<usize>,
+        fail_preclean: bool,
     }
     impl Vault for FakeVault {
         async fn get(&self, key: String) -> Result<Option<String>, String> {
@@ -376,7 +418,9 @@ mod tests {
             }
         }
         async fn delete(&self, keys: Vec<String>) -> Result<(), String> {
-            if self.fail_delete {
+            let mut calls = self.deletes.lock().unwrap();
+            *calls += 1;
+            if (self.fail_preclean && *calls == 1) || (self.fail_delete && *calls > 1) {
                 return Err("cleanup failed".into());
             }
             for key in keys {
@@ -403,6 +447,7 @@ mod tests {
             ])),
             fail_set,
             fail_delete,
+            ..Default::default()
         }
     }
     fn edit() -> Value {
@@ -411,24 +456,30 @@ mod tests {
         next
     }
     #[test]
-    fn credential_namespaces_cannot_alias_legacy_accounts_or_chunk_suffixes() {
-        let legacy = "a/header/authorization";
-        assert_eq!(account_at(&json!({}), legacy.into()).unwrap(), legacy);
-        let versioned = json!({"credentialVersion":"0123456789abcdef0123456789abcdef"});
-        let key = account_at(&versioned, legacy.into()).unwrap();
-        assert_ne!(key, legacy);
-        assert!(!crate::modules::secrets::is_chunk_account(&key));
+    fn revision_accounts_cannot_alias_legacy_hex_or_chunk_suffixes() {
+        let base = "a/header/authorization";
+        assert_eq!(account_at(&json!({}), base.into()).unwrap(), base);
+        let revised = account_at(&json!({"secretsRevision":3}), base.into()).unwrap();
+        assert_eq!(revised, "a/header/authorization@r3");
+        assert!(!crate::modules::secrets::is_chunk_account(&revised));
+        let legacy = account_at(
+            &json!({"credentialVersion":"0123456789abcdef0123456789abcdef"}),
+            base.into(),
+        )
+        .unwrap();
+        assert_ne!(legacy, revised);
+        assert!(!crate::modules::secrets::is_chunk_account(&legacy));
         for value in [
             Value::Null,
             json!(""),
             json!("../other"),
             json!("0123456789abcdef0123456789abcde:1"),
         ] {
-            assert!(account_at(&json!({"credentialVersion":value}), legacy.into()).is_err());
+            assert!(account_at(&json!({"credentialVersion":value}), base.into()).is_err());
         }
     }
     #[tokio::test]
-    async fn failed_staging_preserves_every_active_credential_and_never_publishes() {
+    async fn a_failed_keychain_write_leaves_the_previous_secrets_and_configuration_usable() {
         let vault = existing(true, false);
         let original = vault.values.lock().unwrap().clone();
         let plans = plan(
@@ -520,6 +571,114 @@ mod tests {
             "old secret"
         );
         assert!(!values.contains_key(&account_at(&next[0], "a/oauth/tokens".into()).unwrap()));
+    }
+    #[tokio::test]
+    async fn creating_a_server_with_a_secret_keeps_it_after_commit() {
+        for imported in [true, false] {
+            let vault = FakeVault::default();
+            if imported {
+                vault.values.lock().unwrap().insert(
+                    "a/header/authorization".into(),
+                    "imported secret".into(),
+                );
+            }
+            let mut next = [server()];
+            let writes = if imported { vec![] } else { vec![replacement()] };
+            let plans = plan(&[], &mut next, vec![("a".into(), writes)]).unwrap();
+            assert_eq!(next[0]["secretsRevision"], 1);
+            commit(&vault, &plans, || async { Ok(()) }).await.unwrap();
+            let key = account_at(&next[0], "a/header/authorization".into()).unwrap();
+            assert_eq!(key, "a/header/authorization@r1");
+            let expected = if imported { "imported secret" } else { "new secret" };
+            assert_eq!(vault.values.lock().unwrap()[&key], expected);
+        }
+    }
+    #[tokio::test]
+    async fn a_leftover_from_a_crashed_stage_cannot_become_active() {
+        let vault = existing(false, false);
+        vault
+            .values
+            .lock()
+            .unwrap()
+            .insert("a/header/x-new@r1".into(), "stale".into());
+        let mut next = [edit()];
+        next[0]["transport"]["headers"] = json!([
+            {"name":"Authorization","secret":true},
+            {"name":"X-New","secret":true}
+        ]);
+        let plans = plan(&[server()], &mut next, vec![("a".into(), vec![])]).unwrap();
+        commit(&vault, &plans, || async { Ok(()) }).await.unwrap();
+        assert!(!vault.values.lock().unwrap().contains_key("a/header/x-new@r1"));
+    }
+    #[tokio::test]
+    async fn a_failed_preclean_stops_the_save_before_any_staging() {
+        let vault = FakeVault {
+            fail_preclean: true,
+            ..existing(false, false)
+        };
+        let original = vault.values.lock().unwrap().clone();
+        let plans = plan(
+            &[server()],
+            &mut [edit()],
+            vec![("a".into(), vec![replacement()])],
+        )
+        .unwrap();
+        assert!(commit(&vault, &plans, || async { panic!("must not persist") })
+            .await
+            .is_err());
+        assert_eq!(*vault.values.lock().unwrap(), original);
+    }
+    #[tokio::test]
+    async fn a_legacy_credential_version_is_read_until_the_next_save_then_dropped() {
+        let legacy_key = "a/header/authorization@0123456789abcdef0123456789abcdef";
+        let mut old = server();
+        old["credentialVersion"] = json!("0123456789abcdef0123456789abcdef");
+        let vault = FakeVault {
+            values: Mutex::new(BTreeMap::from([(legacy_key.into(), "kept".into())])),
+            ..Default::default()
+        };
+        let mut next = [edit()];
+        next[0]["credentialVersion"] = old["credentialVersion"].clone();
+        let plans = plan(&[old], &mut next, vec![("a".into(), vec![])]).unwrap();
+        assert!(next[0].get("credentialVersion").is_none());
+        commit(&vault, &plans, || async { Ok(()) }).await.unwrap();
+        assert_eq!(
+            *vault.values.lock().unwrap(),
+            BTreeMap::from([("a/header/authorization@r1".into(), "kept".into())])
+        );
+    }
+    #[tokio::test]
+    async fn a_stale_editor_cannot_overwrite_a_newer_transport_or_secret() {
+        let vault = existing(false, false);
+        let mut saved = [edit()];
+        let plans = plan(
+            &[server()],
+            &mut saved,
+            vec![("a".into(), vec![replacement()])],
+        )
+        .unwrap();
+        commit(&vault, &plans, || async { Ok(()) }).await.unwrap();
+        let after_first = vault.values.lock().unwrap().clone();
+        let stale = Expected {
+            transport: server()["transport"].clone(),
+            revision: 0,
+        };
+        assert!(check_expected(&saved[0], Some(&stale)).is_err());
+        assert_eq!(*vault.values.lock().unwrap(), after_first);
+        let current = Expected {
+            transport: saved[0]["transport"].clone(),
+            revision: 1,
+        };
+        assert!(check_expected(&saved[0], Some(&current)).is_ok());
+    }
+    #[test]
+    fn an_http_session_checks_its_revision_before_reading_tokens() {
+        let oauth = include_str!("oauth/mod.rs");
+        let bearer = &oauth[oauth.find("pub async fn bearer(").unwrap()..];
+        assert!(bearer.find("check_revision").unwrap() < bearer.find("bound_tokens").unwrap());
+        let stream = include_str!("mod.rs");
+        let request = stream.find("credentials::check_revision(&app, &session.server_id").unwrap();
+        assert!(request < stream.find("oauth::bearer(").unwrap());
     }
     #[test]
     fn invalid_secret_and_duplicate_edits_are_rejected_before_staging() {
