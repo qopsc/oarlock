@@ -187,6 +187,39 @@ mod tests {
         }
     }
     #[test]
+    fn every_native_owned_file_is_refused_unless_the_page_opens_it() {
+        for native in NATIVE_FILES {
+            let opened = PAGE_OPENED_FILES.contains(native);
+            for name in [
+                native.to_string(),
+                native.to_ascii_uppercase(),
+                native.replacen(".json", ".JSON", 1),
+            ] {
+                for window in ["main", "settings", "quick", "w-1"] {
+                    assert_eq!(
+                        load(json!(name), window).is_none(),
+                        opened,
+                        "{name} in {window}"
+                    );
+                    assert_eq!(
+                        refusal(
+                            "get_store",
+                            &InvokeBody::Json(json!({ "path": name })),
+                            window
+                        )
+                        .is_none(),
+                        opened,
+                        "{name} in {window}"
+                    );
+                }
+            }
+        }
+        for opened in PAGE_OPENED_FILES {
+            assert!(NATIVE_FILES.contains(opened), "{opened}");
+        }
+    }
+
+    #[test]
     fn every_store_the_app_opens_is_allowed_in_every_window() {
         for window in ["main", "w-1", "w-32", "settings", "quick"] {
             for name in APP_STORES {
