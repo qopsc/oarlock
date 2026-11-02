@@ -256,7 +256,6 @@ export default function App() {
     splitActivePane,
     moveTabIntoSplit,
     movePaneToNewTab,
-    closeActivePane,
     closePaneByLeaf,
   } = useTabs(getLaunchDir() ? { cwd: getLaunchDir() } : undefined);
 
@@ -538,7 +537,7 @@ export default function App() {
     disposeTab,
     disposeDeletedTabs,
     disposeTabs,
-    disposePane: closeActivePane,
+    disposePane: closePaneByLeaf,
   });
 
   const { pendingAppClose, confirmAppClose, cancelAppClose } = useAppCloseGuard(

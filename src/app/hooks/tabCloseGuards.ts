@@ -46,6 +46,8 @@ export type CloseManyPending = CloseManyHazards & {
   plan: CloseTabsPlan;
   /** Only a space deletion: what runs once the user confirms. */
   commit?: () => void;
+  /** Only a space deletion: the space whose tabs are rechecked at confirmation. */
+  spaceId?: string;
 };
 
 export function hasCloseManyHazards(hazards: CloseManyHazards): boolean {

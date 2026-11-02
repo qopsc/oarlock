@@ -114,12 +114,49 @@ it("closing a split pane asks first when a program runs in it", async () => {
   expect(disposePane).not.toHaveBeenCalled();
   expect(render().pendingPaneClose).toBe(5);
   render().confirmPaneClose();
-  expect(disposePane).toHaveBeenCalledWith(5);
+  expect(disposePane).toHaveBeenCalledWith(30);
   expect(render().pendingPaneClose).toBeNull();
   disposePane.mockClear();
   fake.busy.mockResolvedValue(false);
   await render().handleClosePane(5);
-  expect(disposePane).toHaveBeenCalledWith(5);
+  expect(disposePane).toHaveBeenCalledWith(30);
+});
+
+it("confirming a pane close closes the pane that was asked about, not the one focused later", async () => {
+  const disposePane = vi.fn();
+  const split = {
+    id: 5, kind: "terminal", spaceId: "s", activeLeafId: 30, paneTree: {},
+  } as unknown as Tab;
+  const params = {
+    tabs: [split], activeId: 5, editorIsDirty: () => false,
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane,
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  fake.busy.mockResolvedValue(true);
+  await render().handleClosePane(5);
+  (split as unknown as { activeLeafId: number }).activeLeafId = 31;
+  render().confirmPaneClose();
+  expect(disposePane).toHaveBeenCalledWith(30);
+});
+
+it("a tab opened in the space after the delete prompt is rechecked before the space goes", async () => {
+  const commit = vi.fn();
+  const live: Tab[] = [...tabs];
+  const params = {
+    get tabs() { return live; }, activeId: 1,
+    editorIsDirty: (id: number) => id === 2 || id === 7,
+    editorCloseRevision: () => "r",
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  await render().handleDeleteSpace("s", commit);
+  expect(render().pendingCloseMany?.dirtyIds).toEqual([2]);
+  live.push({ id: 7, kind: "editor", spaceId: "s", dirty: true } as Tab);
+  await render().confirmCloseMany();
+  expect(commit).not.toHaveBeenCalled();
+  expect(render().pendingCloseMany?.dirtyIds).toEqual([2, 7]);
+  await render().confirmCloseMany();
+  expect(commit).toHaveBeenCalledOnce();
 });
 
 it("a deleted dirty draft the same event detached raises no delete dialog", async () => {
