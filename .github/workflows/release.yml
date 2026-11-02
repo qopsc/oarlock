@@ -96,26 +96,15 @@ jobs:
           printf '%s' "$KEY_CONTENT" > "$HOME/private_keys/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$HOME/private_keys/AuthKey.p8" >> "$GITHUB_ENV"
 
-      # The nested XPC bundle has its own entitlements and must be signed before
-      # Tauri seals the enclosing app. Import the existing release identity for
-      # the beforeBundleCommand; the action removes its temporary keychain later.
-      - name: Import identity for the sandboxed Git helper
-        if: startsWith(matrix.platform, 'macos')
-        uses: apple-actions/import-codesign-certs@v7
-        with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
-          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-
       # macOS builds and signs without publishing: nothing reaches the draft
-      # release until the packaged helper and app signatures verify. A failed
-      # check therefore leaves no unverified .app or .dmg attached to it.
+      # release until the packaged app signature verifies. A failed check
+      # therefore leaves no unverified .app or .dmg attached to it.
       - id: tauri-mac
         if: startsWith(matrix.platform, 'macos')
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OARLOCK_CLI_TARGET: ${{ matrix.rust-target }}
-          OARLOCK_DISTRIBUTION_BUILD: "1"
 
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -130,12 +119,22 @@ jobs:
           tauriScript: bun run tauri
           args: ${{ matrix.args }}
 
-      - name: Verify packaged Git helper sandbox and signatures
+      - name: Verify the packaged macOS app signature
         if: startsWith(matrix.platform, 'macos')
+        shell: bash
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           OARLOCK_RELEASE_TARGET: ${{ matrix.rust-target }}
-        run: bun scripts/git-worker/verify-app.mjs "src-tauri/target/$OARLOCK_RELEASE_TARGET/release/bundle/macos"
+        run: |
+          set -euo pipefail
+          [[ "${APPLE_TEAM_ID:-}" =~ ^[A-Z0-9]{10}$ ]] || { echo "APPLE_TEAM_ID must be a 10 character team id" >&2; exit 1; }
+          dir="src-tauri/target/${OARLOCK_RELEASE_TARGET}/release/bundle/macos"
+          shopt -s nullglob
+          apps=("$dir"/*.app)
+          [ "${#apps[@]}" -eq 1 ] || { echo "Expected exactly one packaged app in $dir, found ${#apps[@]}" >&2; exit 1; }
+          id="$(jq -r .identifier src-tauri/tauri.conf.json)"
+          [ -n "$id" ] && [ "$id" != "null" ] || { echo "bundle identifier missing" >&2; exit 1; }
+          codesign --verify --deep --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\" and identifier \"$id\"" "${apps[0]}"
 
       - name: Upload the verified macOS bundle to the draft release
         if: startsWith(matrix.platform, 'macos')
@@ -180,7 +179,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OARLOCK_CLI_TARGET: ${{ matrix.rust-target }}
-          OARLOCK_DISTRIBUTION_BUILD: "1"
 
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
