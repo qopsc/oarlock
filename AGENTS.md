@@ -5502,7 +5502,7 @@ Native keeps one record per run (`mcp/runs.rs`), removes it on `ai_run_end`, rel
 destruction and Stop (`revoke_chat`, in a cleanup sequence a test drives with a fake). MCP credentials
 use revision-keyed accounts and metadata saves durably with at most 256 tombstones (see above).
 
-Linux (D-12, D-20, batch J; D-12, D-20, built and tested in a `linux/arm64` container, Rust 1.99.1, image
+Linux (D-12, D-20, batch J, built and tested in a `linux/arm64` container, Rust 1.99.1, image
 `oarlock-linux-ci`, as uid 1000): Linux saves now stage privately in every mode (no hidden
 sibling in the user's folder), with cache creation, a mount-id check and a private
 `.oarlock-staging` last resort; cleanup examines at most 4,096 entries. Linux Explorer copy,
