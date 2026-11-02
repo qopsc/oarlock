@@ -194,6 +194,29 @@ describe("runShellDrop", () => {
     confirmed.writer.dispose();
   });
 
+  it("keeps the writer alive when pasting or the notice throws", async () => {
+    const h = harness({
+      paste: () => {
+        throw new Error("paste failed");
+      },
+    });
+    await runShellDrop(h.run);
+    expect(h.refuse).toHaveBeenCalledWith("paste failed");
+    await typeAfter(h, "k");
+    const worse = harness({
+      paste: () => {
+        throw new Error("paste failed");
+      },
+      refuse: () => {
+        throw new Error("toast failed");
+      },
+    });
+    await runShellDrop(worse.run);
+    await typeAfter(worse, "k");
+    h.writer.dispose();
+    worse.writer.dispose();
+  });
+
   it("refuses a WSL drop when the prompt is lost before delivery", async () => {
     let confirmed = true;
     const h = harness({

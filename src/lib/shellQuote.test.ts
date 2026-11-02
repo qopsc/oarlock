@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { cdCommandLine, quoteShellArg } from "./shellQuote";
 
+describe("quoteShellArg (PowerShell)", () => {
+  it.each(["'", "‘", "’", "‚", "‛"])(
+    "doubles the quote delimiter %#",
+    (quote) => {
+      expect(quoteShellArg(`a${quote}b`, true)).toBe(`'a${quote}${quote}b'`);
+    },
+  );
+});
+
 describe("quoteShellArg (posix)", () => {
   const q = (s: string) => quoteShellArg(s, false);
 

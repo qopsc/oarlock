@@ -87,7 +87,19 @@ export type ShellDropRun = {
  * input slot; every path out of here releases it exactly once.
  */
 export async function runShellDrop(run: ShellDropRun): Promise<void> {
-  const { finish } = run;
+  // A throw inside the slot's action would stop the whole input writer.
+  const finish = (action: () => void, size?: number) =>
+    run.finish(() => {
+      try {
+        action();
+      } catch (error) {
+        try {
+          run.refuse(error instanceof Error ? error.message : String(error));
+        } catch {
+          // the notice itself failed; the slot is released either way
+        }
+      }
+    }, size);
   try {
     if (run.target.kind === "wsl" && !run.promptConfirmed())
       return finish(() =>

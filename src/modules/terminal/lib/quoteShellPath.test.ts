@@ -26,6 +26,24 @@ describe("literal shell path arguments", () => {
       }
     });
   }
+  it.each([
+    ["apostrophe", "'"],
+    ["left single quotation mark", "‘"],
+    ["right single quotation mark", "’"],
+    ["single low-9 quotation mark", "‚"],
+    ["single high-reversed-9 quotation mark", "‛"],
+  ])(
+    "doubles the PowerShell quote delimiter: %s",
+    (_name, quote) => {
+      const path = `/tmp/x${quote}; Invoke-Evil; ${quote}y`;
+      expect(quoteShellPath(path, "powershell")).toBe(
+        `'/tmp/x${quote}${quote}; Invoke-Evil; ${quote}${quote}y'`,
+      );
+      expect(formatDroppedPaths([path], "powershell")).toBe(
+        `'/tmp/x${quote}${quote}; Invoke-Evil; ${quote}${quote}y' `,
+      );
+    },
+  );
   it("uses fish literal escapes", () => {
     expect(quoteShellPath("/tmp/a\\b'c", "fish")).toBe("'/tmp/a\\\\b\\'c'");
   });
