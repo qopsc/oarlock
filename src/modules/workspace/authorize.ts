@@ -20,6 +20,23 @@ const inFlight = new Map<string, Promise<boolean>>();
 const keyOf = (grant: Grant, path: string, env: WorkspaceEnv) =>
   `${grant}\u0000${workspaceScopeKey(env)}\u0000${path}`;
 
+const watchers = new Set<{ key: string; run: () => void }>();
+
+/** Runs `run` each time an authorization of exactly `path` succeeds, for the work that was
+ *  refused because it came before the folder was known to the backend. */
+export function onAuthorized(
+  path: string,
+  env: WorkspaceEnv,
+  run: () => void,
+): () => void {
+  const watcher = {
+    key: `${workspaceScopeKey(env)}\u0000${path}`,
+    run,
+  };
+  watchers.add(watcher);
+  return () => void watchers.delete(watcher);
+}
+
 function authorize(
   grant: Grant,
   path: string,
@@ -34,7 +51,12 @@ function authorize(
     ...(grant !== "root" && { opened: grant }),
   })
     .then(
-      () => true,
+      () => {
+        for (const watcher of watchers)
+          if (watcher.key === `${workspaceScopeKey(env)}\u0000${path}`)
+            watcher.run();
+        return true;
+      },
       () => false,
     )
     .finally(() => inFlight.delete(key));

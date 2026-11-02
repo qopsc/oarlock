@@ -1,7 +1,10 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useWorkspaceEnvStore } from "@/modules/workspace";
 import { onSkillsChanged } from "./api";
-import { statusWhenAuthorized } from "./statusWhenAuthorized";
+import {
+  rerunWhenAuthorized,
+  statusWhenAuthorized,
+} from "./statusWhenAuthorized";
 import { useSkillEditRequests } from "./useSkillEditRequests";
 import { askingItems, promptKey } from "./trust";
 import type { ProjectTrustStatus } from "./types";
@@ -50,6 +53,7 @@ export function SkillsWatcher({ root, openFileTab }: Props) {
       }, SETTLE_MS);
     };
     check();
+    const unwatch = rerunWhenAuthorized(root ?? "", env, check);
     void onSkillsChanged(check).then((unlisten) => {
       if (alive) stop = unlisten;
       else unlisten();
@@ -57,6 +61,7 @@ export function SkillsWatcher({ root, openFileTab }: Props) {
     return () => {
       alive = false;
       window.clearTimeout(timer);
+      unwatch();
       stop?.();
     };
   }, [root, env]);
