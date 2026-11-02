@@ -513,7 +513,25 @@ it("merges independent windows' metadata transactions instead of replacing snaps
     "existing",
   ]);
   expect(calls("ai_sessions_mutate").map((c) => c[1])).toEqual([
-    { delta: { creates: [meta("a")], updates: [], deletes: [] } },
-    { delta: { creates: [meta("b")], updates: [], deletes: [] } },
+    { delta: { creates: [meta("a")], updates: [], deletes: [], base: 0 } },
+    { delta: { creates: [meta("b")], updates: [], deletes: [], base: 0 } },
   ]);
+});
+
+it("keeps the base revision a create was enqueued with through a retry", async () => {
+  const meta = (id: string) => ({ id, title: id, createdAt: 1, updatedAt: 1 });
+  storage.data.set("sessions", []);
+  storage.data.set("revision", 3);
+  const sessions = await reload();
+  await sessions.loadAll();
+  storage.invoke.mockClear();
+  storage.invoke.mockRejectedValueOnce(new Error("disk full"));
+  await expect(sessions.saveSessionsList([meta("a")], [])).rejects.toThrow();
+  storage.data.set("revision", 400);
+  storage.invoke.mockClear();
+  await sessions.saveSessionsList([meta("a"), meta("b")], [meta("a")]).catch(() => {});
+  const bases = calls("ai_sessions_mutate").map(
+    ([, arg]) => (arg as { delta: { base: number } }).delta.base,
+  );
+  expect(bases[0]).toBe(3);
 });
