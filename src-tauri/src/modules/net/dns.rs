@@ -1,15 +1,22 @@
 //! Bounded system DNS. A caller may stop waiting, but a running OS lookup
 //! retains its permit until it returns. Never detach unaccounted blocking work.
 use std::{
+    collections::HashMap,
     net::{IpAddr, ToSocketAddrs},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
-use tokio::{sync::Semaphore, task::JoinHandle};
+use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
 
 const ACTIVE: usize = 8;
 const QUEUED: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(10);
+/// How long an answer is reused. A page with fifty badges from one host asks for it fifty
+/// times at once; the answer is classified and pinned per request, so a short reuse changes
+/// nothing about rebinding, it only keeps the resolver from refusing its own callers.
+const ANSWER_TTL: Duration = Duration::from_secs(10);
+const FAILURE_TTL: Duration = Duration::from_secs(2);
+const MAX_HOSTS: usize = 256;
 const TIMEOUT_ERROR: &str = "DNS lookup timed out after 10 seconds";
 
 struct Resolver {
@@ -78,16 +85,76 @@ impl<T> Drop for CancelQueued<T> {
     }
 }
 
+type Answer = Result<Vec<IpAddr>, String>;
+type Slot = Arc<tokio::sync::Mutex<Option<(Instant, Answer)>>>;
+
+/// One lookup per host at a time, and its answer kept briefly: callers that ask for a host
+/// already being resolved wait for that answer instead of taking a resolver slot of their own.
+struct Lookups {
+    hosts: Mutex<HashMap<String, Slot>>,
+}
+
+impl Lookups {
+    fn new() -> Self {
+        Self {
+            hosts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn slot(&self, host: &str) -> Slot {
+        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        if hosts.len() >= MAX_HOSTS && !hosts.contains_key(host) {
+            // A slot nobody holds and whose answer has expired is dead weight.
+            hosts.retain(|_, slot| {
+                slot.try_lock()
+                    .map(|held| {
+                        held.as_ref()
+                            .is_some_and(|(at, answer)| fresh(*at, answer))
+                    })
+                    .unwrap_or(true)
+            });
+        }
+        hosts.entry(host.to_owned()).or_default().clone()
+    }
+
+    async fn resolve(
+        &self,
+        resolver: &Resolver,
+        host: &str,
+        lookup: impl FnOnce() -> std::io::Result<Vec<IpAddr>> + Send + 'static,
+    ) -> Answer {
+        let slot = self.slot(host);
+        let mut held = slot.lock().await;
+        if let Some((at, answer)) = held.as_ref() {
+            if fresh(*at, answer) {
+                return answer.clone();
+            }
+        }
+        let answer = resolver.run(lookup).await;
+        *held = Some((Instant::now(), answer.clone()));
+        answer
+    }
+}
+
+fn fresh(at: Instant, answer: &Answer) -> bool {
+    at.elapsed() < if answer.is_ok() { ANSWER_TTL } else { FAILURE_TTL }
+}
+
 pub async fn lookup(host: &str) -> Result<Vec<IpAddr>, String> {
     static RESOLVER: OnceLock<Resolver> = OnceLock::new();
-    let host = host.to_owned();
-    RESOLVER
-        .get_or_init(|| Resolver::new(ACTIVE, QUEUED))
-        .run(move || {
-            (host.as_str(), 0u16)
-                .to_socket_addrs()
-                .map(|addresses| addresses.map(|a| a.ip()).collect())
-        })
+    static LOOKUPS: OnceLock<Lookups> = OnceLock::new();
+    let name = host.to_owned();
+    LOOKUPS
+        .get_or_init(Lookups::new)
+        .resolve(
+            RESOLVER.get_or_init(|| Resolver::new(ACTIVE, QUEUED)),
+            host,
+            move || {
+                (name.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.map(|a| a.ip()).collect())
+            },
+        )
         .await
 }
 
@@ -243,5 +310,92 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fifty_lookups_of_one_host_make_one_resolver_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let resolver = Resolver::new(ACTIVE, QUEUED);
+        let lookups = Lookups::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let answers = futures_util::future::join_all((0..50).map(|_| {
+            let calls = calls.clone();
+            lookups.resolve(&resolver, "img.shields.io", move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["104.18.0.1".parse().unwrap()])
+            })
+        }))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(answers.iter().all(|answer| answer.as_ref().unwrap().len() == 1));
+
+        tokio::time::advance(ANSWER_TTL).await;
+        let calls_again = calls.clone();
+        lookups
+            .resolve(&resolver, "img.shields.io", move || {
+                calls_again.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "an expired answer is asked for again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn different_hosts_resolve_separately_and_a_failure_is_remembered_briefly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let resolver = Resolver::new(ACTIVE, QUEUED);
+        let lookups = Lookups::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for host in ["a.example", "b.example"] {
+            let calls = calls.clone();
+            lookups
+                .resolve(&resolver, host, move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![])
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for _ in 0..3 {
+            let calls = calls.clone();
+            assert!(lookups
+                .resolve(&resolver, "gone.example", move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::Error::other("no such host"))
+                })
+                .await
+                .is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "one failed attempt for the burst");
+        tokio::time::advance(FAILURE_TTL).await;
+        let calls_again = calls.clone();
+        let _ = lookups
+            .resolve(&resolver, "gone.example", move || {
+                calls_again.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_hosts_are_dropped_once_the_table_is_full() {
+        let resolver = Resolver::new(ACTIVE, QUEUED);
+        let lookups = Lookups::new();
+        for i in 0..MAX_HOSTS {
+            let _ = lookups
+                .resolve(&resolver, &format!("h{i}.example"), || {
+                    Err(std::io::Error::other("fixture"))
+                })
+                .await;
+        }
+        assert_eq!(lookups.hosts.lock().unwrap().len(), MAX_HOSTS);
+        tokio::time::advance(FAILURE_TTL).await;
+        let _ = lookups
+            .resolve(&resolver, "new.example", || Ok(vec![]))
+            .await;
+        assert_eq!(lookups.hosts.lock().unwrap().len(), 1);
     }
 }
