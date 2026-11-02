@@ -26,6 +26,9 @@ use super::workspace::WorkspaceRegistry;
 
 pub struct AssetScope {
     scope: tauri::scope::fs::Scope,
+    /// The app's own data, config and local data folders, resolved. Nothing there is ever a
+    /// preview: it holds the stores, the trust decisions and the secrets file.
+    app_state: Vec<PathBuf>,
     literal_leading_dot: bool,
     granted_roots: Mutex<Vec<PathBuf>>,
 }
@@ -64,7 +67,17 @@ fn needs_grant(root: &Path, granted: &[PathBuf], literal_leading_dot: bool) -> b
         .any(|granted| covers(granted, root, literal_leading_dot))
 }
 
+/// Whether `path` lies in one of `dirs`.
+fn under_any(path: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| path.starts_with(dir))
+}
+
 impl AssetScope {
+    /// Whether `real`, a resolved path, is in the app's own state folders.
+    pub fn is_app_state(&self, real: &Path) -> bool {
+        under_any(real, &self.app_state)
+    }
+
     fn grant_root(&self, root: &Path) {
         let mut granted = self
             .granted_roots
@@ -89,8 +102,25 @@ impl AssetScope {
 
 /// Grants every workspace root the registry has authorized and will authorize.
 pub fn install(app: &tauri::AppHandle) {
+    let scope = app.asset_protocol_scope();
+    let paths = app.path();
+    let app_state: Vec<PathBuf> = [
+        paths.app_data_dir(),
+        paths.app_config_dir(),
+        paths.app_local_data_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
+    .collect();
+    for dir in &app_state {
+        if let Err(e) = scope.forbid_directory(dir, true) {
+            log::warn!("asset scope: cannot forbid {}: {e}", dir.display());
+        }
+    }
     app.manage(AssetScope {
-        scope: app.asset_protocol_scope(),
+        scope,
+        app_state,
         literal_leading_dot: literal_leading_dot(&app.config().app.security.asset_protocol.scope),
         granted_roots: Mutex::new(Vec::new()),
     });
@@ -105,6 +135,16 @@ mod tests {
 
     fn paths(list: &[&str]) -> Vec<PathBuf> {
         list.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn the_apps_state_folders_are_recognized_by_their_resolved_path() {
+        let state = paths(&["/home/me/.local/share/app", "/home/me/.config/app"]);
+        assert!(under_any(Path::new("/home/me/.config/app/oarlock-spaces.json"), &state));
+        assert!(under_any(Path::new("/home/me/.local/share/app/x/y.png"), &state));
+        assert!(!under_any(Path::new("/home/me/.config/application/x.png"), &state));
+        assert!(!under_any(Path::new("/home/me/pictures/x.png"), &state));
+        assert!(!under_any(Path::new("/home/me/pictures/x.png"), &[]));
     }
 
     #[test]

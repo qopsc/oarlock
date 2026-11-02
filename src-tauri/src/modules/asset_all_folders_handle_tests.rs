@@ -478,3 +478,15 @@ fn only_the_current_page_of_the_window_may_ask() {
     pages.begin("main", || {}).unwrap();
     assert!(!page_admits(&pages, "main", Some(&format!("t={token}"))), "reloaded");
 }
+
+#[test]
+fn the_apps_own_state_is_never_a_preview_whatever_the_settings() {
+    let store = Path::new("/home/me/.config/app/oarlock-spaces.json");
+    let plain = Path::new("/home/me/Library/Application Support/app/project-trust.json");
+    for path in [store, plain] {
+        assert!(!serves_file(path, true, true, true), "granted and all folders");
+        assert!(!serves_file(path, true, false, true));
+    }
+    assert!(serves_file(plain, false, false, true), "the same name elsewhere");
+    assert!(serves_file(store, false, true, false));
+}

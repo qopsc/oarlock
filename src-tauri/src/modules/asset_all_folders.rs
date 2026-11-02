@@ -23,6 +23,7 @@ use tauri::http::{self, header, HeaderValue, Method, StatusCode};
 use tauri::utils::mime_type::MimeType;
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
+use super::asset_scope::AssetScope;
 use super::net::page::NetworkPages;
 use super::pty::AllowedOrigins;
 use super::workspace::{Origin, WorkspaceRegistry};
@@ -129,8 +130,10 @@ pub fn protocol<R: Runtime>(
         let _worker = worker;
         let scope = app.asset_protocol_scope();
         let served = |real: &Path| {
-            serves(
+            serves_file(
                 real,
+                app.try_state::<AssetScope>()
+                    .is_some_and(|state| state.is_app_state(real)),
                 scope_allows_opened(&scope, real),
                 app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref()),
             )
@@ -183,6 +186,16 @@ fn app_reaches_all(registry: Option<&WorkspaceRegistry>) -> bool {
 /// may access all folders and nothing on the path is a dot name.
 fn serves(real: &Path, asset_scope_allows: bool, all_folders: bool) -> bool {
     asset_scope_allows || (all_folders && !has_dot_name(real))
+}
+
+/// `serves`, except for the app's own state folders, which no setting opens to a preview.
+fn serves_file(
+    real: &Path,
+    in_app_state: bool,
+    asset_scope_allows: bool,
+    all_folders: bool,
+) -> bool {
+    !in_app_state && serves(real, asset_scope_allows, all_folders)
 }
 
 /// Whether a name on `path` starts with a dot, as a wildcard with `requireLiteralLeadingDot`
