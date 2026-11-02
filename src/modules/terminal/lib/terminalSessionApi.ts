@@ -17,6 +17,7 @@ import {
   ghosttyCwdForLeaf,
   ghosttyPtyIdForLeaf,
   ghosttySelectionForLeaf,
+  ghosttyShellDialect,
   ghosttySessionInAlternateScreen,
   type GhosttyScrollAction,
   hasGhosttySession,
@@ -244,6 +245,11 @@ export async function leafHasForegroundProcess(
   leafId: number,
 ): Promise<boolean> {
   return ghosttyLeafHasForegroundProcess(leafId);
+}
+
+/** The quoting dialect of the pane's shell; null when it is not a recognized one. */
+export function leafShellDialect(leafId: number) {
+  return ghosttyShellDialect(leafId);
 }
 
 /**

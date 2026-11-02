@@ -18,6 +18,7 @@ export {
   leafHasForegroundProcess,
   leafIdForPty,
   leafShellAtPrompt,
+  leafShellDialect,
   adjustFocusedTerminalFont,
   focusedTerminalInAlternateScreen,
   navigateFocusedBlocks,
