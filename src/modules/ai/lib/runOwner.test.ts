@@ -58,7 +58,6 @@ it("stop releases the stream, the native record and pending preparation", async 
 it("a failed release stays reachable and a retry releases only what is left", async () => {
   const turn = beginRun("c2", { kind: "turn", admit: async () => {} });
   const { source, state } = stalledStream();
-  const cancel = vi.spyOn(source, "cancel");
   turn.wrapStream(source);
   turn.setupDone();
   invokeMock.mockRejectedValue(new Error("IPC failed"));
