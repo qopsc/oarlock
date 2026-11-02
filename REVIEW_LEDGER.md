@@ -4608,7 +4608,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R032 | Windows/WSL port | The affected polling path is WSL-specific and outside this release. |
 | R043 | Open, Tier 2 | The safe search keymap is still higher precedence than the editor's Ctrl+G Go to Line binding on Linux; the Windows case is port work. |
 | R044 | Open, Tier 2 | The core package is now a tracked workspace package, but its declared types still refer to ignored `dist` files. A copy without `dist` reproduces TS2307 on both imports. The app's clean build has not been shown to fail. |
-| R048 | Open, Tier 2 | Current URI helpers turn `/repo/a\\b.rs` into `file:///repo/a/b.rs` and turn a localhost URI into a relative path. A direct helper probe reproduced both. |
+| R048 | Closed | Language-server URIs preserve literal Unix backslashes, recognize localhost, reject other hosts, and compare Unix paths without treating backslashes as separators. Regressions reproduced the previous incorrect paths. |
 | R049 | Open, Tier 2 | Native shell-environment capture retains each shell's first result, including failure, while the UI offers redetection. |
 | R053 | Open, Tier 2 | Preset installation hints still offer macOS-specific commands on Linux. Windows guidance is port work. |
 | R055 | Closed | Status reports invalid UTF-8 instead of showing an empty repository. A Linux real-Git regression uses a non-UTF-8 filename; macOS refused creation of that filename. |
@@ -4634,10 +4634,16 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **3 closed; 22 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **4 closed; 21 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
 Status now reports non-UTF-8 output instead of showing an empty change list. A truncated historical blob or history response is reported as an error instead of being displayed as complete. Two real-Git tests failed against the previous implementation and passed after the fix; the Linux-only third test uses an actual non-UTF-8 filename. The supported status truncation indicator is unchanged.
 
 Validation: the full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, including the 32 entry-point and 15 remote-scope cases; strict Clippy passed. The frontend suite passed 6,083 tests (two skipped), types passed, and lint remained at 80 warnings. All three new Git regressions passed in an offline Linux container; that build emitted four existing Linux-only warnings.
+
+### R048 checkpoint — language-server file URIs
+
+Local file URIs preserve literal backslashes in Unix filenames, resolve `localhost` as the local machine, and refuse other URI hosts rather than treating a host name as a relative path. URI comparison no longer equates a Unix filename containing a backslash with a directory path. Existing Windows drive-letter cases continue to pass. The new cases failed before the fix.
+
+Validation: 105 focused language-server tests and the full frontend suite passed (6,085 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, and strict Clippy passed. This is automated helper and integration coverage, not a packaged language-server navigation test.

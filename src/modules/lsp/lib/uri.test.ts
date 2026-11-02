@@ -8,6 +8,12 @@ describe("pathToFileUri", () => {
     );
   });
 
+  it("preserves backslashes in Unix filenames", () => {
+    expect(pathToFileUri("/repo/a\\b.rs")).toBe("file:///repo/a%5Cb.rs");
+    expect(fileUriToPath("file:///repo/a%5Cb.rs")).toBe("/repo/a\\b.rs");
+    expect(sameFileUri("file:///repo/a%5Cb.rs", "file:///repo/a/b.rs")).toBe(false);
+  });
+
   it("encodes a windows path with drive letter", () => {
     expect(pathToFileUri("C:/Users/me/app.ts")).toBe(
       "file:///C:/Users/me/app.ts",
@@ -39,6 +45,12 @@ describe("fileUriToPath", () => {
 
   it("rejects non-file uris", () => {
     expect(fileUriToPath("https://example.com/x")).toBeNull();
+  });
+
+  it("accepts localhost file URIs but refuses other hosts", () => {
+    expect(fileUriToPath("file://localhost/repo/a.rs")).toBe("/repo/a.rs");
+    expect(sameFileUri("file://localhost/repo/a.rs", "file:///repo/a.rs")).toBe(true);
+    expect(fileUriToPath("file://other-host/repo/a.rs")).toBeNull();
   });
 
   it("rejects malformed percent encodings instead of breaking server message handling", () => {

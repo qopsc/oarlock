@@ -1,7 +1,9 @@
 import { pathKey } from "@/lib/pathKey";
 
 export function pathToFileUri(path: string): string {
-  let p = path.replace(/\\/g, "/");
+  let p = /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\")
+    ? path.replace(/\\/g, "/")
+    : path;
   if (!p.startsWith("/")) p = `/${p}`;
   return `file://${p
     .split("/")
@@ -13,9 +15,12 @@ export function pathToFileUri(path: string): string {
 
 export function fileUriToPath(uri: string): string | null {
   if (!uri.startsWith("file://")) return null;
+  let encodedPath = uri.slice("file://".length);
+  if (/^localhost\//i.test(encodedPath)) encodedPath = encodedPath.slice(9);
+  if (!encodedPath.startsWith("/")) return null;
   let p: string;
   try {
-    p = decodeURIComponent(uri.slice("file://".length));
+    p = decodeURIComponent(encodedPath);
   } catch {
     return null;
   }
@@ -30,5 +35,10 @@ export function sameFileUri(a: string, b: string): boolean {
   if (a === b) return true;
   const pa = fileUriToPath(a);
   const pb = fileUriToPath(b);
-  return pa !== null && pb !== null && pathKey(pa) === pathKey(pb);
+  if (pa === null || pb === null) return false;
+  const key = (path: string) =>
+    /^[A-Za-z]:[\\/]/.test(path)
+      ? pathKey(path)
+      : path.length > 1 ? path.replace(/\/+$/, "") : path;
+  return key(pa) === key(pb);
 }
