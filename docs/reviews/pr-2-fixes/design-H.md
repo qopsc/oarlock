@@ -361,3 +361,45 @@ to the same degree. Unsaved text still triggers the normal prompt first.
    `windows/quit.rs` (the quit state machine, required by O-07) and
    `src-tauri/src/modules/git/commands.rs` (the `git_discard` signature). `EditorPane.tsx` is inside
    `editor/**`; `src/modules/ai/lib/native.ts` is untouched.
+
+---
+
+## Revision 1 (review of this design; supersedes the sections above where they differ)
+
+Decisions: O-07 keeps "cancel that verification and re-ask that window"; verify flushes, then reads
+revisions synchronously, then answers, in one task. `git_discard_match` stays stateless. Ownership
+also covers `windows.rs`, `windows/quit.rs`, `git/commands.rs`, `fs/file.rs` (`fs_read_file` only)
+and `editor/lib/useDocument.ts`.
+
+1. O-08 sequence fence (replaces the "ordering between two IPC deliveries" residual). The editor's
+   versioned `fs_read_file` returns `mutationSequence`, the mutation stream's sequence sampled under
+   the stream state lock after the bytes were read. `DiscardBegin` is published under that same lock
+   before Git starts, so a read that saw Git's content carries a sequence at or above the begin
+   event's. `subscribeDocumentMutations` exposes the highest sequence its listen callback received
+   (`mutationFence`). `DocumentSession.reload` holds a non-discard adoption whose `mutationSequence`
+   is above the fence until the listener reaches it, then re-evaluates with the existing epoch,
+   generation and `pendingDiscards` checks (begin has staged the document by then, so the read is
+   suppressed; if end already ran, its forced reload bumped `readGeneration` and the held result is
+   dropped). When the listener is down or not yet live the fence is initialised from the native
+   sequence (`fs_mutation_sequence`, one cheap command, called when the listener goes live and on
+   reconcile) so nothing waits forever. A sequence gap that swallowed the begin event itself stays a
+   documented Low residual. Cost: one lock read per editor read and a u64 in the reply. Test:
+   `a read observing a newer mutation sequence is not adopted before the begin event`.
+2. O-08 `git_discard` takes the `roots` that `git_discard_scope` returned and refuses, publishing no
+   events, when its own `plan` yields different roots. Rust test retargets the alias between the two.
+3. O-08 and O-09 listener: the callback branches on kind. `discard-begin` feeds its `roots` to
+   `recoveryTargetsChanged` (a pending Restore or Save As whose destination Git rewrites is
+   invalidated); `discard-end` feeds nothing; `planDocumentMutation` and the reconcile `failedEvent`
+   path ignore discard kinds. Published roots are canonical (`repo.git_path` based), so local
+   matching misses a spelling such as `/tmp` against `/private/tmp`: best effort, accepted.
+4. O-08 the 60 s remote deadline is dropped. A remote round is released only by `discard-end`, a
+   sequence gap, a reconcile, listener loss or reload.
+5. O-07 test: the flush promise is held, the revision changes while it is pending, then it resolves;
+   `answer(request, false)` is asserted. It fails if the read moves before the await.
+6. O-15: on a publish conflict the cached `Store` is dropped (`None`), so Retry reloads from disk.
+   Docs say a changed catalog is noticed when a change is published, the change is refused, and Retry
+   reloads the catalog.
+7. O-08 `nativeDiscard.test.ts` asserts the bridge sends raw document paths plus the native roots and
+   compares no spellings itself; the Rust alias test is the alias guarantee.
+8. O-08 a rejected or malformed `git_discard_match` for a remote round is caught and disposes the round
+   with preserve.
