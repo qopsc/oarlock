@@ -178,8 +178,8 @@ export function ThemesSection() {
         deleteCustomTheme,
         () => selectedTheme.current,
         () => setThemeId(DEFAULT_THEME_ID),
+        deleteThemeFile,
       );
-      await deleteThemeFile(id);
     } catch (error) {
       setImportError(String(error));
     }

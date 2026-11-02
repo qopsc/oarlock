@@ -9,9 +9,14 @@ const FS_CHANGED_EVENT = "fs:changed";
 
 type FsChangedPayload = { paths: string[] };
 
+export type UnavailableWatch = { path: string; reason: string };
+
 export type FsWatchHandles = {
   directories: { path: string; handle: string }[];
   files: { path: string; handle: string }[];
+  /** Paths native could not watch (a deleted folder); the rest of the batch registered. */
+  unavailableDirectories?: UnavailableWatch[];
+  unavailableFiles?: UnavailableWatch[];
 };
 
 export function releaseWatchHandles(handles: string[]): void {
@@ -31,11 +36,15 @@ export function createFileWatchClient(
     noticed = false;
   };
   const failed = new Map<() => void, Entry[]>();
+  // Paths that were not there; asked for again on a refresh, never announced, so they
+  // cannot keep a real failure's notice on screen.
+  const missing = new Map<() => void, Entry[]>();
   let health: ReturnType<typeof watchHealth.subscribe> | undefined;
   const stopHealth = () => {
     health?.dispose();
     health = undefined;
     failed.clear();
+    missing.clear();
     clearNotice();
   };
   type Entry = { handle?: string; removed: boolean };
@@ -48,8 +57,10 @@ export function createFileWatchClient(
       if (entry.handle !== undefined) handles.push(entry.handle);
     }
     releaseWatchHandles(handles);
-    for (const [retry, held] of failed) {
-      if (held.every((entry) => entry.removed)) failed.delete(retry);
+    for (const set of [failed, missing]) {
+      for (const [retry, held] of set) {
+        if (held.every((entry) => entry.removed)) set.delete(retry);
+      }
     }
     if (!failed.size) clearNotice();
   };
@@ -72,12 +83,13 @@ export function createFileWatchClient(
       health ??= watchHealth.subscribe(
         () => {},
         () => {
-          for (const retry of [...failed.keys()]) retry();
+          for (const retry of [...failed.keys(), ...missing.keys()]) retry();
         },
       );
       const ownHealth = health;
       const attempt = () => {
         failed.delete(attempt);
+        missing.delete(attempt);
         const requested = new Map<string, Entry[]>();
         const livePaths: string[] = [],
           liveFiles: string[] = [];
@@ -119,6 +131,19 @@ export function createFileWatchClient(
                 else entry.handle = handle;
               }
             }
+            // A folder that is gone is not an error to announce, but it is asked for
+            // again on the next health refresh or Retry, in case it comes back.
+            const gone: Entry[] = [];
+            for (const [kind, list] of [
+              ["directories", result.unavailableDirectories],
+              ["files", result.unavailableFiles],
+            ] as const) {
+              for (const { path } of list ?? []) {
+                const entry = requested.get(key(kind, path))?.shift();
+                if (entry && !entry.removed) gone.push(entry);
+              }
+            }
+            if (gone.length) missing.set(attempt, gone);
             releaseWatchHandles(late);
             if (!failed.size) clearNotice();
           })

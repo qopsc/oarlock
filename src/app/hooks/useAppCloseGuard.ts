@@ -59,6 +59,15 @@ export function closeAfterFlush(
   return flush.ok || alreadyWarned ? "close" : "warn";
 }
 
+/** Closing refused while documents are being updated or another window verifies a quit. */
+function notifyCloseBlocked(): void {
+  toast.info("Can't close yet", {
+    id: "close-blocked",
+    description:
+      "Document updates are being applied or another window is finishing a quit. Try again in a moment.",
+  });
+}
+
 export async function boundedSpaceFlush(
   flush: () => Promise<void>,
   timeoutMs: number,
@@ -199,7 +208,10 @@ export function useAppCloseGuard(
   const warned = useRef(false);
   const closeWindow = useCallback(async () => {
     const seal = `window-close:${attempt.current}`;
-    if (!sealEditors(seal)) return;
+    if (!sealEditors(seal)) {
+      notifyCloseBlocked();
+      return;
+    }
     forceClose.current = true;
     try {
       await getCurrentWindow().close();
@@ -327,7 +339,11 @@ export function useAppCloseGuard(
       .onCloseRequested(async (event) => {
         if (disposed || forceClose.current) return;
         event.preventDefault();
-        if (editorQuitSealed() || closing.current || pending.current) return;
+        if (editorQuitSealed()) {
+          notifyCloseBlocked();
+          return;
+        }
+        if (closing.current || pending.current) return;
         const generation = ++attempt.current;
         const current = () =>
           !disposed &&

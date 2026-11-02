@@ -87,6 +87,65 @@ describe("watch handles", () => {
     });
   });
 
+  it("registers the valid paths of a batch and retries a missing folder on refresh without announcing it", async () => {
+    const { watchHealth } = await import("./watchHealth");
+    const { toast } = await import("sonner");
+    vi.mocked(toast.error).mockClear();
+    invoke.mockResolvedValue({
+      directories: [{ path: "/repo/src", handle: "src" }],
+      files: [{ path: "/repo/src/a.ts", handle: "a" }],
+      unavailableDirectories: [{ path: "/repo/old", reason: "No such file" }],
+      unavailableFiles: [{ path: "/repo/old/x.rs", reason: "parent gone" }],
+    });
+    const watch = createFileWatchClient(() => local);
+    watch.add(["/repo/src", "/repo/old"], ["/repo/src/a.ts", "/repo/old/x.rs"]);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(toast.error).not.toHaveBeenCalled();
+    // The folder comes back: a health refresh asks for only the paths that were missing.
+    invoke.mockResolvedValue({
+      directories: [{ path: "/repo/old", handle: "old" }],
+      files: [{ path: "/repo/old/x.rs", handle: "x" }],
+    });
+    await watchHealth.retry();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+    expect(invoke).toHaveBeenLastCalledWith("fs_watch_add", {
+      paths: ["/repo/old"],
+      files: ["/repo/old/x.rs"],
+      workspace: local,
+    });
+    await watchHealth.retry();
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(toast.error).not.toHaveBeenCalled();
+    watch.dispose();
+    const released = invoke.mock.calls
+      .filter(([command]) => command === "watch_release")
+      .flatMap(([, args]) => args.handles as string[]);
+    expect(released.sort()).toEqual(["a", "old", "src", "x"]);
+  });
+
+  it("a missing folder never keeps another batch's failure notice on screen", async () => {
+    const { toast } = await import("sonner");
+    vi.mocked(toast.error).mockClear();
+    vi.mocked(toast.dismiss).mockClear();
+    invoke.mockResolvedValueOnce({
+      directories: [],
+      files: [],
+      unavailableDirectories: [{ path: "/gone", reason: "missing" }],
+    });
+    const watch = createFileWatchClient(() => local);
+    watch.add(["/gone"]);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+    invoke.mockRejectedValueOnce(new Error("backend down"));
+    watch.add(["/real"]);
+    await vi.waitFor(() => expect(toast.error).toHaveBeenCalled());
+    invoke.mockResolvedValue({ directories: [{ path: "/real", handle: "real" }], files: [] });
+    const { watchHealth } = await import("./watchHealth");
+    await watchHealth.retry();
+    await vi.waitFor(() => expect(toast.dismiss).toHaveBeenCalled());
+    watch.dispose();
+  });
+
   it("keeps a surviving duplicate's recovered handle", async () => {
     const { watchHealth } = await import("./watchHealth");
     const { toast } = await import("sonner");

@@ -4,14 +4,20 @@ export type RecoveryTarget = {
   changed: () => boolean | Promise<boolean>;
   dispose: () => void;
 };
-type Pending = { path: string; scope: string; changed: boolean };
+type Pending = {
+  path: string;
+  scope: string;
+  changed: boolean;
+  /** Native keeps the mutation history, so losing this listener loses nothing. */
+  nativeHistory: boolean;
+};
 const pending = new Set<Pending>();
 let covered = false;
 
 /** Fed by the window's existing ordered mutation listener, before quit deferral. */
 export function recoveryMutationCoverage(ready: boolean): void {
   covered = ready;
-  if (!ready) for (const target of pending) target.changed = true;
+  if (!ready) for (const target of pending) if (!target.nativeHistory) target.changed = true;
 }
 export function recoveryTargetsChanged(
   scope: string,
@@ -30,12 +36,13 @@ export function recoveryTargetsChanged(
 export function observeRecoveryTarget(
   path: string,
   scope: string,
+  nativeHistory = false,
 ): RecoveryTarget {
   if (!covered)
     throw new Error(
       "Document updates are unavailable. Retry document synchronization before restoring this draft.",
     );
-  const target: Pending = { path, scope, changed: false };
+  const target: Pending = { path, scope, changed: false, nativeHistory };
   pending.add(target);
   return {
     changed: () => target.changed,
@@ -55,7 +62,7 @@ export async function observeNativeRecoveryTarget(
     end: (id: string) => Promise<unknown>;
   },
 ): Promise<RecoveryTarget> {
-  const local = observeRecoveryTarget(path, scope);
+  const local = observeRecoveryTarget(path, scope, true);
   let id: string;
   try {
     id = await native.begin();

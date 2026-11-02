@@ -1672,14 +1672,16 @@ const EntryRow = memo(function EntryRow({
   const fileName = gitPathBasename(entry.path);
   // The tree already shows the folder; a rename still says where it came from.
   const pathLabel = tree && !entry.originalPath ? "" : entryPathLabel(entry);
-  const showDiscard = entry.unstaged;
+  const unreadable = entry.unreadable;
+  const showDiscard = entry.unstaged && !unreadable;
   const isStageBusy =
     actionBusy === `stage:${entry.path}` ||
     actionBusy === `unstage:${entry.path}`;
   const isDiscardBusy = actionBusy === `discard:${entry.path}`;
-  const disabled = actionBusy !== null;
+  const disabled = actionBusy !== null || unreadable;
 
-  const absolutePath = repoRoot ? gitPathAbsolute(repoRoot, entry.path) : null;
+  const absolutePath =
+    repoRoot && !unreadable ? gitPathAbsolute(repoRoot, entry.path) : null;
   const isDeleted = entry.statusCode === "D";
   const revealLabel = IS_MAC ? "Reveal in Finder" : "Reveal in File Manager";
 
@@ -1716,11 +1718,13 @@ const EntryRow = memo(function EntryRow({
           />
           <button
             type="button"
+            disabled={unreadable}
+            title={unreadable ? entry.statusLabel : undefined}
             onClick={() => {
               onFocusRow(row.key);
               void onSelectFile(entry);
             }}
-            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left disabled:cursor-not-allowed disabled:opacity-70"
           >
             {tree ? <span aria-hidden className="size-3.5 shrink-0" /> : null}
             <FileIcon name={fileName} className="size-4 shrink-0" />
@@ -1736,7 +1740,11 @@ const EntryRow = memo(function EntryRow({
               >
                 {fileName}
               </span>
-              {pathLabel ? (
+              {unreadable ? (
+                <span className="shrink-0 text-[10.5px] leading-tight text-destructive">
+                  {entry.statusLabel}
+                </span>
+              ) : pathLabel ? (
                 <span className="min-w-0 flex-1 truncate text-[10.5px] leading-tight text-muted-foreground/75">
                   {pathLabel}
                 </span>
@@ -1801,6 +1809,7 @@ const EntryRow = memo(function EntryRow({
         {/* Open actions */}
         <ContextMenuItem
           className={COMPACT_ITEM}
+          disabled={unreadable}
           onSelect={() => {
             onFocusRow(row.key);
             void onSelectFile(entry);
@@ -1827,7 +1836,7 @@ const EntryRow = memo(function EntryRow({
         >
           {entry.checkState === "checked" ? "Unstage" : "Stage"}
         </ContextMenuItem>
-        {entry.unstaged ? (
+        {entry.unstaged && !unreadable ? (
           <ContextMenuItem
             className={COMPACT_ITEM}
             variant="destructive"

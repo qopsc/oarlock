@@ -59,7 +59,8 @@ export async function getBgImage(id: string): Promise<Blob | null> {
     req.onsuccess = () => resolve((req.result as Blob | undefined) ?? null);
     req.onerror = () => reject(req.error);
   });
-  return blob ? inspectBackgroundImage(blob) : null;
+  // Inspected when it was imported; a stored blob is not copied over IPC on every start.
+  return blob;
 }
 
 export async function deleteBgImage(id: string): Promise<void> {

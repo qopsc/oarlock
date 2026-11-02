@@ -17,3 +17,35 @@ it("refuses branch dispatch before the release job can publish", () => {
   expect(branch.stdout + branch.stderr).toContain("release tag");
   expect(run("refs/tags/not-a-release").status).not.toBe(0);
 });
+
+it("verifies the macOS bundle before anything is uploaded to the release", () => {
+  const workflow = readFileSync(path.resolve(".github/workflows/release.yml"), "utf8");
+  const steps = workflow.split(/\n {6}(?=- )/);
+  const named = (needle: string) => steps.findIndex((step) => step.includes(needle));
+  const build = named("id: tauri-mac");
+  const verify = named("verify-app.mjs");
+  const upload = named("Upload the verified macOS bundle");
+  expect(build).toBeGreaterThan(-1);
+  expect(build).toBeLessThan(verify);
+  expect(verify).toBeLessThan(upload);
+  expect(steps[build]).not.toMatch(/tagName|releaseDraft|releaseId/);
+  expect(steps[upload]).toContain("steps.tauri-mac.outputs.artifactPaths");
+  // A directory is never handed to `gh release upload`; the .app is tarred under a
+  // per-architecture name, and plain files (the .dmg) go up as they are.
+  expect(steps[upload]).toContain('if [ -d "$artifact" ]');
+  expect(steps[upload]).toContain('tar -czf "$archive"');
+  expect(steps[upload]).toContain('${stem}_${ARCH}.app.tar.gz');
+  expect(steps[upload]).toContain("x86_64) ARCH=x64 ;;");
+  expect(steps[upload]).toContain('*) ARCH="${ARCH_TARGET%%-*}" ;;');
+  // Both legs resolve to distinct names: Oarlock_x64.app.tar.gz and Oarlock_aarch64.app.tar.gz.
+  const arch = (target: string) =>
+    spawnSync("bash", ["-c", `case "\${T%%-*}" in x86_64) A=x64 ;; *) A="\${T%%-*}" ;; esac; echo "$A"`], {
+      encoding: "utf8", env: { ...process.env, T: target },
+    }).stdout.trim();
+  expect(arch("x86_64-apple-darwin")).toBe("x64");
+  expect(arch("aarch64-apple-darwin")).toBe("aarch64");
+  expect(steps[upload]).toContain("ARCH_TARGET: ${{ matrix.rust-target }}");
+  const publishing = steps.filter((step) => /tagName:/.test(step));
+  expect(publishing).toHaveLength(1);
+  expect(publishing[0]).toContain("!startsWith(matrix.platform, 'macos')");
+});

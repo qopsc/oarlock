@@ -177,7 +177,7 @@ import {
   WorkspaceInputBar,
 } from "./components/WorkspaceInputBar";
 import { WorkspaceSurface } from "./components/WorkspaceSurface";
-import { hasOpenPathTab, renamedPath, spacesEmptiedByTabs } from "./hooks/tabCloseGuards";
+import { hasOpenPathTab, spacesEmptiedByTabs } from "./hooks/tabCloseGuards";
 import { aiToggleAction } from "./hooks/aiToggle";
 import { useAppCloseGuard } from "./hooks/useAppCloseGuard";
 import { useOpenFolder } from "./hooks/useOpenFolder";
@@ -256,7 +256,6 @@ export default function App() {
     splitActivePane,
     moveTabIntoSplit,
     movePaneToNewTab,
-    closeActivePane,
     closePaneByLeaf,
   } = useTabs(getLaunchDir() ? { cwd: getLaunchDir() } : undefined);
 
@@ -514,8 +513,13 @@ export default function App() {
     pendingCloseMany,
     closeManyConfirming,
     handleClose,
+    pendingPaneClose,
+    handleClosePane,
+    confirmPaneClose,
+    cancelPaneClose,
     handleCloseTabsToRight,
     handleCloseOtherTabs,
+    handleDeleteSpace: guardSpaceDeletion,
     confirmClose,
     cancelClose,
     confirmTerminalClose,
@@ -533,6 +537,7 @@ export default function App() {
     disposeTab,
     disposeDeletedTabs,
     disposeTabs,
+    disposePane: closePaneByLeaf,
   });
 
   const { pendingAppClose, confirmAppClose, cancelAppClose } = useAppCloseGuard(
@@ -900,20 +905,26 @@ export default function App() {
       }
       updateTab(change.id, { path: change.path, title: change.title });
     }
+    const detached = new Set<number>();
     for (const id of plan.deleted) {
       const editor = editorRefs.current.get(id);
-      if (editor?.hasUnsavedChanges()) editor.detach();
+      if (editor?.hasUnsavedChanges()) {
+        editor.detach();
+        detached.add(id);
+      }
     }
-    handlePathsDeleted(plan.deleted, (id) =>
-      editorRefs.current.get(id)?.hasUnsavedChanges(),
+    handlePathsDeleted(
+      plan.deleted,
+      (id) => editorRefs.current.get(id)?.hasUnsavedChanges(),
+      detached,
     );
     for (const id of plan.refresh) editorRefs.current.get(id)?.reload();
-  }, async (scope, isLive, failedEvent) => {
+  }, async (scope, isLive) => {
     const spaces = useSpaces.getState().spaces;
     const groups = new Map<string, {
       workspace: WorkspaceEnv;
       roots: Set<string>;
-      documents: { id: number; path: string; version?: string; alternatePath?: string; snapshot: BindingSnapshot | null }[];
+      documents: { id: number; path: string; version?: string; snapshot: BindingSnapshot | null }[];
     }>();
     for (const tab of tabsRef.current) {
       if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
@@ -937,15 +948,12 @@ export default function App() {
         if (slash >= 0) group.roots.add(tab.path.slice(0, slash) || "/");
       }
       const snapshot = editorRefs.current.get(tab.id)?.bindingSnapshot() ?? null;
-      const alternatePath = failedEvent?.kind === "renamed"
-        ? renamedPath(tab.path, failedEvent.from, failedEvent.to) ?? undefined
-        : undefined;
-      group.documents.push({ id: tab.id, path: tab.path, version: snapshot?.version, alternatePath, snapshot });
+      group.documents.push({ id: tab.id, path: tab.path, version: snapshot?.version, snapshot });
     }
     for (const group of groups.values()) {
       const results = await invoke<{ id: number; path: string | null }[]>("fs_reconcile_documents", {
         workspace: group.workspace, roots: [...group.roots],
-        documents: group.documents.map(({ id, path, version, alternatePath }) => ({ id, path, version, alternatePath })),
+        documents: group.documents.map(({ id, path, version }) => ({ id, path, version })),
       });
       if (!isLive()) return;
       flushSync(() => { for (const result of results) {
@@ -1124,11 +1132,11 @@ export default function App() {
   const handleCloseTabOrPane = useCallback(() => {
     const t = tabsRef.current.find((x) => x.id === activeId);
     if (t?.kind === "terminal" && leafIds(t.paneTree).length > 1) {
-      closeActivePane(activeId);
+      void handleClosePane(activeId);
       return;
     }
     void handleClose(activeId);
-  }, [activeId, closeActivePane, handleClose]);
+  }, [activeId, handleClosePane, handleClose]);
 
   const restartActiveTerminal = useCallback(() => {
     const leafId = restartTarget(tabsRef.current, activeId);
@@ -1540,14 +1548,16 @@ export default function App() {
 
   const handleDeleteSpace = useCallback(
     (id: string) => {
-      const nextSpaceId = useSpaces.getState().remove(id);
-      if (!nextSpaceId) return;
-      const root = useSpaces
-        .getState()
-        .spaces.find((s) => s.id === nextSpaceId)?.root;
-      removeTabsForSpace(id, nextSpaceId, root ?? undefined);
+      void guardSpaceDeletion(id, () => {
+        const nextSpaceId = useSpaces.getState().remove(id);
+        if (!nextSpaceId) return;
+        const root = useSpaces
+          .getState()
+          .spaces.find((s) => s.id === nextSpaceId)?.root;
+        removeTabsForSpace(id, nextSpaceId, root ?? undefined);
+      });
     },
-    [removeTabsForSpace],
+    [guardSpaceDeletion, removeTabsForSpace],
   );
 
   // The pane keeps its shell; its agent records follow it to its new tab.
@@ -2135,6 +2145,9 @@ export default function App() {
             pendingTerminalCloseTab={pendingTerminalCloseTab}
             onCancelTerminalClose={cancelTerminalClose}
             onConfirmTerminalClose={confirmTerminalClose}
+            pendingPaneClose={pendingPaneClose}
+            onCancelPaneClose={cancelPaneClose}
+            onConfirmPaneClose={confirmPaneClose}
             pendingTerminalRestart={pendingRestartLeaf}
             onCancelTerminalRestart={cancelRestart}
             onConfirmTerminalRestart={confirmRestart}

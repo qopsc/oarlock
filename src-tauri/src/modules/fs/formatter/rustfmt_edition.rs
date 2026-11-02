@@ -44,6 +44,18 @@ fn edition(value: &toml::Value, path: &Path) -> Result<String, String> {
     }
 }
 
+const DEFAULT_EDITION: &str = "2021";
+
+/// The edition for `path`, or the previous default when it cannot be determined (a crate
+/// opened without its workspace root, an unreadable manifest): formatting must not stop
+/// because the edition lookup could not reach a manifest.
+pub(super) fn for_document_or_default(path: &Path, gates: &Gates<'_>) -> String {
+    for_document(path, gates).unwrap_or_else(|error| {
+        log::warn!("Formatting {} with edition {DEFAULT_EDITION}: {error}", path.display());
+        DEFAULT_EDITION.to_owned()
+    })
+}
+
 /// A loose file retains the previous 2021 default; a Cargo package follows its manifest.
 pub(super) fn for_document(path: &Path, gates: &Gates<'_>) -> Result<String, String> {
     let Some(start) = path.parent() else {
@@ -125,7 +137,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(for_document(&file, &gates).unwrap(), "2024");
-        let mut args = super::super::arguments("rustfmt", file.to_str().unwrap(), "").unwrap();
+        let args_for = |edition: &str| {
+            super::super::arguments("rustfmt", file.to_str().unwrap(), "", edition).unwrap()
+        };
+        let args = args_for("2021");
         let content = "fn main() { let gen = 1; }";
         let run = |args: &[String]| {
             super::super::run(
@@ -138,7 +153,7 @@ mod tests {
             )
         };
         assert!(run(&args).is_ok(), "2021 accepts gen as an identifier");
-        args[4] = for_document(&file, &gates).unwrap();
+        let args = args_for(&for_document(&file, &gates).unwrap());
         assert!(
             run(&args).is_err(),
             "2024 reserves gen and must not use 2021 parsing"
@@ -162,6 +177,38 @@ mod tests {
         assert_eq!(for_document(&file, &gates).unwrap(), "2018");
         fs::write(package.join("Cargo.toml"), "[package\n").unwrap();
         assert!(for_document(&file, &gates).is_err());
+    }
+
+    #[test]
+    fn an_unreachable_workspace_or_unreadable_manifest_falls_back_to_the_default_edition() {
+        let root = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(root.path()).unwrap();
+        let package = base.join("crates/api");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            base.join("Cargo.toml"),
+            "[workspace]\n[workspace.package]\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname='api'\nedition.workspace=true\n",
+        )
+        .unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&package).unwrap();
+        let gates = registry.gates(Origin::App);
+        let file = package.join("lib.rs");
+        assert!(for_document(&file, &gates).is_err(), "workspace root is out of reach");
+        assert_eq!(for_document_or_default(&file, &gates), "2021");
+        fs::write(package.join("Cargo.toml"), "[package\n").unwrap();
+        assert_eq!(for_document_or_default(&file, &gates), "2021");
+    }
+
+    #[test]
+    fn the_edition_is_part_of_the_argument_vector() {
+        let args = super::super::arguments("rustfmt", "/a.rs", "", "2018").unwrap();
+        assert_eq!(args, ["rustfmt", "--emit", "stdout", "--edition", "2018"]);
     }
 
     #[test]

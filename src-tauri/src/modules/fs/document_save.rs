@@ -306,13 +306,32 @@ fn write_checked_with_policy(
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(version(&saved, content)?)
+    Ok(committed_version(version(&saved, content), content))
+}
+
+/// The write has been published: a failure to describe it must not read as a failed save,
+/// which would have callers discard what they just committed. The placeholder matches no
+/// disk state, so the next save asks the user before it overwrites.
+fn committed_version(version: std::io::Result<String>, content: &[u8]) -> String {
+    version.unwrap_or_else(|error| {
+        log::warn!("Saved a document but could not read its version back: {error}");
+        format!("v2:unavailable:{:x}", Sha256::digest(content))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{io::Write, sync::Barrier};
+
+    #[test]
+    fn a_committed_write_whose_version_cannot_be_read_is_still_a_success() {
+        let ok = committed_version(Ok("v2:real".into()), b"x");
+        assert_eq!(ok, "v2:real");
+        let degraded = committed_version(Err(std::io::Error::other("fstat failed")), b"x");
+        assert!(degraded.starts_with("v2:unavailable:"));
+        assert_ne!(degraded, committed_version(Err(std::io::Error::other("e")), b"y"));
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn replacement_preserves_permissions_on_ramfs() {

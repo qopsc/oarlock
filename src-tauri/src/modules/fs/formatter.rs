@@ -77,7 +77,12 @@ fn language_hint(path: &str, language: Option<&str>) -> Result<String, String> {
         .ok_or_else(|| "Invalid formatter filename".into())
 }
 
-fn arguments(formatter: &str, path: &str, custom: &str) -> Result<Vec<String>, String> {
+fn arguments(
+    formatter: &str,
+    path: &str,
+    custom: &str,
+    rustfmt_edition: &str,
+) -> Result<Vec<String>, String> {
     let args: Vec<String> = match formatter {
         "biome" => vec![
             "biome".into(),
@@ -97,7 +102,7 @@ fn arguments(formatter: &str, path: &str, custom: &str) -> Result<Vec<String>, S
             "--emit".into(),
             "stdout".into(),
             "--edition".into(),
-            "2021".into(),
+            rustfmt_edition.into(),
         ],
         "gofmt" => vec!["gofmt".into()],
         "clang-format" => vec!["clang-format".into(), format!("--assume-filename={path}")],
@@ -316,14 +321,17 @@ pub async fn fs_format_document(
                 .gates(Origin::App)
                 .spawn_cwd(Some(cwd), &workspace)?;
             let hint = language_hint(&path, language.as_deref())?;
-            let mut args = arguments(
+            let edition = if formatter == "rustfmt" {
+                rustfmt_edition::for_document_or_default(&real_document, &gates)
+            } else {
+                String::new()
+            };
+            let args = arguments(
                 &formatter,
                 &hint,
                 custom_command.as_deref().unwrap_or_default(),
+                &edition,
             )?;
-            if formatter == "rustfmt" {
-                args[4] = rustfmt_edition::for_document(&real_document, &gates)?;
-            }
             run(
                 &args,
                 cwd,
@@ -500,6 +508,7 @@ mod tests {
             arguments(
                 "prettier",
                 &language_hint("/repo/code.txt", Some("ts")).unwrap(),
+                "",
                 ""
             )
             .unwrap(),
@@ -519,13 +528,13 @@ mod tests {
             "shfmt",
             "zigfmt",
         ] {
-            let args = arguments(formatter, "/repo/file's.ts", "").unwrap();
+            let args = arguments(formatter, "/repo/file's.ts", "", "2021").unwrap();
             assert!(!args
                 .iter()
                 .any(|a| matches!(a.as_str(), "--write" | "-w" | "-i")));
         }
         assert_eq!(
-            arguments("ruff", "/a.py", "").unwrap(),
+            arguments("ruff", "/a.py", "", "").unwrap(),
             ["ruff", "format", "--stdin-filename", "/a.py", "-"]
         );
         for bad in [
@@ -535,13 +544,13 @@ mod tests {
             r#"["tool", "--write"]"#,
             r#"["tool", "{file}"]"#,
         ] {
-            assert!(arguments("custom", "/a", bad).is_err());
+            assert!(arguments("custom", "/a", bad, "").is_err());
         }
         assert_eq!(
-            arguments("custom", "/a", r#"["tool", "--stdin"]"#).unwrap(),
+            arguments("custom", "/a", r#"["tool", "--stdin"]"#, "").unwrap(),
             ["tool", "--stdin"]
         );
-        assert!(arguments("unknown", "/a", "").is_err());
+        assert!(arguments("unknown", "/a", "", "").is_err());
     }
 
     #[test]

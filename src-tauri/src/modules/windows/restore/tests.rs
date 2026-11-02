@@ -267,18 +267,6 @@ fn source_directory_alias_does_not_move_external_state() {
 
 #[cfg(unix)]
 #[test]
-fn a_linked_state_root_cannot_start_restoration() {
-    let root = fixture();
-    let wrapper = tempfile::tempdir().unwrap();
-    let alias = wrapper.path().join("linked-root");
-    std::os::unix::fs::symlink(root.path(), &alias).unwrap();
-    assert!(run(&alias).is_err());
-    assert_eq!(fs::read_to_string(root.path().join("oarlock-spaces.json")).unwrap(), "old spaces");
-    assert_eq!(fs::read_to_string(root.path().join("windows/w-a/oarlock-spaces.json")).unwrap(), "saved spaces");
-}
-
-#[cfg(unix)]
-#[test]
 fn ordinary_launch_does_not_replace_the_saved_registry() {
     use std::os::unix::fs::MetadataExt;
     let dir = fixture();
@@ -328,4 +316,36 @@ fn hardlinked_source_state_is_preserved_and_not_adopted() {
     assert_eq!(fs::read(&source).unwrap(), b"saved spaces");
     assert_eq!(fs::read(&alias).unwrap(), b"saved spaces");
     assert_eq!(fs::read(dir.path().join("oarlock-spaces.json")).unwrap(), b"old spaces");
+}
+
+#[test]
+fn a_symlinked_data_directory_starts_and_adopts() {
+    let real = fixture();
+    let holder = tempfile::tempdir().unwrap();
+    let link = holder.path().join("Application Support");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    let plan = run(&link).unwrap();
+    assert_eq!(plan.adopt.as_deref(), Some("w-a"));
+    verify(real.path());
+}
+
+#[test]
+fn an_ordinary_launch_through_a_symlink_needs_no_pin() {
+    let real = tempfile::tempdir().unwrap();
+    put(&real.path().join(REGISTRY_FILE), r#"{"windows":["main","w-b"]}"#);
+    let holder = tempfile::tempdir().unwrap();
+    let link = holder.path().join("data");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    let plan = run(&link).unwrap();
+    assert_eq!(plan.open, ["main", "w-b"]);
+    assert!(quick_plan(&fs::canonicalize(&link).unwrap()).unwrap().is_some());
+}
+
+#[test]
+fn recovery_work_is_not_a_quick_launch() {
+    let adoption = fixture();
+    assert!(quick_plan(adoption.path()).unwrap().is_none());
+    let journal = tempfile::tempdir().unwrap();
+    fs::create_dir(journal.path().join(JOURNAL)).unwrap();
+    assert!(quick_plan(journal.path()).unwrap().is_none());
 }

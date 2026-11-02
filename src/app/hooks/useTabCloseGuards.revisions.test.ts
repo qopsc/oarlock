@@ -17,7 +17,9 @@ vi.mock("react", () => ({
   useState: (value: unknown) => {
     const index = fake.cursor++;
     if (!(index in fake.slots)) fake.slots[index] = value;
-    return [fake.slots[index], (next: unknown) => { fake.slots[index] = next; }];
+    return [fake.slots[index], (next: unknown) => {
+      fake.slots[index] = typeof next === "function" ? next(fake.slots[index]) : next;
+    }];
   },
 }));
 vi.mock("@/modules/settings/preferences", () => ({
@@ -56,7 +58,7 @@ it.each(["before confirmation", "during the terminal check"])(
       tabs, activeId: 1,
       editorIsDirty: (id: number) => id === 2,
       editorCloseRevision: () => revision,
-      disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs,
+      disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs, disposePane: vi.fn(),
     };
     const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
     render().handleCloseOtherTabs(1);
@@ -83,7 +85,7 @@ it("does not reconfirm an editor that was saved during the check", async () => {
   const params = {
     tabs, activeId: 1, editorIsDirty: (id: number) => id === 2 && dirty,
     editorCloseRevision: () => "old",
-    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs,
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs, disposePane: vi.fn(),
   };
   const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
   render().handleCloseOtherTabs(1);
@@ -95,4 +97,155 @@ it("does not reconfirm an editor that was saved during the check", async () => {
   release(false);
   await confirmation;
   expect(disposeTabs).toHaveBeenCalledOnce();
+});
+
+it("closing a split pane asks first when a program runs in it", async () => {
+  const disposePane = vi.fn();
+  const split = {
+    id: 5, kind: "terminal", spaceId: "s", activeLeafId: 30, paneTree: {},
+  } as unknown as Tab;
+  const params = {
+    tabs: [split], activeId: 5, editorIsDirty: () => false,
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane,
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  fake.busy.mockResolvedValue(true);
+  await render().handleClosePane(5);
+  expect(disposePane).not.toHaveBeenCalled();
+  expect(render().pendingPaneClose).toBe(5);
+  render().confirmPaneClose();
+  expect(disposePane).toHaveBeenCalledWith(30);
+  expect(render().pendingPaneClose).toBeNull();
+  disposePane.mockClear();
+  fake.busy.mockResolvedValue(false);
+  await render().handleClosePane(5);
+  expect(disposePane).toHaveBeenCalledWith(30);
+});
+
+it("confirming a pane close closes the pane that was asked about, not the one focused later", async () => {
+  const disposePane = vi.fn();
+  const split = {
+    id: 5, kind: "terminal", spaceId: "s", activeLeafId: 30, paneTree: {},
+  } as unknown as Tab;
+  const params = {
+    tabs: [split], activeId: 5, editorIsDirty: () => false,
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane,
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  fake.busy.mockResolvedValue(true);
+  await render().handleClosePane(5);
+  (split as unknown as { activeLeafId: number }).activeLeafId = 31;
+  render().confirmPaneClose();
+  expect(disposePane).toHaveBeenCalledWith(30);
+});
+
+it("a tab opened in the space after the delete prompt is rechecked before the space goes", async () => {
+  const commit = vi.fn();
+  const live: Tab[] = [...tabs];
+  const params = {
+    get tabs() { return live; }, activeId: 1,
+    editorIsDirty: (id: number) => id === 2 || id === 7,
+    editorCloseRevision: () => "r",
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  await render().handleDeleteSpace("s", commit);
+  expect(render().pendingCloseMany?.dirtyIds).toEqual([2]);
+  live.push({ id: 7, kind: "editor", spaceId: "s", dirty: true } as Tab);
+  await render().confirmCloseMany();
+  expect(commit).not.toHaveBeenCalled();
+  expect(render().pendingCloseMany?.dirtyIds).toEqual([2, 7]);
+  await render().confirmCloseMany();
+  expect(commit).toHaveBeenCalledOnce();
+});
+
+it("a deleted dirty draft the same event detached raises no delete dialog", async () => {
+  const disposeDeletedTabs = vi.fn();
+  const params = {
+    tabs, activeId: 1, editorIsDirty: () => true,
+    disposeTab: vi.fn(), disposeDeletedTabs, disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  render().handlePathsDeleted([2], () => true, new Set([2]));
+  expect(render().pendingDeleteTabs).toBeNull();
+  render().handlePathsDeleted([2], () => true);
+  expect(render().pendingDeleteTabs).toEqual([2]);
+});
+
+it("a single-tab confirmation asks again when the buffer changed after the prompt", async () => {
+  let revision = "a";
+  const disposeTab = vi.fn();
+  const params = {
+    tabs, activeId: 1, editorIsDirty: (id: number) => id === 2,
+    editorCloseRevision: () => revision,
+    disposeTab, disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  await render().handleClose(2);
+  expect(render().pendingCloseTab).toBe(2);
+  revision = "b";
+  render().confirmClose();
+  expect(disposeTab).not.toHaveBeenCalled();
+  expect(render().pendingCloseTab).toBe(2);
+  render().confirmClose();
+  expect(disposeTab).toHaveBeenCalledWith(2);
+});
+
+it("a delete confirmation asks again when the draft changed after the prompt", () => {
+  let revision = "a";
+  const disposeDeletedTabs = vi.fn();
+  const params = {
+    tabs, activeId: 1, editorIsDirty: () => true,
+    editorCloseRevision: () => revision,
+    disposeTab: vi.fn(), disposeDeletedTabs, disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  render().handlePathsDeleted([2], () => true);
+  disposeDeletedTabs.mockClear();
+  revision = "b";
+  render().confirmDeleteClose();
+  expect(disposeDeletedTabs).not.toHaveBeenCalled();
+  render().confirmDeleteClose();
+  expect(disposeDeletedTabs).toHaveBeenCalledWith([2]);
+});
+
+const otherSpaceTab = { id: 9, kind: "editor", spaceId: "other", dirty: true } as Tab;
+
+it("deleting a space with a dirty editor asks before it commits", async () => {
+  const disposeTabs = vi.fn();
+  const commit = vi.fn();
+  const params = {
+    tabs: [...tabs, otherSpaceTab], activeId: 1,
+    editorIsDirty: (id: number) => id === 2,
+    editorCloseRevision: () => "r",
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs, disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  await render().handleDeleteSpace("s", commit);
+  expect(commit).not.toHaveBeenCalled();
+  const pending = render().pendingCloseMany;
+  expect(pending?.kind).toBe("space");
+  expect(pending?.dirtyIds).toEqual([2]);
+  await render().confirmCloseMany();
+  expect(commit).toHaveBeenCalledOnce();
+  expect(disposeTabs).not.toHaveBeenCalled();
+  expect(render().pendingCloseMany).toBeNull();
+});
+
+it("deleting a space with a running shell asks, and a clean space commits at once", async () => {
+  const commit = vi.fn();
+  const params = {
+    tabs: [...tabs, otherSpaceTab], activeId: 1,
+    editorIsDirty: () => false,
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  fake.busy.mockResolvedValue(true);
+  await render().handleDeleteSpace("s", commit);
+  expect(commit).not.toHaveBeenCalled();
+  expect(render().pendingCloseMany?.busyLeafIds).toEqual([30]);
+  render().cancelCloseMany();
+  fake.busy.mockResolvedValue(false);
+  await render().handleDeleteSpace("s", commit);
+  expect(commit).toHaveBeenCalledOnce();
 });

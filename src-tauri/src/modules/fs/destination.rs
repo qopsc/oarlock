@@ -160,7 +160,18 @@ impl Staged<'_> {
         self.publish(replace, false)
     }
 
-    fn publish(mut self, replace: bool, inherit: bool) -> io::Result<fs::File> {
+    fn publish(self, replace: bool, inherit: bool) -> io::Result<fs::File> {
+        self.publish_then(replace, inherit, sync_directory)
+    }
+
+    /// `sync` runs once the entry is in place. A failure there cannot undo the rename, so it
+    /// is logged: the save did commit, it is only not yet known to survive a power cut.
+    fn publish_then(
+        mut self,
+        replace: bool,
+        inherit: bool,
+        sync: impl FnOnce(&Dir) -> io::Result<()>,
+    ) -> io::Result<fs::File> {
         let dir = &self.destination.dir;
         // Allocate the returned handle before publication, never after commit.
         let file = self.file().try_clone()?;
@@ -181,13 +192,45 @@ impl Staged<'_> {
                     ),
                 )
             })?;
+        if let Err(error) = sync(dir) {
+            log::warn!(
+                "Saved {} but could not sync its folder: {error}",
+                self.destination.opened.display()
+            );
+        }
         Ok(file)
     }
+}
+
+/// Makes the rename itself durable. On Apple `File::sync_all` is `F_FULLFSYNC`.
+fn sync_directory(dir: &Dir) -> io::Result<()> {
+    dir.try_clone()?.into_std_file().sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_folder_is_synced_after_the_rename_and_a_failed_sync_does_not_fail_the_save() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("document");
+        fs::write(&target, b"old").unwrap();
+        let dest = Destination::pin(&target, false, &|_| Ok(())).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let staged = dest.stage(b"new").unwrap();
+        staged
+            .publish_then(true, true, |_| {
+                seen.borrow_mut().push(fs::read(&target).unwrap());
+                Err(io::Error::other("sync refused"))
+            })
+            .unwrap();
+        assert_eq!(seen.into_inner(), vec![b"new".to_vec()], "synced after publication");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let staged = dest.stage(b"newer").unwrap();
+        staged.persist(true).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"newer");
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

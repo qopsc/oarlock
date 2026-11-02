@@ -1,4 +1,5 @@
 import { requireCurrentPreferences } from "@/modules/settings/readiness";
+import { actionableEntries, isUnreadableEntry } from "./unreadableEntries";
 import {
   currentWorkspaceEnv,
   useWorkspaceEnvStore,
@@ -54,6 +55,7 @@ type SourceControlEntry = {
   statusCode: string;
   originalPath: string | null;
   untracked: boolean;
+  unreadable: boolean;
 };
 
 export type CheckState = "checked" | "indeterminate" | "unchecked";
@@ -69,6 +71,7 @@ export type SourceControlFileEntry = {
   staged: boolean;
   unstaged: boolean;
   untracked: boolean;
+  unreadable: boolean;
 };
 
 type PendingDiscard = {
@@ -173,6 +176,7 @@ function makeEntry(
     statusCode: statusCodeForMode(mode, file),
     originalPath: file.originalPath,
     untracked: file.untracked,
+    unreadable: isUnreadableEntry(file),
   };
 }
 
@@ -441,7 +445,7 @@ export function useSourceControlPanel(
     [status],
   );
 
-  const fileEntries = useMemo<SourceControlFileEntry[]>(() => {
+  const allFileEntries = useMemo<SourceControlFileEntry[]>(() => {
     const seen = new Set<string>();
     const out: SourceControlFileEntry[] = [];
     for (const file of status?.changedFiles ?? []) {
@@ -466,18 +470,20 @@ export function useSourceControlPanel(
         staged: file.staged,
         unstaged: file.unstaged,
         untracked: file.untracked,
+        unreadable: isUnreadableEntry(file),
       });
     }
     return out;
   }, [status]);
 
   const headerCheckState = useMemo<CheckState>(() => {
+    const fileEntries = actionableEntries(allFileEntries);
     if (fileEntries.length === 0) return "unchecked";
     const allChecked = fileEntries.every((e) => e.checkState === "checked");
     if (allChecked) return "checked";
     const anyStaged = fileEntries.some((e) => e.staged);
     return anyStaged ? "indeterminate" : "unchecked";
-  }, [fileEntries]);
+  }, [allFileEntries]);
 
   const allClean = stagedEntries.length === 0 && unstagedEntries.length === 0;
   const canPush = !!status?.upstream && status.behind === 0;
@@ -661,7 +667,7 @@ export function useSourceControlPanel(
 
   const selectEntry = useCallback(
     async (entry: SourceControlEntry) => {
-      if (!repo) return;
+      if (!repo || entry.unreadable) return;
       const nextSelection: DiffSelection = {
         path: entry.path,
         mode: entry.mode,
@@ -790,7 +796,9 @@ export function useSourceControlPanel(
       unstagedEntries.length === 0
     )
       return;
-    setPendingDiscard({ scope: "all", entries: unstagedEntries, owner });
+    const entries = actionableEntries(unstagedEntries);
+    if (entries.length === 0) return;
+    setPendingDiscard({ scope: "all", entries, owner });
   }, [isCurrent, owner, repo, summary.busyAction, unstagedEntries]);
 
   const cancelPendingDiscard = useCallback(() => {
@@ -826,8 +834,9 @@ export function useSourceControlPanel(
   }, [isCurrent, native, owner, pendingDiscard, repo, runMutation]);
 
   const stageAllEntries = useCallback(async () => {
-    if (!repo || unstagedEntries.length === 0) return;
-    const paths = new Set(unstagedEntries.map((entry) => entry.path));
+    const entries = actionableEntries(unstagedEntries);
+    if (!repo || entries.length === 0) return;
+    const paths = new Set(entries.map((entry) => entry.path));
     await runMutation(
       "stage:all",
       (s) => optimisticStage(s, paths),
@@ -837,8 +846,9 @@ export function useSourceControlPanel(
   }, [native, repo, runMutation, unstagedEntries]);
 
   const unstageAllEntries = useCallback(async () => {
-    if (!repo || stagedEntries.length === 0) return;
-    const paths = new Set(stagedEntries.map((entry) => entry.path));
+    const entries = actionableEntries(stagedEntries);
+    if (!repo || entries.length === 0) return;
+    const paths = new Set(entries.map((entry) => entry.path));
     await runMutation(
       "unstage:all",
       (s) => optimisticUnstage(s, paths),
@@ -849,7 +859,7 @@ export function useSourceControlPanel(
 
   const selectFile = useCallback(
     async (entry: SourceControlFileEntry) => {
-      if (!repo) return;
+      if (!repo || entry.unreadable) return;
       const mode: DiffMode = entry.unstaged ? "-" : "+";
       const nextSelection: DiffSelection = { path: entry.path, mode };
       if (sameSelection(selected, nextSelection)) {
@@ -870,7 +880,7 @@ export function useSourceControlPanel(
 
   const toggleStageFile = useCallback(
     async (entry: SourceControlFileEntry) => {
-      if (!repo) return;
+      if (!repo || entry.unreadable) return;
       const paths = new Set([entry.path]);
       if (entry.checkState === "checked") {
         await runMutation(
@@ -900,6 +910,7 @@ export function useSourceControlPanel(
     (entry: SourceControlFileEntry) => {
       if (
         !repo ||
+        entry.unreadable ||
         repo.repoRoot !== summary.repo?.repoRoot ||
         !isCurrent() ||
         owner.busy ||
@@ -919,6 +930,7 @@ export function useSourceControlPanel(
           statusCode: entry.statusCode,
           originalPath: entry.originalPath,
           untracked: entry.untracked,
+          unreadable: false,
         },
       });
     },
@@ -1111,7 +1123,7 @@ export function useSourceControlPanel(
     actionMessage,
     stagedEntries,
     unstagedEntries,
-    fileEntries,
+    fileEntries: allFileEntries,
     headerCheckState,
     allClean,
     canPush,

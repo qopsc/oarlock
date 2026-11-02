@@ -121,10 +121,13 @@ it("captures each layout's scrollback keys before a later flush changes them", a
   expect(fake.saveState).toHaveBeenNthCalledWith(2, "space", { tabs: [{ key: "second" }], activeTabIndex: 0 });
 });
 
-it("flushes the layout even if saving scrollback fails", async () => {
+it("a failed scrollback save is a warning, not a failed flush", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   fake.persistScrollback.mockRejectedValueOnce(new Error("history failed"));
   const flush = await mount();
-  await expect(flush()).rejects.toThrow("history failed");
+  await expect(flush()).resolves.toBeUndefined();
+  expect(warn).toHaveBeenCalledWith("Could not save terminal scrollback", expect.any(Error));
+  warn.mockRestore();
   expect(fake.saveStore).toHaveBeenCalledOnce();
   await expect(flush()).resolves.toBeUndefined();
   expect(fake.saveState).toHaveBeenCalledTimes(1);

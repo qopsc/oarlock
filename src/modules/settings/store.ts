@@ -876,16 +876,6 @@ function clampBlur(v: number): number {
   return Math.min(64, Math.max(0, Math.round(v)));
 }
 
-export async function setBackgroundKind(value: BackgroundKind): Promise<void> {
-  await writePref(KEY_BG_KIND, value);
-}
-
-export async function setBackgroundImageId(
-  value: string | null,
-): Promise<void> {
-  await writePref(KEY_BG_IMAGE_ID, value);
-}
-
 export async function setBackgroundOpacity(value: number): Promise<void> {
   await writePref(KEY_BG_OPACITY, clampBgOpacity(value));
 }

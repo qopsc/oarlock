@@ -119,3 +119,27 @@ it("allows cleanup after partial registration fails", async () => {
   expect(fake.gitOff).toHaveBeenCalledOnce();
   expect(fake.fsOff).toHaveBeenCalledOnce();
 });
+
+it("watches a deleted file whose folder is gone: the repository root registers and the pane is ready", async () => {
+  fake.invoke.mockImplementation(async (command) =>
+    command === "git_watch_add"
+      ? "git-1"
+      : {
+          directories: [{ path: "/repo", handle: "dir-1" }],
+          files: [],
+          unavailableDirectories: [{ path: "/repo/old", reason: "gone" }],
+          unavailableFiles: [{ path: "/repo/old/x.rs", reason: "gone" }],
+        },
+  );
+  const changed = vi.fn();
+  const watch = watchWorkingDiff("/repo", "old/x.rs", env, changed);
+  await expect(watch.ready).resolves.toBeUndefined();
+  fake.gitChanged(["/repo"]);
+  expect(changed).toHaveBeenCalledOnce();
+  watch.dispose();
+  await vi.waitFor(() =>
+    expect(fake.invoke).toHaveBeenCalledWith("watch_release", {
+      handles: ["dir-1"],
+    }),
+  );
+});

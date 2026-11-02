@@ -30,20 +30,16 @@ it.each(["image/png", "image/gif"])(
   },
 );
 
-it("revalidates a saved background before handing it to the browser", async () => {
-  validation.inspect.mockRejectedValue(
-    new Error("Image format is unavailable or unsupported"),
-  );
+it("hands a saved background back without inspecting it again at startup", async () => {
+  const stored = new Blob([new Uint8Array([1, 2, 3])], { type: "image/jpeg" });
   const data = {
-    result: new Blob([new Uint8Array([1, 2, 3])]),
+    result: stored,
     onsuccess: undefined as (() => void) | undefined,
   };
-  const remove = vi.fn();
-  const transaction = vi.fn(() => ({ objectStore: () => ({ get: () => data, delete: remove }) }));
   const opened = {
     result: {
       onclose: null,
-      transaction,
+      transaction: () => ({ objectStore: () => ({ get: () => data }) }),
     },
     onsuccess: undefined as (() => void) | undefined,
   };
@@ -53,10 +49,8 @@ it("revalidates a saved background before handing it to the browser", async () =
   opened.onsuccess?.();
   await vi.waitFor(() => expect(data.onsuccess).toBeTypeOf("function"));
   data.onsuccess?.();
-  await expect(result).rejects.toThrow("unsupported");
-  expect(validation.inspect).toHaveBeenCalledOnce();
-  expect(transaction).toHaveBeenCalledWith("images", "readonly");
-  expect(remove).not.toHaveBeenCalled();
+  await expect(result).resolves.toBe(stored);
+  expect(validation.inspect).not.toHaveBeenCalled();
 });
 
 it("decodes the inspected snapshot rather than reading the selected file again", async () => {

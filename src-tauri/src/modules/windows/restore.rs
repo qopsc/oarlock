@@ -473,8 +473,37 @@ fn recover(root: &Path, checkpoint: &mut impl FnMut() -> io::Result<()>) -> io::
     Ok(())
 }
 
+/// The plan of an ordinary launch: no recovery journal and no window to adopt. It reads the
+/// registry without pinning the data directory, so a launch with nothing to repair does not
+/// depend on safe-storage support (Windows has none). `None` sends the caller down the pinned,
+/// strict path, which also reports any damage in the registry.
+fn quick_plan(root: &Path) -> io::Result<Option<RestorePlan>> {
+    match fs::symlink_metadata(root.join(JOURNAL)) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+        Ok(_) => return Ok(None),
+    }
+    let registry = root.join(REGISTRY_FILE);
+    let saved = match fs::symlink_metadata(&registry) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+        Ok(meta) if meta.file_type().is_file() => {
+            serde_json::from_slice::<RegistryFile>(&fs::read(&registry)?)?.windows
+        }
+        Ok(_) => return Ok(None),
+    };
+    let plan = restore_plan(saved);
+    Ok(plan.adopt.is_none().then_some(plan))
+}
+
 pub(super) fn run(root: &Path) -> io::Result<RestorePlan> {
     fs::create_dir_all(root)?;
+    // A symbolic link at the data directory (state kept on another volume) is resolved once;
+    // the pinned opens below refuse links in every component.
+    let root = &fs::canonicalize(root)?;
+    if let Ok(Some(plan)) = quick_plan(root) {
+        return Ok(plan);
+    }
     let owner = pin_root(root)?;
     let result: io::Result<RestorePlan> = (|| {
         recover(root, &mut || Ok(()))?;
