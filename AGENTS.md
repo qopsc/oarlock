@@ -3997,10 +3997,14 @@ opening its shared TemporaryItems parent, so cleanup rechecks the directory's
 identity through its returned path; a separate same-user process can race that
 final check. Linux opens an `O_TMPFILE` in the target directory and holds a file
 lock until publication. Existing files are linked through a private Git common
-directory on the same filesystem, a hidden sibling outside repositories, or a
-private same-filesystem cache fallback. Before each save, only matching regular
-staging entries older than one minute whose locks are available are removed; no
-journal or startup sweep is used. A file in a repository with no safe staging
+directory on the same filesystem, or a private same-filesystem cache fallback
+(the user cache directory, created 0700 when missing; for a folder with no `.git`
+ancestor only, a 0700 `.oarlock-staging` child of the folder as a last resort,
+removed after publishing and left alone while it holds anything); a link in any of
+them goes through a mount-id check (`statx`), and `EXDEV` moves to the next
+location. Before each save, only matching regular staging entries older than one
+minute whose locks are available are removed, examining at most 4,096 entries of
+the private staging folder; no journal or startup sweep is used. A file in a repository with no safe staging
 location is refused. Other platforms retain their existing safe-refusal policy.
 The operation-owned directory is private before content is linked into it. No editor placeholder or content file
 is created in the worktree. New-file inheritance is reproduced with an empty
@@ -5318,8 +5322,20 @@ metadata-preserving copy operation followed by a no-replace publication. Nested
 links escaping authorized folders are refused; links are not traversed. A folder
 copy reads entries as encountered, so concurrent external edits can produce mixed
 versions. Copies are refused when a suitable private same-volume staging location
-is unavailable. Linux rename, move and delete use the same checks; metadata-safe
-copy remains unavailable there pending validation. Windows remains a later port.
+is unavailable. Linux rename, move and delete use the same checks. Linux copy
+(`fs/linux_copy.rs`) stages in a private per-operation folder (`copy-<pid>-<hex>.d`,
+`flock`ed, swept when stale) in the same private location as saves, copies
+entry by entry through `O_NOFOLLOW` handles (`copy_file_range` with a read/write
+fallback), keeps mode, POSIX access and default ACLs, `user.*` xattrs, times and,
+where permitted, ownership (a group that cannot be kept never widens access: its
+bits are cleared, or an ACL refuses the copy), lets SELinux and SMACK label the new
+file, keeps a copied folder writable by its owner until a directory-relative
+`renameat2(RENAME_NOREPLACE)` has published it and only then sets its final mode,
+and refuses setuid and setgid files, special files, nested links that escape the
+authorized folders where they are or where the copy puts them (relative targets
+are resolved against the destination, on macOS too), and filesystems without
+`RENAME_NOREPLACE`. It was validated in a Linux container as an unprivileged user,
+not on a desktop. Windows remains a later port.
 
 Review follow-up: tab and active-tab mutations update their shared refs before
 React publishes a render, so returned pane IDs and disposal do not depend on
@@ -5384,8 +5400,7 @@ the S-01 scope forbid list and the Windows-only lock change in `shell/background
 Deferred by decision, with no fix in these batches: O-01, O-06, O-08, O-09, O-10 and O-15
 (each proposes deleting a mechanism built on an earlier approved decision, which the owner deferred
 to a separate decision), O-07 (D-11 only adds a toast when a seal refuses a close; the quit barrier is
-unchanged), D-12 (its module is `cfg(target_os = "linux")` and only the Darwin target is installed
-here) and D-20 (needs a Linux copy implementation). Left open
+unchanged). Left open
 inside closed or partly closed findings: S-09 (a same-user process can change configuration between
 the re-preflight and Git reading it), S-23 (every `read_skill_file` still rehashes the project skills
 tree, `resolve_inside` canonicalizes before the open, and a shell function named `command` can change
@@ -5405,3 +5420,13 @@ component test (batch D). The `REVIEW_LEDGER.md` closure texts for R076 ("persis
 queue overflow") and R095 ("fails visibly on reply-buffer overflow") no longer describe the behavior:
 overflow is now a transient notice for input and a dropped, logged reply, and only a failed
 `pty_write` is persistent.
+
+Batch J (D-12, D-20, built and tested in a `linux/arm64` container, Rust 1.99.1, image
+`oarlock-linux-ci`, as uid 1000): Linux saves now stage privately in every mode (no hidden
+sibling in the user's folder), with cache creation, a mount-id check and a private
+`.oarlock-staging` last resort; cleanup examines at most 4,096 entries. Linux Explorer copy,
+paste and drop work as on macOS (see the Explorer mutation policy), and the save path no longer
+refuses SELinux and SMACK labelled files (`security.selinux` and `security.SMACK64*` are
+LSM-managed; other `security.*` and `trusted.*` names still refuse). Not run: a Linux desktop,
+SELinux enforcing, bind mounts and NFS (their `EXDEV` and `EINVAL` paths are covered by injected
+failures only).
