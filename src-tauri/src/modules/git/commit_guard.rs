@@ -50,13 +50,23 @@ fn executable_setting(
     match (section.as_str(), variable.as_str()) {
         ("hook", _) => Some("Git hook configuration"),
         ("core", "hookspath") if simple => Some("core.hooksPath"),
-        ("core", "fsmonitor") if simple && enabled(value) => Some("core.fsmonitor"),
+        ("core", "fsmonitor") if simple && repository_scope && enabled(value) => {
+            Some("core.fsmonitor")
+        }
         ("core", "gitproxy") if simple => Some("core.gitProxy"),
-        ("filter", "clean" | "smudge" | "process") => Some("a Git filter driver"),
-        ("diff", "external" | "command" | "textconv") => Some("a Git diff driver"),
-        ("merge", "driver") => Some("a Git merge driver"),
-        ("commit", "gpgsign") if simple && enabled(value) => Some("commit.gpgSign"),
-        ("gpg", "program" | "defaultkeycommand") => Some("a Git signing program"),
+        ("filter", "clean" | "smudge" | "process") if repository_scope => {
+            Some("a Git filter driver")
+        }
+        ("diff", "external" | "command" | "textconv") if repository_scope => {
+            Some("a Git diff driver")
+        }
+        ("merge", "driver") if repository_scope => Some("a Git merge driver"),
+        ("commit", "gpgsign") if simple && repository_scope && enabled(value) => {
+            Some("commit.gpgSign")
+        }
+        ("gpg", "program" | "defaultkeycommand") if repository_scope => {
+            Some("a Git signing program")
+        }
         ("credential", "helper") if repository_scope => Some("credential.helper"),
         ("core", "sshcommand") if simple && repository_scope => Some("core.sshCommand"),
         ("core", "askpass") if simple && repository_scope => Some("core.askPass"),

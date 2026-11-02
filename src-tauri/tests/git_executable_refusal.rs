@@ -200,6 +200,54 @@ fn repository_config_loaded_by_global_include_is_refused() {
 }
 
 #[test]
+fn user_scope_lfs_signing_and_fsmonitor_settings_are_accepted() {
+    use oarlock_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
+    use std::process::Command;
+    const CHILD: &str = "OARLOCK_S02_USER_SCOPE_CHILD";
+    if let Ok(repo) = std::env::var(CHILD) {
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(std::path::Path::new(&repo)).unwrap();
+        if let Err(error) =
+            operations::commit(&registry, &repo, "test commit", &WorkspaceEnv::Local)
+        {
+            panic!("user-wide settings refused: {error}");
+        }
+        return;
+    }
+    if !git_available() {
+        return;
+    }
+    let fx = fixture();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".gitconfig"),
+        "[filter \"lfs\"]\n clean = git-lfs clean -- %f\n smudge = git-lfs smudge -- %f\n process = git-lfs filter-process\n required = true\n\
+         [gpg \"ssh\"]\n program = /usr/bin/ssh-keygen\n\
+         [gpg]\n program = gpg\n\
+         [core]\n fsmonitor = /usr/local/bin/watchman-hook\n\
+         [diff \"x\"]\n textconv = cat\n\
+         [merge \"x\"]\n driver = true\n",
+    )
+    .unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "user_scope_lfs_signing_and_fsmonitor_settings_are_accepted",
+            "--nocapture",
+        ])
+        .env("HOME", home.path())
+        .env(CHILD, fx.repo_str())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "child failed: {} {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[test]
 fn commit_refuses_a_symlink_hooks_directory() {
     if !git_available() {
         return;
