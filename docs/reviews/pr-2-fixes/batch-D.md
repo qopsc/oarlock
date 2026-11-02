@@ -83,4 +83,13 @@ Each item is its own commit (`git log --oneline` after 9b3f8de).
 - O-03 rework: `menuShortcuts.test.ts` parses the `json!` table in `app_menu.rs` and compares field by field.
 - Size: not moved to a lazy chunk. The reviewer's measured delta for the batch is +1,332 bytes gzip in the eager startup chunk and +1,466 in total client JS; the new branches are small additions to `CloseDialogs.tsx` and `useTabCloseGuards.ts`, which App mounts eagerly. The merger should account for it in `.size-limit.json`.
 
+Follow-ups after acceptance (section 7 below): L-1 to L-4.
+
 Checks after the rework: `bun run lint` `Found 80 warnings.`; `bun run check-types` clean; `bun run test` `Test Files  643 passed (643)` / `Tests  6147 passed | 2 skipped (6149)`; `cargo clippy --all-targets --locked -- -D warnings` `Finished` with no warnings; `cargo test --locked -- --test-threads=1` `test result: ok. 1605 passed; 0 failed; 4 ignored` plus every integration suite ok.
+
+## 7. Follow-ups after acceptance
+
+- L-1: the Intel macOS archive is named `Oarlock_x64.app.tar.gz` (`x86_64` maps to `x64` before naming, as tauri-action does); the workflow test asserts the mapping and runs the `case` for both targets.
+- L-2: unavailable watch paths live in a separate `missing` retry set that is asked again on a health refresh but never holds the failure notice; test "a missing folder never keeps another batch's failure notice on screen".
+- L-3: the test is renamed to "registers the valid paths of a batch and retries a missing folder on refresh without announcing it".
+- L-4 (AGENTS.md, release prose, append to the macOS release sentence from section 3): "The macOS legs upload their own bundles, so turning updater artifacts on (`createUpdaterArtifacts`) needs their `.app.tar.gz` and `.sig` names made per-architecture and their `latest.json` entries merged, or the two legs overwrite each other."
