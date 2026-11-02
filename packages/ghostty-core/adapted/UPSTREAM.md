@@ -11,10 +11,10 @@ per-terminal frame loop, or per-pane GPU lifecycle.
 - Restty commit: `7700b14a7643ba9240818209ef1e0aa90d83ad77`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`, WebAssembly SIMD and scalar variants
-- SIMD artifact size: `1074803` bytes
-- Scalar artifact size: `1015766` bytes
-- SIMD SHA-256: `fa72b189db516cea69e55dfc71f492a7e81940a4d56c582c09d0a2660e871c20`
-- Scalar SHA-256: `b427483b6c7630aaf312845a42969226d48f64409eaf713a83fd1ef0095a8836`
+- SIMD artifact size: `1075756` bytes
+- Scalar artifact size: `1016721` bytes
+- SIMD SHA-256: `6960a7749b74fb7511ae222ff77c409a03a50daa730c6c73ea86cd2e15f1e40b`
+- Scalar SHA-256: `088ea2fea11c0753c4f30653446aa0676f24b8de2c0cbe6ddc6f4b5c4a3d7637`
 
 Oarlock-specific changes include:
 

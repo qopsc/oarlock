@@ -416,6 +416,11 @@ const StreamHandler = struct {
     /// A reply that does not fit is dropped whole, never cut, and the terminal
     /// goes on; the first drop is logged.
     reply_drop_logged: bool = false,
+    /// While a held Kitty read is answered: where its answer starts in the
+    /// queue, and whether one of its packets was dropped. A dropped packet
+    /// drops the whole answer, so the program never sees a truncated one.
+    answer_start: usize = 0,
+    answer_dropped: bool = false,
     /// Kitty keyboard flags a program may turn on
     /// (`restty_set_kitty_keyboard_flags`). Pushes and sets keep only these,
     /// so the flags reported to queries and used for key encoding agree.
@@ -682,9 +687,12 @@ const StreamHandler = struct {
         defer self.freeKittyRead(read);
         self.kitty_read_answer = answer;
         self.output_limit = max_kitty_answer_output;
+        self.answer_start = self.output.items.len;
+        self.answer_dropped = false;
         defer {
             self.kitty_read_answer = null;
             self.output_limit = max_output_bytes;
+            self.answer_dropped = false;
         }
         self.readonly.vt(.kitty_clipboard, .{
             .metadata = read.metadata,
@@ -991,13 +999,17 @@ const StreamHandler = struct {
     }
 
     fn appendOutput(self: *StreamHandler, bytes: []const u8) !void {
-        if (bytes.len == 0) return;
+        if (bytes.len == 0 or self.answer_dropped) return;
 
         const limit = self.output_limit;
         if (self.output.items.len > limit or bytes.len > limit - self.output.items.len) {
             if (!self.reply_drop_logged) {
                 self.reply_drop_logged = true;
                 log.warn("terminal reply queue full; dropping replies", .{});
+            }
+            if (self.kitty_read_answer != null) {
+                self.answer_dropped = true;
+                self.output.shrinkRetainingCapacity(self.answer_start);
             }
             return;
         }
