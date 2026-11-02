@@ -190,6 +190,7 @@ it("drops held-key repeats past a small backlog behind a stalled read", () => {
   }
   expect(refused).not.toHaveBeenCalled();
   expect(writer.holdingInput).toBe(true);
+  expect(writer.pendingActions).toBeLessThanOrEqual(33);
   input.dispatchEvent(key({ key: "b", code: "KeyB" }));
   controller.dispose(); writer.dispose();
 });
