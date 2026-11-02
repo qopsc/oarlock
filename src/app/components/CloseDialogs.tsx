@@ -239,7 +239,12 @@ export function CloseDialogs({
             <AlertDialogCancel onClick={onCancelClose}>
               Cancel
             </AlertDialogCancel>
-            <AlertDialogAction onClick={onConfirmClose}>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                onConfirmClose();
+              }}
+            >
               Close Anyway
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -348,7 +353,12 @@ export function CloseDialogs({
             <AlertDialogCancel onClick={onCancelDeleteClose}>
               Cancel
             </AlertDialogCancel>
-            <AlertDialogAction onClick={onConfirmDeleteClose}>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                onConfirmDeleteClose();
+              }}
+            >
               Close Anyway
             </AlertDialogAction>
           </AlertDialogFooter>
