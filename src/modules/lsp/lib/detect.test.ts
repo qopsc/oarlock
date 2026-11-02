@@ -98,6 +98,9 @@ describe("LSP binary detection", () => {
 
     expect(runtime.state.clearDetected).toHaveBeenCalledWith("rust-analyzer");
     expect(core.invoke).toHaveBeenCalledTimes(2);
+    expect(core.invoke).toHaveBeenLastCalledWith("lsp_detect", {
+      command: "rust-analyzer", shell: null, refresh: true,
+    });
   });
 
   // crynta/terax-ai#1039: servers are looked up through the shell set in Oarlock.

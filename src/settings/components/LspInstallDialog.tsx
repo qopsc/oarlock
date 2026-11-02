@@ -1,4 +1,5 @@
 import { writeClipboardText } from "@/lib/clipboardWrite";
+import { IS_MAC } from "@/lib/platform";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -8,7 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { redetectBinary, type LspPreset } from "@/modules/lsp";
+import { installCommandForPlatform, redetectBinary, type LspPreset } from "@/modules/lsp";
 import { setLspActivation } from "@/modules/settings/store";
 import {
   Copy01Icon,
@@ -48,11 +49,12 @@ export function LspInstallDialog({ server, onClose }: Props) {
   }, [copied]);
 
   if (!server) return null;
+  const installCommand = installCommandForPlatform(server, IS_MAC);
 
   const copyInstallCommand = async () => {
-    if (!server.install) return;
+    if (!installCommand) return;
     try {
-      await writeClipboardText(server.install.command);
+      await writeClipboardText(installCommand);
       setCopied(true);
     } catch {
       setCopied(false);
@@ -96,10 +98,10 @@ export function LspInstallDialog({ server, onClose }: Props) {
           </DialogDescription>
         </DialogHeader>
 
-        {server.install ? (
+        {installCommand ? (
           <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 font-mono text-[11px]">
             <span className="min-w-0 flex-1 select-text break-all">
-              {server.install.command}
+              {installCommand}
             </span>
             <button
               type="button"
@@ -116,8 +118,7 @@ export function LspInstallDialog({ server, onClose }: Props) {
           </div>
         ) : (
           <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            Install this custom server manually and make sure its command is
-            available on PATH.
+            {server.install ? "See the documentation for installation on this system." : "Install this custom server manually and make sure its command is available on PATH."}
           </p>
         )}
 

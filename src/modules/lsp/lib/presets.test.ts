@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LspCustomServer } from "@/modules/settings/store";
 import {
   allServers,
+  installCommandForPlatform,
   LSP_PRESETS,
   serverById,
   serverForLanguage,
@@ -16,6 +17,18 @@ const customPy: LspCustomServer = {
   languages: { py: "python" },
   rootMarkers: [],
 };
+
+it("only offers macOS-specific install commands on macOS", () => {
+  for (const id of ["clangd", "zls", "lua-ls", "sourcekit"]) {
+    const preset = LSP_PRESETS.find((entry) => entry.id === id);
+    if (!preset) throw new Error(`missing preset ${id}`);
+    expect(installCommandForPlatform(preset, false)).toBeNull();
+    expect(installCommandForPlatform(preset, true)).toBe(preset.install?.command);
+  }
+  const generic = LSP_PRESETS.find((entry) => entry.id === "pyright");
+  if (!generic) throw new Error("missing pyright preset");
+  expect(installCommandForPlatform(generic, false)).toBe(generic.install?.command);
+});
 
 describe("serversForLanguage", () => {
   it("returns the built-in servers that claim a language", () => {

@@ -13,13 +13,17 @@ export function lspShell(): string | null {
 }
 
 export function detectBinary(command: string): Promise<string | null> {
+  return detect(command, false);
+}
+
+function detect(command: string, refresh: boolean): Promise<string | null> {
   const cached = useLspRuntimeStore.getState().detected[command];
   if (cached !== undefined) return Promise.resolve(cached);
   let p = pending.get(command);
   if (!p) {
     const request: Promise<string | null> = invoke<string | null>(
       "lsp_detect",
-      { command, shell: lspShell() },
+      { command, shell: lspShell(), ...(refresh ? { refresh: true } : {}) },
     )
       .catch(() => null)
       .then((path) => {
@@ -38,7 +42,7 @@ export function detectBinary(command: string): Promise<string | null> {
 export function redetectBinary(command: string): Promise<string | null> {
   pending.delete(command);
   useLspRuntimeStore.getState().clearDetected(command);
-  return detectBinary(command);
+  return detect(command, true);
 }
 
 /**

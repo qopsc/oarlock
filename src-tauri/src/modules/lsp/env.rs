@@ -61,6 +61,13 @@ struct EnvCache {
 
 #[cfg(unix)]
 impl EnvCache {
+    fn invalidate(&self, shell: &str) {
+        self.shells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(shell);
+    }
+
     fn get(&self, shell: &str, capture: impl FnOnce(&str) -> Option<ServerEnv>) -> Arc<ServerEnv> {
         let cell = self
             .shells
@@ -77,6 +84,22 @@ impl EnvCache {
         })
         .clone()
     }
+}
+
+/// A user-requested recheck must not reuse a stale or failed shell capture.
+pub fn invalidate_server_env(shell: Option<String>) {
+    #[cfg(unix)]
+    {
+        use crate::modules::pty::shell_init::terminal_shell_path;
+        let configured = terminal_shell_path(shell);
+        let login = terminal_shell_path(None);
+        captured_envs().invalidate(&configured);
+        if configured != login {
+            captured_envs().invalidate(&login);
+        }
+    }
+    #[cfg(windows)]
+    let _ = shell;
 }
 
 #[cfg(unix)]
@@ -347,6 +370,40 @@ mod tests {
         assert!(cache.get("/bin/broken", capture).is_empty());
         assert!(cache.get("/bin/broken", capture).is_empty());
         assert_eq!(captures.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn invalidation_recaptures_a_failed_or_stale_shell_environment() {
+        let cache = EnvCache::default();
+        assert!(cache.get("/bin/fish", |_| None).is_empty());
+        cache.invalidate("/bin/fish");
+        assert_eq!(cache.get("/bin/fish", |_| Some(HashMap::from([
+            ("PATH".into(), "/new/bin".into()),
+        ])))["PATH"], "/new/bin");
+        cache.invalidate("/bin/fish");
+        assert_eq!(cache.get("/bin/fish", |_| Some(HashMap::from([
+            ("PATH".into(), "/newer/bin".into()),
+        ])))["PATH"], "/newer/bin");
+    }
+
+    #[test]
+    fn invalidation_does_not_let_an_older_capture_replace_the_new_one() {
+        let cache = Arc::new(EnvCache::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_cache = cache.clone();
+        let old = std::thread::spawn(move || old_cache.get("/bin/fish", |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Some(HashMap::from([("PATH".into(), "/old".into())]))
+        }));
+        started_rx.recv().unwrap();
+        cache.invalidate("/bin/fish");
+        let fresh = cache.get("/bin/fish", |_| Some(HashMap::from([("PATH".into(), "/new".into())])));
+        release_tx.send(()).unwrap();
+        assert_eq!(old.join().unwrap()["PATH"], "/old");
+        assert_eq!(fresh["PATH"], "/new");
+        assert_eq!(cache.get("/bin/fish", |_| panic!("fresh capture was lost"))["PATH"], "/new");
     }
 
     #[test]

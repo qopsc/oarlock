@@ -4609,8 +4609,8 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R043 | Closed | Ctrl+G reaches Go to Line before safe search, while Vim remains first; a CodeMirror precedence regression reproduced the conflict. Windows runtime validation remains port work. |
 | R044 | Open, Tier 2 | The core package is now a tracked workspace package, but its declared types still refer to ignored `dist` files. A copy without `dist` reproduces TS2307 on both imports. The app's clean build has not been shown to fail. |
 | R048 | Closed | Language-server URIs preserve literal Unix backslashes, recognize localhost, reject other hosts, and compare Unix paths without treating backslashes as separators. Regressions reproduced the previous incorrect paths. |
-| R049 | Open, Tier 2 | Native shell-environment capture retains each shell's first result, including failure, while the UI offers redetection. |
-| R053 | Open, Tier 2 | Preset installation hints still offer macOS-specific commands on Linux. Windows guidance is port work. |
+| R049 | Closed; packaged check manual | An explicit recheck invalidates the selected and fallback shell captures before probing. Tests cover failures, changed captures and an older capture finishing late. |
+| R053 | Closed | Both install interfaces show macOS-specific commands only on macOS and direct other systems to the documentation. |
 | R055 | Closed | Status reports invalid UTF-8 instead of showing an empty repository. A Linux real-Git regression uses a non-UTF-8 filename; macOS refused creation of that filename. |
 | R056 | Open, Tier 2 | The shared path guard still refuses Unix filenames containing colons or control characters, although Git status can name them. |
 | R057 | Closed | A staged diff and history now report truncated Git output as an error. Real-Git regressions first reproduced both incomplete results and then passed with the fix. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **11 closed; 14 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **13 closed; 12 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4701,3 +4701,9 @@ The selected R103 policy keeps the existing explicit refusal for formats whose d
 Validation: 21 focused native asset tests and 26 focused frontend tests passed, including sparse oversized PDF/image files, range playback, admission, workspace ownership and image recovery. The full macOS native suite passed 1,584 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,092 tests (two skipped), types passed and lint remained at 80 warnings. Two earlier frontend expectations were updated for the guarded URL and its access-setting query, then the suite passed.
 
 Manual signed-release checks: open an image and a PDF larger than 50 MiB and confirm the notice and Open externally action; confirm a large video still plays and seeking works. Exercise local images in Markdown, permitted workspace assets with all-folder access off, and permission toggling. Attempt an unsupported background import and reopen an existing unsupported background; confirm a visible explanation and that the stored image remains available for recovery.
+
+### R049 and R053 checkpoint — language-server recheck and install guidance
+
+An explicit Check again now asks native code to invalidate the configured shell's cached environment, including the login-shell fallback, before probing. Ordinary detection continues to reuse its capture. A narrow optional `refresh` argument was added to the existing `lsp_detect` command; omitted arguments retain the prior behavior. Tests cover a failed capture, a changed PATH and an older in-flight capture finishing after invalidation. On non-macOS systems, both install interfaces direct users to the relevant documentation rather than presenting the macOS-only Homebrew or Xcode commands. macOS retains the existing commands.
+
+Validation: 21 focused frontend tests and native environment tests passed. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,093 tests (two skipped), types passed and lint remained at 80 warnings. Manual signed-release check: install a missing language server into a directory newly added to the configured shell's PATH, choose Check again, and confirm it becomes available; on Linux confirm the four platform-specific presets show documentation rather than a macOS command.

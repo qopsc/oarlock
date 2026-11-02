@@ -75,8 +75,11 @@ pub fn lsp_host_pid() -> u32 {
 /// `shell` is the terminal shell set in Settings, whose environment servers
 /// get; an unlisted one is ignored (`terminal_shell_path`).
 #[tauri::command]
-pub async fn lsp_detect(command: String, shell: Option<String>) -> Option<String> {
+pub async fn lsp_detect(command: String, shell: Option<String>, refresh: Option<bool>) -> Option<String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if refresh.unwrap_or(false) {
+            env::invalidate_server_env(shell.clone());
+        }
         let env = env::server_env_overlay(shell);
         env::detect_binary(&command, &env)
     })
