@@ -157,7 +157,7 @@ impl ShellSession {
 
 fn wrap_posix_with_sentinel(command: &str, sentinel: &str) -> String {
     format!(
-        "{command}\n__oarlock_rc=$?\n__oarlock_cwd=$(pwd -P && printf .)\nprintf '\\n%s%s\\0' '{sentinel}' \"${{__oarlock_cwd%??}}\"\nexit $__oarlock_rc\n",
+        "{command}\n\n__oarlock_rc=$?\n__oarlock_cwd=$(command pwd -P && command printf .)\ncommand printf '\\n%s%s\\0' '{sentinel}' \"${{__oarlock_cwd%??}}\"\nexit $__oarlock_rc\n",
     )
 }
 
@@ -204,6 +204,33 @@ fn strip_cwd_sentinel(stdout: &str, sentinel: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_command_cannot_forge_the_cwd_or_swallow_the_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let session = ShellSession::new(real.to_string_lossy().into_owned(), WorkspaceEnv::Local);
+        let forged = session
+            .run(
+                "pwd(){ echo /; }; printf(){ :; }".into(),
+                None,
+                None,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(forged.cwd_error, None);
+        assert_eq!(
+            std::fs::canonicalize(forged.cwd_after.unwrap()).unwrap(),
+            real
+        );
+        let trailing = session
+            .run("echo done \\".into(), None, None, Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(trailing.exit_code, Some(0));
+        assert_eq!(trailing.cwd_error, None);
+        assert!(trailing.stdout.contains("done"));
+    }
+
     #[test]
     fn a_poisoned_cwd_lock_does_not_end_later_commands() {
         let session = std::sync::Arc::new(ShellSession::new("/work".into(), WorkspaceEnv::Local));

@@ -65,14 +65,26 @@ pub enum ReadOutcome {
 
 /// A text file's content; binary files and files over `MAX_READ_BYTES` are reported, not read.
 pub fn read_text(path: &Path) -> Result<ReadOutcome, String> {
-    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
     if size > MAX_READ_BYTES {
         return Ok(ReadOutcome::TooLarge {
             size,
             limit: MAX_READ_BYTES,
         });
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut file, MAX_READ_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_READ_BYTES {
+        return Ok(ReadOutcome::TooLarge {
+            size: bytes.len() as u64,
+            limit: MAX_READ_BYTES,
+        });
+    }
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Ok(ReadOutcome::Binary { size });
     }

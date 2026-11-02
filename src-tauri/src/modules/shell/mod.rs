@@ -369,10 +369,9 @@ pub async fn shell_session_open(
     // wsl_home spawns wsl.exe on Windows and authorization hits the disk.
     let registry_app = app.clone();
     let (initial, workspace) = tauri::async_runtime::spawn_blocking(move || {
-        registry_app
-            .state::<WorkspaceRegistry>()
-            .gates(origin.unwrap_or_default())
-            .spawn_cwd(cwd.as_deref(), &workspace)?;
+        let registry = registry_app.state::<WorkspaceRegistry>();
+        let gates = registry.gates(origin.unwrap_or_default());
+        gates.spawn_cwd(cwd.as_deref(), &workspace)?;
         let initial = match cwd.as_deref().filter(|s| !s.is_empty()) {
             Some(c) => c.to_string(),
             None => {
@@ -385,6 +384,10 @@ pub async fn shell_session_open(
                 }
             }
         };
+        // The default home is a place the shell starts in like any other: it passes the gates.
+        if cwd.as_deref().is_none_or(str::is_empty) {
+            gates.spawn_cwd(Some(&initial), &workspace)?;
+        }
         Ok::<_, String>((initial, workspace))
     })
     .await
