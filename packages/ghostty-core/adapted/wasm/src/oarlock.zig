@@ -22,6 +22,7 @@ const ErrorCode = enum(u32) {
     out_of_memory = 2,
     invalid_arg = 3,
     internal = 4,
+    reply_overflow = 5,
 };
 
 const CellFlags = struct {
@@ -412,6 +413,8 @@ const StreamHandler = struct {
     kitty_read_answer: ?ghostty.clipboard.Read.Result = null,
     /// The reply queue's bound; raised while a held read is answered.
     output_limit: usize = max_output_bytes,
+    /// Once a reply cannot fit, no partial protocol stream may be delivered.
+    reply_overflow: bool = false,
     /// Kitty keyboard flags a program may turn on
     /// (`restty_set_kitty_keyboard_flags`). Pushes and sets keep only these,
     /// so the flags reported to queries and used for key encoding agree.
@@ -987,30 +990,14 @@ const StreamHandler = struct {
     }
 
     fn appendOutput(self: *StreamHandler, bytes: []const u8) !void {
-        if (bytes.len == 0) return;
+        if (bytes.len == 0 or self.reply_overflow) return;
 
         const limit = self.output_limit;
-        if (bytes.len >= limit) {
+        if (self.output.items.len > limit or bytes.len > limit - self.output.items.len) {
+            self.reply_overflow = true;
             self.output.clearRetainingCapacity();
-            try self.output.appendSlice(self.alloc, bytes[bytes.len - limit ..]);
             return;
         }
-
-        if (self.output.items.len + bytes.len > limit) {
-            const drop = self.output.items.len + bytes.len - limit;
-            if (drop >= self.output.items.len) {
-                self.output.clearRetainingCapacity();
-            } else {
-                const remaining = self.output.items.len - drop;
-                std.mem.copyForwards(
-                    u8,
-                    self.output.items[0..remaining],
-                    self.output.items[drop..],
-                );
-                self.output.items.len = remaining;
-            }
-        }
-
         try self.output.appendSlice(self.alloc, bytes);
     }
 
@@ -2447,6 +2434,7 @@ pub export fn restty_write(handle: ?*Restty, ptr: [*]const u8, len: usize) u32 {
         h.search.viewport_dirty = true;
         h.search.active_dirty = true;
     }
+    if (h.stream.handler.reply_overflow) return @intFromEnum(ErrorCode.reply_overflow);
     return @intFromEnum(ErrorCode.ok);
 }
 
@@ -2800,6 +2788,8 @@ pub export fn restty_output_ptr(handle: ?*Restty) usize {
 
 pub export fn restty_output_len(handle: ?*Restty) u32 {
     const h = handle orelse return 0;
+    // No valid reply reaches this length; the host treats it as a fatal error.
+    if (h.stream.handler.reply_overflow) return std.math.maxInt(i32);
     return @intCast(h.output.items.len);
 }
 

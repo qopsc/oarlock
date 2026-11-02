@@ -82,7 +82,8 @@ function base64(bytes: Uint8Array): string {
 /** `length` bytes of a repeating, not merely constant, pattern. */
 function patterned(length: number): Uint8Array {
   const bytes = new Uint8Array(length);
-  for (let index = 0; index < length; index += 1) bytes[index] = (index * 31) % 251;
+  for (let index = 0; index < length; index += 1)
+    bytes[index] = (index * 31) % 251;
   return bytes;
 }
 
@@ -121,6 +122,35 @@ describe.each([
       terminal.dispose();
     }
   }
+
+  it("reports reply overflow rather than delivering a truncated escape sequence", () => {
+    const terminal = ghostty.createTerminal(80, 24);
+    try {
+      // Each primary-device-attributes query emits a 12-byte response. Two
+      // realistic-sized input slices together exceed the 256 KiB reply cap.
+      terminal.write(encoder.encode("\x1b[c".repeat(10_922)));
+      expect(() =>
+        terminal.write(encoder.encode("\x1b[c".repeat(10_924))),
+      ).toThrow(/reply.*(overflow|limit)/i);
+      expect(() => terminal.drainOutputBytes()).toThrow(
+        /reply.*(overflow|limit)/i,
+      );
+    } finally {
+      terminal.dispose();
+    }
+  });
+
+  it("delivers complete replies up to the output limit", () => {
+    const terminal = ghostty.createTerminal(80, 24);
+    try {
+      terminal.write(encoder.encode("\x1b[c".repeat(21_845)));
+      expect(decoder.decode(terminal.drainOutputBytes())).toBe(
+        "\x1b[?62;22;52c".repeat(21_845),
+      );
+    } finally {
+      terminal.dispose();
+    }
+  });
 
   describe("Kitty graphics", () => {
     it("answers capability queries and accepts direct RGB and PNG transmissions", () => {
@@ -406,10 +436,15 @@ describe.each([
 
     it("holds a read for the host and replays its answer through Ghostty", () => {
       withTerminal(80, 24, (terminal, write) => {
-        terminal.setClipboardPolicy({ readsToHost: true, writesAllowed: false });
+        terminal.setClipboardPolicy({
+          readsToHost: true,
+          writesAllowed: false,
+        });
         // Nothing answers the program until the host does.
         expect(
-          write(`\x1b]5522;type=read:name=${b64("vim")};${b64("text/plain .")}\x07`),
+          write(
+            `\x1b]5522;type=read:name=${b64("vim")};${b64("text/plain .")}\x07`,
+          ),
         ).toBe("");
         expect(terminal.drainEvents()).toEqual([
           {
@@ -436,36 +471,53 @@ describe.each([
             "\x1b]5522;type=read:status=DONE\x07",
         );
         // An answered read is gone.
-        expect(terminal.answerKittyClipboardRead(1, { status: "denied" })).toBe(false);
+        expect(terminal.answerKittyClipboardRead(1, { status: "denied" })).toBe(
+          false,
+        );
       });
     });
 
     it("answers refusals, busy beyond four held reads, and held reads when reads stop", () => {
       withTerminal(80, 24, (terminal, write) => {
-        terminal.setClipboardPolicy({ readsToHost: true, writesAllowed: false });
+        terminal.setClipboardPolicy({
+          readsToHost: true,
+          writesAllowed: false,
+        });
         const read = `\x1b]5522;type=read;${b64("text/plain")}\x1b\\`;
         expect(write(read.repeat(4))).toBe("");
         expect(write(read)).toBe("\x1b]5522;type=read:status=EBUSY\x1b\\");
         expect(
-          terminal.drainEvents().map((event) =>
-            event.type === "kitty-clipboard-read" ? event.id : null,
-          ),
+          terminal
+            .drainEvents()
+            .map((event) =>
+              event.type === "kitty-clipboard-read" ? event.id : null,
+            ),
         ).toEqual([1, 2, 3, 4]);
-        expect(terminal.answerKittyClipboardRead(2, { status: "denied" })).toBe(true);
+        expect(terminal.answerKittyClipboardRead(2, { status: "denied" })).toBe(
+          true,
+        );
         expect(decoder.decode(terminal.drainOutputBytes())).toBe(
           "\x1b]5522;type=read:status=EPERM\x1b\\",
         );
-        terminal.setClipboardPolicy({ readsToHost: false, writesAllowed: false });
+        terminal.setClipboardPolicy({
+          readsToHost: false,
+          writesAllowed: false,
+        });
         expect(decoder.decode(terminal.drainOutputBytes())).toBe(
           "\x1b]5522;type=read:status=EPERM\x1b\\".repeat(3),
         );
-        expect(terminal.answerKittyClipboardRead(4, { status: "denied" })).toBe(false);
+        expect(terminal.answerKittyClipboardRead(4, { status: "denied" })).toBe(
+          false,
+        );
       });
     });
 
     it("hands allowed text writes to the host and refuses what it cannot write", () => {
       withTerminal(80, 24, (terminal, write) => {
-        terminal.setClipboardPolicy({ readsToHost: false, writesAllowed: true });
+        terminal.setClipboardPolicy({
+          readsToHost: false,
+          writesAllowed: true,
+        });
         expect(write(kittyWrite("text/plain", "hi"))).toBe(
           "\x1b]5522;type=write:status=DONE\x1b\\",
         );
@@ -482,7 +534,12 @@ describe.each([
             clear: false,
             contents: [{ mime: "text/plain", data: encoder.encode("hi") }],
           },
-          { type: "kitty-clipboard-write", primary: false, clear: true, contents: [] },
+          {
+            type: "kitty-clipboard-write",
+            primary: false,
+            clear: true,
+            contents: [],
+          },
         ]);
       });
     });
@@ -503,8 +560,14 @@ describe.each([
 
     it("hands images, with their text, and writes of megabytes to the host", () => {
       withTerminal(80, 24, (terminal, write) => {
-        terminal.setClipboardPolicy({ readsToHost: false, writesAllowed: true });
-        const png = Uint8Array.from({ length: 300 }, (_, index) => index & 0xff);
+        terminal.setClipboardPolicy({
+          readsToHost: false,
+          writesAllowed: true,
+        });
+        const png = Uint8Array.from(
+          { length: 300 },
+          (_, index) => index & 0xff,
+        );
         // The first text and the first image are taken, the rest dropped.
         expect(
           write(
@@ -529,21 +592,30 @@ describe.each([
 
         // Far past the 256 KiB other events may carry.
         const large = patterned(3 * 1024 * 1024);
-        expect(write(kittyWriteParts([{ mime: "image/png", data: large }]))).toBe(
-          "\x1b]5522;type=write:status=DONE\x1b\\",
-        );
+        expect(
+          write(kittyWriteParts([{ mime: "image/png", data: large }])),
+        ).toBe("\x1b]5522;type=write:status=DONE\x1b\\");
         const [event] = terminal.drainEvents();
-        const data = event?.type === "kitty-clipboard-write" ? event.contents[0]?.data : null;
+        const data =
+          event?.type === "kitty-clipboard-write"
+            ? event.contents[0]?.data
+            : null;
         expect(data && Buffer.from(large).equals(data)).toBe(true);
       });
     });
 
     it("answers a read with megabytes of image", () => {
       withTerminal(80, 24, (terminal, write) => {
-        terminal.setClipboardPolicy({ readsToHost: true, writesAllowed: false });
+        terminal.setClipboardPolicy({
+          readsToHost: true,
+          writesAllowed: false,
+        });
         write(`\x1b]5522;type=read;${b64("image/png")}\x1b\\`);
         const [read] = terminal.drainEvents();
-        expect(read).toMatchObject({ type: "kitty-clipboard-read", mimes: ["image/png"] });
+        expect(read).toMatchObject({
+          type: "kitty-clipboard-read",
+          mimes: ["image/png"],
+        });
         // More than the 4 MiB a reply could once take.
         const image = patterned(6 * 1024 * 1024);
         expect(
@@ -556,11 +628,16 @@ describe.each([
         const reply = decoder.decode(terminal.drainOutputBytes());
         const chunks = [
           ...reply.matchAll(
-            new RegExp(`\x1b\\]5522;type=read:status=DATA:mime=${b64("image/png")};([^\x1b]*)\x1b\\\\`, "g"),
+            new RegExp(
+              `\x1b\\]5522;type=read:status=DATA:mime=${b64("image/png")};([^\x1b]*)\x1b\\\\`,
+              "g",
+            ),
           ),
         ].map((match) => Buffer.from(match[1], "base64"));
         expect(Buffer.concat(chunks).equals(image)).toBe(true);
-        expect(reply.endsWith("\x1b]5522;type=read:status=DONE\x1b\\")).toBe(true);
+        expect(reply.endsWith("\x1b]5522;type=read:status=DONE\x1b\\")).toBe(
+          true,
+        );
       });
     });
 
@@ -572,7 +649,9 @@ describe.each([
         expect(terminal.kittyPasteEvent(false, ["text/plain"])).toBe(true);
         const event = decoder.decode(terminal.drainOutputBytes());
         // Ghostty's event: the types on offer under a fresh password.
-        const pw = /^\x1b\]5522;type=read:status=OK:pw=([^:;\x1b]+)\x1b\\/.exec(event)?.[1];
+        const pw = /^\x1b\]5522;type=read:status=OK:pw=([^:;\x1b]+)\x1b\\/.exec(
+          event,
+        )?.[1];
         expect(pw && atob(pw)).toMatch(/^[2-9a-km-zA-HJ-NP-Z]{22}$/);
         expect(event).toContain(
           `\x1b]5522;type=read:status=DATA:mime=Lg==:pw=${pw};${b64("text/plain\n")}\x1b\\`,
@@ -596,13 +675,18 @@ describe.each([
         terminal.answerKittyClipboardRead(2, { status: "denied" });
         read("app");
         expect(
-          terminal.drainEvents().map((event) =>
-            event.type === "kitty-clipboard-read" ? event.granted : null,
-          ),
+          terminal
+            .drainEvents()
+            .map((event) =>
+              event.type === "kitty-clipboard-read" ? event.granted : null,
+            ),
         ).toEqual([false]);
 
         // Reads that cannot reach the host would lose the paste.
-        terminal.setClipboardPolicy({ readsToHost: false, writesAllowed: true });
+        terminal.setClipboardPolicy({
+          readsToHost: false,
+          writesAllowed: true,
+        });
         terminal.drainOutputBytes();
         expect(terminal.kittyPasteEvent(false, ["text/plain"])).toBe(false);
       });
@@ -647,7 +731,10 @@ describe.each([
         expect(terminal.dndAccepted()).toBe("copy");
 
         terminal.dndDrop(position, [
-          { mime: "text/uri-list", data: encoder.encode("file:///tmp/a.txt\r\n") },
+          {
+            mime: "text/uri-list",
+            data: encoder.encode("file:///tmp/a.txt\r\n"),
+          },
           { mime: "text/plain", data: encoder.encode("hello") },
         ]);
         expect(decoder.decode(terminal.drainOutputBytes())).toBe(

@@ -312,11 +312,11 @@ export function runStackWorkloads(
   let bytes = 0;
   let inputs = 0;
   for (const input of adversarialInputs()) {
-    for (let offset = 0; offset < input.bytes.byteLength; offset += 96 * 1024) {
-      terminal.write(input.bytes.subarray(offset, offset + 96 * 1024));
+    for (let offset = 0; offset < input.bytes.byteLength; offset += 32 * 1024) {
+      terminal.write(input.bytes.subarray(offset, offset + 32 * 1024));
+      terminal.drainOutputBytes();
     }
     terminal.drainEvents();
-    terminal.drainOutputBytes();
     refresh();
     bytes += input.bytes.byteLength;
     inputs += 1;

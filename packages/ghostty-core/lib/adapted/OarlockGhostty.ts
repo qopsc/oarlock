@@ -38,10 +38,10 @@ export const ADAPTED_GHOSTTY_COMMIT =
 export const ADAPTED_RESTTY_COMMIT =
   "7700b14a7643ba9240818209ef1e0aa90d83ad77";
 export const ADAPTED_GHOSTTY_WASM_SHA256 =
-  "4ce072f77919d1372cfe60a97d5bb216ff7f07ef051a9d1a5633e3941d9339e1";
+  "2c8ce7de75f8c03037ba878b784520d19f941cb10f8f2a900e269e5fa9e8d5e0";
 
 export const ADAPTED_GHOSTTY_SCALAR_WASM_SHA256 =
-  "548fca54db2d13a63b57b7e5dda72c2df55d96571d8ae477929604a2046d4d35";
+  "cc0331b242ca43d9bd2c5be4c3a764c1696fbcea814ec6181b663f881e5c601d";
 
 let wasmSimdAvailable: boolean | undefined;
 
@@ -780,6 +780,8 @@ export class OarlockGhosttyTerminal {
   drainOutputBytes(): Uint8Array {
     this.assertLive();
     const length = this.exports.restty_output_len(this.handle);
+    if (length === 0x7fff_ffff)
+      throw new Error("Terminal reply buffer overflow; terminal output stopped");
     if (length === 0) return emptyBytes;
     const pointer = this.exports.restty_output_ptr(this.handle);
     validateRange(this.memory.buffer, pointer, length);
@@ -2172,7 +2174,9 @@ function checkResult(code: number, operation: string): void {
         ? "out of memory"
         : code === 3
           ? "invalid argument"
-          : "internal error";
+          : code === 5
+            ? "terminal reply buffer overflow"
+            : "internal error";
   throw new Error(`Adapted Ghostty ${operation} failed: ${reason} (${code})`);
 }
 
