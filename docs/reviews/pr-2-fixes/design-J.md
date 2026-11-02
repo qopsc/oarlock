@@ -228,3 +228,49 @@ in the container, then the same on macOS to prove no regression (the macOS build
    0700 private child of the destination as a last-resort location (see section 2)?
 4. **Ownership**: best-effort, owner stays the copier when `fchown` is not permitted (matches `cp`), rather than the macOS
    behavior (`copyfile` also leaves the copier as owner). Confirm.
+
+## 6. Revision 1 (design review; these points supersede the text above where they conflict)
+
+Decisions: `security.selinux` is handled in this batch; a 0700 `<dest>/.oarlock-staging` last resort is allowed for non-repository
+destinations; default ACLs on folders are preserved; ownership is best effort.
+
+1. **Read-only folders (D-20 steps 5 and 7).** Renaming a directory to a different parent needs write permission on the moved
+   directory (its `..` changes), so as uid 1000 `chmod 0555` then `renameat2` fails with EACCES. The staged top-level folder keeps
+   owner rwx until after `renameat2`; then `finalize` applies its final mode, ACL and times through the retained descriptor and
+   verifies. A failure after publication is reported as "copied, but its permissions could not be set" (the folder stays). Nested
+   folders get their final metadata right after their children (no rename of their own). Before removing a staged or stale tree,
+   every owned directory is `chmod`ed to 0700 depth-first (`remove_tree`; the 0700 area protects it).
+2. **LSM labels (`access_control/extended.rs`, save and copy).** `security.selinux` and `security.SMACK64*` are LSM-managed on
+   Linux: skipped by `capture`, never removed by `apply`, excluded from equality and `verify`. Copy lets the kernel label the new
+   file; save sets the staged file's label to the original's when they differ and refuses with a reason if `fsetxattr` is denied.
+   `security.capability`, `security.ima`, `security.evm`, `trusted.*` and other namespaces stay refused. Pure test of the
+   classification.
+3. **Staging locations.** Ordered candidates, each tried until one opens and is on the destination's mount (`statx` `stx_mnt_id`,
+   falling back to `st_dev`): Git common dir (repository only), the user cache (`$XDG_CACHE_HOME` or `~/.cache`, created 0700
+   when missing), and, only for destinations with no `.git` ancestor, `<dest>/.oarlock-staging` through `private_child` (0700,
+   ACL privatized, owned by us; removed with `rmdir` after publishing, left in place when not empty). Never in the `Some(None)`
+   arm. `EXDEV` from `linkat` or `renameat2` (bind mounts) advances to the next candidate; copies restage there.
+4. **Ownership and group widening.** `AccessControl::apply_for_copy` tries `fchown(owner, group)`, then group only, else keeps
+   the copier. If the resulting group differs from the source group and the source mode or ACL mask grants group permissions:
+   without an ACL the group bits are cleared; with an ACL the copy is refused with a reason. A different owner is accepted. The
+   `fchown` call is an injectable seam.
+5. **Tests run unprivileged.** `docker run --user 1000:1000`, tmpfs `mode=1777,exec`, writable target and registry volumes,
+   `HOME` and `XDG_CACHE_HOME` on the primary tmpfs. Added tests: read-only top-level folder, failed copy with a read-only nested
+   folder (cleanup), default-ACL round trip including removal of an inherited default ACL, group-not-preserved widening,
+   LSM classification, `RENAME_NOREPLACE` EINVAL refusal, short and zero `copy_file_range`, concurrent copy against the stale
+   sweep, a nested relative link that escapes only at the destination, missing cache dir and the destination-child fallback.
+   The remaining macOS-only copy tests that use no macOS helper are generalized to Linux.
+6. **Nested links (also macOS).** Besides the source-side `canonicalize` check, a relative target is resolved lexically against
+   the link's final destination path: inside the copied item is allowed, otherwise the longest existing prefix is canonicalized
+   and must satisfy `reaches`.
+7. **Directory metadata.** `AccessControl::capture` accepts directories; `system.posix_acl_default` is captured explicitly and
+   applied (removed when the source has none, so an inherited default does not survive). Directory setgid is kept when the group
+   is kept; verification failure refuses. Setuid/setgid files stay refused. ENOTSUP from the destination refuses.
+8. **Source open.** `O_PATH|O_NOFOLLOW` first, classify with `fstat`, then reopen files and folders through `/proc/self/fd/N`;
+   special files are never opened.
+9. **Data copy.** `copy_file_range` until it returns 0, then read/write until `read` returns 0; `st_size` is never the stop
+   condition. The source's times are read before its data.
+10. **Sync.** Copies skip the per-file `fsync`; one `syncfs` on the area before publication and `sync_directory` after.
+11. **`RENAME_NOREPLACE` EINVAL** (NFS, some FUSE) is a refusal, never a plain rename.
+12. **Ownership of files.** `linux_copy` in `fs/mod.rs`, `linux_copy.rs` and `linux_copy_tests.rs` join batch J; `destination.rs`
+    changes only `sync_directory` visibility.
