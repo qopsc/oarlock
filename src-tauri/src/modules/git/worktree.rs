@@ -540,7 +540,19 @@ pub fn remove_with_guard(
         guard(&folder).map_err(|error| GitError::command("remove worktree", error))?;
         // The target's own configuration and hooks run during removal, so it is
         // inspected whether or not it is forced.
-        drop(owned_repo_root(registry, &worktree.path, &repo.workspace)?);
+        match owned_repo_root(registry, &worktree.path, &repo.workspace) {
+            Ok(target) => drop(target),
+            // A refusal already says what to do; anything else gets the same way out.
+            Err(error @ GitError::CommandFailed { context: "native Git refused", .. }) => {
+                return Err(error)
+            }
+            Err(error) => {
+                return Err(GitError::command(
+                    "remove worktree",
+                    format!("the worktree could not be checked ({error}). Remove it in the terminal instead."),
+                ))
+            }
+        }
         if !force {
             let changes = count_changes(registry, &repo.workspace, &worktree.path)?;
             if changes > 0 {
@@ -1338,6 +1350,21 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("native-owned"), "{error}");
         assert_eq!(std::fs::read(held.join("windows/state.json")).unwrap(), b"native");
+    }
+
+    #[test]
+    fn removal_of_a_worktree_that_cannot_be_acquired_points_to_the_terminal() {
+        let Some(fx) = Fixture::new() else { return };
+        let wt = fx.add(new_branch("elsewhere", None), None).unwrap();
+        let dir = PathBuf::from(&wt.path);
+        // A fresh registry that only knows the main checkout: the target is not authorized.
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&fx.main).unwrap();
+        let error = remove(&registry, &fx.root(), &wt.path, true, &WorkspaceEnv::Local)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("terminal"), "{error}");
+        assert!(dir.exists());
     }
 
     #[test]
