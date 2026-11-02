@@ -140,10 +140,14 @@ fn ensure_utf8_locale(cmd: &mut CommandBuilder) {
         let up = v.to_ascii_uppercase();
         up.contains("UTF-8") || up.contains("UTF8")
     };
-    let already_utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
+    let effective = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
-        .any(|k| std::env::var(k).ok().as_deref().is_some_and(is_utf8));
-    if already_utf8 {
+        .find_map(|key| {
+            cmd.get_env(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| (*key, value.to_string_lossy().into_owned()))
+        });
+    if effective.as_ref().is_some_and(|(_, value)| is_utf8(value)) {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -152,7 +156,7 @@ fn ensure_utf8_locale(cmd: &mut CommandBuilder) {
     let fallback = "C.UTF-8";
     #[cfg(windows)]
     let fallback = "en_US.UTF-8";
-    cmd.env("LANG", fallback);
+    cmd.env(effective.map_or("LANG", |(key, _)| key), fallback);
 }
 
 /// Replaces whatever terminal launched Oarlock with Oarlock as the shell's terminal.
@@ -1571,6 +1575,45 @@ mod tests {
     use portable_pty::CommandBuilder;
 
     use super::{apply_common, sanitize_shell_override, ShellControlEnv};
+
+    #[cfg(unix)]
+    #[test]
+    fn utf8_locale_respects_effective_precedence_in_the_child_environment() {
+        for (all, ctype, lang, changed) in [
+            (Some("C"), Some("en_US.UTF-8"), Some("en_US.UTF-8"), "LC_ALL"),
+            (Some(""), Some("C"), Some("en_US.UTF-8"), "LC_CTYPE"),
+            (None, None, Some("C"), "LANG"),
+        ] {
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.env_clear();
+            for (key, value) in [("LC_ALL", all), ("LC_CTYPE", ctype), ("LANG", lang)] {
+                if let Some(value) = value { cmd.env(key, value); }
+            }
+            super::ensure_utf8_locale(&mut cmd);
+            assert!(cmd.get_env(changed).unwrap().to_string_lossy().to_ascii_uppercase().contains("UTF-8"));
+            let output = std::process::Command::new("/usr/bin/locale")
+                .arg("charmap")
+                .env_clear()
+                .envs(cmd.iter_full_env_as_str())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).to_ascii_uppercase().contains("UTF-8"));
+        }
+    }
+
+    #[test]
+    fn utf8_locale_leaves_an_existing_effective_utf8_setting_unchanged() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env_clear();
+        cmd.env("LC_ALL", "en_US.UTF-8");
+        cmd.env("LC_CTYPE", "C");
+        cmd.env("LANG", "C");
+        super::ensure_utf8_locale(&mut cmd);
+        assert_eq!(cmd.get_env("LC_ALL"), Some(OsStr::new("en_US.UTF-8")));
+        assert_eq!(cmd.get_env("LC_CTYPE"), Some(OsStr::new("C")));
+        assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("C")));
+    }
 
     #[test]
     fn rejects_non_enumerated_override() {

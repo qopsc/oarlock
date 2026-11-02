@@ -4615,7 +4615,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R056 | Open, Tier 2 | The shared path guard still refuses Unix filenames containing colons or control characters, although Git status can name them. |
 | R057 | Closed | A staged diff and history now report truncated Git output as an error. Real-Git regressions first reproduced both incomplete results and then passed with the fix. |
 | R063 | Closed | Source Control preserves Git filenames containing backslashes in grouping, labels, copy and file-open paths. A tree regression reproduced the incorrect folder before the fix. |
-| R072 | Open, Tier 2 | The shell locale check accepts any UTF-8 variable even if a higher-priority non-UTF-8 variable wins, and changes only `LANG`. |
+| R072 | Closed | Shell locale selection reads the actual child environment in `LC_ALL`, `LC_CTYPE`, `LANG` precedence order. Regressions invoke the system locale utility on macOS and Linux. |
 | R082 | Closed | Terminal link resolution preserves literal backslashes in Unix directories and filenames; a regression reproduced the wrong target, and Windows drive and UNC cases still pass. |
 | R086 | Closed; platform checks remain | AP002 binds completion to its terminal and workspace; existing ownership tests and real POSIX-shell checks are recorded in the depth checkpoint. Mounted GUI and Windows/WSL checks remain manual/port work. |
 | R093 | Open, Tier 2 | The optional WebGL shader path still does not check failed texture/framebuffer allocation or completeness. No driver-pressure reproduction was run. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **8 closed; 17 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **9 closed; 16 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4667,3 +4667,9 @@ Validation: 48 focused Source Control tests and the full frontend suite passed (
 ### R122 and R123 checkpoint — architecture-guide corrections
 
 The shell guide now describes launch-only, profile-specific fish integration; the WebGL guide describes one WASM instance per terminal from a shared compiled module. These documentation changes were checked against the current implementation and resource guide. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,088 tests (two skipped), types passed and lint remained at 80 warnings.
+
+### R072 checkpoint — effective shell locale
+
+Shell startup now reads the locale values from the actual child command and respects `LC_ALL`, `LC_CTYPE`, then `LANG` precedence, ignoring empty values. If the effective value is not UTF-8, it replaces that value with the existing platform fallback; an already effective UTF-8 setting stays untouched. Replacing a non-UTF-8 `LC_ALL` changes all locale categories for the child, a deliberate trade-off needed for the existing UTF-8 terminal guarantee. A regression failed before the change and uses the real `locale charmap` utility after it.
+
+Validation: both focused locale tests passed on macOS and in the offline Linux container. The first Linux attempt ran unrelated integration links concurrently and was killed by the container memory limit; restricting the retry to library tests and one build job passed. The full macOS native suite passed 1,580 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,088 tests (two skipped), types passed and lint remained at 80 warnings. Linux emitted four already recorded unrelated warnings.
