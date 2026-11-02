@@ -650,7 +650,7 @@ static GIT_PROGRAM: OnceLock<OsString> = OnceLock::new();
 
 /// The `git` found on `PATH` the first time Git is needed, as an absolute path,
 /// so a later `PATH` change or a planted earlier entry cannot swap the binary.
-fn git_program() -> &'static OsStr {
+fn git_program() -> Option<&'static OsStr> {
     pinned_program(&GIT_PROGRAM, || {
         let path = std::env::var_os("PATH").unwrap_or_default();
         find_on_path(if cfg!(windows) { "git.exe" } else { "git" }, &path)
@@ -658,20 +658,16 @@ fn git_program() -> &'static OsStr {
 }
 
 /// A lookup that finds nothing is not remembered: the launch fails as "not installed"
-/// (the name cannot exist) and the next one looks again.
-const GIT_NOT_FOUND: &str = "oarlock-git-not-installed";
-
+/// without spawning anything, and the next one looks again.
 fn pinned_program(
     cell: &OnceLock<OsString>,
     lookup: impl FnOnce() -> Option<PathBuf>,
-) -> &OsStr {
+) -> Option<&OsStr> {
     if let Some(found) = cell.get() {
-        return found;
+        return Some(found);
     }
-    match lookup() {
-        Some(path) => cell.get_or_init(|| path.into_os_string()),
-        None => OsStr::new(GIT_NOT_FOUND),
-    }
+    let path = lookup()?;
+    Some(cell.get_or_init(|| path.into_os_string()))
 }
 
 fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
@@ -721,7 +717,7 @@ fn build_git_command(
         return Ok(cmd);
     }
 
-    let mut cmd = Command::new(git_program());
+    let mut cmd = Command::new(git_program().ok_or(GitError::NotInstalled)?);
     #[cfg(test)]
     isolate_test_home(&mut cmd);
     // Every path this API receives names an entry selected by the caller.
@@ -1188,20 +1184,22 @@ mod tests {
         use std::path::PathBuf;
         use std::sync::OnceLock;
         let cell = OnceLock::new();
-        let missing = super::pinned_program(&cell, || None);
-        assert!(!std::path::Path::new(missing).is_absolute());
-        assert_ne!(missing, "git", "a bare name would be searched on PATH at launch");
+        assert!(super::pinned_program(&cell, || None).is_none());
         assert!(cell.get().is_none(), "a failed lookup was cached");
         let found = super::pinned_program(&cell, || Some(PathBuf::from("/opt/tools/git")));
-        assert_eq!(found, "/opt/tools/git");
+        assert_eq!(found.unwrap(), "/opt/tools/git");
         let later = super::pinned_program(&cell, || Some(PathBuf::from("/planted/git")));
-        assert_eq!(later, "/opt/tools/git");
+        assert_eq!(later.unwrap(), "/opt/tools/git");
     }
 
     #[test]
     fn every_launch_uses_the_binary_resolved_once() {
-        let first = super::git_program();
-        assert_eq!(first, super::git_program());
+        let Some(first) = super::git_program() else {
+            let error = super::build_git_command(&WorkspaceEnv::Local, None, &[]).err();
+            assert!(matches!(error, Some(GitError::NotInstalled)));
+            return;
+        };
+        assert_eq!(Some(first), super::git_program());
         let command = super::build_git_command(&WorkspaceEnv::Local, None, &[]).unwrap();
         assert_eq!(command.get_program(), first);
         if first != "git" {

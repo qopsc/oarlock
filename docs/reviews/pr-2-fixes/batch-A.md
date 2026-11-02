@@ -177,3 +177,10 @@ cargo test --locked -- --test-threads=1
 test result: ok. 1615 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 77.44s
 (all integration binaries ok: git_entrypoint_guard 32, git_executable_refusal 10, git_operations 61, git_remote_scope 15, git_store_aliases 2, git_fixture_isolation 2, git_ai_diff 8, git_optional_reads 5)
 ```
+
+## 7. Second rework
+
+- S-11-R2: `pinned_program` and `git_program` return `Option`; `build_git_command` returns `GitError::NotInstalled` when the lookup fails and spawns nothing (no sentinel name). Tests: `a_failed_lookup_is_not_pinned_and_a_found_binary_is_never_replaced` (lookup `None` yields `None` and caches nothing) and `every_launch_uses_the_binary_resolved_once` (asserts `NotInstalled` from `build_git_command` when this host has no git). The `NotInstalled` branch of the second test only runs on a host without git; the `None` path is covered everywhere by the first.
+- T-01-R2: the discard worker returns `work.execute(..., &guard)` directly; the source pin matches the new text.
+- AGENTS.md prose, add to edit 2: "The backend refuses entry names that contain U+FFFD (what status shows for a name that is not UTF-8), and the panel marks such entries unreadable (`unreadable` on the status entry); disabling open, stage and discard for them is the frontend's part."
+- Checks: `cargo clippy --all-targets --locked -- -D warnings` clean; `cargo test --locked --lib process`: 39 passed; `cargo test --locked --lib git::`: 197 passed; 0 failed.
