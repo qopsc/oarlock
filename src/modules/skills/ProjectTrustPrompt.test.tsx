@@ -68,6 +68,31 @@ describe("ProjectTrustPrompt", () => {
     expect(html).toContain("Use servers");
   });
 
+  it("shows a server's environment even when its command line is long", () => {
+    const padding = Array.from({ length: 60 }, (_, i) => `--flag-${i}`).join(
+      " ",
+    );
+    const html = render([
+      trustItem({
+        kind: "mcp-json",
+        path: "/work/proj/.mcp.json",
+        entries: [
+          {
+            title: "db",
+            detail: `sets REGION=eu\nsets API_URL=https://x.example\nnpx -y db-mcp ${padding}`,
+          },
+        ],
+      }),
+    ]);
+    const env = html.indexOf("sets REGION=eu");
+    const command = html.indexOf("npx -y db-mcp");
+    expect(env).toBeGreaterThan(-1);
+    expect(html).toContain("sets API_URL=https://x.example");
+    expect(env).toBeLessThan(command);
+    const envSpan = html.slice(html.lastIndexOf("<span", env), env);
+    expect(envSpan).not.toContain("line-clamp");
+  });
+
   it("asks about skills and servers together", () => {
     const html = render([
       trustItem(),

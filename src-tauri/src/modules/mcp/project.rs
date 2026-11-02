@@ -190,9 +190,9 @@ pub fn parse(bytes: &[u8], project_key: &str) -> Result<Vec<ProjectEntry>, Strin
 /// shows the command the user reads, and these run other code beside it.
 fn is_loader_variable(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
-    name.starts_with("DYLD_")
-        || name.starts_with("LD_")
-        || name.starts_with("PYTHON")
+    ["DYLD_", "LD_", "PYTHON", "NPM_CONFIG_", "UV_", "PIP_", "GIT_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
         || matches!(
             name.as_str(),
             "PATH"
@@ -207,6 +207,12 @@ fn is_loader_variable(name: &str) -> bool {
                 | "JAVA_TOOL_OPTIONS"
                 | "JDK_JAVA_OPTIONS"
                 | "_JAVA_OPTIONS"
+                | "HOME"
+                | "XDG_CONFIG_HOME"
+                | "DOTNET_STARTUP_HOOKS"
+                | "CLASSPATH"
+                | "PERLLIB"
+                | "ZDOTDIR"
         )
 }
 
@@ -314,14 +320,16 @@ pub fn describe(entry: &ProjectEntry) -> String {
                 .map(|w| quote(w))
                 .collect::<Vec<_>>()
                 .join(" ");
-            if env.is_empty() {
+            // The environment goes first, one line each, so the prompt shows it before a long
+            // command line and never clips it.
+            let set: Vec<String> = env
+                .iter()
+                .map(|(name, value)| format!("sets {name}={}", quote(value)))
+                .collect();
+            if set.is_empty() {
                 line
             } else {
-                let set: Vec<String> = env
-                    .iter()
-                    .map(|(name, value)| format!("{name}={}", quote(value)))
-                    .collect();
-                format!("{line} · sets {}", set.join(", "))
+                format!("{}\n{line}", set.join("\n"))
             }
         }
         (Some(RawTransport::Remote { sse, url, .. }), _) => {
@@ -1068,7 +1076,7 @@ mod tests {
         assert!(describe(&entries[1]).starts_with("Cannot be used"));
         assert_eq!(
             describe(&entries[2]),
-            "npx -y db-mcp --url ${DB_URL:-postgres://localhost} · sets TOKEN=${TOKEN} · reads DB_URL, TOKEN from your environment"
+            "sets TOKEN=${TOKEN}\nnpx -y db-mcp --url ${DB_URL:-postgres://localhost} · reads DB_URL, TOKEN from your environment"
         );
         assert!(parse(b"[]", "/p").is_err());
         assert!(parse(b"{nope", "/p").is_err());
@@ -1083,7 +1091,7 @@ mod tests {
         let entries = parse(text.as_bytes(), "/p").unwrap();
         assert_eq!(
             describe(&entries[0]),
-            "npx -y db-mcp · sets API_URL=https://x.example/${TENANT}, REGION=eu · reads TENANT from your environment"
+            "sets API_URL=https://x.example/${TENANT}\nsets REGION=eu\nnpx -y db-mcp · reads TENANT from your environment"
         );
     }
 
@@ -1099,6 +1107,17 @@ mod tests {
             "PERL5OPT",
             "RUBYOPT",
             "BASH_ENV",
+            "npm_config_node_options",
+            "NPM_CONFIG_PREFIX",
+            "UV_INDEX_URL",
+            "pip_index_url",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GIT_SSH_COMMAND",
+            "DOTNET_STARTUP_HOOKS",
+            "CLASSPATH",
+            "PERLLIB",
+            "ZDOTDIR",
         ] {
             let text = format!(
                 r#"{{"mcpServers": {{"x": {{"command": "npx", "env": {{"{name}": "--require ./x.js"}}}}}}}}"#
