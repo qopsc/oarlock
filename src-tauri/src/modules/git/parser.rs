@@ -66,6 +66,25 @@ pub fn parse_porcelain_v2(stdout: &str) -> PorcelainV2 {
     out
 }
 
+/// Parses raw `status --porcelain=v2 -z` bytes. A name that is not UTF-8 (Linux
+/// allows any bytes) must not fail the whole read: it is shown with replacement
+/// characters and labelled, and every other entry is kept.
+pub fn parse_porcelain_v2_bytes(stdout: &[u8]) -> PorcelainV2 {
+    let text = String::from_utf8_lossy(stdout);
+    let lossy = matches!(text, std::borrow::Cow::Owned(_));
+    let mut parsed = parse_porcelain_v2(&text);
+    if lossy {
+        for file in &mut parsed.files {
+            let bad = file.path.contains('\u{fffd}')
+                || file.original_path.as_deref().is_some_and(|p| p.contains('\u{fffd}'));
+            if bad {
+                file.status_label = "Unreadable name".into();
+            }
+        }
+    }
+    parsed
+}
+
 fn skip_fields(s: &str, n: usize) -> Option<&str> {
     let mut rest = s;
     for _ in 0..n {
@@ -191,6 +210,32 @@ mod tests {
             name: name.into(),
             head,
         }
+    }
+
+    #[test]
+    fn one_invalid_utf8_name_is_marked_and_the_rest_of_the_status_is_kept() {
+        let mut stdout = b"# branch.head main\0".to_vec();
+        stdout.extend_from_slice(b"1 .M N... 100644 100644 100644 aaaa bbbb before.txt\0");
+        stdout.extend_from_slice(b"1 .M N... 100644 100644 100644 aaaa bbbb bad-\xff-name.txt\0");
+        stdout.extend_from_slice(b"? after.txt\0");
+        let parsed = parse_porcelain_v2_bytes(&stdout);
+        let names: Vec<&str> = parsed.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(parsed.files[0].path, "before.txt");
+        assert_eq!(parsed.files[0].status_label, "Modified");
+        assert_eq!(parsed.files[1].status_label, "Unreadable name");
+        assert!(parsed.files[1].path.contains('\u{fffd}'));
+        assert_eq!(parsed.files[2].path, "after.txt");
+        assert_eq!(parsed.files[2].status_label, "Untracked");
+        assert_eq!(parsed.branch, "main");
+    }
+
+    #[test]
+    fn valid_utf8_status_is_never_marked_unreadable() {
+        let stdout = "1 .M N... 100644 100644 100644 aaaa bbbb caf\u{e9}.txt\0".as_bytes();
+        let parsed = parse_porcelain_v2_bytes(stdout);
+        assert_eq!(parsed.files[0].path, "caf\u{e9}.txt");
+        assert_eq!(parsed.files[0].status_label, "Modified");
     }
 
     #[test]

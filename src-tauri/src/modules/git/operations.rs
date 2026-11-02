@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::modules::git::errors::{GitError, Result};
-use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2};
+use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2_bytes};
 use crate::modules::git::process::{
     decode_text, ensure_git_available, ensure_success, git_show_text, read_text_file,
     run_git_in_capped,
@@ -222,10 +222,7 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
     )?;
     ensure_success(&output, "git status failed")?;
 
-    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
-        GitError::command("git status", "output contains invalid UTF-8 or was cut mid-character")
-    })?;
-    let parsed = parse_porcelain_v2(stdout);
+    let parsed = parse_porcelain_v2_bytes(&output.stdout);
     let mut listing_error = None;
     let files = untracked::expand_untracked_dirs(parsed.files, |dir, budget| {
         if listing_error.is_some() {
@@ -366,9 +363,7 @@ pub fn diff_content(
                 "staged path list is truncated",
             ));
         }
-        let text = std::str::from_utf8(&output.stdout)
-            .map_err(|_| GitError::command("git diff", "cannot decode staged paths"))?;
-        parse_porcelain_v2(text)
+        parse_porcelain_v2_bytes(&output.stdout)
             .files
             .into_iter()
             .find(|file| file.path == rel_path)

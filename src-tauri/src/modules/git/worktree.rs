@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::modules::git::errors::{GitError, Result};
-use crate::modules::git::parser::parse_porcelain_v2;
+use crate::modules::git::parser::parse_porcelain_v2_bytes;
 use crate::modules::git::process::{ensure_git_available, ensure_success, run_git_guarded};
 use crate::modules::git::types::{
     GitLinkedWorktree, GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeEntry,
@@ -505,7 +505,7 @@ fn count_changes(
         DEFAULT_TIMEOUT_SECS,
     )?;
     ensure_success(&output, "git status failed")?;
-    let files = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout)).files;
+    let files = parse_porcelain_v2_bytes(&output.stdout).files;
     Ok(u32::try_from(files.len()).unwrap_or(u32::MAX))
 }
 
