@@ -1,2 +1,2 @@
-export { initVim } from "./dist/vim"
-export * from "./dist/types"
+export { initVim } from "./declarations/vim"
+export * from "./declarations/types"

@@ -4607,7 +4607,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R023 | Windows/WSL port | The mount translation is WSL-specific and outside this release. |
 | R032 | Windows/WSL port | The affected polling path is WSL-specific and outside this release. |
 | R043 | Closed | Ctrl+G reaches Go to Line before safe search, while Vim remains first; a CodeMirror precedence regression reproduced the conflict. Windows runtime validation remains port work. |
-| R044 | Open, Tier 2 | The core package is now a tracked workspace package, but its declared types still refer to ignored `dist` files. A copy without `dist` reproduces TS2307 on both imports. The app's clean build has not been shown to fail. |
+| R044 | Closed | The Vim core ships tracked declarations, and an isolated consumer typechecks without an ignored `dist` directory. |
 | R048 | Closed | Language-server URIs preserve literal Unix backslashes, recognize localhost, reject other hosts, and compare Unix paths without treating backslashes as separators. Regressions reproduced the previous incorrect paths. |
 | R049 | Closed; packaged check manual | An explicit recheck invalidates the selected and fallback shell captures before probing. Tests cover failures, changed captures and an older capture finishing late. |
 | R053 | Closed | Both install interfaces show macOS-specific commands only on macOS and direct other systems to the documentation. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **13 closed; 12 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **14 closed; 11 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4707,3 +4707,9 @@ Manual signed-release checks: open an image and a PDF larger than 50 MiB and con
 An explicit Check again now asks native code to invalidate the configured shell's cached environment, including the login-shell fallback, before probing. Ordinary detection continues to reuse its capture. A narrow optional `refresh` argument was added to the existing `lsp_detect` command; omitted arguments retain the prior behavior. Tests cover a failed capture, a changed PATH and an older in-flight capture finishing after invalidation. On non-macOS systems, both install interfaces direct users to the relevant documentation rather than presenting the macOS-only Homebrew or Xcode commands. macOS retains the existing commands.
 
 Validation: 21 focused frontend tests and native environment tests passed. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,093 tests (two skipped), types passed and lint remained at 80 warnings. Manual signed-release check: install a missing language server into a directory newly added to the configured shell's PATH, choose Check again, and confirm it becomes available; on Linux confirm the four platform-specific presets show documentation rather than a macOS command.
+
+### R044 checkpoint — Vim core declarations in a clean checkout
+
+The fork's public declaration entry now points to tracked, pinned declarations instead of ignored `dist` files. The maintenance note calls for keeping those declarations aligned with exported API changes. A regression copies only the declaration entry and its tracked declaration directory to a temporary consumer, then typechecks it with library checking enabled and no `dist` directory; it failed against the old entry.
+
+Validation: the isolated consumer and full frontend suite passed (6,094 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. This validates the package declaration entry, not a fresh dependency installation or packaged Vim behavior.

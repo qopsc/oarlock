@@ -5,6 +5,10 @@ https://github.com/replit/codemirror-vim (MIT; see LICENSE).
 `upstream/vim.js` and `upstream-tests/vim_test.js` retain the installed upstream
 sources as compatibility baselines. They are development fixtures, never app imports.
 
+`declarations/` contains the pinned public type declarations. Keep them in sync
+with the local core when its exported API changes; they are checked without
+the ignored `dist` directory by `declarations.test.ts`.
+
 Oarlock's `vim.js` preserves the command table, motions, operators, registers,
 macros and Ex commands. Coroutine continuations suspend only at worker-backed
 search operations and asynchronous command callbacks. Ordinary commands still
