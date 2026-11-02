@@ -69,7 +69,10 @@ fn nodeletebusy_does_not_bind_the_named_entry_to_the_open_file() {
     // Apple's fcntl.h defines AT_NODELETEBUSY as 0x4000. It refuses an open
     // file, but does not compare the pathname with a particular open handle.
     const AT_NODELETEBUSY: libc::c_int = 0x4000;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("oarlock-nodeletebusy-")
+        .tempdir()
+        .unwrap();
     let dir = Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
     fs::write(tmp.path().join("selected"), "selected").unwrap();
     fs::write(tmp.path().join("replacement"), "replacement").unwrap();
@@ -77,14 +80,20 @@ fn nodeletebusy_does_not_bind_the_named_entry_to_the_open_file() {
     let name = std::ffi::CString::new("selected").unwrap();
     let unlink = || unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), AT_NODELETEBUSY) };
 
-    assert_eq!(unlink(), -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBUSY)
-    );
+    let check_unlink = |expected, expected_errno| {
+        let result = unlink();
+        let error = (result == -1).then(std::io::Error::last_os_error);
+        assert!(
+            result == expected && expected_errno == error.as_ref().and_then(std::io::Error::raw_os_error),
+            "unlinkat {} returned {result}, errno {error:?}; directory entries: {:?}",
+            tmp.path().join("selected").display(),
+            fs::read_dir(tmp.path()).map(|entries| entries.map(|entry| entry.map(|entry| (entry.path(), entry.file_type()))).collect::<Vec<_>>()),
+        );
+    };
+    check_unlink(-1, Some(libc::EBUSY));
     fs::rename(tmp.path().join("selected"), tmp.path().join("original")).unwrap();
     fs::rename(tmp.path().join("replacement"), tmp.path().join("selected")).unwrap();
-    assert_eq!(unlink(), 0);
+    check_unlink(0, None);
     assert_eq!(
         fs::read_to_string(tmp.path().join("original")).unwrap(),
         "selected"
