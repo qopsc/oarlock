@@ -14,8 +14,23 @@ pub struct GitRepoFixture {
     _tmp: TempDir,
 }
 
+static ISOLATED_HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+
+/// Production Git launches read `$HOME/.gitconfig`; point the test process at an
+/// empty home so a developer's LFS, signing or fsmonitor setup cannot leak in.
+pub fn isolate_home() {
+    ISOLATED_HOME.get_or_init(|| {
+        let home = TempDir::new().expect("isolated home");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+        std::env::set_var("USERPROFILE", home.path());
+        home
+    });
+}
+
 impl GitRepoFixture {
     pub fn new() -> Self {
+        isolate_home();
         let tmp = TempDir::new().expect("tempdir");
         let canonical = std::fs::canonicalize(tmp.path()).expect("canonicalize");
         let registry = WorkspaceRegistry::default();
@@ -91,6 +106,7 @@ pub struct FsFixture {
 
 impl FsFixture {
     pub fn new() -> Self {
+        isolate_home();
         let tmp = TempDir::new().expect("tempdir");
         let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
         Self { root, _tmp: tmp }
