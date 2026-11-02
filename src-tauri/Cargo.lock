@@ -3064,6 +3064,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tempfile",
  "tokio",
+ "toml 0.8.2",
  "wasmparser",
  "which",
  "window-vibrancy",

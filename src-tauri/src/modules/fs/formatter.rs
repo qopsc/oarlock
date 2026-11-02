@@ -17,6 +17,8 @@ use std::{
 use tauri::{ipc::Channel, Manager, State, Window};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+mod rustfmt_edition;
+
 const MAX_BYTES: usize = 50 * 1024 * 1024;
 const MAX_FORMATTERS: usize = 4;
 
@@ -300,9 +302,9 @@ pub async fn fs_format_document(
             }
             let workspace = WorkspaceEnv::from_option(workspace);
             let requested = resolve_path(&path, &workspace)?;
-            app.state::<WorkspaceRegistry>()
-                .gates(Origin::App)
-                .authorized_write_target(&requested)?;
+            let registry = app.state::<WorkspaceRegistry>();
+            let gates = registry.gates(Origin::App);
+            let real_document = gates.authorized_write_target(&requested)?;
             if cancel.is_requested() {
                 return Err("Formatter cancelled".into());
             }
@@ -314,11 +316,14 @@ pub async fn fs_format_document(
                 .gates(Origin::App)
                 .spawn_cwd(Some(cwd), &workspace)?;
             let hint = language_hint(&path, language.as_deref())?;
-            let args = arguments(
+            let mut args = arguments(
                 &formatter,
                 &hint,
                 custom_command.as_deref().unwrap_or_default(),
             )?;
+            if formatter == "rustfmt" {
+                args[4] = rustfmt_edition::for_document(&real_document, &gates)?;
+            }
             run(
                 &args,
                 cwd,

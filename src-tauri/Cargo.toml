@@ -48,6 +48,7 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "=0.8.2"
 getrandom = "0.4"
 memchr = "2"
 oarlock-control-protocol = { path = "crates/oarlock-control-protocol" }

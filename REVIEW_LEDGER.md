@@ -4632,11 +4632,13 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R191 | Closed; mounted check manual | A failed Markdown refresh keeps the previous content with a stale notice and Retry. A successful read clears the notice; state-transition regressions pass. |
 | R200 | Closed; mounted check manual | Multi-option `:set`, `:setlocal` and `:setglobal` commands now apply options in order and stop after an invalid option. Adapter regressions reproduce the original issue. |
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
-| R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
+| R217 | Closed, Tier 2 | Rustfmt uses the owning Cargo package's edition, including workspace inheritance, without executing Cargo. Manifest reads stay inside authorized folders and fail visibly on malformed, oversized, inaccessible or unsupported manifests. Loose files retain the prior 2021 default. A real rustfmt regression distinguishes 2021 from 2024 syntax; additional tests cover defaults, inherited editions and unauthorized workspaces. |
 
-Counts: **22 closed or partially held; 3 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **23 closed or partially held; 2 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 R093 checkpoint: the three new mocked allocation/completeness regressions failed against the previous implementation and pass with cleanup and retry. The full frontend suite passed 6,106 tests (two skipped); the native suite passed 1,586 library tests (four ignored) and all integration tests. Strict Clippy and types passed; lint remained at 80 warnings. Sandboxed test runs could not access local servers, PTYs and file watches; the full suites passed when rerun with those facilities available.
+
+R217 checkpoint: focused manifest and real-rustfmt tests passed. The full frontend suite passed 6,106 tests (two skipped); the native suite passed 1,588 library tests (four ignored) and all integration tests. Strict Clippy and types passed; lint remained at 80 warnings. This adds the already-transitive locked TOML parser as a direct dependency; no Cargo process or repository configuration is executed to determine an edition.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
