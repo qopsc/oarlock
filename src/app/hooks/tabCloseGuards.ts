@@ -33,7 +33,7 @@ export function hasOpenPathTab(tabs: readonly Tab[], path: string): boolean {
   );
 }
 
-export type CloseManyKind = "right" | "other";
+export type CloseManyKind = "right" | "other" | "space";
 
 export type CloseManyHazards = {
   dirtyIds: number[];
@@ -44,6 +44,8 @@ export type CloseManyPending = CloseManyHazards & {
   kind: CloseManyKind;
   anchorId: number;
   plan: CloseTabsPlan;
+  /** Only a space deletion: what runs once the user confirms. */
+  commit?: () => void;
 };
 
 export function hasCloseManyHazards(hazards: CloseManyHazards): boolean {

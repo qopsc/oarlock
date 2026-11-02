@@ -99,6 +99,12 @@ function closeManyMessage(pending: CloseManyPending, tabs: Tab[]): string {
   const { kind, dirtyIds, busyLeafIds } = pending;
   const dirtyCount = dirtyIds.length;
   const busyCount = busyLeafIds.length;
+  if (kind === "space" && dirtyCount > 0) {
+    const dirty = `${dirtyCount} tab${dirtyCount === 1 ? " has" : "s have"} unsaved changes`;
+    return busyCount > 0
+      ? `${dirty} and a process is running in this space. Deleting it will discard the changes and terminate the process. Delete anyway?`
+      : `${dirty} in this space. Deleting it will discard them. Delete anyway?`;
+  }
   if (dirtyCount === 1 && busyCount === 0) {
     const dirty = tabs.find(
       (tab) => tab.kind === "editor" && dirtyIds.includes(tab.id),
@@ -120,6 +126,9 @@ function closeManyMessage(pending: CloseManyPending, tabs: Tab[]): string {
   }
   const process =
     busyCount === 1 ? "A process is" : `${busyCount} processes are`;
+  if (kind === "space") {
+    return `${process} running in this space. Deleting it will terminate ${busyCount === 1 ? "it" : "them"}. Delete anyway?`;
+  }
   return kind === "right"
     ? `${process} running in ${busyCount === 1 ? "a tab" : "tabs"} to the right. Closing will terminate ${busyCount === 1 ? "it" : "them"}. Close anyway?`
     : `${process} running in ${busyCount === 1 ? "another tab" : "other tabs"}. Closing will terminate ${busyCount === 1 ? "it" : "them"}. Close anyway?`;
@@ -310,9 +319,11 @@ export function CloseDialogs({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {pendingCloseMany?.kind === "right"
-                ? "Close Tabs to the Right"
-                : "Close Other Tabs"}
+              {pendingCloseMany?.kind === "space"
+                ? "Delete Space"
+                : pendingCloseMany?.kind === "right"
+                  ? "Close Tabs to the Right"
+                  : "Close Other Tabs"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {pendingCloseMany ? closeManyMessage(pendingCloseMany, tabs) : ""}
@@ -329,7 +340,11 @@ export function CloseDialogs({
                 onConfirmCloseMany();
               }}
             >
-              {closeManyConfirming ? "Checking..." : "Close Anyway"}
+              {closeManyConfirming
+                ? "Checking..."
+                : pendingCloseMany?.kind === "space"
+                  ? "Delete Anyway"
+                  : "Close Anyway"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

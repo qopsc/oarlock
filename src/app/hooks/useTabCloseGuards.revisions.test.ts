@@ -96,3 +96,44 @@ it("does not reconfirm an editor that was saved during the check", async () => {
   await confirmation;
   expect(disposeTabs).toHaveBeenCalledOnce();
 });
+
+const otherSpaceTab = { id: 9, kind: "editor", spaceId: "other", dirty: true } as Tab;
+
+it("deleting a space with a dirty editor asks before it commits", async () => {
+  const disposeTabs = vi.fn();
+  const commit = vi.fn();
+  const params = {
+    tabs: [...tabs, otherSpaceTab], activeId: 1,
+    editorIsDirty: (id: number) => id === 2,
+    editorCloseRevision: () => "r",
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs,
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  await render().handleDeleteSpace("s", commit);
+  expect(commit).not.toHaveBeenCalled();
+  const pending = render().pendingCloseMany;
+  expect(pending?.kind).toBe("space");
+  expect(pending?.dirtyIds).toEqual([2]);
+  await render().confirmCloseMany();
+  expect(commit).toHaveBeenCalledOnce();
+  expect(disposeTabs).not.toHaveBeenCalled();
+  expect(render().pendingCloseMany).toBeNull();
+});
+
+it("deleting a space with a running shell asks, and a clean space commits at once", async () => {
+  const commit = vi.fn();
+  const params = {
+    tabs: [...tabs, otherSpaceTab], activeId: 1,
+    editorIsDirty: () => false,
+    disposeTab: vi.fn(), disposeDeletedTabs: vi.fn(), disposeTabs: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  fake.busy.mockResolvedValue(true);
+  await render().handleDeleteSpace("s", commit);
+  expect(commit).not.toHaveBeenCalled();
+  expect(render().pendingCloseMany?.busyLeafIds).toEqual([30]);
+  render().cancelCloseMany();
+  fake.busy.mockResolvedValue(false);
+  await render().handleDeleteSpace("s", commit);
+  expect(commit).toHaveBeenCalledOnce();
+});

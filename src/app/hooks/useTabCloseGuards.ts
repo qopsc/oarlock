@@ -161,6 +161,33 @@ export function useTabCloseGuards({
     [disposeTabs, dirtyRevisions, evaluateCloseMany, planCloseMany, withCurrentActive],
   );
 
+  const handleDeleteSpace = useCallback(
+    async (spaceId: string, commit: () => void) => {
+      const closeIds = tabsRef.current
+        .filter((tab) => tab.spaceId === spaceId)
+        .map((tab) => tab.id);
+      const plan = { closeIds, nextActiveId: activeIdRef.current };
+      const requestId = ++closeManyRequestRef.current;
+      const evaluated = await evaluateCloseMany(closeIds);
+      if (requestId !== closeManyRequestRef.current) return;
+      const revisions = dirtyRevisions(closeIds);
+      const hazards = { ...evaluated, dirtyIds: [...revisions.keys()] };
+      if (hasCloseManyHazards(hazards)) {
+        acknowledgedRevisionsRef.current = revisions;
+        setPendingCloseMany({
+          kind: "space",
+          anchorId: closeIds[0] ?? activeIdRef.current,
+          plan,
+          commit,
+          ...hazards,
+        });
+        return;
+      }
+      commit();
+    },
+    [dirtyRevisions, evaluateCloseMany],
+  );
+
   const handleCloseTabsToRight = useCallback(
     (anchorId: number) => {
       void handleCloseMany("right", anchorId);
@@ -190,10 +217,13 @@ export function useTabCloseGuards({
       setCloseManyConfirming(false);
       return;
     }
-    disposeTabs(
-      pendingCloseMany.anchorId,
-      withCurrentActive(pendingCloseMany.plan),
-    );
+    if (pendingCloseMany.commit) pendingCloseMany.commit();
+    else {
+      disposeTabs(
+        pendingCloseMany.anchorId,
+        withCurrentActive(pendingCloseMany.plan),
+      );
+    }
     setPendingCloseMany(null);
     acknowledgedRevisionsRef.current.clear();
     setCloseManyConfirming(false);
@@ -259,6 +289,7 @@ export function useTabCloseGuards({
     handleClose,
     handleCloseTabsToRight,
     handleCloseOtherTabs,
+    handleDeleteSpace,
     confirmClose,
     cancelClose,
     confirmTerminalClose,

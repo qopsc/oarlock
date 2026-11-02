@@ -516,6 +516,7 @@ export default function App() {
     handleClose,
     handleCloseTabsToRight,
     handleCloseOtherTabs,
+    handleDeleteSpace: guardSpaceDeletion,
     confirmClose,
     cancelClose,
     confirmTerminalClose,
@@ -1540,14 +1541,16 @@ export default function App() {
 
   const handleDeleteSpace = useCallback(
     (id: string) => {
-      const nextSpaceId = useSpaces.getState().remove(id);
-      if (!nextSpaceId) return;
-      const root = useSpaces
-        .getState()
-        .spaces.find((s) => s.id === nextSpaceId)?.root;
-      removeTabsForSpace(id, nextSpaceId, root ?? undefined);
+      void guardSpaceDeletion(id, () => {
+        const nextSpaceId = useSpaces.getState().remove(id);
+        if (!nextSpaceId) return;
+        const root = useSpaces
+          .getState()
+          .spaces.find((s) => s.id === nextSpaceId)?.root;
+        removeTabsForSpace(id, nextSpaceId, root ?? undefined);
+      });
     },
-    [removeTabsForSpace],
+    [guardSpaceDeletion, removeTabsForSpace],
   );
 
   // The pane keeps its shell; its agent records follow it to its new tab.
