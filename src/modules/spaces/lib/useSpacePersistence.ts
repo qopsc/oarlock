@@ -104,7 +104,9 @@ export function useSpacePersistence({
       if (failed?.status === "rejected") throw failed.reason;
       await saveSpacesStore();
       for (const [id, value] of pending) last.current.set(id, value);
-      if (!history.ok) throw history.error;
+      // Scrollback is a convenience file: losing it must not fail the layout flush or
+      // raise the application-state warning on close.
+      if (!history.ok) console.warn("Could not save terminal scrollback", history.error);
     });
     queue.current = run.catch(() => undefined);
     return run;

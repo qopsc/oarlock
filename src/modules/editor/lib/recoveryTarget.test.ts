@@ -74,3 +74,20 @@ it("native acquisition failure drops its local recovery observer", async () => {
   expect(next.changed()).toBe(false);
   next.dispose();
 });
+
+it("a recovery with native history survives an unrelated reconcile", async () => {
+  const { observeNativeRecoveryTarget } = await import("./recoveryTarget");
+  recoveryMutationCoverage(true);
+  let nativeChanged = false;
+  const target = await observeNativeRecoveryTarget("/a", "local", {
+    begin: async () => "h",
+    changed: async () => nativeChanged,
+    end: async () => {},
+  });
+  recoveryMutationCoverage(false);
+  recoveryMutationCoverage(true);
+  expect(await target.changed()).toBe(false);
+  nativeChanged = true;
+  expect(await target.changed()).toBe(true);
+  target.dispose();
+});
