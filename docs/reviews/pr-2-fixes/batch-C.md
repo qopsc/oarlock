@@ -19,6 +19,15 @@ A-01 deviation: `agent.ts` documents that Claude Code reads a CR in the same chu
 
 P-02 note: an oversized paste is taken as one unit up to 8 MiB when the queue is under budget, rather than refused at 256 KiB, because a healthy PTY should accept a 1 MiB paste. The native side already bounds a write at 64 MiB (`MAX_INPUT_BYTES`) and tests it (`oversized_terminal_input_is_refused_before_a_stalled_writer`), so `session.rs` needed no change.
 
+### Rework round (Opus review C-R1 to C-R7)
+
+- C-R1: `reserveInput({ deadline: false })`, used by paste confirmation; test "still sends a paste the user confirms after the slot deadline window". Commit: "P-03 rework: give slots held for a user prompt no deadline".
+- C-R3: held-key test asserts `pendingActions <= 33` and fails with the `event.repeat` hunk reverted (checked). Commit "P-03 rework: assert the repeat coalescing bound".
+- C-R4: message made neutral ("A newer copy or a program's clipboard write replaced it"). Commit "P-04 rework".
+- C-R2 and C-R6: `send_to_agent` asks `leafHasForegroundProcess` before typing and before Enter and refuses when the shell is at its prompt; the agent-record check was removed rather than kept as a hint, because it had no remaining decision to inform. `BoundedPtyWriter.enqueue` gained a `settled(delivered)` callback and the input owner a `writeDelivered`, so `ok` is returned only after the PTY took the Enter. "or resend" dropped from the error. Tests: shell at prompt, agent exits before Enter, no integration record, Enter cancelled before delivery, and the writer `settled` test. Commit "A-01 rework". Unknown or failed foreground lookups count as "not running" (the helper returns false on error), which errs towards not typing.
+- C-R7: per-answer latch in `answerKittyRead` rewinds the reply queue to the answer's start when a packet is dropped. Artifacts rebuilt. No real-WASM regression test: Ghostty caps an answer at 32 MiB of data (about 43 MiB of base64), under the 48 MiB answer queue, so the drop cannot be triggered through the public API (a probe with two 25 MiB representations produced one complete, well-formed answer from Ghostty itself). The existing answer test passes against the new artifacts. Commit "P-01 rework".
+- C-R5: prose corrected to the code (repeats drop silently; the Copy toast covers any newer write and other failures), and the R076 ledger line added to section 4.
+
 ## 2. Findings left open
 
 None. `pty/session.rs` and `clipboard_write.rs` needed no edits.
@@ -27,28 +36,29 @@ Consequence of P-01 to know: a Kitty clipboard answer that exceeds the raised an
 
 ## 3. AGENTS.md edits
 
-- Section "Terminal migration status", anchor "Terminal replies have a PTY budget of their own, apart from what the user types". Append: "Input has its own budget of 256 KiB: one paste may exceed it, up to 8 MiB, while nothing beyond the budget is queued. Input past the budget, a reserved input slot beyond 256 waiting or idle for 60 s, and held-key repeats past 32 waiting are dropped with a notice (a refused reply silently), never by stopping the writer. Only a failed `pty_write` stops the writer, until the shell is restarted."
+- Section "Terminal migration status", anchor "Terminal replies have a PTY budget of their own, apart from what the user types". Append: "Input has its own budget of 256 KiB: one paste may exceed it, up to 8 MiB, while nothing beyond the budget is queued. Input past the budget, a reserved input slot beyond 256 waiting, and a slot idle for 60 s are dropped with a notice; held-key repeats past 32 waiting and refused replies are dropped silently. None of them stops the writer. A slot that waits for the user (paste confirmation) has no deadline. Only a failed `pty_write` stops the writer, until the shell is restarted."
 - Same section, wherever reply overflow is described as ending the pane: "A reply that does not fit the core's 256 KiB reply queue is dropped whole and logged once; the pane keeps running."
 - Same section, after "Caps Lock and Num Lock are reported with every key": "Only keys that type something count as user input for app-driven input ownership; a bare modifier press does not cancel queued app input."
-- Section "Frontend", module `agents/`, anchor "Delivery differs because only Claude's hook protocol can return terminal bytes". Append: "`send_to_agent` types the instruction, waits 90 ms, then sends Enter, and reports an error when the terminal changed in between or no agent session is armed for the terminal."
-- Same Terminal section, anchor "Explicit Copy buttons share ordering". Append: "The terminal's own Copy tells the user when a program's write took the slot first."
+- Section "Frontend", module `agents/`, anchor "Delivery differs because only Claude's hook protocol can return terminal bytes". Append: "`send_to_agent` asks the PTY whether a program owns the foreground before typing and again before Enter (the agent record is not consulted, as it goes stale without shell integration), types the instruction, waits 90 ms, sends Enter and reports success only once the PTY took it; otherwise it returns an error saying the line was typed but not submitted."
+- Same Terminal section, anchor "Explicit Copy buttons share ordering". Append: "The terminal's own Copy toasts when a newer write (a program's, or the user's next copy) replaced it, and on any other failure."
 - Section "PTY shell integration", anchor "Shells advertise `TERM=xterm-256color`". Append: "A non-UTF-8 `LC_ALL` is left as the user set it; `LC_CTYPE` or `LANG` get a UTF-8 locale when they are the effective setting."
 - Anchor "The adapted Ghostty revision is pinned in `packages/ghostty-core/adapted/UPSTREAM.md`": no change to AGENTS.md; the artifact sizes and SHA-256 values in that file are updated.
 
 ## 4. docs/architecture edits
 
 - `docs/architecture/pty-transport-v2.md`, wherever the writer or reply overflow is described as a persistent error: replace with the first bullet of section 3.
-- `docs/architecture/ghostty-resource-efficiency.md`, artifact size mentions if present: SIMD 1,074,998 to 1,074,803 bytes, scalar 1,015,961 to 1,015,766 bytes.
+- `docs/architecture/ghostty-resource-efficiency.md`, artifact size mentions if present: SIMD 1,074,998 to 1,075,756 bytes, scalar 1,015,961 to 1,016,721 bytes.
+- `REVIEW_LEDGER.md` (the merger records this; this batch does not edit it): R076's closure text ("persistent visible error on queue overflow") no longer describes the behavior. Only a failed `pty_write` is persistent; overflow is a transient notice.
 
 ## 5. Checks run
 
-Zig 0.16.0 (official aarch64-macos tarball, run from the session scratchpad; nothing installed in the repository). An unmodified-source build first reproduced the previous SIMD SHA-256 `2c8ce7de75f8c03037ba878b784520d19f941cb10f8f2a900e269e5fa9e8d5e0` exactly. The patched source was then built with `zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseFast` (SIMD) and the same with `-Dwasm-simd=false` (scalar). New SIMD `fa72b189db516cea69e55dfc71f492a7e81940a4d56c582c09d0a2660e871c20` (1074803 bytes); new scalar `b427483b6c7630aaf312845a42969226d48f64409eaf713a83fd1ef0095a8836` (1015766 bytes). `FORK.md` describes only the legacy fork artifact and is unchanged; `UPSTREAM.md` and `OarlockGhostty.ts` carry the sizes and hashes. The build's `zig-pkg`, `zig-out` and `.zig-cache` directories were deleted afterwards (an untracked `zig-pkg` fails `source-encoding.test.ts`).
+Zig 0.16.0 (official aarch64-macos tarball, run from the session scratchpad; nothing installed in the repository). An unmodified-source build first reproduced the previous SIMD SHA-256 `2c8ce7de75f8c03037ba878b784520d19f941cb10f8f2a900e269e5fa9e8d5e0` exactly. The patched source was then built with `zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseFast` (SIMD) and the same with `-Dwasm-simd=false` (scalar). Final artifacts (after the P-01 rework): SIMD `6960a7749b74fb7511ae222ff77c409a03a50daa730c6c73ea86cd2e15f1e40b` (1075756 bytes); scalar `088ea2fea11c0753c4f30653446aa0676f24b8de2c0cbe6ddc6f4b5c4a3d7637` (1016721 bytes). `FORK.md` describes only the legacy fork artifact and is unchanged; `UPSTREAM.md` and `OarlockGhostty.ts` carry the sizes and hashes. The build's `zig-pkg`, `zig-out` and `.zig-cache` directories were deleted afterwards (an untracked `zig-pkg` fails `source-encoding.test.ts`).
 
-- `bun run lint`: `Checked 1406 files in 395ms. No fixes applied.` and `Found 80 warnings.` (same count as before the batch)
+- `bun run lint`: `Checked 1406 files in 621ms. No fixes applied.` and `Found 80 warnings.` (same count as before the batch)
 - `bun run check-types`: `$ tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json` (no errors)
-- `bun run test`: `Test Files  643 passed (643)` and `Tests  6143 passed | 2 skipped (6145)` (includes `dist-budget.test.ts` and `source-encoding.test.ts`)
+- `bun run test`: `Test Files  643 passed (643)` and `Tests  6148 passed | 2 skipped (6150)` (rerun after the rework round) (includes `dist-budget.test.ts` and `source-encoding.test.ts`)
 - `bun run soak:ghostty`: `Tests  4 passed (4)`
-- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 34.66s`, no warnings
+- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 0.82s` (rerun after the rework), no warnings
 - `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed; the machine's real HOME did not trip the Git guard suites): `test result: ok. 1591 passed; 0 failed; 4 ignored` for the library and `ok` for every integration binary, `ghostty_artifacts` included (2 passed).
-- `bun run size` fails on the base commit too; deltas measured against fe147a5 in a scratch worktree: total client JS 14.51 kB over its limit (base 13.84 kB, +0.67 kB); primary terminal JS 98.52 kB gzip (base 97.99 kB, +0.53 kB; limit 95.79 kB); startup 256.22 kB (base 256.69 kB, -0.47 kB); WebGL fallback 16.57 kB (unchanged); WASM variants 655.58 kB (base 655.72 kB, -0.14 kB). The merger should raise the terminal and total allowances by about 0.6 kB each or accept the overshoot already present on the base.
+- `bun run size` fails on the base commit too; after the rework, against fe147a5 (total 13.84 kB over, terminal 97.99 kB, startup 256.69 kB, WebGL 16.57 kB, WASM 655.72 kB): total client JS 14.67 kB over its limit (+0.83 kB); primary terminal JS 98.66 kB gzip (+0.67 kB; limit 95.79 kB); startup 256.69 kB (unchanged); WebGL fallback 16.56 kB; WASM variants 656.13 kB gzip (+0.41 kB). The merger should raise the terminal and total allowances by about 0.7 kB and 0.9 kB, or accept the overshoot already present on the base.
 - Em-dash gate: no U+2014 in this batch's diff (checked below the commit).
