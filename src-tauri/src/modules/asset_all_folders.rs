@@ -7,9 +7,10 @@
 //! A request is served when the asset protocol would serve the file, or, while the app may
 //! access all folders, when no name on the file's real path starts with a dot: the same rule
 //! the asset scope's `requireLiteralLeadingDot` applies below a granted root, so `~/.ssh` and
-//! `.env` stay out. A link is judged by where it leads. Like the asset protocol, any frame can
-//! request it; a request carrying a foreign `Origin` (a page in the preview reading it with
-//! `fetch`) is refused, and responses only name the app's own origin.
+//! `.env` stay out. A link is judged by where it leads. A request carrying a foreign `Origin` (a page in the preview reading it with
+//! `fetch`) is refused, and responses only name the app's own origin. Navigations and image
+//! loads carry no `Origin`, so the URL also names the page generation native delivered to the
+//! app's page (`t=`), which a frame it embeds cannot read.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -21,6 +22,7 @@ use tauri::http::{self, header, HeaderValue, Method, StatusCode};
 use tauri::utils::mime_type::MimeType;
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
+use super::net::page::NetworkPages;
 use super::pty::AllowedOrigins;
 use super::workspace::{Origin, WorkspaceRegistry};
 
@@ -55,6 +57,7 @@ pub fn protocol<R: Runtime>(
     responder: UriSchemeResponder,
 ) {
     let app = ctx.app_handle().clone();
+    let label = ctx.webview_label().to_string();
     let Ok(admitted) = preview_admission().clone().try_acquire_owned() else {
         responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
         return;
@@ -80,6 +83,13 @@ pub fn protocol<R: Runtime>(
             responder.respond(status_only(StatusCode::FORBIDDEN, None));
             return;
         };
+        let belongs = app
+            .try_state::<NetworkPages>()
+            .is_some_and(|pages| page_admits(&pages, &label, request.uri().query()));
+        if !belongs {
+            responder.respond(status_only(StatusCode::FORBIDDEN, Some(&origin)));
+            return;
+        }
         let scope = app.asset_protocol_scope();
         let served = |real: &Path| {
             serves(
@@ -110,6 +120,21 @@ fn scope_allows_opened(scope: &tauri::scope::fs::Scope, path: &Path) -> bool {
             .allowed_patterns()
             .iter()
             .any(|pattern| pattern.matches_path_with(path, options))
+}
+
+/// The `t` of a query: the page generation the app's own page put in the URL.
+fn page_token(query: Option<&str>) -> Option<&str> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("t="))
+        .filter(|token| !token.is_empty())
+}
+
+/// Whether the request comes from the current page of `label`. A frame the app embeds sends no
+/// `Origin` on a navigation or an image load, and cannot read the token off the app's page, so
+/// the token is what keeps a previewed site from asking for files by itself.
+fn page_admits(pages: &NetworkPages, label: &str, query: Option<&str>) -> bool {
+    page_token(query).is_some_and(|token| pages.with_page(label, token, || Ok(())).is_ok())
 }
 
 /// The app's setting, read for each request: the AI tools' setting never widens previews.

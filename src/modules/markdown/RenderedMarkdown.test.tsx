@@ -11,6 +11,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(() => new Promise(() => {})),
 }));
 
+vi.stubGlobal(
+  "window",
+  Object.assign(new EventTarget(), { __OARLOCK_NETWORK_PAGE__: "page-token" }),
+);
+
 const { RenderedMarkdown } = await import("./RenderedMarkdown");
 const { imageHeightStyle } = await import("./MarkdownImage");
 

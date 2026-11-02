@@ -7,6 +7,10 @@ vi.mock("@tauri-apps/api/core", () => ({
     `${protocol}://localhost/${encodeURIComponent(path)}`,
   invoke: vi.fn(() => new Promise(() => {})),
 }));
+vi.stubGlobal(
+  "window",
+  Object.assign(new EventTarget(), { __OARLOCK_NETWORK_PAGE__: "page-token" }),
+);
 vi.mock("@/modules/settings/store", () => ({ setLastWslDistro: vi.fn() }));
 
 const { dirOf, joinPath } = await import("./localImages");
@@ -14,7 +18,7 @@ const { previewRehypePlugins } = await import("./previewPipeline");
 const { MarkdownImage } = await import("./MarkdownImage");
 
 const asset = (path: string) =>
-  `src="oarlock-asset://localhost/${encodeURIComponent(path)}?access=0"`;
+  `src="oarlock-asset://localhost/${encodeURIComponent(path)}?access=0&amp;t=page-token"`;
 
 function render(markdown: string, file = "/repo/docs/README.md") {
   return renderToStaticMarkup(

@@ -440,3 +440,21 @@ fn a_scoped_path_is_still_judged_again_on_the_opened_handle() {
     );
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+#[test]
+fn only_the_current_page_of_the_window_may_ask() {
+    let pages = NetworkPages::default();
+    assert!(!page_admits(&pages, "main", Some("access=1&t=abc")), "no page");
+    pages.begin("main", || {}).unwrap();
+    assert!(!page_admits(&pages, "main", Some("t=abc")), "not delivered yet");
+    let token = pages.finish("main").unwrap();
+    assert!(page_admits(&pages, "main", Some(&format!("access=1&t={token}"))));
+    assert!(page_admits(&pages, "main", Some(&format!("t={token}&access=0"))));
+    assert!(!page_admits(&pages, "main", None), "a frame with no token");
+    assert!(!page_admits(&pages, "main", Some("access=1")));
+    assert!(!page_admits(&pages, "main", Some("t=")));
+    assert!(!page_admits(&pages, "main", Some("t=guess")));
+    assert!(!page_admits(&pages, "w-2", Some(&format!("t={token}"))), "another window");
+    pages.begin("main", || {}).unwrap();
+    assert!(!page_admits(&pages, "main", Some(&format!("t={token}"))), "reloaded");
+}
