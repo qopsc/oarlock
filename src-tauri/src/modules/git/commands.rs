@@ -441,7 +441,11 @@ mod tests {
             (commands, "crate::modules::fs::native_store::refuse_write(&owner, &root)?;\n        operations::checkout_branch("),
             (discard, "let guard = super::utils::store_guard(&dirs);\n                work.execute(&app.state::<WorkspaceRegistry>(), &guard)"),
         ] {
-            assert!(source.contains(call), "missing the native-store guard: {call}");
+            let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                squash(source).contains(&squash(call)),
+                "missing the native-store guard: {call}"
+            );
         }
     }
 }

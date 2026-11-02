@@ -118,7 +118,6 @@ export type EditorPaneHandle = {
   /** Synchronous buffer state; tab decorations may still be awaiting a render. */
   hasUnsavedChanges: () => boolean;
   closeRevision: () => string;
-  prepareDiscard: () => import("./lib/documentSession").DiscardPreparation;
   detach: () => void;
   retarget: (from: string, to: string) => boolean;
   bindingSnapshot: () => { path: string; version?: string; epoch: number; session: number } | null;
@@ -208,7 +207,6 @@ export const EditorPane = memo(
       isSaved,
       hasUnsavedChanges,
       closeRevision,
-      prepareDiscard,
       reload,
       text,
       formatAndSave,
@@ -784,7 +782,6 @@ export const EditorPane = memo(
         save: () => performSaveRef.current(),
         hasUnsavedChanges,
         closeRevision,
-        prepareDiscard,
         detach,
         retarget,
         bindingSnapshot,
@@ -807,7 +804,6 @@ export const EditorPane = memo(
         searchCounts,
         hasUnsavedChanges,
         closeRevision,
-        prepareDiscard,
         detach,
         retarget,
         bindingSnapshot,

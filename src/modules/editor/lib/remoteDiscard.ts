@@ -20,10 +20,6 @@ export function createRemoteDiscards(
     invoke<boolean[]>("git_discard_match", { roots, paths, workspace }),
 ): Omit<DiscardChannel, "currentSequence"> {
   const rounds = new Map<number, Round>();
-  const drop = (id: number, round: Round) => {
-    if (rounds.get(id) === round) rounds.delete(id);
-    round.dispose();
-  };
   return {
     begin(event: DiscardBegin) {
       if (event.origin === ownLabel || rounds.has(event.id)) return;
@@ -32,8 +28,9 @@ export function createRemoteDiscards(
       void round
         .ready((paths) => match(event.roots, paths, event.workspace))
         .catch((error: unknown) => {
+          // Git may still be running: keep the round, so every staged document
+          // stays protected and is retained at `discard-end`.
           console.warn("Discard identity lookup failed; drafts are kept", error);
-          drop(event.id, round);
         });
     },
     end(event: DiscardEnd) {
@@ -44,7 +41,8 @@ export function createRemoteDiscards(
       else round.dispose();
     },
     reset() {
-      for (const [id, round] of [...rounds]) drop(id, round);
+      for (const round of rounds.values()) round.dispose();
+      rounds.clear();
     },
   };
 }

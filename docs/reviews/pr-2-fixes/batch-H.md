@@ -16,9 +16,11 @@ Fails-without-the-guard proofs run during the work (guard removed, test red, gua
 ancestor match in `recoveryTargetsChanged` (parent-rename test); `awaitMutationSequence` returning
 null (fence test); removing `discard.begin` and the `roots` feed to `recoveryTargetsChanged`
 (remote and recovery tests); dropping the `hasNewEdits` comparison and reading before the flush in
-`QuitApproval.verify` (both quit tests). The Rust bracket, claim and roots-mismatch tests were
-verified by construction (the guard types are what they exercise); `discard_refuses_roots_...`
-fails if `Scope::confirm` is not called.
+`QuitApproval.verify` (both quit tests). The Rust bracket and claim tests were verified by construction.
+`discard_refuses_roots_confirmed_against_another_repository` calls `prepare`, the only way `execute`
+obtains its work (plan plus `Scope::confirm`); it fails when `confirm` is removed from `prepare`
+(checked in rework round 2). `execute` cannot bypass the comparison because it has no other source of
+`Work`.
 
 ## 2. Deviations and limits
 
@@ -72,17 +74,42 @@ New "Review 108" paragraph, superseding these earlier ones:
 - `two-process-model.md`: the Discard command list now reads `git_discard_scope`,
   `git_discard_match`, `git_discard`.
 
-## 5. Checks run
+## 5. Rework after review (round 2)
 
-- `bun run check-types`: `$ tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json` (no errors)
-- `bun run lint`: `Checked 1414 files in 456ms. No fixes applied.` / `Found 80 warnings.`
-- `bun run test` (`vitest run`, whole repo): `Test Files  4 failed | 641 passed (645)` / `Tests  1 failed | 6164 passed | 2 skipped (6167)`. The 4 failures are
-  `src/app/dist-budget.test.ts` (shared Lezer highlighter), `packages/codemirror-vim/scrolling.test.js`,
-  `packages/codemirror-vim/range.test.js` and `src/modules/editor/lib/vim.test.ts` ("No getDrawSelectionConfig export
-  is defined on the @codemirror/view mock"). None of those files or their inputs was touched; the worktree has no
-  `node_modules` of its own (symlinked to the main checkout's), which is the likely cause. They were not run on the
-  base commit.
-- `cargo clippy --all-targets --locked -- -D warnings`: `Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (no warnings)
-- `cargo test --locked -- --test-threads=1` (nextest not installed): library `test result: ok. 1662 passed; 0 failed; 4 ignored`, every integration suite ok, 0 failed.
-- `bun run size` was not run (no new dependency; the client lost the coordinator, seal and recovery code and gained about 150 lines).
+- `discard.rs`: `prepare(registry, root, entries, workspace, roots)` wraps `plan` and `Scope::confirm`;
+  `execute` takes its work only from it. The roots-mismatch test now goes through `prepare`.
+- `remoteDiscard.ts`: a failed identity lookup is logged and the round is kept until `discard-end`,
+  a gap, or listener loss (it used to dispose at once, which unprotected buffers while Git ran).
+  Test: "a rejected identity lookup keeps the round, so Git's later write is not adopted" (red with
+  the old dispose).
+- `commands.rs` source-string guard test collapses whitespace on both sides.
+- `prepareDiscard` removed from the `useDocument` handle and `EditorPane` props; `session.prepareDiscard`
+  stays for `documentSession.test` and `documentFormattingLifetime.test`.
+- `themes.rs`: dropped `a_snapshot_read_does_not_touch_the_disk` (it never called `themes_snapshot`, so
+  proved nothing; the read path is now just `Ok(store.snapshot.clone())`). `settle` still matches the
+  two conflict messages by substring; a typed error was left as an optional follow-up.
 
+## 6. Residuals for the AGENTS.md Discard paragraph
+
+State all of these:
+- A sequence gap that swallowed `discard-begin` itself.
+- An early release on a gap or listener loss while Git is still running (a lost event), after which a
+  buffer equal to the disk can adopt Git's later write.
+- The unfenced period at listener start, including a possibly-ahead `fs_mutation_sequence`:
+  `mutationFenceLive(sequence)` can move the handled sequence past events emitted but not yet delivered.
+- A dropped emit holds reads until the next event of any kind; only reloads are fenced, the initial
+  load is not.
+- Canonical roots do not match another spelling (`/tmp` against `/private/tmp`) in the local recovery
+  tracker.
+
+## 7. Checks run (after round 2, real `bun install --frozen-lockfile`)
+
+- `bun run check-types`: `$ tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json`, no errors.
+- `bun run lint`: `Checked 1414 files in 604ms. No fixes applied.` / `Found 80 warnings.`
+- `bun run vitest run` (whole repo): `Test Files  645 passed (645)` / `Tests  6183 passed | 2 skipped (6185)`.
+  The four failures reported in round 1 were the symlinked `node_modules`; they are gone with a real install.
+- `cargo clippy --all-targets --locked -- -D warnings`: no warnings.
+- `cargo test --locked -- --test-threads=1` (nextest not installed): library `test result: ok. 1661 passed; 0 failed; 4 ignored`; every integration suite ok, 0 failed.
+- `check:dist` and `bun run size` were not run by me; the reviewer measured total client JS 2,898,367 bytes against the
+  base 2,900,924 (-2,557), terminal 98.65 kB unchanged, startup 257.93 kB (-0.25 kB). The base is already over both
+  budgets on this machine; the allowances are settled at the final merge.

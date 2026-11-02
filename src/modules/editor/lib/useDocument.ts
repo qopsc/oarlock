@@ -167,7 +167,6 @@ export function useDocument({ path, onDirtyChange, onBindingChange }: Options) {
     closeRevision: session.closeRevision,
     formatAndSave: session.formatAndSave,
     reload: session.reload,
-    prepareDiscard: session.prepareDiscard,
     text: session.text,
     adoptDiskText: session.adoptDiskText,
     openAnyway: session.openAnyway,

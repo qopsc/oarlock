@@ -169,6 +169,19 @@ pub async fn git_discard_match(
     })
     .await
 }
+/// The only way `execute` gets its work: the repository must still resolve to the
+/// roots the user confirmed, so a retargeted alias cannot move Git elsewhere.
+fn prepare(
+    registry: &WorkspaceRegistry,
+    root: String,
+    entries: Vec<DiscardEntry>,
+    workspace: WorkspaceEnv,
+    roots: &[String],
+) -> Result<(Scope, Work), String> {
+    let (scope, work) = plan(registry, root, entries, workspace)?;
+    scope.confirm(roots)?;
+    Ok((scope, work))
+}
 /// Runs Git for entries confirmed against `roots`; a repository that no longer
 /// resolves to those roots is refused before anything is announced or run.
 pub async fn execute(
@@ -180,13 +193,13 @@ pub async fn execute(
     roots: Vec<String>,
 ) -> Result<(), String> {
     crate::modules::fs::blocking(move || {
-        let (scope, work) = plan(
+        let (scope, work) = prepare(
             &app.state::<WorkspaceRegistry>(),
             repo_root.clone(),
             entries,
             workspace.clone(),
+            &roots,
         )?;
-        scope.confirm(&roots)?;
         let claims: Vec<PathBuf> = scope.paths.iter().map(PathBuf::from).collect();
         let discarding = mutation_events::Discarding {
             origin,
@@ -373,21 +386,28 @@ mod identity_tests {
                 untracked: false,
             }]
         };
-        let plan_alias = || {
-            plan(
+        let confirmed = plan(
+            &registry,
+            alias.to_string_lossy().into_owned(),
+            entries(),
+            WorkspaceEnv::Local,
+        )
+        .unwrap()
+        .0
+        .paths;
+        let prepared = || {
+            prepare(
                 &registry,
                 alias.to_string_lossy().into_owned(),
                 entries(),
                 WorkspaceEnv::Local,
+                &confirmed,
             )
-            .unwrap()
-            .0
         };
-        let confirmed = plan_alias().paths;
-        assert!(plan_alias().confirm(&confirmed).is_ok());
+        assert!(prepared().is_ok());
         fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&b, &alias).unwrap();
-        assert!(plan_alias().confirm(&confirmed).is_err());
+        assert!(prepared().is_err());
     }
     #[cfg(unix)]
     #[test]

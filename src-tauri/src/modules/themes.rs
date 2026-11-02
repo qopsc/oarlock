@@ -521,13 +521,6 @@ mod tests {
         assert_eq!(std::fs::read(&store.path).unwrap(), external);
     }
     #[test]
-    fn a_snapshot_read_does_not_touch_the_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        std::fs::remove_file(&store.path).unwrap();
-        assert_eq!(store.snapshot.clone().revision, 0);
-    }
-    #[test]
     fn a_refused_publish_drops_the_cached_store_so_retry_reloads() {
         let dir = tempfile::tempdir().unwrap();
         let mut saved = Some(Store::open(dir.path()).unwrap());

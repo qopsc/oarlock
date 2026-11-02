@@ -184,7 +184,7 @@ it("this window's own discard is left to its bridge", async () => {
   expect(stage).not.toHaveBeenCalled();
 });
 
-it("a rejected identity lookup disposes the round and keeps the text", async () => {
+it("a rejected identity lookup keeps the round, so Git's later write is not adopted", async () => {
   const b = windowB();
   await flush();
   vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -193,8 +193,14 @@ it("a rejected identity lookup disposes the round and keeps the text", async () 
   });
   b.session.change("T");
   await b.session.save();
-  b.setDisk("HEAD", 6);
   receive(begin(6));
+  await flush();
+  // Git writes after the lookup failed and before discard-end.
+  b.setDisk("HEAD", 6);
+  b.session.reload();
+  await flush();
+  expect(b.session.text()).toBe("T");
+  receive(end(7, 6));
   await flush();
   expect(b.session.text()).toBe("T");
   expect(b.session.hasUnsavedChanges()).toBe(true);
