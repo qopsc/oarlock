@@ -10,7 +10,6 @@ export type McpToolAccess = { trusted: boolean; alwaysAllow: boolean };
 
 /** What one agent run gets from the window's MCP servers. */
 export type McpRunTools = {
-  release?: () => Promise<void>;
   tools: Record<string, Tool>;
   /** Per tool: what its approval gate depends on. Never-allowed tools are absent. */
   access: Record<string, McpToolAccess>;

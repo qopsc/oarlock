@@ -1,12 +1,10 @@
-import { holdMcpRun, type RunLease } from "./mcpRunLeases";
+import { beginRun, claimRun, takePaused, type RunOwner } from "./runOwner";
 import {
   denyUnansweredApprovals,
   EXPIRED_APPROVAL_REASON,
 } from "./toolApprovals";
-import { ownedStream } from "./ownedStream";
-import { beginChatWork } from "./chatWork";
 import { assertWorkspaceAvailable } from "@/modules/workspace/availability";
-import { assertChatCanStart } from "../store/chatStop";
+import { beginRunAdmission } from "../store/chatStop";
 import { currentWorkspaceEnv } from "@/modules/workspace/env";
 import { mcpToolsForRun } from "@/modules/mcp";
 import type { UIMessage } from "@ai-sdk/react";
@@ -92,7 +90,6 @@ type SendOptions = {
 };
 
 export function createContextAwareTransport(deps: Deps) {
-  let pendingApprovalLease: RunLease | undefined;
   let cacheScope = "";
   let readCache = deps.toolContext.readCache;
   let binding:
@@ -107,13 +104,21 @@ export function createContextAwareTransport(deps: Deps) {
     // Keep a waiting approval lease intact when admission is refused.
     deps.assertReady();
     const chatId = deps.toolContext.getSessionId?.();
-    const previousLease = pendingApprovalLease;
-    pendingApprovalLease = undefined;
-    let lease: RunLease | undefined;
+    const previous = takePaused(chatId ?? null);
+    let owner: RunOwner | undefined;
     let mcpPromise: ReturnType<typeof mcpToolsForRun> | undefined;
     let transferred = false;
-    const finishRunWork = beginChatWork(chatId ?? null);
+    const stillWanted = () => {
+      options.abortSignal?.throwIfAborted();
+      owner?.signal.throwIfAborted();
+    };
     try {
+      owner =
+        (chatId ? claimRun(chatId, options.messages) : undefined) ??
+        beginRun(chatId ?? null, {
+          kind: "turn",
+          admit: chatId ? (id) => beginRunAdmission(chatId, id) : undefined,
+        });
       const last = options.messages[options.messages.length - 1];
       if (!binding && last?.role === "assistant") {
         const tail = [last];
@@ -163,30 +168,26 @@ export function createContextAwareTransport(deps: Deps) {
       );
       // A continuation cannot replace the original project's MCP tools with those
       // of a newly selected space. Dispatch still rechecks current permissions.
-      const admission = chatId ? assertChatCanStart(chatId) : Promise.resolve();
+      const admission = owner.ready;
       mcpPromise = mcpToolsForRun({
         root: live.workspaceRoot,
         workspace,
         admission,
-        ownLease: (release) => {
-          lease = holdMcpRun(chatId ?? null, release);
-          return lease.release;
-        },
+        scope: chatId ? { runId: owner.runId, ready: admission } : undefined,
         signal: options.abortSignal,
         onWaiting: () => deps.onStep?.("Starting MCP servers"),
       });
       await admission;
-      options.abortSignal?.throwIfAborted();
+      stillWanted();
       deps.assertReady();
       const [projectMemory, mcp, skills] = await Promise.all([
         readAgentsMd(live.workspaceRoot, maxMemoryBytes(contextLimit), client),
         mcpPromise,
         deps.getSkills?.(live.workspaceRoot, workspace),
       ]);
-      if (mcp?.release) lease ??= holdMcpRun(chatId ?? null, mcp.release);
-      // Acquire the continuation's lease before releasing the approval pause's.
-      await previousLease?.release();
-      options.abortSignal?.throwIfAborted();
+      // Acquire the continuation's record before releasing the approval pause's.
+      await previous?.close("continued");
+      stillWanted();
       deps.assertReady();
       const envBlock = formatEnvBlock(live);
       const messagesForRun = envBlock
@@ -230,54 +231,17 @@ export function createContextAwareTransport(deps: Deps) {
         originalMessages: options.messages,
         onError: formatAiError,
       });
-      if (!mcp?.release || !lease) return stream;
-      const ownedLease = lease;
-      const approvals = new Set<string>();
-      let failed = false;
-      const owned = ownedStream(
-        stream,
-        async (reason) => {
-          try {
-            if (
-              reason === "complete" &&
-              approvals.size &&
-              !failed &&
-              !options.abortSignal?.aborted
-            ) {
-              pendingApprovalLease = ownedLease;
-            } else await ownedLease.release();
-          } finally {
-            finishRunWork();
-          }
-        },
-        options.abortSignal,
-        (chunk) => {
-          if (chunk.type === "tool-approval-request")
-            approvals.add(chunk.toolCallId);
-          else if (
-            chunk.type === "tool-output-available" ||
-            chunk.type === "tool-output-error" ||
-            chunk.type === "tool-output-denied"
-          )
-            approvals.delete(chunk.toolCallId);
-          else if (chunk.type === "error" || chunk.type === "abort")
-            failed = true;
-        },
-      );
       transferred = true;
-      return owned;
+      return owner.wrapStream(stream, { signal: options.abortSignal });
     } finally {
-      try {
-        if (!transferred) {
-          const prepared = await mcpPromise;
-          lease ??= prepared?.release
-            ? holdMcpRun(chatId ?? null, prepared.release)
-            : undefined;
-          await Promise.all([lease?.release(), previousLease?.release()]);
+      if (!transferred) {
+        try {
+          await mcpPromise?.catch(() => {});
+          await Promise.all([owner?.close("error"), previous?.close("continued")]);
+        } finally {
+          owner?.setupDone();
         }
-      } finally {
-        if (!transferred) finishRunWork();
-      }
+      } else owner?.setupDone();
     }
   };
 

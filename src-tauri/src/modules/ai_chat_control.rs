@@ -363,10 +363,16 @@ mod tests {
     fn ai_run_begin_is_refused_while_the_chat_is_stopping() {
         let mut state = Control::default();
         let ran = RefCell::new(0);
-        state.admit_in("w", "chat", || Ok(*ran.borrow_mut() += 1)).unwrap();
+        state.admit_in("w", "chat", || {
+            *ran.borrow_mut() += 1;
+            Ok(())
+        }).unwrap();
         assert_eq!(*ran.borrow(), 1);
         state.begin("chat").unwrap();
-        assert!(state.admit_in("w", "chat", || Ok(*ran.borrow_mut() += 1)).is_err());
+        assert!(state.admit_in("w", "chat", || {
+            *ran.borrow_mut() += 1;
+            Ok(())
+        }).is_err());
         assert_eq!(*ran.borrow(), 1);
         assert!(state.admit_in("w", "other", || Ok(())).is_ok());
     }

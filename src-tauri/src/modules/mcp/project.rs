@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use reqwest::Url;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager, Webview, WebviewWindow};
+use tauri::{AppHandle, Manager, Webview};
 
 use super::import::{self, RawEntry, RawTransport};
 use crate::modules::project_trust::{
@@ -631,67 +631,6 @@ pub(super) fn resolve_run_project(
 }
 pub(super) fn run_listings(app: &AppHandle, window: &str) -> Vec<ProjectServers> {
     window_listings(app, window)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunProject {
-    lease: Option<u64>,
-    project_key: Option<String>,
-    projects: Vec<ProjectServers>,
-}
-#[tauri::command]
-pub async fn mcp_run_open(
-    app: AppHandle,
-    window: WebviewWindow,
-    root: Option<String>,
-    workspace: Option<crate::modules::workspace::WorkspaceEnv>,
-) -> Result<RunProject, String> {
-    super::require_app_window(&window)?;
-    let label = window.label().to_owned();
-    let owner = app
-        .state::<super::McpState>()
-        .leases
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .owner(&label);
-    crate::modules::fs::blocking(move || {
-        let project = root
-            .map(|root| project_trust::resolve_project(&root, workspace))
-            .transpose()?;
-        let mut lease = None;
-        let key = project.as_ref().map(|p| p.key.clone());
-        if let Some(project) = project {
-            app.state::<crate::modules::workspace::WorkspaceRegistry>()
-                .authorized_existing(&project.real)
-                .map_err(|e| e.to_string())?;
-            // No server => no retained project or worker. Trust is rechecked on every message.
-            if listing(&app, &project).is_some_and(|p| !p.servers.is_empty()) {
-                lease = Some(
-                    app.state::<super::McpState>()
-                        .leases
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(&label, &owner, project)?,
-                );
-            }
-        }
-        Ok(RunProject {
-            lease,
-            project_key: key,
-            projects: window_listings(&app, &label),
-        })
-    })
-    .await
-}
-#[tauri::command]
-pub fn mcp_run_release(app: AppHandle, window: WebviewWindow, lease: u64) {
-    app.state::<super::McpState>()
-        .leases
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(window.label(), lease);
-    let _ = app.emit_to(window.label(), "mcp:run-leases-changed", ());
 }
 
 // ---- Starting one ----

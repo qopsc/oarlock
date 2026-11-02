@@ -72,6 +72,7 @@ vi.mock("../store/chatStore", () => ({
 }));
 vi.mock("../store/chatStop", () => ({
   assertChatCanStart: fake.admission,
+  beginRunAdmission: fake.admission,
   useChatStop: Object.assign(
     (select: (s: { states: object }) => unknown) => select({ states: {} }),
     { getState: () => ({ states: {} }) },
@@ -288,7 +289,7 @@ it("registers for shared Stop before beginning async preparation", async () => {
   render().setValue("/slow");
   render().submit();
   await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(fake.admission).toHaveBeenCalledWith("chat");
+  expect(fake.admission).toHaveBeenCalledWith("chat", expect.any(String));
   expect(fake.skill).not.toHaveBeenCalled();
   const { cancelComposerWork } = await import("./composerWork");
   cancelComposerWork("chat");

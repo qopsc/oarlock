@@ -2,17 +2,18 @@ import { preferencesReady } from "@/modules/settings/readiness";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { invoke } from "@tauri-apps/api/core";
 import { createComposerImports, type ComposerImport } from "./composerImports";
-import {
-  beginComposerWork,
-  cancelComposerWork,
-  type ComposerWork,
-} from "./composerWork";
+import { cancelComposerWork } from "./composerWork";
+import { beginRun } from "./runOwner";
 import { useSpaces } from "@/modules/spaces/lib/useSpaces";
 import {
   useWorkspaceEnvStore,
   workspaceScopeKey,
 } from "@/modules/workspace/env";
-import { assertChatCanStart, useChatStop } from "../store/chatStop";
+import {
+  assertChatCanStart,
+  beginRunAdmission,
+  useChatStop,
+} from "../store/chatStop";
 import {
   createContext,
   useContext,
@@ -116,7 +117,15 @@ export function useComposer(): ComposerCtx {
   return ctx;
 }
 
-type Submission = ComposerWork & { admission: Promise<void> };
+type Submission = {
+  signal: AbortSignal;
+  admission: Promise<void>;
+  cancel: () => void;
+  /** Ends a submission that never reached the chat; a running turn is untouched. */
+  finish: () => void;
+  accept: (userMessageId?: string) => void;
+  onFinish: (cleanup: () => void) => void;
+};
 
 type ProviderProps = {
   children: React.ReactNode;
@@ -427,9 +436,18 @@ export function AiComposerProvider({ children }: ProviderProps) {
   const beginSubmission = (): Submission | null => {
     if (!sessionId || useChatStore.getState().activeSessionId !== sessionId)
       return null;
-    const admission = assertChatCanStart(sessionId);
-    void admission.catch(() => {});
-    const work = Object.assign(beginComposerWork(sessionId), { admission });
+    const owner = beginRun(sessionId, {
+      kind: "prepare",
+      admit: (runId) => beginRunAdmission(sessionId, runId),
+    });
+    const work: Submission = {
+      signal: owner.signal,
+      admission: owner.ready,
+      cancel: () => owner.cancel("navigated"),
+      finish: () => owner.abandon(),
+      accept: (id) => owner.accept(id),
+      onFinish: (cleanup) => owner.onPrepared(cleanup),
+    };
     submission.current = work;
     setPreparingSubmission(true);
     const space = useSpaces.getState().activeId;
@@ -694,7 +712,6 @@ export function AiComposerProvider({ children }: ProviderProps) {
       return;
     }
     sending.current = true;
-    let accepted = false;
     const pending = (async () => {
       await work.admission;
       work.signal.throwIfAborted();
@@ -706,9 +723,8 @@ export function AiComposerProvider({ children }: ProviderProps) {
       await sendUserMessage(
         chat,
         { role: "user", parts } as Parameters<typeof chat.sendMessage>[0],
-        () => {
-          accepted = true;
-          work.finish();
+        (userMessageId) => {
+          work.accept(userMessageId);
           // A Stop rejection keeps the entire draft. Edits made while admission
           // was pending belong to the next draft and must not be discarded.
           setValue((current) => (current === value ? "" : current));
@@ -729,7 +745,7 @@ export function AiComposerProvider({ children }: ProviderProps) {
         toast.error("Could not send message", { description: String(error) });
       })
       .finally(() => {
-        if (!accepted) work.finish();
+        work.finish();
       });
     // Re-focus immediately after submit so the user can type a follow-up
     requestAnimationFrame(() => textareaRef.current?.focus());

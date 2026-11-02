@@ -159,7 +159,7 @@ type OutgoingMessage = Parameters<Chat<UIMessage>["sendMessage"]>[0];
 export async function sendUserMessage(
   chat: Chat<UIMessage>,
   message: OutgoingMessage,
-  onAccepted?: () => void,
+  onAccepted?: (userMessageId?: string) => void,
 ): Promise<void> {
   // Keep context capture synchronous with submission. The transport checks the
   // shared native barrier before any work starts, including approval continuations.
@@ -168,7 +168,7 @@ export async function sendUserMessage(
   const settled = denyUnansweredApprovals(chat.messages);
   if (settled !== chat.messages) chat.messages = settled;
   const sent = chat.sendMessage(message);
-  onAccepted?.();
+  onAccepted?.([...chat.messages].reverse().find((m) => m.role === "user")?.id);
   return sent;
 }
 

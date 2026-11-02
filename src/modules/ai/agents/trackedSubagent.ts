@@ -1,5 +1,5 @@
 import { requireCurrentPreferences } from "@/modules/settings/readiness";
-import { beginChatWork } from "../lib/chatWork";
+import { trackWork } from "../lib/runOwner";
 import { toast } from "sonner";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
@@ -35,7 +35,7 @@ type Args = Parameters<typeof runSubagent>[0] & {
   title: string;
 };
 export async function runTrackedSubagent(args: Args) {
-  const ready = beginChatWork(args.sessionId);
+  const ready = trackWork(args.sessionId);
   try {
     return await runTracked(args, ready);
   } finally {

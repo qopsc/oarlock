@@ -66,15 +66,16 @@ describe("chat eviction", () => {
 });
 
 it("keeps an approval's transport until its retained MCP ownership is released", async () => {
-  const { holdMcpRun } = await import("../lib/mcpRunLeases");
+  const { beginRun } = await import("../lib/runOwner");
   chats.clear();
   useChatStore.setState({ activeSessionId: null });
-  const lease = holdMcpRun("approval", async () => {});
+  const lease = beginRun("approval", { kind: "turn" });
+  lease.pause();
   const paused = fakeChat();
   touchChat("approval", paused);
   for (let i = 0; i < 10; i++) touchChat(`others-${i}`, fakeChat());
   expect(chats.get("approval")).toBe(paused);
-  await lease.release();
+  await lease.close("complete");
   touchChat("after-release", fakeChat());
   expect(chats.has("approval")).toBe(false);
 });

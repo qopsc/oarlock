@@ -7,7 +7,13 @@ vi.mock("@/modules/mcp", () => ({ mcpToolsForRun: mcpMock }));
 const platform = vi.hoisted(() => ({ IS_WINDOWS: true }));
 vi.mock("@/lib/platform", () => platform);
 const stopGate = vi.hoisted(() => vi.fn(async () => {}));
-vi.mock("../store/chatStop", () => ({ assertChatCanStart: stopGate }));
+vi.mock("../store/chatStop", () => ({ beginRunAdmission: stopGate }));
+const invokeMock = vi.hoisted(() =>
+  vi.fn<(command: string, args?: unknown) => Promise<unknown>>(
+    async () => undefined,
+  ),
+);
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const agentMock = vi.hoisted(() => ({
@@ -26,8 +32,14 @@ vi.mock("./native", () => ({
 }));
 
 const aiMock = vi.hoisted(() => ({
-  toUIMessageStream: vi.fn<() => string | ReadableStream<unknown>>(
-    () => "stream-ok",
+  toUIMessageStream: vi.fn<() => ReadableStream<unknown>>(
+    () =>
+      new ReadableStream<unknown>({
+        start(controller) {
+          controller.enqueue("stream-ok");
+          controller.close();
+        },
+      }),
   ),
 }));
 
@@ -41,6 +53,14 @@ import type { UIMessage } from "@ai-sdk/react";
 
 const run = { stream: { kind: "stream" }, tools: { kind: "tools" } };
 agentMock.runAgentStream.mockImplementation(() => run);
+
+async function readAll(stream: ReadableStream<unknown>) {
+  const chunks: unknown[] = [];
+  const reader = stream.getReader();
+  for (let next = await reader.read(); !next.done; next = await reader.read())
+    chunks.push(next.value);
+  return chunks;
+}
 
 function userMessage(text: string): UIMessage {
   return { id: "u1", role: "user", parts: [{ type: "text", text }] };
@@ -120,9 +140,9 @@ describe("context-aware AI transport", () => {
       makeDeps({ workspaceRoot: "/repo", cwd: "/repo" }),
     );
 
-    expect(await transport.sendMessages({ messages: original })).toBe(
-      "stream-ok",
-    );
+    expect(
+      await readAll(await transport.sendMessages({ messages: original })),
+    ).toEqual(["stream-ok"]);
     expect(aiMock.toUIMessageStream).toHaveBeenCalledWith(
       expect.objectContaining({
         stream: run.stream,
@@ -292,9 +312,11 @@ describe("context-aware AI transport", () => {
     const transport = createContextAwareTransport(
       makeDeps({ workspaceRoot: "/repo-fail", cwd: null }),
     );
-    expect(await transport.sendMessages({ messages: [userMessage("a")] })).toBe(
-      "stream-ok",
-    );
+    expect(
+      await readAll(
+        await transport.sendMessages({ messages: [userMessage("a")] }),
+      ),
+    ).toEqual(["stream-ok"]);
     expect(lastCall().projectMemory).toBeNull();
   });
 
@@ -451,97 +473,106 @@ it("does not start the model after Stop during project preparation", async () =>
   expect(agentMock.runAgentStream).not.toHaveBeenCalled();
 });
 
-it("retains MCP ownership until the model stream finishes", async () => {
+const noTools = { tools: {}, access: {}, instructions: [] };
+const ended = () =>
+  invokeMock.mock.calls
+    .filter(([command]) => command === "ai_run_end")
+    .map(([, args]) => (args as { runId: string }).runId);
+function sessionDeps(
+  id: string,
+  live: Record<string, unknown> = {
+    workspaceRoot: "/original",
+    cwd: "/original",
+  },
+) {
+  const deps = makeDeps(live);
+  deps.toolContext = {
+    getTerminalContext: () => null,
+    getSessionId: () => id,
+  } as never;
+  return deps;
+}
+
+it("retains the run record until the model stream finishes", async () => {
   const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
   useWorkspaceEnvStore.setState({ env: { kind: "local" } });
-  const release = vi.fn(async () => {});
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
-  const source = new ReadableStream({
-    start(c) {
-      c.enqueue("answer");
-      c.close();
-    },
-  });
-  aiMock.toUIMessageStream.mockReturnValueOnce(source);
+  invokeMock.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
+  aiMock.toUIMessageStream.mockReturnValueOnce(
+    new ReadableStream({
+      start(c) {
+        c.enqueue("answer");
+        c.close();
+      },
+    }),
+  );
   const transport = createContextAwareTransport(
-    makeDeps({ workspaceRoot: "/original", cwd: "/original" }),
+    sessionDeps("retain-turn", {
+      workspaceRoot: "/original",
+      cwd: "/original",
+    }),
   );
   const stream = await transport.sendMessages({
     messages: [userMessage("hello")],
   });
-  expect(release).not.toHaveBeenCalled();
+  expect(ended()).toEqual([]);
   const reader = stream.getReader();
   expect((await reader.read()).value).toBe("answer");
   expect((await reader.read()).done).toBe(true);
-  expect(release).toHaveBeenCalledOnce();
+  expect(ended()).toHaveLength(1);
   expect(mcpMock).toHaveBeenLastCalledWith(
     expect.objectContaining({
       root: "/original",
       workspace: { kind: "local" },
+      scope: expect.objectContaining({ runId: ended()[0] }),
     }),
   );
 });
-it("releases MCP ownership if model preparation throws", async () => {
-  const release = vi.fn(async () => {});
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
+it("releases the run record if model preparation throws", async () => {
+  invokeMock.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
   agentMock.runAgentStream.mockRejectedValueOnce(
     new Error("model unavailable"),
   );
-  const transport = createContextAwareTransport(
-    makeDeps({ workspaceRoot: "/original", cwd: "/original" }),
-  );
   await expect(
-    transport.sendMessages({ messages: [userMessage("hello")] }),
+    createContextAwareTransport(sessionDeps("prep-throws")).sendMessages({
+      messages: [userMessage("hello")],
+    }),
   ).rejects.toThrow("model unavailable");
-  expect(release).toHaveBeenCalledOnce();
+  expect(ended()).toHaveLength(1);
 });
 
-it("keeps Stop blocked until a stalled stream's MCP release finishes", async () => {
-  const { drainChatWork } = await import("./chatWork");
+it("keeps Stop blocked until a stalled stream's record release finishes", async () => {
+  const { closeChatRuns } = await import("./runOwner");
+  invokeMock.mockClear();
   let finish!: () => void;
-  const release = vi.fn(
-    () =>
-      new Promise<void>((resolve) => {
-        finish = resolve;
-      }),
+  invokeMock.mockImplementation((command) =>
+    command === "ai_run_end"
+      ? new Promise<void>((resolve) => {
+          finish = resolve;
+        })
+      : Promise.resolve(undefined),
   );
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
+  mcpMock.mockResolvedValueOnce(noTools);
   aiMock.toUIMessageStream.mockReturnValueOnce(new ReadableStream());
-  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
-  deps.toolContext = {
-    getTerminalContext: () => null,
-    getSessionId: () => "mcp-release-stop",
-  } as never;
   const controller = new AbortController();
-  const stream = await createContextAwareTransport(deps).sendMessages({
+  const stream = await createContextAwareTransport(
+    sessionDeps("mcp-release-stop"),
+  ).sendMessages({
     messages: [userMessage("hello")],
     abortSignal: controller.signal,
   });
   controller.abort();
   let drained = false;
-  const pending = drainChatWork("mcp-release-stop").then(() => {
+  const pending = closeChatRuns("mcp-release-stop", "stop").then(() => {
     drained = true;
   });
-  await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(ended()).toHaveLength(1));
   expect(drained).toBe(false);
   finish();
   await pending;
   expect(drained).toBe(true);
+  invokeMock.mockImplementation(async () => undefined);
   await stream.cancel();
 });
 
@@ -564,34 +595,28 @@ function approvalStream(failed = false) {
     },
   });
 }
-it("keeps a paused approval's MCP server until its continuation has acquired ownership", async () => {
-  const { hasMcpRunLeases } = await import("./mcpRunLeases");
-  const first = vi.fn(async () => {}),
-    second = vi.fn(async () => {});
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release: first,
-  });
+it("keeps a paused approval's record until its continuation has acquired its own", async () => {
+  const { chatHasRuns } = await import("./runOwner");
+  invokeMock.mockClear();
+  stopGate.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
   aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
   const live = { workspaceRoot: "/original", cwd: "/original" };
-  const deps = makeDeps(live);
-  deps.toolContext = {
-    getTerminalContext: () => null,
-    getSessionId: () => "approval-turn",
-  } as never;
-  const transport = createContextAwareTransport(deps);
+  const transport = createContextAwareTransport(
+    sessionDeps("approval-turn", live),
+  );
   await drain(
     await transport.sendMessages({ messages: [userMessage("hello")] }),
   );
-  expect(first).not.toHaveBeenCalled();
-  expect(hasMcpRunLeases("approval-turn")).toBe(true);
+  expect(ended()).toEqual([]);
+  expect(chatHasRuns("approval-turn")).toBe(true);
+  const firstRun = stopGate.mock.calls[0] as unknown as [string, string];
   live.workspaceRoot = "/other";
   live.cwd = "/other";
   mcpMock.mockImplementationOnce(async () => {
-    expect(first).not.toHaveBeenCalled();
-    return { tools: {}, access: {}, instructions: [], release: second };
+    expect(stopGate).toHaveBeenCalledTimes(2);
+    expect(ended()).toEqual([]);
+    return noTools;
   });
   aiMock.toUIMessageStream.mockReturnValueOnce(
     new ReadableStream({
@@ -606,71 +631,45 @@ it("keeps a paused approval's MCP server until its continuation has acquired own
   expect(mcpMock).toHaveBeenLastCalledWith(
     expect.objectContaining({ root: "/original" }),
   );
-  expect(first).toHaveBeenCalledOnce();
-  expect(second).toHaveBeenCalledOnce();
-  expect(hasMcpRunLeases("approval-turn")).toBe(false);
+  const secondRun = stopGate.mock.calls[1] as unknown as [string, string];
+  expect(ended()).toEqual([firstRun[1], secondRun[1]]);
+  expect(chatHasRuns("approval-turn")).toBe(false);
 });
 it("releases pending approvals on Stop even when their SDK stream already finished", async () => {
-  const { releaseChatMcpRuns, hasMcpRunLeases } = await import(
-    "./mcpRunLeases"
-  );
-  const { drainChatWork } = await import("./chatWork");
-  const release = vi.fn(async () => {});
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
+  const { closeChatRuns, chatHasRuns } = await import("./runOwner");
+  invokeMock.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
   aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
-  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
-  deps.toolContext = {
-    getTerminalContext: () => null,
-    getSessionId: () => "paused-stop",
-  } as never;
   await drain(
-    await createContextAwareTransport(deps).sendMessages({
+    await createContextAwareTransport(sessionDeps("paused-stop")).sendMessages({
       messages: [userMessage("hello")],
     }),
   );
-  await drainChatWork("paused-stop");
-  expect(release).not.toHaveBeenCalled();
-  await releaseChatMcpRuns("paused-stop");
-  expect(release).toHaveBeenCalledOnce();
-  expect(hasMcpRunLeases("paused-stop")).toBe(false);
+  expect(ended()).toEqual([]);
+  await closeChatRuns("paused-stop", "stop");
+  expect(ended()).toHaveLength(1);
+  expect(chatHasRuns("paused-stop")).toBe(false);
 });
 it("does not retain a stream that reports an error after requesting approval", async () => {
-  const release = vi.fn(async () => {});
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
+  invokeMock.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
   aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream(true));
   await drain(
     await createContextAwareTransport(
-      makeDeps({ workspaceRoot: "/original" }),
-    ).sendMessages({ messages: [userMessage("hello")] }),
+      sessionDeps("approval-error"),
+    ).sendMessages({
+      messages: [userMessage("hello")],
+    }),
   );
-  expect(release).toHaveBeenCalledOnce();
+  expect(ended()).toHaveLength(1);
 });
 
 it("releases the superseded approval even when the next message fails before model setup", async () => {
-  const { hasMcpRunLeases } = await import("./mcpRunLeases");
-  const release = vi.fn(async () => {});
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
+  const { chatHasRuns } = await import("./runOwner");
+  invokeMock.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
   aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
-  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
-  deps.toolContext = {
-    getTerminalContext: () => null,
-    getSessionId: () => "superseded-approval",
-  } as never;
+  const deps = sessionDeps("superseded-approval");
   const transport = createContextAwareTransport(deps);
   await drain(
     await transport.sendMessages({ messages: [userMessage("hello")] }),
@@ -681,27 +680,18 @@ it("releases the superseded approval even when the next message fails before mod
   await expect(
     transport.sendMessages({ messages: [{ ...userMessage("new"), id: "u2" }] }),
   ).rejects.toThrow("context unavailable");
-  expect(release).toHaveBeenCalledOnce();
-  expect(hasMcpRunLeases("superseded-approval")).toBe(false);
+  expect(ended()).toHaveLength(2);
+  expect(chatHasRuns("superseded-approval")).toBe(false);
 });
-it("rejects an approval continuation before releasing its pending MCP lease", async () => {
-  const { releaseChatMcpRuns } = await import("./mcpRunLeases");
-  const release = vi.fn(async () => {});
-  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
-  deps.toolContext = {
-    getTerminalContext: () => null,
-    getSessionId: () => "prefs-approval",
-  } as never;
+it("rejects an approval continuation before releasing its pending record", async () => {
+  const { closeChatRuns } = await import("./runOwner");
+  invokeMock.mockClear();
+  const deps = sessionDeps("prefs-approval");
   let ready = true;
   deps.assertReady = () => {
     if (!ready) throw new Error("Preferences unavailable");
   };
-  mcpMock.mockResolvedValueOnce({
-    tools: {},
-    access: {},
-    instructions: [],
-    release,
-  });
+  mcpMock.mockResolvedValueOnce(noTools);
   aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
   const transport = createContextAwareTransport(deps);
   await drain(
@@ -713,20 +703,20 @@ it("rejects an approval continuation before releasing its pending MCP lease", as
     transport.sendMessages({ messages: [userMessage("hello")] }),
   ).rejects.toThrow("Preferences");
   expect(agentMock.runAgentStream).toHaveBeenCalledTimes(calls);
-  expect(release).not.toHaveBeenCalled();
-  await releaseChatMcpRuns("prefs-approval");
-  expect(release).toHaveBeenCalledOnce();
+  expect(ended()).toEqual([]);
+  await closeChatRuns("prefs-approval", "stop");
+  expect(ended()).toHaveLength(1);
 });
 it("rechecks preferences after asynchronous MCP preparation and releases prepared resources", async () => {
+  invokeMock.mockClear();
   let ready = true;
-  const release = vi.fn(async () => {});
-  const deps = makeDeps({ workspaceRoot: "/original", cwd: "/original" });
+  const deps = sessionDeps("late-prefs");
   deps.assertReady = () => {
     if (!ready) throw new Error("Preferences unavailable");
   };
   mcpMock.mockImplementationOnce(async () => {
     ready = false;
-    return { tools: {}, access: {}, instructions: [], release };
+    return noTools;
   });
   agentMock.runAgentStream.mockClear();
   await expect(
@@ -735,5 +725,5 @@ it("rechecks preferences after asynchronous MCP preparation and releases prepare
     }),
   ).rejects.toThrow("Preferences");
   expect(agentMock.runAgentStream).not.toHaveBeenCalled();
-  expect(release).toHaveBeenCalledOnce();
+  expect(ended()).toHaveLength(1);
 });

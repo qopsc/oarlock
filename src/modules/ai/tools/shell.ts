@@ -1,4 +1,4 @@
-import { beginChatWork } from "../lib/chatWork";
+import { trackWork } from "../lib/runOwner";
 import { tool } from "ai";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { z } from "zod";
@@ -101,7 +101,7 @@ export function buildShellTools(ctx: ToolContext) {
         if (!safety.ok) return { error: safety.reason };
         const sid = ctx.getSessionId();
         if (!sid) return { error: "no active chat session" };
-        const finished = beginChatWork(sid);
+        const finished = trackWork(sid);
         try {
           abortSignal?.throwIfAborted();
           const cwd = ctx.getCwd();
@@ -164,7 +164,7 @@ export function buildShellTools(ctx: ToolContext) {
         const safety = checkShellCommand(command);
         if (!safety.ok) return { error: safety.reason };
         const effectiveCwd = cwd ?? ctx.getCwd();
-        const finished = beginChatWork(ctx.getSessionId());
+        const finished = trackWork(ctx.getSessionId());
         try {
           abortSignal?.throwIfAborted();
           const handle = await native.shellBgSpawn(
@@ -203,7 +203,7 @@ export function buildShellTools(ctx: ToolContext) {
           };
         const safety = checkShellCommand(command);
         if (!safety.ok) return { error: safety.reason };
-        const finished = beginChatWork(ctx.getSessionId());
+        const finished = trackWork(ctx.getSessionId());
         try {
           abortSignal?.throwIfAborted();
           const pid = await native.shellDetachedSpawn(
