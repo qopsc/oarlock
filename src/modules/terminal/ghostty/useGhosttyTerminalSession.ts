@@ -66,7 +66,7 @@ import { IS_WINDOWS } from "@/lib/platform";
 import type { DropShell } from "../lib/quoteShellPath";
 import { captureDropOwner } from "../lib/dropOwnership";
 import { cachedShellDialect } from "../lib/shellDialectCache";
-import { shellPromptConfirmed } from "../lib/shellPromptConfirmed";
+import { foregroundJob, shellPromptConfirmed } from "../lib/shellPromptConfirmed";
 import { launchShellDrop } from "../lib/shellDropLauncher";
 import { GhosttySemanticEventRouter } from "./core/GhosttySemanticEventRouter";
 import { getGhosttyCoreRuntime } from "./GhosttyCoreRuntime";
@@ -791,27 +791,32 @@ export async function ghosttyLeafHasForegroundProcess(
   }
 }
 
+function promptState(session: GhosttySession) {
+  return {
+    promptSeen: session.promptSeen,
+    alternateScreen: session.model?.modes().alternateScreen,
+  };
+}
+
+function promptConfirmed(session: GhosttySession): boolean {
+  return shellPromptConfirmed(session.workspace, promptState(session));
+}
+
 /**
  * A job owns the pane's terminal (Unix), or its shell has a console program
  * as a child (Windows; a GUI app it started does not count); null when that
- * cannot be told.
+ * cannot be told. A WSL pane, which the process check cannot see into, counts
+ * as having one until shell integration reported a prompt (`foregroundJob`).
  */
-function promptConfirmed(session: GhosttySession): boolean {
-  return shellPromptConfirmed(session.workspace, {
-    promptSeen: session.promptSeen,
-    alternateScreen: session.model?.modes().alternateScreen,
-  });
-}
-
 export async function ghosttyLeafHasForegroundJob(
   leafId: number,
 ): Promise<boolean | null> {
   const session = sessions.get(leafId);
   if (!session?.pty || session.shellExited) return null;
-  if (!promptConfirmed(session)) return true;
-  return invoke<boolean>("pty_has_foreground_job", {
-    id: session.pty.id,
-  }).catch(() => null);
+  const id = session.pty.id;
+  return foregroundJob(session.workspace, promptState(session), () =>
+    invoke<boolean>("pty_has_foreground_job", { id }).catch(() => null),
+  );
 }
 
 export function disposeGhosttySession(leafId: number): boolean {

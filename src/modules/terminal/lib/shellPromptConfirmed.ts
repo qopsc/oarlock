@@ -7,6 +7,14 @@ import type { WorkspaceEnv } from "@/modules/workspace/env";
  * (OSC 133 B) for this shell, and never in the alternate screen. Other panes
  * are judged by the process check and always pass here.
  */
+export function foregroundJob(
+  env: WorkspaceEnv,
+  state: { promptSeen: boolean; alternateScreen: boolean | undefined },
+  query: () => Promise<boolean | null>,
+): Promise<boolean | null> {
+  return shellPromptConfirmed(env, state) ? query() : Promise.resolve(true);
+}
+
 export function shellPromptConfirmed(
   env: WorkspaceEnv,
   state: { promptSeen: boolean; alternateScreen: boolean | undefined },
