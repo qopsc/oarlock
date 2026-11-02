@@ -260,7 +260,7 @@ pub(super) fn inspect(
     registry: &WorkspaceRegistry,
     repo: &ResolvedGitDirectory,
     action: RemoteAction,
-) -> Result<()> {
+) -> Result<Vec<ResolvedGitDirectory>> {
     let remotes = output(repo, &["remote"])?.unwrap_or_default();
     let names: Vec<&str> = remotes.lines().collect();
     if names.len() > 128
@@ -306,6 +306,7 @@ pub(super) fn inspect(
                 }
             })]
         };
+    let mut pins = Vec::new();
     for remote in selected {
         let named = names.contains(&remote.as_str());
         let urls = if named {
@@ -350,12 +351,12 @@ pub(super) fn inspect(
             if !registry.is_authorized(&canonical) {
                 return Err(GitError::command("native Git refused", format!("Local Git remote {} is outside the authorized workspace. Open its folder in Oarlock and retry.", canonical.display())));
             }
-            drop(owned_repo_root(
+            pins.push(owned_repo_root(
                 registry,
                 &canonical.to_string_lossy(),
                 &WorkspaceEnv::Local,
             )?);
         }
     }
-    Ok(())
+    Ok(pins)
 }

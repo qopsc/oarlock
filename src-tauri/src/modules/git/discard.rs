@@ -598,7 +598,9 @@ pub async fn execute(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            work.execute(&app.state::<WorkspaceRegistry>(), &|path| crate::modules::fs::native_store::refuse_write(&app, path))
+            let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
+            let guard = super::utils::store_guard(&dirs);
+            work.execute(&app.state::<WorkspaceRegistry>(), &guard)
         }))
         .unwrap_or_else(|_| {
             Err("Git Discard failed unexpectedly; editor drafts were retained".into())
@@ -1057,6 +1059,27 @@ mod identity_tests {
             if path == protected { Err("Protected native store".into()) } else { Ok(()) }
         }).is_err());
         assert_eq!(fs::read_to_string(protected).unwrap(), "a draft");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn discard_refuses_a_hard_link_to_a_native_store_with_the_real_check() {
+        use crate::modules::fs::native_store::StoreDirs;
+        let (temp, repo, _other, registry) = repositories();
+        let data = temp.path().canonicalize().unwrap().join("data");
+        fs::create_dir_all(data.join("windows")).unwrap();
+        let store = data.join("windows/state.json");
+        fs::write(&store, "native").unwrap();
+        let dirs = StoreDirs::under(&data, &data, &data, Vec::new());
+        let (_, work) = plan(&registry, repo.to_str().unwrap().into(), vec![DiscardEntry {
+            path: "file".into(), untracked: false,
+        }], WorkspaceEnv::Local).unwrap();
+        fs::remove_file(repo.join("file")).unwrap();
+        fs::hard_link(&store, repo.join("file")).unwrap();
+        let error = work
+            .execute(&registry, &utils::store_guard(&dirs))
+            .unwrap_err();
+        assert!(error.contains("native-owned"), "{error}");
+        assert_eq!(fs::read_to_string(&store).unwrap(), "native");
     }
     #[cfg(unix)]
     #[test]

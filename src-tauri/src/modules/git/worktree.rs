@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::modules::git::errors::{GitError, Result};
-use crate::modules::git::parser::parse_porcelain_v2;
+use crate::modules::git::parser::parse_porcelain_v2_bytes;
 use crate::modules::git::process::{ensure_git_available, ensure_success, run_git_guarded};
 use crate::modules::git::types::{
     GitLinkedWorktree, GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeEntry,
@@ -505,7 +505,7 @@ fn count_changes(
         DEFAULT_TIMEOUT_SECS,
     )?;
     ensure_success(&output, "git status failed")?;
-    let files = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout)).files;
+    let files = parse_porcelain_v2_bytes(&output.stdout).files;
     Ok(u32::try_from(files.len()).unwrap_or(u32::MAX))
 }
 
@@ -538,6 +538,21 @@ pub fn remove_with_guard(
     );
     if !folder_gone {
         guard(&folder).map_err(|error| GitError::command("remove worktree", error))?;
+        // The target's own configuration and hooks run during removal, so it is
+        // inspected whether or not it is forced.
+        match owned_repo_root(registry, &worktree.path, &repo.workspace) {
+            Ok(target) => drop(target),
+            // A refusal already says what to do; anything else gets the same way out.
+            Err(error @ GitError::CommandFailed { context: "native Git refused", .. }) => {
+                return Err(error)
+            }
+            Err(error) => {
+                return Err(GitError::command(
+                    "remove worktree",
+                    format!("the worktree could not be checked ({error}). Remove it in the terminal instead."),
+                ))
+            }
+        }
         if !force {
             let changes = count_changes(registry, &repo.workspace, &worktree.path)?;
             if changes > 0 {
@@ -582,7 +597,6 @@ fn remove(
 mod tests {
     use super::super::utils::authorized_repo_root;
     use super::*;
-    use std::process::Command;
 
     fn entry(path: &str) -> GitWorktreeEntry {
         GitWorktreeEntry {
@@ -897,7 +911,7 @@ mod tests {
     // Integration tests against real repositories.
 
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("git")
+        crate::modules::git::process::test_git()
             .args([
                 "-c",
                 "user.name=t",
@@ -934,7 +948,7 @@ mod tests {
         /// A repository `app` with one commit on `main` and a branch `other`, the repository
         /// folder alone authorized.
         fn new() -> Option<Self> {
-            if Command::new("git").arg("--version").output().is_err() {
+            if crate::modules::git::process::test_git().arg("--version").output().is_err() {
                 return None;
             }
             let dir = tempfile::tempdir().unwrap();
@@ -1296,6 +1310,73 @@ mod tests {
         assert!(result.removed);
         assert!(!dir.exists());
         assert_eq!(fx.worktree_paths(), vec![fx.root()]);
+    }
+
+    #[test]
+    fn add_and_remove_refuse_native_store_locations_with_the_real_check() {
+        use super::super::utils::store_guard;
+        use crate::modules::fs::native_store::StoreDirs;
+        let Some(fx) = Fixture::new() else { return };
+        let data = fx.base.join("data");
+        std::fs::create_dir_all(data.join("windows")).unwrap();
+        let dirs = StoreDirs::under(&data, &data, &data, Vec::new());
+        let dest = data.join("windows/new-worktree");
+        let error = add_with_guard(
+            &fx.registry,
+            &fx.root(),
+            &new_branch("into-store", None),
+            Some(dest.to_str().unwrap()),
+            &WorkspaceEnv::Local,
+            &store_guard(&dirs),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("native-owned"), "{error}");
+        assert!(!dest.exists());
+
+        // A worktree that contains the store tree is not removed.
+        let wt = fx.add(new_branch("holds-store", None), None).unwrap();
+        let held = PathBuf::from(&wt.path).join("data");
+        std::fs::create_dir_all(held.join("windows")).unwrap();
+        std::fs::write(held.join("windows/state.json"), "native").unwrap();
+        let dirs = StoreDirs::under(&held, &held, &held, Vec::new());
+        let error = remove_with_guard(
+            &fx.registry,
+            &fx.root(),
+            &wt.path,
+            true,
+            &WorkspaceEnv::Local,
+            &store_guard(&dirs),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("native-owned"), "{error}");
+        assert_eq!(std::fs::read(held.join("windows/state.json")).unwrap(), b"native");
+    }
+
+    #[test]
+    fn removal_of_a_worktree_that_cannot_be_acquired_points_to_the_terminal() {
+        let Some(fx) = Fixture::new() else { return };
+        let wt = fx.add(new_branch("elsewhere", None), None).unwrap();
+        let dir = PathBuf::from(&wt.path);
+        // A fresh registry that only knows the main checkout: the target is not authorized.
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&fx.main).unwrap();
+        let error = remove(&registry, &fx.root(), &wt.path, true, &WorkspaceEnv::Local)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("terminal"), "{error}");
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn forced_removal_refuses_a_target_worktree_with_executable_configuration() {
+        let Some(fx) = Fixture::new() else { return };
+        let wt = fx.add(new_branch("hostile", None), None).unwrap();
+        let dir = PathBuf::from(&wt.path);
+        git_ok(&fx.main, &["config", "extensions.worktreeConfig", "true"]);
+        git_ok(&dir, &["config", "--worktree", "core.fsmonitor", "/usr/bin/true"]);
+        let error = fx.remove(&wt.path, true).unwrap_err();
+        assert!(error.to_string().contains("fsmonitor"), "{error}");
+        assert!(dir.exists(), "the hostile worktree was removed");
     }
 
     #[cfg(unix)]

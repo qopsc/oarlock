@@ -229,10 +229,9 @@ mod tests {
     }
     #[test]
     fn effective_config_capture_refuses_hooks_declared_outside_the_hooks_directory() {
-        use std::process::Command;
         let root = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            let result = Command::new("git")
+            let result = crate::modules::git::process::test_git()
                 .arg("-C")
                 .arg(root.path())
                 .args(args)

@@ -20,3 +20,16 @@ fn git_fixture_ignores_inherited_repository_and_config_overrides() {
     assert_eq!(reported, a.repo_path);
     assert_ne!(reported, b.repo_path);
 }
+
+#[test]
+fn git_fixture_isolates_home_from_the_users_git_configuration() {
+    let _fixture = GitRepoFixture::new();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    assert!(
+        !home.join(".gitconfig").exists(),
+        "HOME still points at a user configuration: {}",
+        home.display()
+    );
+    let xdg = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME is set"));
+    assert!(!xdg.join("git/config").exists());
+}

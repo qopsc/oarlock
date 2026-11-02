@@ -50,13 +50,32 @@ fn executable_setting(
     match (section.as_str(), variable.as_str()) {
         ("hook", _) => Some("Git hook configuration"),
         ("core", "hookspath") if simple => Some("core.hooksPath"),
-        ("core", "fsmonitor") if simple && enabled(value) => Some("core.fsmonitor"),
+        ("core", "fsmonitor") if simple && repository_scope && enabled(value) => {
+            Some("core.fsmonitor")
+        }
         ("core", "gitproxy") if simple => Some("core.gitProxy"),
-        ("filter", "clean" | "smudge" | "process") => Some("a Git filter driver"),
-        ("diff", "external" | "command" | "textconv") => Some("a Git diff driver"),
-        ("merge", "driver") => Some("a Git merge driver"),
-        ("commit", "gpgsign") if simple && enabled(value) => Some("commit.gpgSign"),
-        ("gpg", "program" | "defaultkeycommand") => Some("a Git signing program"),
+        ("filter", "clean" | "smudge" | "process") if repository_scope => {
+            Some("a Git filter driver")
+        }
+        ("diff", "external" | "command" | "textconv") if repository_scope => {
+            Some("a Git diff driver")
+        }
+        ("merge", "driver") if repository_scope => Some("a Git merge driver"),
+        ("commit", "gpgsign") if simple && repository_scope && enabled(value) => {
+            Some("commit.gpgSign")
+        }
+        ("gpg", "program" | "defaultkeycommand") if repository_scope => {
+            Some("a Git signing program")
+        }
+        ("merge", "verifysignatures") if simple && repository_scope && enabled(value) => {
+            Some("merge.verifySignatures")
+        }
+        ("tag", "gpgsign") if simple && repository_scope && enabled(value) => {
+            Some("tag.gpgSign")
+        }
+        ("push", "gpgsign") if simple && repository_scope && enabled(value) => {
+            Some("push.gpgSign")
+        }
         ("credential", "helper") if repository_scope => Some("credential.helper"),
         ("core", "sshcommand") if simple && repository_scope => Some("core.sshCommand"),
         ("core", "askpass") if simple && repository_scope => Some("core.askPass"),
@@ -214,8 +233,15 @@ fn inspect_repo_origins(repo: &ResolvedGitDirectory) -> Result<()> {
             } else {
                 repo.local_path.join(path)
             };
-            candidate.starts_with(&repo.local_path)
-                || std::fs::canonicalize(&candidate).is_ok_and(|p| p.starts_with(&repo.local_path))
+            let roots = match &repo.ownership {
+                Some(owner) => owner.content_roots(),
+                None => vec![repo.local_path.clone()],
+            };
+            let canonical = std::fs::canonicalize(&candidate).ok();
+            roots.iter().any(|root| {
+                candidate.starts_with(root)
+                    || canonical.as_ref().is_some_and(|path| path.starts_with(root))
+            })
         });
         let mut record = pair[1].to_vec();
         record.push(0);
@@ -355,14 +381,14 @@ pub(super) fn preflight(repo: &ResolvedGitDirectory) -> Result<()> {
 mod tests {
     use super::*;
     use crate::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn guarded_invocation_neutralizes_new_hooks_and_fsmonitor_after_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::modules::git::process::test_git()
                 .current_dir(&root)
                 .args(args)
                 .output()

@@ -1,6 +1,11 @@
 //! Ordered entry mutations and window-owned pending recovery destinations.
-//! Recovery acquisition and mutation identity capture use the same gate, so
-//! aliases and away-and-back renames cannot disappear between IPC responses.
+//! Mutations that touch the same paths (or a path and its ancestor) run one at a
+//! time, from claim to publish, so they commit and publish in the same order;
+//! unrelated ones run side by side. The stream lock is held only to claim, to
+//! record and to publish, never across filesystem work, so deleting a large
+//! folder in one window stalls nothing else. Recovery acquisition claims its
+//! target the same way, so aliases and away-and-back renames cannot slip
+//! between IPC responses.
 use super::destination::Destination;
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 use serde::Serialize;
@@ -9,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock, Mutex,
+        Arc, Condvar, LazyLock, Mutex,
     },
 };
 use tauri::{Emitter, Manager};
@@ -49,9 +54,29 @@ struct State {
     sequence: u64,
     next: u64,
     recoveries: HashMap<String, Recovery>,
+    claims: Vec<(u64, Vec<String>)>,
+    next_claim: u64,
+    emit_failures: u64,
 }
 #[derive(Default)]
-struct Stream(Mutex<State>, Mutex<HashMap<String, Arc<AtomicBool>>>);
+struct Stream(
+    Mutex<State>,
+    Mutex<HashMap<String, Arc<AtomicBool>>>,
+    Condvar,
+);
+
+/// Paths a running operation owns until it has published; dropped on every exit.
+struct Claim<'a> {
+    stream: &'a Stream,
+    id: u64,
+}
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut state = self.stream.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.claims.retain(|(id, _)| *id != self.id);
+        self.stream.2.notify_all();
+    }
+}
 fn comparable(path: &Path) -> String {
     let path = super::to_canon(path);
     // Conservative on case-sensitive volumes: an extra interruption is safe.
@@ -69,41 +94,90 @@ fn affected(target: &Path, changed: &Path) -> bool {
     let changed = comparable(changed);
     target == changed || target.starts_with(&format!("{}/", changed.trim_end_matches('/')))
 }
+fn under(child: &str, parent: &str) -> bool {
+    child.starts_with(&format!("{}/", parent.trim_end_matches('/')))
+}
+fn overlaps(a: &str, b: &str) -> bool {
+    a == b || under(a, b) || under(b, a)
+}
+/// The entry a request names, spelled through its resolved parent when that exists.
+fn claim_path(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
 impl Stream {
+    /// Waits until no running operation owns an overlapping path, then owns them.
+    fn claim(&self, paths: &[PathBuf]) -> Claim<'_> {
+        let paths: Vec<String> = paths.iter().map(|path| comparable(path)).collect();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        while state.claims.iter().any(|(_, held)| {
+            held.iter()
+                .any(|held| paths.iter().any(|wanted| overlaps(held, wanted)))
+        }) {
+            state = self.2.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.next_claim += 1;
+        let id = state.next_claim;
+        state.claims.push((id, paths));
+        Claim { stream: self, id }
+    }
     #[cfg(test)]
     fn apply<T>(
         &self,
         workspace: WorkspaceEnv,
         mutation: impl FnOnce() -> Result<(T, Option<Change>), String>,
-        publish: impl FnOnce(Event),
+        publish: impl FnOnce(Event) -> Result<(), String>,
     ) -> Result<T, String> {
-        self.apply_tracked(workspace, HashMap::new, mutation, publish)
+        // The root overlaps every path, so these run strictly one at a time.
+        self.apply_tracked(
+            workspace,
+            &[PathBuf::from("/")],
+            HashMap::new,
+            mutation,
+            publish,
+        )
     }
     fn apply_tracked<T>(
         &self,
         workspace: WorkspaceEnv,
+        claims: &[PathBuf],
         resolve: impl FnOnce() -> HashMap<String, PathBuf>,
         mutation: impl FnOnce() -> Result<(T, Option<Change>), String>,
-        publish: impl FnOnce(Event),
+        publish: impl FnOnce(Event) -> Result<(), String>,
     ) -> Result<T, String> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _claim = self.claim(claims);
         // Only recovery needs this additional metadata work, and identity must
         // be captured before deletion/rename makes the old parent unavailable.
-        let paths = if !state
+        // Recoveries registered later cannot overlap this claim (their `begin`
+        // would have waited for it), so only these are judged at publish.
+        let existing: Vec<String> = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .recoveries
-            .values()
-            .any(|entry| entry.generation.load(Ordering::Acquire))
-        {
-            HashMap::new()
-        } else {
-            resolve()
-        };
+            .iter()
+            .filter(|(_, entry)| entry.generation.load(Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let paths = if existing.is_empty() { HashMap::new() } else { resolve() };
         let (result, change) = mutation()?;
         if let Some(change) = change {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let changed_paths = change.paths();
-            for recovery in state.recoveries.values_mut().filter(|entry| {
-                entry.workspace == workspace && entry.generation.load(Ordering::Acquire)
-            }) {
+            for recovery in state
+                .recoveries
+                .iter_mut()
+                .filter(|(id, entry)| {
+                    existing.contains(*id)
+                        && entry.workspace == workspace
+                        && entry.generation.load(Ordering::Acquire)
+                })
+                .map(|(_, entry)| entry)
+            {
                 recovery.changed |= changed_paths.iter().any(|path| {
                     // If preflight could not resolve an entry that did commit,
                     // conservatively invalidate rather than miss its identity.
@@ -112,12 +186,17 @@ impl Stream {
                         .is_none_or(|path| affected(&recovery.target, path))
                 });
             }
+            // The sequence advances even when delivery fails, so a window that
+            // missed the event sees a gap and reconciles instead of trusting it.
             state.sequence += 1;
-            publish(Event {
+            if let Err(error) = publish(Event {
                 sequence: state.sequence,
                 workspace,
                 change,
-            });
+            }) {
+                state.emit_failures += 1;
+                log::error!("Could not broadcast committed filesystem mutation: {error}");
+            }
         }
         Ok(result)
     }
@@ -136,11 +215,13 @@ impl Stream {
         workspace: WorkspaceEnv,
         resolve: impl FnOnce() -> Result<(PathBuf, PathBuf), String>,
     ) -> Result<String, String> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !epoch.load(Ordering::Acquire) {
             return Err("Recovery window was reloaded or closed".into());
         }
         let (requested, target) = resolve()?;
+        // Owning the target until the record exists keeps a mutation from
+        // committing between the pin and the registration unseen.
+        let _claim = self.claim(std::slice::from_ref(&target));
         let destination = Destination::pin(&target, false, &|opened| {
             if opened == target {
                 Ok(())
@@ -149,6 +230,7 @@ impl Stream {
             }
         })
         .map_err(|e| e.to_string())?;
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !epoch.load(Ordering::Acquire) {
             return Err("Recovery window was reloaded or closed".into());
         }
@@ -287,8 +369,16 @@ pub fn transact<T>(
     requested: &[String],
     mutation: impl FnOnce() -> Result<(T, Option<Change>), String>,
 ) -> Result<T, String> {
+    let claims: Vec<PathBuf> = requested
+        .iter()
+        .map(|path| match resolve_path(path, &workspace) {
+            Ok(resolved) => claim_path(&resolved),
+            Err(_) => PathBuf::from(path),
+        })
+        .collect();
     STREAM.apply_tracked(
         workspace.clone(),
+        &claims,
         || {
             requested
                 .iter()
@@ -304,11 +394,7 @@ pub fn transact<T>(
                 .collect()
         },
         mutation,
-        |event| {
-            if let Err(error) = app.emit("fs:mutation", event) {
-                log::error!("Could not broadcast committed filesystem mutation: {error}");
-            }
-        },
+        |event| app.emit("fs:mutation", event).map_err(|error| error.to_string()),
     )
 }
 
@@ -351,9 +437,206 @@ mod tests {
                     let json = serde_json::to_value(event).unwrap();
                     assert_eq!(json["kind"], "deleted");
                     assert_eq!(json["paths"], serde_json::json!(["/work/a"]));
+                    Ok(())
                 },
             )
             .unwrap();
+    }
+    #[test]
+    fn a_running_mutation_does_not_hold_the_stream_lock() {
+        let stream = Stream::default();
+        stream
+            .apply(
+                WorkspaceEnv::Local,
+                || {
+                    assert!(
+                        stream.0.try_lock().is_ok(),
+                        "the stream lock is held across the filesystem mutation"
+                    );
+                    Ok(((), None))
+                },
+                |_| unreachable!(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unrelated_mutations_overlap_while_related_ones_wait_their_turn() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let stream = Arc::new(Stream::default());
+        let (entered, started) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let slow = {
+            let stream = stream.clone();
+            std::thread::spawn(move || {
+                stream
+                    .apply_tracked(
+                        WorkspaceEnv::Local,
+                        &[PathBuf::from("/work/big")],
+                        HashMap::new,
+                        || {
+                            entered.send(()).unwrap();
+                            held.recv().unwrap();
+                            Ok(((), None))
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            })
+        };
+        started.recv().unwrap();
+        // A different folder is not delayed by the slow delete above. It runs on
+        // a thread so a broken claim fails the test instead of hanging it.
+        let (done, finished) = mpsc::channel();
+        let other = {
+            let stream = stream.clone();
+            std::thread::spawn(move || {
+                let result = stream.apply_tracked(
+                    WorkspaceEnv::Local,
+                    &[PathBuf::from("/work/other")],
+                    HashMap::new,
+                    || Ok((7, None)),
+                    |_| Ok(()),
+                );
+                done.send(result).unwrap();
+            })
+        };
+        let unrelated = finished.recv_timeout(Duration::from_secs(2));
+        if unrelated.is_err() {
+            release.send(()).unwrap();
+        }
+        assert_eq!(unrelated.expect("an unrelated mutation waited").unwrap(), 7);
+        other.join().unwrap();
+        // Something inside the folder being removed waits for it.
+        let (ran, observed) = mpsc::channel();
+        let nested = {
+            let stream = stream.clone();
+            std::thread::spawn(move || {
+                stream
+                    .apply_tracked(
+                        WorkspaceEnv::Local,
+                        &[PathBuf::from("/work/big/inner")],
+                        HashMap::new,
+                        || {
+                            ran.send(()).unwrap();
+                            Ok(((), None))
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            })
+        };
+        assert!(observed.recv_timeout(Duration::from_millis(150)).is_err());
+        release.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        slow.join().unwrap();
+        nested.join().unwrap();
+    }
+    #[test]
+    fn a_failed_broadcast_is_counted_and_leaves_a_visible_sequence_gap() {
+        let stream = Stream::default();
+        let change = || {
+            Some(Change::Deleted {
+                paths: vec!["/work/a".into()],
+            })
+        };
+        stream
+            .apply(WorkspaceEnv::Local, || Ok(((), change())), |_| {
+                Err("no window".into())
+            })
+            .unwrap();
+        assert_eq!(stream.0.lock().unwrap().emit_failures, 1);
+        let mut seen = 0;
+        stream
+            .apply(WorkspaceEnv::Local, || Ok(((), change())), |event| {
+                seen = event.sequence;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, 2, "the lost event must be visible as a gap");
+    }
+    #[test]
+    fn an_unrelated_mutation_does_not_invalidate_a_recovery_registered_meanwhile() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let stream = Arc::new(Stream::default());
+        let (entered, started) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let mutation = {
+            let stream = stream.clone();
+            std::thread::spawn(move || {
+                stream
+                    .apply_tracked(
+                        WorkspaceEnv::Local,
+                        &[PathBuf::from("/elsewhere/node_modules")],
+                        HashMap::new,
+                        || {
+                            entered.send(()).unwrap();
+                            held.recv().unwrap();
+                            Ok((
+                                (),
+                                Some(Change::Deleted {
+                                    paths: vec!["/elsewhere/node_modules".into()],
+                                }),
+                            ))
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            })
+        };
+        started.recv().unwrap();
+        let id = begin_at(&stream, "a", &root.join("draft"));
+        release.send(()).unwrap();
+        mutation.join().unwrap();
+        let changed = stream.0.lock().unwrap().recoveries.get(&id).unwrap().changed;
+        assert!(!changed, "an unrelated delete invalidated a concurrent recovery");
+    }
+    #[test]
+    fn a_recovery_waits_for_a_running_mutation_of_its_target() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("draft");
+        let stream = Arc::new(Stream::default());
+        let (entered, started) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let mutation = {
+            let (stream, target) = (stream.clone(), target.clone());
+            std::thread::spawn(move || {
+                stream
+                    .apply_tracked(
+                        WorkspaceEnv::Local,
+                        &[target],
+                        HashMap::new,
+                        || {
+                            entered.send(()).unwrap();
+                            held.recv().unwrap();
+                            Ok(((), None))
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            })
+        };
+        started.recv().unwrap();
+        let (registered, observed) = mpsc::channel();
+        let begin = {
+            let (stream, target) = (stream.clone(), target.clone());
+            std::thread::spawn(move || {
+                let id = begin_at(&stream, "a", &target);
+                registered.send(()).unwrap();
+                id
+            })
+        };
+        assert!(observed.recv_timeout(Duration::from_millis(150)).is_err());
+        release.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        mutation.join().unwrap();
+        begin.join().unwrap();
     }
     #[test]
     fn concurrent_mutations_publish_in_commit_order() {
@@ -385,6 +668,7 @@ mod tests {
                                     .lock()
                                     .unwrap()
                                     .push((event.sequence, paths[0].parse::<i32>().unwrap()));
+                                Ok(())
                             },
                         )
                         .unwrap()
@@ -475,6 +759,7 @@ mod tests {
                 stream
                     .apply_tracked(
                         WorkspaceEnv::Local,
+                        &[from.clone(), to.clone()],
                         || {
                             HashMap::from([
                                 (from_name.clone(), resolve_entry(from).unwrap()),
@@ -491,7 +776,7 @@ mod tests {
                                 }),
                             ))
                         },
-                        |_| {},
+                        |_| Ok(()),
                     )
                     .unwrap();
             }
@@ -537,6 +822,7 @@ mod tests {
         let id = begin_at(&stream, "a", &root.join("draft"));
         let failed: Result<(), String> = stream.apply_tracked(
             WorkspaceEnv::Local,
+            std::slice::from_ref(&root),
             || HashMap::from([("x".into(), root.clone())]),
             || Err("denied".into()),
             |_| panic!(),
@@ -545,6 +831,7 @@ mod tests {
         stream
             .apply_tracked(
                 WorkspaceEnv::Local,
+                std::slice::from_ref(&root),
                 || HashMap::from([("x".into(), root.join("unrelated"))]),
                 || {
                     Ok((
@@ -554,7 +841,7 @@ mod tests {
                         }),
                     ))
                 },
-                |_| {},
+                |_| Ok(()),
             )
             .unwrap();
         stream
@@ -562,6 +849,7 @@ mod tests {
                 WorkspaceEnv::Wsl {
                     distro: "Ubuntu".into(),
                 },
+                std::slice::from_ref(&root),
                 HashMap::new,
                 || {
                     Ok((
@@ -571,13 +859,14 @@ mod tests {
                         }),
                     ))
                 },
-                |_| {},
+                |_| Ok(()),
             )
             .unwrap();
         assert!(!stream.changed("a", &id, resolve_entry).unwrap());
         stream
             .apply_tracked(
                 WorkspaceEnv::Local,
+                std::slice::from_ref(&root),
                 || HashMap::from([("x".into(), root.clone())]),
                 || {
                     Ok((
@@ -587,7 +876,7 @@ mod tests {
                         }),
                     ))
                 },
-                |_| {},
+                |_| Ok(()),
             )
             .unwrap();
         assert!(stream.changed("a", &id, resolve_entry).unwrap());
@@ -612,7 +901,7 @@ mod tests {
                             continue_io.recv().unwrap();
                             Ok(((), None))
                         },
-                        |_| {},
+                        |_| Ok(()),
                     )
                     .unwrap();
             })

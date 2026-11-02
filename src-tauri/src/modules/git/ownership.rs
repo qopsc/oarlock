@@ -86,6 +86,20 @@ impl RepositoryPin {
     fn common_path(&self) -> &Path {
         self.common.as_ref().unwrap_or(&self.git).path()
     }
+    /// Every folder that is part of this repository's own content: the worktree, its
+    /// Git directory, the shared one and, for a linked worktree, the main checkout.
+    pub(super) fn content_roots(&self) -> Vec<PathBuf> {
+        let common = self.common_path();
+        let mut roots = vec![
+            self.path().to_path_buf(),
+            self.git.path().to_path_buf(),
+            common.to_path_buf(),
+        ];
+        if common.file_name().is_some_and(|name| name == ".git") {
+            roots.extend(common.parent().map(Path::to_path_buf));
+        }
+        roots
+    }
     pub(super) fn hooks_path(&self) -> PathBuf {
         self.common_path().join("hooks")
     }

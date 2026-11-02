@@ -169,14 +169,13 @@ fn validate_paths(repo: &ResolvedGitDirectory, bytes: &[u8]) -> Result<Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     #[test]
     fn changing_index_and_head_cannot_change_the_validated_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::modules::git::process::test_git()
                 .current_dir(&root)
                 .args(args)
                 .output()

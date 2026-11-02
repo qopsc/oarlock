@@ -41,6 +41,8 @@ pub struct GitChangedFile {
     pub unstaged: bool,
     pub untracked: bool,
     pub status_label: String,
+    /// The name was not valid UTF-8; `path` only approximates it and names no real file.
+    pub unreadable: bool,
 }
 
 #[derive(Serialize)]
@@ -296,6 +298,7 @@ mod serde_shape_tests {
             unstaged: false,
             untracked: false,
             status_label: "renamed".into(),
+            unreadable: false,
         };
         let json = serde_json::to_value(&file).unwrap();
         assert_eq!(
@@ -309,6 +312,7 @@ mod serde_shape_tests {
                 "unstaged": false,
                 "untracked": false,
                 "statusLabel": "renamed",
+                "unreadable": false,
             })
         );
     }

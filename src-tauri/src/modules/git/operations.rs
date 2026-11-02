@@ -3,10 +3,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::modules::git::errors::{GitError, Result};
-use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2};
+use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2_bytes};
 use crate::modules::git::process::{
     decode_text, ensure_git_available, ensure_success, git_show_text, read_text_file,
-    run_git_capped, run_git_guarded,
+    run_git_in_capped,
 };
 use crate::modules::git::types::{
     DiscardEntry, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
@@ -222,10 +222,7 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
     )?;
     ensure_success(&output, "git status failed")?;
 
-    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
-        GitError::command("git status", "output contains invalid UTF-8 or was cut mid-character")
-    })?;
-    let parsed = parse_porcelain_v2(stdout);
+    let parsed = parse_porcelain_v2_bytes(&output.stdout);
     let mut listing_error = None;
     let files = untracked::expand_untracked_dirs(parsed.files, |dir, budget| {
         if listing_error.is_some() {
@@ -263,9 +260,8 @@ fn list_untracked_in(
     dir: &str,
     budget: usize,
 ) -> Result<Option<Vec<String>>> {
-    let output = run_git_capped(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
+    let output = run_git_in_capped(
+        repo_root,
         [
             "ls-files",
             "--others",
@@ -367,9 +363,7 @@ pub fn diff_content(
                 "staged path list is truncated",
             ));
         }
-        let text = std::str::from_utf8(&output.stdout)
-            .map_err(|_| GitError::command("git diff", "cannot decode staged paths"))?;
-        parse_porcelain_v2(text)
+        parse_porcelain_v2_bytes(&output.stdout)
             .files
             .into_iter()
             .find(|file| file.path == rel_path)
@@ -380,24 +374,12 @@ pub fn diff_content(
 
     let original = if staged {
         let spec = original_rel.as_deref().unwrap_or(&rel_path);
-        git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
-            &format!("HEAD:{spec}"),
-        )?
+        git_show_text(&repo_root, &format!("HEAD:{spec}"))?
     } else {
-        git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
-            &format!(":{rel_path}"),
-        )?
+        git_show_text(&repo_root, &format!(":{rel_path}"))?
     };
     let modified = if staged {
-        git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
-            &format!(":{rel_path}"),
-        )?
+        git_show_text(&repo_root, &format!(":{rel_path}"))?
     } else {
         read_text_file(&repo_root.local_path, &worktree_path)?
     };
@@ -441,15 +423,23 @@ pub fn file_base(
         return Err(GitError::PathOutsideWorkspace(cwd.local_path));
     }
     ensure_git_available(&cwd.workspace)?;
-    let spec = format!("HEAD:./{name}");
     super::ownership::authorize_containing_metadata(registry, &cwd.local_path)?;
     let Some(location) = worktree::locate_work_tree(&cwd.workspace, &cwd.git_path)? else {
         return Ok(None);
     };
-    let _guarded = discovered_root(registry, &cwd, &location.toplevel)?;
-    let output = run_git_guarded(
-        &cwd.workspace,
-        Some(&cwd.git_path),
+    let guarded = discovered_root(registry, &cwd, &location.toplevel)?;
+    // The pinned run starts in the worktree root, so name the file from there.
+    let relative = cwd
+        .local_path
+        .strip_prefix(&guarded.local_path)
+        .map_err(|_| GitError::PathOutsideWorkspace(cwd.local_path.clone()))?;
+    let mut spec = String::from("HEAD:");
+    for part in relative.components() {
+        spec.push_str(&part.as_os_str().to_string_lossy());
+        spec.push('/');
+    }
+    spec.push_str(name);
+    let output = guarded.run(
         [
             OsStr::new("show"),
             OsStr::new("--no-show-signature"),
@@ -465,7 +455,7 @@ pub fn file_base(
         return Ok(None);
     }
     if output.exit_code != Some(0) {
-        return Ok(match git_show_text(&cwd.workspace, &cwd.git_path, &spec)? {
+        return Ok(match git_show_text(&guarded, &spec)? {
             TextSource::Text(text) => Some(text),
             TextSource::Missing | TextSource::Binary => None,
         });
@@ -609,6 +599,9 @@ pub(crate) fn discard_owned(
         return Err(GitError::PathOutsideWorkspace(owner.path().into()));
     }
     ensure_git_available(&repo_root.workspace)?;
+    // The plan was preflighted when Discard began; execution follows a
+    // cross-window wait, so the configuration is read again here.
+    super::commit_guard::preflight(repo_root)?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -680,7 +673,7 @@ pub fn push(
 ) -> Result<GitPushResult> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(
+    let remote_pins = super::remote_guard::inspect(
         registry,
         &repo_root,
         super::remote_guard::RemoteAction::Push,
@@ -691,8 +684,9 @@ pub fn push(
         return Err(GitError::NoUpstream);
     }
 
-    let output = repo_root.run(["push"], NETWORK_TIMEOUT_SECS)?;
-    ensure_success(&output, "git push failed")?;
+    let output = run_network(&repo_root, ["push"]);
+    validate_remote_pins(&remote_pins)?;
+    ensure_success(&output?, "git push failed")?;
 
     let upstream = upstream.unwrap();
     let (remote, branch) = split_upstream(&upstream);
@@ -702,6 +696,18 @@ pub fn push(
         pushed: true,
     })
 }
+
+/// `--shortstat` diffs every commit, so no diff driver or converter may run.
+const LOG_FLAGS: [&str; 7] = [
+    "log",
+    "--no-show-signature",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    // Full ref names in `%D`, so refs are classified by namespace.
+    "--decorate=full",
+    "--shortstat",
+];
 
 const LOG_FORMAT: &str = "%H%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%D%x1f%s";
 const MAX_LOG_LIMIT: u32 = 200;
@@ -732,17 +738,12 @@ pub fn log(
         }
         _ => None,
     };
-    let mut args: Vec<&OsStr> = vec![
-        OsStr::new("log"),
-        OsStr::new("--no-show-signature"),
-        OsStr::new("--no-color"),
-        // Full ref names in `%D`, so refs are classified by namespace.
-        OsStr::new("--decorate=full"),
-        OsStr::new("--shortstat"),
+    let mut args: Vec<&OsStr> = LOG_FLAGS.iter().map(OsStr::new).collect();
+    args.extend([
         OsStr::new(&count_arg),
         OsStr::new(&skip_arg),
         OsStr::new(&format_arg),
-    ];
+    ]);
     if let Some(sha) = anchor {
         args.push(OsStr::new(sha));
     }
@@ -751,7 +752,10 @@ pub fn log(
         return Err(GitError::TimedOut("git log"));
     }
     if output.truncated {
-        return Err(GitError::command("git log", "output was truncated; view history in the terminal"));
+        return Err(GitError::command(
+            "git log",
+            "output was truncated; view history in the terminal",
+        ));
     }
     if output.exit_code != Some(0) {
         if anchor.is_none() && super::branches::is_unborn_head(&repo_root)? {
@@ -948,18 +952,10 @@ pub fn commit_file_diff(
 
     let parent = super::branches::first_parent(&repo_root, sha)?;
     let original = match parent.as_deref() {
-        Some(p) => git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
-            &format!("{p}:{original_rel}"),
-        )?,
+        Some(p) => git_show_text(&repo_root, &format!("{p}:{original_rel}"))?,
         None => TextSource::Missing,
     };
-    let modified = git_show_text(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        &format!("{sha}:{rel}"),
-    )?;
+    let modified = git_show_text(&repo_root, &format!("{sha}:{rel}"))?;
 
     let mut diff_args: Vec<OsString> = vec![
         "show".into(),
@@ -1021,13 +1017,14 @@ pub fn fetch(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(
+    let remote_pins = super::remote_guard::inspect(
         registry,
         &repo_root,
         super::remote_guard::RemoteAction::Fetch,
     )?;
-    let output = repo_root.run(["fetch", "--prune"], NETWORK_TIMEOUT_SECS)?;
-    ensure_success(&output, "git fetch failed")
+    let output = run_network(&repo_root, ["fetch", "--prune"]);
+    validate_remote_pins(&remote_pins)?;
+    ensure_success(&output?, "git fetch failed")
 }
 
 pub fn pull_ff_only(
@@ -1037,13 +1034,31 @@ pub fn pull_ff_only(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(
+    let remote_pins = super::remote_guard::inspect(
         registry,
         &repo_root,
         super::remote_guard::RemoteAction::Fetch,
     )?;
-    let output = repo_root.run(["pull", "--ff-only"], NETWORK_TIMEOUT_SECS)?;
-    ensure_success(&output, "git pull --ff-only failed")
+    let output = run_network(&repo_root, ["pull", "--ff-only"]);
+    validate_remote_pins(&remote_pins)?;
+    ensure_success(&output?, "git pull --ff-only failed")
+}
+
+/// Network launches keep the user's credential helpers, so repository-scoped
+/// ones are checked again right before the launch rather than at acquisition.
+fn run_network<const N: usize>(repo: &ResolvedGitDirectory, args: [&str; N]) -> Result<GitOutput> {
+    super::commit_guard::preflight(repo)?;
+    repo.run(args, NETWORK_TIMEOUT_SECS)
+}
+
+/// A local remote replaced while the transfer ran may have been read instead.
+fn validate_remote_pins(pins: &[ResolvedGitDirectory]) -> Result<()> {
+    for pin in pins {
+        if let Some(owner) = &pin.ownership {
+            owner.validate()?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_commit_success(output: &GitOutput) -> Result<()> {
@@ -1081,7 +1096,7 @@ mod tests {
     use crate::modules::git::commit_files::status_label_for;
 
     fn git(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        crate::modules::git::process::test_git()
             .args([
                 "-c",
                 "user.name=t",
@@ -1094,6 +1109,103 @@ mod tests {
             .current_dir(dir)
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_preflight_reads_stay_pinned_to_the_acquired_git_directory() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            a.path().canonicalize().unwrap(),
+            b.path().canonicalize().unwrap(),
+        );
+        if !git(&a, &["init", "-q"]) || !git(&b, &["init", "-q"]) {
+            return;
+        }
+        std::fs::create_dir(a.join("d")).unwrap();
+        std::fs::write(a.join("d/x.txt"), "x").unwrap();
+        std::fs::write(a.join("file.txt"), "real\n").unwrap();
+        std::fs::write(b.join("file.txt"), "decoy\n").unwrap();
+        assert!(git(&a, &["add", "file.txt"]) && git(&a, &["commit", "-q", "-m", "a"]));
+        assert!(git(&b, &["add", "file.txt"]) && git(&b, &["commit", "-q", "-m", "b"]));
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&a).unwrap();
+        let repo = owned_repo_root(&registry, a.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        std::fs::rename(a.join(".git"), a.join(".git.moved")).unwrap();
+        std::fs::rename(b.join(".git"), a.join(".git")).unwrap();
+        assert!(
+            list_untracked_in(&repo, "d", 10).is_err(),
+            "untracked listing ran against a replaced Git directory"
+        );
+        assert!(
+            git_show_text(&repo, "HEAD:file.txt").is_err(),
+            "git show ran against a replaced Git directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_and_network_launches_recheck_the_configuration_at_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        if !git(&root, &["init", "-q"]) {
+            return;
+        }
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        assert!(git(&root, &["add", "."]) && git(&root, &["commit", "-q", "-m", "i"]));
+        std::fs::write(root.join("f.txt"), "two\n").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let repo =
+            owned_repo_root(&registry, root.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        let marker = root.join("ran");
+        let helper = format!("!touch {}", marker.display());
+        assert!(git(&root, &["config", "credential.helper", &helper]));
+        assert!(git(&root, &["config", "core.fsmonitor", "/usr/bin/true"]));
+        let entries = [DiscardEntry {
+            path: "f.txt".into(),
+            untracked: false,
+        }];
+        let error = discard_owned(&registry, &repo, &entries).unwrap_err();
+        assert!(error.to_string().contains("fsmonitor"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "two\n"
+        );
+        assert!(git(&root, &["config", "--unset", "core.fsmonitor"]));
+        let error = run_network(&repo, ["ls-remote", "."]).err().unwrap();
+        assert!(error.to_string().contains("credential.helper"), "{error}");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_remote_stays_pinned_for_the_whole_transfer() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            a.path().canonicalize().unwrap(),
+            b.path().canonicalize().unwrap(),
+        );
+        if !git(&a, &["init", "-q"]) || !git(&b, &["init", "-q"]) {
+            return;
+        }
+        assert!(git(&a, &["remote", "add", "origin", b.to_str().unwrap()]));
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&a).unwrap();
+        registry.authorize(&b).unwrap();
+        let repo = owned_repo_root(&registry, a.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        let pins = super::super::remote_guard::inspect(
+            &registry,
+            &repo,
+            super::super::remote_guard::RemoteAction::Fetch,
+        )
+        .unwrap();
+        assert_eq!(pins.len(), 1, "the local remote's pin was dropped");
+        std::fs::rename(b.join(".git"), b.join(".git.moved")).unwrap();
+        assert!(git(&b, &["init", "-q"]));
+        assert!(pins[0].ownership.as_ref().unwrap().validate().is_err());
     }
 
     #[test]
@@ -1212,6 +1324,12 @@ mod tests {
         for c in " /:\\?\"'".chars() {
             assert!(!is_remote_name_char(c));
         }
+    }
+
+    #[test]
+    fn history_stats_never_run_a_diff_driver_or_converter() {
+        assert!(LOG_FLAGS.contains(&"--no-ext-diff"));
+        assert!(LOG_FLAGS.contains(&"--no-textconv"));
     }
 
     #[test]

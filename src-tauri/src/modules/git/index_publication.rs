@@ -403,7 +403,7 @@ mod tests {
         }
     }
     fn git(path: &Path, args: &[&str]) -> Vec<u8> {
-        let output = Command::new("git")
+        let output = crate::modules::git::process::test_git()
             .arg("-C")
             .arg(path)
             .args(args)
@@ -764,7 +764,7 @@ mod tests {
         forged.extend_from_slice(&checksum);
         let path = repo.with_file_name("forged-index");
         std::fs::write(&path, &forged).unwrap();
-        let control = Command::new("git")
+        let control = crate::modules::git::process::test_git()
             .arg("-C")
             .arg(&repo)
             .arg("write-tree")
