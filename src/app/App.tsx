@@ -514,6 +514,10 @@ export default function App() {
     pendingCloseMany,
     closeManyConfirming,
     handleClose,
+    pendingPaneClose,
+    handleClosePane,
+    confirmPaneClose,
+    cancelPaneClose,
     handleCloseTabsToRight,
     handleCloseOtherTabs,
     handleDeleteSpace: guardSpaceDeletion,
@@ -534,6 +538,7 @@ export default function App() {
     disposeTab,
     disposeDeletedTabs,
     disposeTabs,
+    disposePane: closeActivePane,
   });
 
   const { pendingAppClose, confirmAppClose, cancelAppClose } = useAppCloseGuard(
@@ -1125,11 +1130,11 @@ export default function App() {
   const handleCloseTabOrPane = useCallback(() => {
     const t = tabsRef.current.find((x) => x.id === activeId);
     if (t?.kind === "terminal" && leafIds(t.paneTree).length > 1) {
-      closeActivePane(activeId);
+      void handleClosePane(activeId);
       return;
     }
     void handleClose(activeId);
-  }, [activeId, closeActivePane, handleClose]);
+  }, [activeId, handleClosePane, handleClose]);
 
   const restartActiveTerminal = useCallback(() => {
     const leafId = restartTarget(tabsRef.current, activeId);
@@ -2138,6 +2143,9 @@ export default function App() {
             pendingTerminalCloseTab={pendingTerminalCloseTab}
             onCancelTerminalClose={cancelTerminalClose}
             onConfirmTerminalClose={confirmTerminalClose}
+            pendingPaneClose={pendingPaneClose}
+            onCancelPaneClose={cancelPaneClose}
+            onConfirmPaneClose={confirmPaneClose}
             pendingTerminalRestart={pendingRestartLeaf}
             onCancelTerminalRestart={cancelRestart}
             onConfirmTerminalRestart={confirmRestart}

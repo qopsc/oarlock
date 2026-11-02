@@ -28,6 +28,9 @@ type Props = {
   pendingTerminalCloseTab: number | null;
   onCancelTerminalClose: () => void;
   onConfirmTerminalClose: () => void;
+  pendingPaneClose: number | null;
+  onCancelPaneClose: () => void;
+  onConfirmPaneClose: () => void;
   pendingTerminalRestart: number | null;
   onCancelTerminalRestart: () => void;
   onConfirmTerminalRestart: () => void;
@@ -146,6 +149,9 @@ export function CloseDialogs({
   pendingTerminalCloseTab,
   onCancelTerminalClose,
   onConfirmTerminalClose,
+  pendingPaneClose,
+  onCancelPaneClose,
+  onConfirmPaneClose,
   pendingTerminalRestart,
   onCancelTerminalRestart,
   onConfirmTerminalRestart,
@@ -175,6 +181,17 @@ export function CloseDialogs({
   const cancelTerminalClose = () => {
     setOptOutTerminalClose(false);
     onCancelTerminalClose();
+  };
+
+  const confirmPaneClose = () => {
+    if (optOutTerminalClose) void persistOptOut();
+    setOptOutTerminalClose(false);
+    onConfirmPaneClose();
+  };
+
+  const cancelPaneClose = () => {
+    setOptOutTerminalClose(false);
+    onCancelPaneClose();
   };
 
   const confirmTerminalRestart = () => {
@@ -249,6 +266,32 @@ export function CloseDialogs({
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction onClick={confirmTerminalClose}>
+              Close Anyway
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={pendingPaneClose !== null}
+        onOpenChange={(open) => !open && cancelPaneClose()}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Close Pane?</AlertDialogTitle>
+            <AlertDialogDescription>
+              A process is running. Closing this pane will terminate it.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <OptOutRow
+            checked={optOutTerminalClose}
+            onCheckedChange={setOptOutTerminalClose}
+          />
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={cancelPaneClose}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={confirmPaneClose}>
               Close Anyway
             </AlertDialogAction>
           </AlertDialogFooter>

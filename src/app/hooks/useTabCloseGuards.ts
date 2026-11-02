@@ -31,6 +31,7 @@ type Params = {
   disposeTab: (id: number) => void;
   disposeDeletedTabs: (ids: number[]) => void;
   disposeTabs: (anchorId: number, plan: CloseTabsPlan) => void;
+  disposePane: (tabId: number) => void;
 };
 
 /**
@@ -46,6 +47,7 @@ export function useTabCloseGuards({
   disposeTab,
   disposeDeletedTabs,
   disposeTabs,
+  disposePane,
 }: Params) {
   const tabsRef = useRef(tabs);
   const activeIdRef = useRef(activeId);
@@ -63,6 +65,7 @@ export function useTabCloseGuards({
   const [pendingCloseMany, setPendingCloseMany] =
     useState<CloseManyPending | null>(null);
   const [closeManyConfirming, setCloseManyConfirming] = useState(false);
+  const [pendingPaneClose, setPendingPaneClose] = useState<number | null>(null);
   const closeManyRequestRef = useRef(0);
   const acknowledgedRevisionsRef = useRef(new Map<number, unknown>());
 
@@ -88,6 +91,31 @@ export function useTabCloseGuards({
     },
     [tabs, disposeTab, editorIsDirty],
   );
+
+  const handleClosePane = useCallback(
+    async (tabId: number) => {
+      const tab = tabsRef.current.find((x) => x.id === tabId);
+      if (
+        tab?.kind === "terminal" &&
+        confirmRunningTerminal() &&
+        (await leafHasForegroundProcess(tab.activeLeafId))
+      ) {
+        setPendingPaneClose(tabId);
+        return;
+      }
+      disposePane(tabId);
+    },
+    [disposePane],
+  );
+
+  const confirmPaneClose = useCallback(() => {
+    if (pendingPaneClose !== null) disposePane(pendingPaneClose);
+    setPendingPaneClose(null);
+  }, [pendingPaneClose, disposePane]);
+
+  const cancelPaneClose = useCallback(() => {
+    setPendingPaneClose(null);
+  }, []);
 
   const captureCloseMany = useCallback((closeIds: number[]) => {
     const close = new Set(closeIds);
@@ -287,6 +315,10 @@ export function useTabCloseGuards({
     pendingCloseMany,
     closeManyConfirming,
     handleClose,
+    pendingPaneClose,
+    handleClosePane,
+    confirmPaneClose,
+    cancelPaneClose,
     handleCloseTabsToRight,
     handleCloseOtherTabs,
     handleDeleteSpace,

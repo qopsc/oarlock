@@ -130,6 +130,7 @@ it.each(["right", "other"] as const)(
       disposeTab: vi.fn(),
       disposeDeletedTabs: vi.fn(),
       disposeTabs: dispose,
+      disposePane: vi.fn(),
     });
     if (kind === "right") api.handleCloseTabsToRight(1);
     else api.handleCloseOtherTabs(1);
@@ -155,6 +156,7 @@ it("batch close accepts a completed save before the dirty badge clears", async (
     disposeTab: vi.fn(),
     disposeDeletedTabs: vi.fn(),
     disposeTabs: dispose,
+      disposePane: vi.fn(),
   });
   api.handleCloseOtherTabs(1);
   await settle();
