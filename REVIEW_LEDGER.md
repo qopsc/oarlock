@@ -4612,7 +4612,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R049 | Closed; packaged check manual | An explicit recheck invalidates the selected and fallback shell captures before probing. Tests cover failures, changed captures and an older capture finishing late. |
 | R053 | Closed | Both install interfaces show macOS-specific commands only on macOS and direct other systems to the documentation. |
 | R055 | Closed | Status reports invalid UTF-8 instead of showing an empty repository. A Linux real-Git regression uses a non-UTF-8 filename; macOS refused creation of that filename. |
-| R056 | Open, Tier 2 | The shared path guard still refuses Unix filenames containing colons or control characters, although Git status can name them. |
+| R056 | Closed on Unix; Windows port | Literal Unix filenames containing colons, control characters and backslashes can be staged, previewed and unstaged; NUL, traversal and symlink-ancestor protections remain. |
 | R057 | Closed | A staged diff and history now report truncated Git output as an error. Real-Git regressions first reproduced both incomplete results and then passed with the fix. |
 | R063 | Closed | Source Control preserves Git filenames containing backslashes in grouping, labels, copy and file-open paths. A tree regression reproduced the incorrect folder before the fix. |
 | R072 | Closed | Shell locale selection reads the actual child environment in `LC_ALL`, `LC_CTYPE`, `LANG` precedence order. Regressions invoke the system locale utility on macOS and Linux. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **15 closed; 10 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **16 closed; 9 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4719,3 +4719,9 @@ Validation: the isolated consumer and full frontend suite passed (6,094 passed, 
 The local Vim core now processes each argument of `:set`, `:setlocal` and `:setglobal` in order, retaining the existing per-option behavior and stopping after an invalid option. Adapter regressions first reproduced the ignored second argument and now cover local and global settings, filetype reset, and the invalid-option stop. The existing upstream behavior that stores `insertModeEscKeysTimeout` as text is unchanged; the regression records that behavior rather than claiming a numeric conversion fix.
 
 Validation: the Vim adapter tests and full frontend suite passed (6,096 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. Manual signed-release check: in the built-in Vim editor run `:set textwidth=42 filetype=python`, then verify both settings, and test normal Vim editing and terminal Neovim separately.
+
+### R056 checkpoint — literal Unix Git filenames
+
+Unix Git operations now accept valid filenames containing colons, tabs, newlines and literal backslashes. NUL and dot-component traversal remain rejected; parent symlinks remain refused, and Git continues to receive literal pathspecs. Windows retains its previous stricter validation as port work. Real-Git regressions stage, preview and unstage these names, including a name resembling Git glob magic, check that another file is not staged, and refuse a colon-named symlink leading outside the repository.
+
+Validation: the final real-Git filename and symlink regressions passed on macOS and in the offline Linux container. The focused Git operation, 32-entry-point and 15 remote-scope suites passed. The full macOS native suite passed 1,584 library tests (four ignored) and all integration suites; the final two-test Git regression was rerun after strengthening its assertions. Strict Clippy passed. The full frontend suite passed 6,096 tests (two skipped), types passed and lint remained at 80 warnings. Linux retained its previously noted unrelated warnings.

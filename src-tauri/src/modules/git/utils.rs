@@ -177,7 +177,11 @@ pub fn resolve_within_repo(repo_root: &Path, rel: &str) -> Result<PathBuf> {
 /// Git names directory entries, not the filesystem objects their symlinks target.
 /// Historical entries need only lexical validation; they need not exist today.
 pub fn git_entry_name(rel: &str) -> Result<String> {
-    if !is_safe_pathspec(rel) || rel.starts_with(['/', '\\']) || Path::new(rel).is_absolute() {
+    if !is_safe_pathspec(rel)
+        || rel.starts_with('/')
+        || (cfg!(windows) && rel.starts_with('\\'))
+        || Path::new(rel).is_absolute()
+    {
         return Err(GitError::InvalidPath(rel.into()));
     }
     #[cfg(windows)]
@@ -240,14 +244,15 @@ fn is_valid_branch_name(name: &str) -> bool {
 }
 
 pub fn is_safe_pathspec(rel: &str) -> bool {
-    if rel.is_empty() || rel.contains(':') || rel.contains('\0') {
+    if rel.is_empty() || rel.contains('\0') {
         return false;
     }
-    if rel.chars().any(|c| (c as u32) < 0x20) {
+    if cfg!(windows) && (rel.contains(':') || rel.chars().any(|c| (c as u32) < 0x20)) {
         return false;
     }
     // Reject `.`/`..` so the deleted-path branch can't be used to escape the repo.
-    !rel.split(['/', '\\']).any(|c| c == "." || c == "..")
+    !rel.split(|c| c == '/' || (cfg!(windows) && c == '\\'))
+        .any(|c| c == "." || c == "..")
 }
 
 fn resolve_deleted_within_repo(repo_root: &Path, joined: &Path, rel: &str) -> Result<PathBuf> {
@@ -319,6 +324,7 @@ mod tests {
         assert!(is_safe_pathspec("file.with.dots"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn safe_pathspec_rejects_colon() {
         assert!(!is_safe_pathspec("evil:path"));
@@ -329,9 +335,17 @@ mod tests {
     #[test]
     fn safe_pathspec_rejects_nul_and_control() {
         assert!(!is_safe_pathspec("foo\0bar"));
-        assert!(!is_safe_pathspec("foo\nbar"));
-        assert!(!is_safe_pathspec("foo\rbar"));
-        assert!(!is_safe_pathspec("foo\tbar"));
+        #[cfg(windows)]
+        {
+            assert!(!is_safe_pathspec("foo\nbar"));
+            assert!(!is_safe_pathspec("foo\rbar"));
+            assert!(!is_safe_pathspec("foo\tbar"));
+        }
+        #[cfg(unix)]
+        {
+            assert!(is_safe_pathspec("foo\nbar"));
+            assert!(is_safe_pathspec(":foo\tbar"));
+        }
     }
 
     #[test]
@@ -339,6 +353,7 @@ mod tests {
         assert!(!is_safe_pathspec(""));
     }
 
+    #[cfg(windows)]
     #[test]
     fn resolve_within_repo_rejects_colon_path() {
         let tmp = std::env::temp_dir();
