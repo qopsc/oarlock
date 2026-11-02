@@ -436,6 +436,10 @@ fn defense_args(args: Vec<OsString>, workspace: &WorkspaceEnv) -> (Vec<OsString>
         ("core.editor", ":"),
         ("sequence.editor", ":"),
         ("interactive.diffFilter", ""),
+        // A submodule's own config and hooks are never inspected by the preflight.
+        ("submodule.recurse", "false"),
+        ("fetch.recurseSubmodules", "false"),
+        ("push.recurseSubmodules", "false"),
     ] {
         add(key, value);
     }
@@ -1049,5 +1053,30 @@ mod tests {
         let mut within = vec![b'a'; 8191];
         within.push(0);
         assert!(matches!(decode_text(within), TextSource::Binary));
+    }
+
+    fn guarded_args(args: &[&str]) -> Vec<String> {
+        let (args, _) = super::defense_args(
+            args.iter().map(OsString::from).collect(),
+            &WorkspaceEnv::Local,
+        );
+        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn submodule_recursion_is_off_for_every_guarded_command() {
+        for command in ["status", "switch", "pull", "fetch", "push", "worktree"] {
+            let args = guarded_args(&[command]);
+            for want in [
+                "submodule.recurse=false",
+                "fetch.recurseSubmodules=false",
+                "push.recurseSubmodules=false",
+            ] {
+                assert!(
+                    args.iter().any(|a| a == want),
+                    "{command} lacks -c {want}: {args:?}"
+                );
+            }
+        }
     }
 }
