@@ -4630,11 +4630,11 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R177 | AI/MCP on hold | The affected environment parsing belongs to MCP configuration. |
 | R187 | AI/MCP on hold | The affected tool-policy map belongs to MCP configuration. |
 | R191 | Closed; mounted check manual | A failed Markdown refresh keeps the previous content with a stale notice and Retry. A successful read clears the notice; state-transition regressions pass. |
-| R200 | Open, Tier 2 | The built-in Vim `:set` implementation still processes only `setArgs[0]`; a mounted-editor reproduction remains outstanding. |
+| R200 | Closed; mounted check manual | Multi-option `:set`, `:setlocal` and `:setglobal` commands now apply options in order and stop after an invalid option. Adapter regressions reproduce the original issue. |
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **14 closed; 11 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **15 closed; 10 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4713,3 +4713,9 @@ Validation: 21 focused frontend tests and native environment tests passed. The f
 The fork's public declaration entry now points to tracked, pinned declarations instead of ignored `dist` files. The maintenance note calls for keeping those declarations aligned with exported API changes. A regression copies only the declaration entry and its tracked declaration directory to a temporary consumer, then typechecks it with library checking enabled and no `dist` directory; it failed against the old entry.
 
 Validation: the isolated consumer and full frontend suite passed (6,094 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. This validates the package declaration entry, not a fresh dependency installation or packaged Vim behavior.
+
+### R200 checkpoint — Vim multi-option commands
+
+The local Vim core now processes each argument of `:set`, `:setlocal` and `:setglobal` in order, retaining the existing per-option behavior and stopping after an invalid option. Adapter regressions first reproduced the ignored second argument and now cover local and global settings, filetype reset, and the invalid-option stop. The existing upstream behavior that stores `insertModeEscKeysTimeout` as text is unchanged; the regression records that behavior rather than claiming a numeric conversion fix.
+
+Validation: the Vim adapter tests and full frontend suite passed (6,096 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. Manual signed-release check: in the built-in Vim editor run `:set textwidth=42 filetype=python`, then verify both settings, and test normal Vim editing and terminal Neovim separately.

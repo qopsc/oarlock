@@ -6130,6 +6130,12 @@ return resumeVim(cm, (function* () {
         }
         return;
       }
+      if (setArgs.length > 1) {
+        for (var i = 0; i < setArgs.length; i++) {
+          if (this.set(cm, Object.assign({}, params, { args: [setArgs[i]] })) === false) return false;
+        }
+        return;
+      }
       if (setArgs[0] === 'filetype&' || setArgs[0] === 'ft&') {
         if (setCfg.scope !== 'global') cm.setOption('mode', 'auto');
         return;
@@ -6171,6 +6177,7 @@ return resumeVim(cm, (function* () {
         var oldValue = getOption(optionName, cm, setCfg);
         if (oldValue instanceof Error) {
           showConfirm(cm, oldValue.message);
+          return false;
         } else if (oldValue === true || oldValue === false) {
           showConfirm(cm, ' ' + (oldValue ? '' : 'no') + optionName);
         } else {
@@ -6180,6 +6187,7 @@ return resumeVim(cm, (function* () {
         var setOptionReturn = setOption(optionName, value, cm, setCfg);
         if (setOptionReturn instanceof Error) {
           showConfirm(cm, setOptionReturn.message);
+          return false;
         }
       }
     },

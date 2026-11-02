@@ -40,3 +40,6 @@ Review 104 adds `:set filetype&` / `:set ft&` reset through the adapter's automa
 language selection. Empty filetype remains explicit plain text; the document
 bridge distinguishes that from reset. Ordinary filetype assignments keep the
 existing Ex option dispatch.
+
+The local `:set`, `:setlocal` and `:setglobal` dispatcher applies each option
+in a multi-option command in order, stopping when an option reports an error.
