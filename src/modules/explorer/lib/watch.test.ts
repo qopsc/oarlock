@@ -101,13 +101,27 @@ describe("watch handles", () => {
     watch.add(["/repo/src", "/repo/old"], ["/repo/src/a.ts", "/repo/old/x.rs"]);
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
     await Promise.resolve();
+    expect(toast.error).not.toHaveBeenCalled();
+    // The folder comes back: a health refresh asks for only the paths that were missing.
+    invoke.mockResolvedValue({
+      directories: [{ path: "/repo/old", handle: "old" }],
+      files: [{ path: "/repo/old/x.rs", handle: "x" }],
+    });
     await watchHealth.retry();
-    expect(invoke).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+    expect(invoke).toHaveBeenLastCalledWith("fs_watch_add", {
+      paths: ["/repo/old"],
+      files: ["/repo/old/x.rs"],
+      workspace: local,
+    });
+    await watchHealth.retry();
+    expect(invoke).toHaveBeenCalledTimes(2);
     expect(toast.error).not.toHaveBeenCalled();
     watch.dispose();
-    expect(invoke).toHaveBeenCalledWith("watch_release", {
-      handles: ["src", "a"],
-    });
+    const released = invoke.mock.calls
+      .filter(([command]) => command === "watch_release")
+      .flatMap(([, args]) => args.handles as string[]);
+    expect(released.sort()).toEqual(["a", "old", "src", "x"]);
   });
 
   it("keeps a surviving duplicate's recovered handle", async () => {

@@ -43,7 +43,7 @@ export function createFileWatchClient(
     failed.clear();
     clearNotice();
   };
-  type Entry = { handle?: string; removed: boolean; unavailable?: boolean };
+  type Entry = { handle?: string; removed: boolean };
   const entries = new Map<string, Entry[]>();
   const key = (kind: string, path: string) => JSON.stringify([kind, path]);
   const removeEntries = (removed: Entry[]) => {
@@ -93,10 +93,7 @@ export function createFileWatchClient(
           for (const path of new Set(values)) {
             const id = key(kind, path);
             const pending = (acquired.get(id) ?? []).filter(
-              (entry) =>
-                !entry.removed &&
-                entry.handle === undefined &&
-                !entry.unavailable,
+              (entry) => !entry.removed && entry.handle === undefined,
             );
             requested.set(id, pending);
             for (const _entry of pending) live.push(path);
@@ -127,15 +124,19 @@ export function createFileWatchClient(
                 else entry.handle = handle;
               }
             }
-            for (const [kind, gone] of [
+            // A folder that is gone is not an error to announce, but it is asked for
+            // again on the next health refresh or Retry, in case it comes back.
+            const gone: Entry[] = [];
+            for (const [kind, list] of [
               ["directories", result.unavailableDirectories],
               ["files", result.unavailableFiles],
             ] as const) {
-              for (const { path } of gone ?? []) {
+              for (const { path } of list ?? []) {
                 const entry = requested.get(key(kind, path))?.shift();
-                if (entry) entry.unavailable = true;
+                if (entry && !entry.removed) gone.push(entry);
               }
             }
+            if (gone.length) failed.set(attempt, gone);
             releaseWatchHandles(late);
             if (!failed.size) clearNotice();
           })
