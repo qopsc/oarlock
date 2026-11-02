@@ -600,3 +600,38 @@ fn a_nested_relative_link_that_escapes_only_at_the_destination_refuses_the_folde
     assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
     drop(tmp);
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_relative_link_cannot_reach_through_an_entry_that_forces_a_conflict_name() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let (src, dest, outside) = (root.join("source"), root.join("destination"), root.join("out"));
+    for dir in [&src, &dest, &outside] {
+        fs::create_dir(dir).unwrap();
+    }
+    let registry = WorkspaceRegistry::default();
+    registry.authorize(&src).unwrap();
+    registry.authorize(&dest).unwrap();
+    fs::create_dir(src.join("tree")).unwrap();
+    fs::write(src.join("tree/x"), "inside").unwrap();
+    fs::write(outside.join("x"), "secret").unwrap();
+    symlink("../tree/x", src.join("tree/link")).unwrap();
+    symlink(&outside, dest.join("tree")).unwrap();
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let result = copy_batch_impl(
+        vec![path(&src.join("tree"))],
+        &path(&dest),
+        &path(&dest),
+        &WorkspaceEnv::Local,
+        &registry,
+        &FileIndexState::default(),
+        true,
+    )
+    .unwrap();
+    assert!(result.created.is_empty(), "{result:?}");
+    assert_eq!(result.failed.len(), 1, "{result:?}");
+    assert!(result.failed[0].message.contains("escapes"), "{result:?}");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
+}

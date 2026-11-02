@@ -200,6 +200,29 @@ fn resolve_existing_prefix(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Whether a relative target, walked from the link's folder, never rises above the
+/// copied item's root. Judged by depth, never by comparing names: the item may be
+/// published under a conflict name that differs from the one assumed here.
+fn stays_inside_item(written: &Path, link_dest_dir: &Path, item_dest: &Path) -> bool {
+    use std::path::Component;
+    let Ok(below) = link_dest_dir.strip_prefix(item_dest) else {
+        return false;
+    };
+    let mut depth = below.components().count() as isize;
+    for component in written.components() {
+        match component {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            _ => return false,
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// A link inside a copied folder is kept only if it stays within the authorized
 /// folders both where it is now and where the copy will put it: a relative
 /// target such as `../../x` resolves differently after the move.
@@ -220,10 +243,10 @@ pub(super) fn nested_link_allowed(
     if written.is_absolute() {
         return Ok(());
     }
-    let lexical = lexical_normalize(&link_dest_dir.join(&written));
-    if lexical.starts_with(item_dest) {
+    if stays_inside_item(&written, link_dest_dir, item_dest) {
         return Ok(());
     }
+    let lexical = lexical_normalize(&link_dest_dir.join(&written));
     if !registry
         .gates(Origin::App)
         .reaches(&resolve_existing_prefix(&lexical)?)
