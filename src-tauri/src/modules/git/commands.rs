@@ -419,3 +419,41 @@ pub async fn git_worktree_remove(
     })
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    /// The guarded entry points take their native-store guard as an argument, so their
+    /// own tests inject one. The real guard needs a Tauri app handle, which this crate's
+    /// tests cannot build, so this pins the production call sites instead: each command
+    /// that changes the work tree must hand over `native_store::refuse_write`.
+    fn call_after<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} is no longer called"));
+        let rest = &source[start..];
+        &rest[..rest.len().min(260)]
+    }
+
+    #[test]
+    fn every_work_tree_changing_command_passes_the_real_native_store_guard() {
+        let commands = include_str!("commands.rs");
+        let discard = include_str!("discard.rs");
+        for (source, marker) in [
+            (commands, "worktree::add_with_guard("),
+            (commands, "worktree::remove_with_guard("),
+            (discard, "work.execute("),
+        ] {
+            let call = call_after(source, marker);
+            assert!(
+                call.contains("native_store::refuse_write("),
+                "{marker} is not given the native-store guard: {call}"
+            );
+        }
+        let checkout = commands.find("operations::checkout_branch(").unwrap();
+        let before = &commands[checkout.saturating_sub(260)..checkout];
+        assert!(
+            before.contains("native_store::refuse_write("),
+            "branch checkout runs without the native-store guard"
+        );
+    }
+}
