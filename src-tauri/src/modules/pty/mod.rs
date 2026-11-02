@@ -5,11 +5,11 @@ mod foreground;
 mod gate;
 mod hub;
 mod output;
-mod path_drop;
 mod presentation;
 mod protocol;
 mod queue;
 mod session;
+mod shell_dialect;
 pub(crate) mod shell_init;
 mod terminal_env;
 #[cfg(unix)]
@@ -400,33 +400,15 @@ pub fn pty_has_foreground_job(webview: tauri::Webview, state: tauri::State<PtySt
     }
 }
 
+/// The quoting dialect of the shell this terminal launched, or `None` for a shell that is not
+/// recognized. Fixed at spawn; nothing about the running process is verified here.
 #[tauri::command]
-pub async fn pty_prepare_path_drop(
+pub fn pty_shell_dialect(
     webview: tauri::Webview,
-    state: tauri::State<'_, PtyState>,
+    state: tauri::State<PtyState>,
     id: u32,
-    paths: Vec<String>,
-    source: WorkspaceEnv,
-) -> Result<path_drop::Prepared, String> {
-    let session = unpoisoned(state.sessions.read())
-        .get(&id)
-        .filter(|session| *session.owner == *webview.label())
-        .cloned()
-        .ok_or("Terminal no longer exists")?;
-    if session.drop_pending.swap(true, Ordering::AcqRel) {
-        return Err("A path drop is already being prepared for this terminal".into());
-    }
-    crate::modules::fs::blocking(move || {
-        struct Pending(Arc<Session>);
-        impl Drop for Pending {
-            fn drop(&mut self) {
-                self.0.drop_pending.store(false, Ordering::Release);
-            }
-        }
-        let pending = Pending(session);
-        path_drop::prepare(&pending.0, paths, source)
-    })
-    .await
+) -> Result<Option<shell_dialect::Dialect>, String> {
+    state.owned(id, webview.label()).map(|session| session.dialect)
 }
 
 /// A terminal reported its working directory (OSC 7): authorizes that folder as a workspace root
@@ -640,53 +622,18 @@ mod tests {
     }
 
     #[test]
-    fn path_drops_require_the_original_live_foreground_shell() {
+    fn the_shell_dialect_is_the_launched_shells_and_belongs_to_its_window() {
         let state = Arc::new(PtyState::default());
-        struct Cleanup<'a>(&'a PtyState);
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                for id in [51, 52, 53, 54] {
-                    if let Some(session) = self.0.take(id) {
-                        reap(id, session, "test cleanup");
-                    }
-                }
-            }
+        let session = open(&state, 51, "main");
+        assert_eq!(
+            state.owned(51, "main").unwrap().dialect,
+            Some(shell_dialect::Dialect::Posix)
+        );
+        assert!(state.owned(51, "w-1").is_err());
+        if let Some(taken) = state.take(51) {
+            reap(51, taken, "test cleanup");
         }
-        let _cleanup = Cleanup(&state);
-        let original = open_running(&state, 51, "main", "read line");
-        let prepare = |session: &Session| {
-            path_drop::prepare(
-                session,
-                vec!["/tmp/a$(echo nope)".into()],
-                WorkspaceEnv::Local,
-            )
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while let Err(error) = prepare(&original) {
-            assert!(Instant::now() < deadline, "original shell drop: {error}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let replaced = open_running(&state, 52, "main", "exec /bin/sleep 30");
-        wait_for("exec replacement", || {
-            path_drop::process_executable(replaced.shell_pid)
-                .is_some_and(|p| p.file_name() == Some(std::ffi::OsStr::new("sleep")))
-        });
-        assert!(prepare(&replaced).is_err());
-        let nested = open_running(&state, 53, "main", "set -m; /bin/sleep 30");
-        wait_for("foreground child", || {
-            unpoisoned(nested.master.lock())
-                .as_ref()
-                .and_then(|master| master.process_group_leader())
-                .is_some_and(|pid| pid > 0 && pid as u32 != nested.shell_pid)
-        });
-        assert!(prepare(&nested).is_err());
-        let shared = open_running(&state, 54, "main", "(read line); :");
-        wait_for("child sharing foreground group", || {
-            foreground::shell_has_children(shared.shell_pid)
-        });
-        assert!(prepare(&shared).is_err());
-        original.close_output();
-        assert!(prepare(&original).is_err());
+        drop(session);
     }
 
     /// What `pty_authorize_cwd` decides for terminal `session` and a reported folder.

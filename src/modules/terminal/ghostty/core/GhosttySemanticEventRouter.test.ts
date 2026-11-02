@@ -29,6 +29,17 @@ describe("GhosttySemanticEventRouter", () => {
     expect(onCommandState.mock.calls).toEqual([[false], [true], [false]]);
   });
 
+  it("reports the end of a prompt only for OSC 133 B, not for A or D", () => {
+    const onPromptEnd = vi.fn();
+    const router = new GhosttySemanticEventRouter({ onPromptEnd });
+
+    router.handle({ type: "prompt-start" });
+    router.handle({ type: "end-of-command", exitCode: 0 });
+    expect(onPromptEnd).not.toHaveBeenCalled();
+    router.handle({ type: "prompt-end" });
+    expect(onPromptEnd).toHaveBeenCalledOnce();
+  });
+
   it("validates and decodes OSC 52 clipboard writes", () => {
     const onClipboard = vi.fn();
     const router = new GhosttySemanticEventRouter({ onClipboard });

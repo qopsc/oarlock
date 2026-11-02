@@ -18,8 +18,8 @@ import {
   getLaunchDir,
 } from "@/lib/launchDir";
 import { toast } from "sonner";
-import { IS_MAC } from "@/lib/platform";
-import { quoteShellPath, type DropShell } from "@/modules/terminal/lib/quoteShellPath";
+import { IS_MAC, IS_WINDOWS } from "@/lib/platform";
+import { quoteShellPath } from "@/modules/terminal/lib/quoteShellPath";
 import { usePresence } from "@/lib/usePresence";
 import { useZoom } from "@/lib/useZoom";
 import { cn, isMarkdownPath } from "@/lib/utils";
@@ -119,6 +119,7 @@ import {
   isTerminalSurfaceTarget,
   leafIds,
   leafShellAtPrompt,
+  leafShellDialect,
   navigateFocusedBlocks,
   type PaneBounds,
   type SplitPosition,
@@ -802,7 +803,6 @@ export default function App() {
         });
         return;
       }
-      const terminalPty = owner.pty;
       const valid = () => {
         const tab = tabsRef.current.find((item) => item.id === activeIdRef.current);
         return request === cdRequest.current && tab?.kind === "terminal" &&
@@ -815,14 +815,12 @@ export default function App() {
           atPrompt === false ? "A program is running in this terminal." :
             "Could not verify the terminal is at its prompt.",
         );
-        const prepared = await invoke<{ shell: DropShell; paths: string[] }>(
-          "pty_prepare_path_drop",
-          { id: terminalPty.id, paths: [path], source: owner.workspace },
-        );
-        const target = prepared.paths[0];
-        if (!target) throw new Error("Could not resolve the directory.");
-        const prefix = prepared.shell === "cmd" ? "cd /d " : "cd ";
-        return `${prefix}${quoteShellPath(target, prepared.shell)}\r`;
+        const shell = await leafShellDialect(leafId);
+        if (!shell) throw new Error("This shell does not support changing directory from here.");
+        const { convertShellPath } = await import("@/modules/terminal/lib/shellPathDrop");
+        const target = convertShellPath(path, owner.workspace, owner.workspace, shell, IS_WINDOWS);
+        const prefix = shell === "cmd" ? "cd /d " : "cd ";
+        return `${prefix}${quoteShellPath(target, shell)}\r`;
       }, valid);
       terminalRefs.current.get(leafId)?.focus();
     },

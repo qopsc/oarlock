@@ -62,6 +62,12 @@ import {
 import { TerminalRequestLifetime } from "../lib/TerminalRequestLifetime";
 import { requestTerminalPrompt } from "../lib/terminalPrompts";
 import { useTerminalStatusStore } from "../lib/terminalStatus";
+import { IS_WINDOWS } from "@/lib/platform";
+import type { DropShell } from "../lib/quoteShellPath";
+import { captureDropOwner } from "../lib/dropOwnership";
+import { cachedShellDialect } from "../lib/shellDialectCache";
+import { foregroundJob, shellPromptConfirmed } from "../lib/shellPromptConfirmed";
+import { launchShellDrop } from "../lib/shellDropLauncher";
 import { GhosttySemanticEventRouter } from "./core/GhosttySemanticEventRouter";
 import { getGhosttyCoreRuntime } from "./GhosttyCoreRuntime";
 import type {
@@ -140,6 +146,10 @@ type GhosttySession = {
   shellExited: boolean;
   disposed: boolean;
   generation: number;
+  /** The shell's quoting dialect, keyed to the pty it was read for. */
+  dialect: { pty: PtySession; value: DropShell | null } | null;
+  /** Shell integration reported a prompt since this shell started. */
+  promptSeen: boolean;
   requests: TerminalRequestLifetime;
   initializing: Promise<void> | null;
   startup: GhosttyStartupTimings;
@@ -561,49 +571,66 @@ export function dropPathsIntoGhosttySession(
   const session = sessions.get(leafId);
   if (!session?.pty || session.shellExited || session.disposed) return false;
   const blocks = ghosttyBlocks(leafId);
+  const commandBar = blocks?.getMode() === "prompt";
   const capture = blocks?.pathInsertion;
-  const insert = blocks?.getMode() === "prompt" ? capture?.() : null;
-  if (!insert) {
+  const insert = commandBar ? capture?.() : null;
+  if (commandBar && !insert) {
     toast.error("Cannot insert dropped paths", {
       description:
         "Use the command bar with the cursor between arguments. Unfinished quotes, compound commands and raw shell input cannot be verified.",
     });
     return true;
   }
+  const input = session.input;
+  if (!commandBar && !input) return false;
   const pty = session.pty;
-  const generation = session.generation;
   const signal = session.requests.signal;
   const navigation = captureTerminalNavigation();
-  const active = () =>
-    navigation() &&
-    !signal.aborted &&
-    sessions.get(leafId) === session &&
-    session.generation === generation &&
-    session.pty === pty &&
-    !session.shellExited &&
-    !session.disposed &&
-    blocks?.getMode() === "prompt" &&
-    blocks.pathInsertion === capture;
+  const running = () =>
+    useTerminalStatusStore.getState().leaves[leafId]?.running === true;
+  // Typing and focus changes while the drop is prepared do not cancel it:
+  // input stays ordered behind its reserved slot.
+  const active = captureDropOwner(
+    session,
+    () => sessions.get(leafId),
+    navigation,
+    signal,
+    () =>
+      commandBar
+        ? blocks?.getMode() === "prompt" && blocks.pathInsertion === capture
+        : ghosttyBlocks(leafId)?.getMode() !== "prompt",
+  );
   const finish = session.writer.reserveInput();
   if (!finish) return true;
-  void import("../lib/shellPathDrop")
-    .then(({ prepareShellPathDrop }) =>
-      prepareShellPathDrop(pty.id, paths, source, active, (text) => {
-        finish(() => {
-          if (!active() || !insert(text)) toast.error("Cannot insert dropped paths", {
-            description: "The terminal or command changed. Drop the files again.",
-          });
-        }, text.length * 2);
-      }),
-    )
-    .then(() => finish(() => toast.message("Terminal input cancelled", {
-      description: "The terminal changed before the dropped paths could be inserted.",
-    })))
-    .catch((error) => {
-      finish(() => toast.error("Cannot insert dropped paths", {
-        description: String(error),
-      }));
-    });
+  const refuse = (description: string) =>
+    toast.error("Cannot insert dropped paths", { description });
+  launchShellDrop({
+    paths,
+    source,
+    target: session.workspace,
+    windows: IS_WINDOWS,
+    finish,
+    atPrompt: commandBar
+      ? async () => true
+      : async () => {
+          if (running()) return false;
+          const job = await ghosttyLeafHasForegroundJob(leafId);
+          return job === null ? null : !job;
+        },
+    dialect: () => shellDialect(session, pty),
+    promptConfirmed: () => commandBar || promptConfirmed(session),
+    active,
+    running,
+    paste: (text) => {
+      if (insert) {
+        if (!insert(text)) refuse("The terminal or command changed. Drop the files again.");
+      } else {
+        input?.paste(text);
+        session.surface?.focus();
+      }
+    },
+    refuse,
+  });
   return true;
 }
 
@@ -681,13 +708,36 @@ export function captureGhosttyCompletionOwner(leafId: number) {
     () => sessions.get(leafId),
     captureTerminalNavigation(),
     () => ghosttyBlocks(leafId)?.getMode() === "prompt",
-    async (id, cwd, workspace) => {
-      const result = await invoke<{ shell: import("../lib/quoteShellPath").DropShell }>(
-        "pty_prepare_path_drop", { id, paths: [cwd], source: workspace },
-      );
-      return result.shell;
+    async (id) => {
+      const session = sessions.get(leafId);
+      const pty = session?.pty;
+      if (!session || !pty || pty.id !== id) throw new Error("Terminal changed");
+      const dialect = await shellDialect(session, pty);
+      if (!dialect) throw new Error("This shell does not support path completion.");
+      return dialect;
     },
   );
+}
+
+/**
+ * The quoting dialect of the shell this pty launched, asked once per pty.
+ * A reply that lands after a restart is returned to its caller (whose own
+ * ownership check fails) and never stored for the new shell.
+ */
+async function shellDialect(
+  session: GhosttySession,
+  pty: PtySession,
+): Promise<DropShell | null> {
+  return cachedShellDialect(session, pty, () =>
+    invoke<DropShell | null>("pty_shell_dialect", { id: pty.id }),
+  );
+}
+
+/** The dialect of the leaf's current shell, for the breadcrumb `cd`. */
+export async function ghosttyShellDialect(leafId: number): Promise<DropShell | null> {
+  const session = sessions.get(leafId);
+  const pty = session?.pty;
+  return session && pty ? shellDialect(session, pty) : null;
 }
 
 export function ghosttyFocusedLeaf(): number | null {
@@ -741,19 +791,32 @@ export async function ghosttyLeafHasForegroundProcess(
   }
 }
 
+function promptState(session: GhosttySession) {
+  return {
+    promptSeen: session.promptSeen,
+    alternateScreen: session.model?.modes().alternateScreen,
+  };
+}
+
+function promptConfirmed(session: GhosttySession): boolean {
+  return shellPromptConfirmed(session.workspace, promptState(session));
+}
+
 /**
  * A job owns the pane's terminal (Unix), or its shell has a console program
  * as a child (Windows; a GUI app it started does not count); null when that
- * cannot be told.
+ * cannot be told. A WSL pane, which the process check cannot see into, counts
+ * as having one until shell integration reported a prompt (`foregroundJob`).
  */
 export async function ghosttyLeafHasForegroundJob(
   leafId: number,
 ): Promise<boolean | null> {
   const session = sessions.get(leafId);
   if (!session?.pty || session.shellExited) return null;
-  return invoke<boolean>("pty_has_foreground_job", {
-    id: session.pty.id,
-  }).catch(() => null);
+  const id = session.pty.id;
+  return foregroundJob(session.workspace, promptState(session), () =>
+    invoke<boolean>("pty_has_foreground_job", { id }).catch(() => null),
+  );
 }
 
 export function disposeGhosttySession(leafId: number): boolean {
@@ -863,6 +926,8 @@ async function respawnGhosttySession(
     () => sessions.get(leafId) === session,
   ))) return false;
   session.pty = null;
+  session.dialect = null;
+  session.promptSeen = false;
   session.shellExited = false;
   session.lastCwd = null;
   session.cwdReports.reset();
@@ -1004,6 +1069,8 @@ function ensureSession(
     shellExited: false,
     disposed: false,
     generation: 0,
+    dialect: null,
+    promptSeen: false,
     requests: new TerminalRequestLifetime(),
     initializing: null,
     startup: createStartupTimings(),
@@ -1137,6 +1204,9 @@ async function initializeSessionGeneration(
     },
     onCommandState: (running) => {
       if (!running) mark("firstPromptMs");
+    },
+    onPromptEnd: () => {
+      if (alive()) session.promptSeen = true;
     },
   });
   const model = await coreRuntime.createModel({
