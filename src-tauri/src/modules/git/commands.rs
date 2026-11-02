@@ -394,10 +394,10 @@ pub async fn git_worktree_add(
     app: AppHandle,
 ) -> Result<GitWorktreeAddResult, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
-    let owner = app.clone();
+    let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
     blocking(app, move |r| {
         worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,
-            &|folder| crate::modules::fs::native_store::refuse_write(&owner, folder)).map_err(Into::into)
+            &super::utils::store_guard(&dirs)).map_err(Into::into)
     })
     .await
 }
@@ -412,48 +412,33 @@ pub async fn git_worktree_remove(
     app: AppHandle,
 ) -> Result<GitWorktreeRemoveResult, String> {
     let workspace = WorkspaceEnv::from_option(workspace);
-    let owner = app.clone();
+    let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
     blocking(app, move |r| {
         worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,
-            &|folder| crate::modules::fs::native_store::refuse_write(&owner, folder)).map_err(Into::into)
+            &super::utils::store_guard(&dirs)).map_err(Into::into)
     })
     .await
 }
 
 #[cfg(test)]
 mod tests {
-    /// The guarded entry points take their native-store guard as an argument, so their
-    /// own tests inject one. The real guard needs a Tauri app handle, which this crate's
-    /// tests cannot build, so this pins the production call sites instead: each command
-    /// that changes the work tree must hand over `native_store::refuse_write`.
-    fn call_after<'a>(source: &'a str, marker: &str) -> &'a str {
-        let start = source
-            .find(marker)
-            .unwrap_or_else(|| panic!("{marker} is no longer called"));
-        let rest = &source[start..];
-        &rest[..rest.len().min(260)]
+    /// Defense in depth: the guard's behavior is tested with the real check in
+    /// `worktree.rs` and `discard.rs`, but only these call sites hand it over.
+    fn production(source: &str) -> &str {
+        &source[..source.find("#[cfg(test)]").unwrap()]
     }
 
     #[test]
-    fn every_work_tree_changing_command_passes_the_real_native_store_guard() {
-        let commands = include_str!("commands.rs");
-        let discard = include_str!("discard.rs");
-        for (source, marker) in [
-            (commands, "worktree::add_with_guard("),
-            (commands, "worktree::remove_with_guard("),
-            (discard, "work.execute("),
+    fn every_work_tree_changing_command_passes_the_native_store_guard() {
+        let commands = production(include_str!("commands.rs"));
+        let discard = production(include_str!("discard.rs"));
+        for (source, call) in [
+            (commands, "worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,\n            &super::utils::store_guard(&dirs))"),
+            (commands, "worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,\n            &super::utils::store_guard(&dirs))"),
+            (commands, "crate::modules::fs::native_store::refuse_write(&owner, &root)?;\n        operations::checkout_branch("),
+            (discard, "let guard = super::utils::store_guard(&dirs);\n            let outcome = work.execute(&app.state::<WorkspaceRegistry>(), &guard);"),
         ] {
-            let call = call_after(source, marker);
-            assert!(
-                call.contains("native_store::refuse_write("),
-                "{marker} is not given the native-store guard: {call}"
-            );
+            assert!(source.contains(call), "missing the native-store guard: {call}");
         }
-        let checkout = commands.find("operations::checkout_branch(").unwrap();
-        let before = &commands[checkout.saturating_sub(260)..checkout];
-        assert!(
-            before.contains("native_store::refuse_write("),
-            "branch checkout runs without the native-store guard"
-        );
     }
 }

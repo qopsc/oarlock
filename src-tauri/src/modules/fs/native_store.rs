@@ -69,17 +69,46 @@ const NATIVE_FILES: &[&str] = &[
     "oarlock-ai-agents.json", "oarlock-subagents.json",
 ];
 
+/// The native stores and store trees a workspace write must not reach, resolved from the app's
+/// folders once so the check itself (`refuse_write_in`) needs no app handle.
+pub(crate) struct StoreDirs {
+    stores: Vec<PathBuf>,
+    trees: Vec<PathBuf>,
+}
+
+impl StoreDirs {
+    pub(crate) fn under(data: &Path, local_data: &Path, config: &Path, extra: Vec<PathBuf>) -> Self {
+        let mut stores: Vec<PathBuf> = NATIVE_FILES.iter().map(|name| data.join(name)).collect();
+        stores.push(local_data.join("secrets.json"));
+        stores.push(config.join(".window-state.json"));
+        stores.extend(extra);
+        Self {
+            stores,
+            trees: vec![
+                data.join("windows"), data.join("terminal-scrollback"),
+                data.join("conversations"), data.join(".oarlock-window-restore"),
+            ],
+        }
+    }
+}
+
+pub(crate) fn store_dirs(app: &tauri::AppHandle) -> Result<StoreDirs, String> {
+    let path = app.path();
+    Ok(StoreDirs::under(
+        &path.app_data_dir().map_err(|e| e.to_string())?,
+        &path.app_local_data_dir().map_err(|e| e.to_string())?,
+        &path.app_config_dir().map_err(|e| e.to_string())?,
+        crate::modules::agent::protected_settings_paths()?,
+    ))
+}
+
+pub(crate) fn refuse_write_in(dirs: &StoreDirs, target: &Path) -> Result<(), String> {
+    check(target, &dirs.stores)?;
+    check_trees(target, &dirs.trees)
+}
+
 pub(crate) fn refuse_write(app: &tauri::AppHandle, target: &Path) -> Result<(), String> {
-    let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let mut stores: Vec<PathBuf> = NATIVE_FILES.iter().map(|name| data.join(name)).collect();
-    stores.push(app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("secrets.json"));
-    stores.push(app.path().app_config_dir().map_err(|e| e.to_string())?.join(".window-state.json"));
-    stores.extend(crate::modules::agent::protected_settings_paths()?);
-    check(target, &stores)?;
-    check_trees(target, &[
-        data.join("windows"), data.join("terminal-scrollback"),
-        data.join("conversations"), data.join(".oarlock-window-restore"),
-    ])
+    refuse_write_in(&store_dirs(app)?, target)
 }
 
 #[cfg(unix)]

@@ -1302,6 +1302,46 @@ mod tests {
     }
 
     #[test]
+    fn add_and_remove_refuse_native_store_locations_with_the_real_check() {
+        use super::super::utils::store_guard;
+        use crate::modules::fs::native_store::StoreDirs;
+        let Some(fx) = Fixture::new() else { return };
+        let data = fx.base.join("data");
+        std::fs::create_dir_all(data.join("windows")).unwrap();
+        let dirs = StoreDirs::under(&data, &data, &data, Vec::new());
+        let dest = data.join("windows/new-worktree");
+        let error = add_with_guard(
+            &fx.registry,
+            &fx.root(),
+            &new_branch("into-store", None),
+            Some(dest.to_str().unwrap()),
+            &WorkspaceEnv::Local,
+            &store_guard(&dirs),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("native-owned"), "{error}");
+        assert!(!dest.exists());
+
+        // A worktree that contains the store tree is not removed.
+        let wt = fx.add(new_branch("holds-store", None), None).unwrap();
+        let held = PathBuf::from(&wt.path).join("data");
+        std::fs::create_dir_all(held.join("windows")).unwrap();
+        std::fs::write(held.join("windows/state.json"), "native").unwrap();
+        let dirs = StoreDirs::under(&held, &held, &held, Vec::new());
+        let error = remove_with_guard(
+            &fx.registry,
+            &fx.root(),
+            &wt.path,
+            true,
+            &WorkspaceEnv::Local,
+            &store_guard(&dirs),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("native-owned"), "{error}");
+        assert_eq!(std::fs::read(held.join("windows/state.json")).unwrap(), b"native");
+    }
+
+    #[test]
     fn forced_removal_refuses_a_target_worktree_with_executable_configuration() {
         let Some(fx) = Fixture::new() else { return };
         let wt = fx.add(new_branch("hostile", None), None).unwrap();
