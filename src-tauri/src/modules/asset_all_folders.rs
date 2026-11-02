@@ -138,7 +138,7 @@ pub fn protocol<R: Runtime>(
                 app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref()),
             )
         };
-        responder.respond(respond_with(&request, &origin, &served, &served));
+        responder.respond(respond_with(&request, &origin, served, served));
       });
     });
 }
