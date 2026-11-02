@@ -759,8 +759,7 @@ the shell owns the foreground; delete the per-drop pgrp verification.
 
 **O-07** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src/modules/editor/lib/quitBarrier.ts`,
 `src/app/hooks/quitApproval.ts`, `src-tauri/src/modules/windows/quit.rs` (verification phase), `src/modules/editor/lib/documentMutations.ts:120-166`
-Status: deferred (batch D): the quit seal is unchanged; only the D-11 toast for a refused close
-landed
+Status: fixed in batch H (`pr-2-fixes/batch-H.md`, head 76778391): the quit seal, overlay, watchdog and `app_quit_changed` are gone; after every approval native sends one verify ticket that each window answers after flushing, reading its dirty revisions and answering in one task, and a changed revision re-asks that window; an edit after a window's answer is the accepted residual (`quitApproval.test.ts`, `windows/quit.rs`)
 
 The quit seal, inert overlay, 6 s watchdog, deferred lifecycle map and the rule that a mutation
 batch cancels an active seal close one window: the IPC latency between a window's final answer
@@ -775,8 +774,7 @@ machinery.
 
 **O-08** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src/modules/editor/lib/discardCoordinator.ts`,
 `src-tauri/src/modules/git/discard.rs` (1,094 lines)
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in batch H (`pr-2-fixes/batch-H.md`, head 76778391): the discard coordinator is replaced by `discard-begin` and `discard-end` on the ordered `fs:mutation` stream, a stateless `git_discard_match`, `prepare` re-planning and refusing changed roots, and a mutation-sequence fence on editor reads so a non-originating window never adopts Git's intermediate content (`remoteDiscard.test.ts`, `git/discard.rs`); residuals in the note's section 6
 
 Non-originating windows always preserve their buffers (`preserve = true`), so the per-window
 prepare barrier, 5 s native timeout, settled acknowledgements and 2 s polling buy nothing over a
@@ -789,8 +787,7 @@ Fix: emit begin and end events on the mutation stream and delete the coordinator
 
 **O-09** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/fs/mutation_events.rs:139-193`,
 `src/modules/editor/lib/recoveryTarget.ts`
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in batch H (`pr-2-fixes/batch-H.md`, head 76778391): the native recovery pins and `fs_recovery_*` commands are deleted; the local tracker over `fs:mutation` invalidates a pending Restore or Save As on every Oarlock-originated mutation of the destination or an ancestor, from any window, and on lost coverage; alias history is no longer tracked (best effort)
 
 Native recovery pins (`fs_recovery_begin`, `changed`, `end`, each pinning a `Destination` under
 the stream mutex) defend Restore and Save As against a same-user alias rename mid-write, which
@@ -1049,8 +1046,7 @@ anything is uploaded to the release"
 external change fatal until restart. Under the approved model a same-user writer is best effort and the conditional
 writer already checks identity and version at publish. Fix: drop `verify_disk` from reads.
 
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in batch H (`pr-2-fixes/batch-H.md`, head 76778391): `verify_disk` is removed from theme reads; `persist` still conflicts on a changed file, and a refused publish drops the cached store so Retry reloads from disk (`themes.rs` tests)
 
 **T-05** · Low · MINOR · 2.0 · CONFIRMED · `test-quality` · `src/modules/markdown/MarkdownImage.lifecycle.test.tsx:100-104`.
 The lifecycle test asserts the local-image failure latch by calling `onError` on a bare element, so it locks in the

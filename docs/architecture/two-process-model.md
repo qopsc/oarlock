@@ -63,7 +63,7 @@ Every command here that takes a path is refused outside the folders the workspac
 #### Mutate
 
 - `fs_create_file` / `fs_create_dir`
-- `fs_rename` / `fs_move` / `fs_delete` / `fs_delete_batch` / `fs_copy` - rename, move, delete and batch delete guard the authorized entry (resolved parent plus name) and look at the native-store guard again immediately before acting. They publish `fs:mutation` through path claims (`fs/mutation_events.rs`): operations on the same path, or a path and an ancestor, run one at a time from claim to publish, unrelated ones overlap, and the stream lock is never held across the filesystem call; a failed broadcast is logged and counted and the sequence still advances so windows see a gap
+- `fs_rename` / `fs_move` / `fs_delete` / `fs_delete_batch` / `fs_copy` - rename, move, delete and batch delete guard the authorized entry (resolved parent plus name) and look at the native-store guard again immediately before acting. They publish `fs:mutation` through path claims (`fs/mutation_events.rs`): operations on the same path, or a path and an ancestor, run one at a time from claim to publish, unrelated ones overlap, and the stream lock is never held across the filesystem call; a failed broadcast is logged and counted and the sequence still advances so windows see a gap. It also carries `discard-begin` (origin window, repository, canonical roots) and `discard-end` for Source Control Discard, and `fs_mutation_sequence` returns the stream's current sequence
 - `fs_reconcile_documents` - finds open documents that moved, by identity: a budget per root (100,000 entries or 5 s), ignore files honored, `.git` skipped, the document's former folder walked first (once, only for unresolved documents, inside a shared 5 s deadline); a missing or unauthorized root is skipped; a document without a native version is never bound to a rename destination, and an unresolved one answers `path: null`
 
 #### Clipboard
@@ -93,7 +93,7 @@ All git commands are gated through the workspace authorization registry.
 - `git_status` - decoded per NUL record; an entry whose name is not UTF-8 is marked `unreadable` and shown as "Unreadable name", and the backend refuses actions on any entry containing U+FFFD
 - `git_diff` / `git_diff_content`
 - `git_file_base` - a file's committed (HEAD) text, for the editor's change gutter
-- `git_stage` / `git_unstage` / `git_discard`
+- `git_stage` / `git_unstage` / `git_discard_scope` / `git_discard_match` / `git_discard`
 - `git_commit`
 - `git_fetch` / `git_pull_ff_only` / `git_push`
 - `git_log` / `git_show_commit` / `git_commit_files` / `git_commit_file_diff`
