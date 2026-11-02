@@ -5526,3 +5526,11 @@ failures only). The Linux folder sync after a save or copy opens a readable desc
 (cap-std's `O_PATH` handle cannot be fsynced), a copy walk skips its own staging location (a
 repository's `.git` can be copied inside the repository), and a crashed save's `.oarlock-staging`
 is swept when a later operation picks another location.
+
+Bundle sizes, from a production build of the merged head (`bun run size`, gzip; a local build of the
+PR 1 merge base matches CI's figures byte for byte, see Review 107): total client JS 2,900,994 bytes,
+primary terminal JS 99,117, startup 257,944, WebGL fallback 16,563, WASM variants 656,131. Against
+the head these batches started from (`e7db16e3`: 2,900,924 and 98,652) that is 70 bytes of total
+and 465 of terminal JS (batch G's drop path and prompt rule); startup fell by 236. The total and
+terminal allowances are set to 2,901,000 and 99,120 bytes, the first allowances on this branch
+taken from a real build; the earlier ones were below what any build produced.
