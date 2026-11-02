@@ -4616,7 +4616,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R057 | Closed | A staged diff and history now report truncated Git output as an error. Real-Git regressions first reproduced both incomplete results and then passed with the fix. |
 | R063 | Open, Tier 2 | Source Control still changes backslashes into separators for grouping and opening. A direct tree helper probe placed Unix `a\\b.txt` under folder `a`. |
 | R072 | Open, Tier 2 | The shell locale check accepts any UTF-8 variable even if a higher-priority non-UTF-8 variable wins, and changes only `LANG`. |
-| R082 | Open, Tier 2 | A direct terminal-link helper probe changed POSIX `/repo/folder\\name/child.txt` into `/repo/folder/name/child.txt`. |
+| R082 | Closed | Terminal link resolution preserves literal backslashes in Unix directories and filenames; a regression reproduced the wrong target, and Windows drive and UNC cases still pass. |
 | R086 | Closed; platform checks remain | AP002 binds completion to its terminal and workspace; existing ownership tests and real POSIX-shell checks are recorded in the depth checkpoint. Mounted GUI and Windows/WSL checks remain manual/port work. |
 | R093 | Open, Tier 2 | The optional WebGL shader path still does not check failed texture/framebuffer allocation or completeness. No driver-pressure reproduction was run. |
 | R095 | Open, Tier 2 | The terminal core still drops arbitrary leading reply bytes on overflow. The source confirms the behavior; no production burst reproduction is claimed. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **4 closed; 21 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **5 closed; 20 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4647,3 +4647,9 @@ Validation: the full macOS native suite passed 1,578 library tests (four ignored
 Local file URIs preserve literal backslashes in Unix filenames, resolve `localhost` as the local machine, and refuse other URI hosts rather than treating a host name as a relative path. URI comparison no longer equates a Unix filename containing a backslash with a directory path. Existing Windows drive-letter cases continue to pass. The new cases failed before the fix.
 
 Validation: 105 focused language-server tests and the full frontend suite passed (6,085 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, and strict Clippy passed. This is automated helper and integration coverage, not a packaged language-server navigation test.
+
+### R082 checkpoint — terminal link path resolution
+
+Terminal link joining now treats backslashes as filename characters in Unix paths, while retaining Windows drive and UNC separator handling. A direct link regression covering directory names, filenames and parent traversal failed before the change and passes afterward. This is automated link-resolution coverage; a packaged-app click on such a file remains a useful manual check.
+
+Validation: the focused terminal-link tests and full frontend suite passed (6,086 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, and strict Clippy passed.

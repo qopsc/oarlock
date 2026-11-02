@@ -66,6 +66,19 @@ describe("terminal link targets", () => {
     expect(joinPath("C:\\work", "src\\x.cs")).toBe("C:\\work\\src\\x.cs");
     expect(joinPath("/", "etc")).toBe("/etc");
   });
+
+  it("preserves literal backslashes in Unix directories and filenames", () => {
+    expect(joinPath("/repo/folder\\name", "child.txt")).toBe(
+      "/repo/folder\\name/child.txt",
+    );
+    expect(resolveTerminalLink("file\\name.rs:2", "/repo", null)).toMatchObject({
+      path: "/repo/file\\name.rs",
+      line: 2,
+    });
+    expect(joinPath("/repo/folder\\name", "../next\\file")).toBe(
+      "/repo/next\\file",
+    );
+  });
 });
 
 describe("file:// hosts", () => {

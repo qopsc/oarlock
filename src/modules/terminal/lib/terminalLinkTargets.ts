@@ -164,7 +164,8 @@ function isAbsolutePath(path: string): boolean {
 
 /** Joins and normalizes `.`/`..` segments, keeping the base's separator. */
 export function joinPath(base: string, relative: string): string {
-  const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/";
+  const windows = /^[A-Za-z]:[\\/]/.test(base) || base.startsWith("\\\\");
+  const separator = windows && base.includes("\\") && !base.includes("/") ? "\\" : "/";
   const uncRoot = /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.exec(base)?.[0];
   const root =
     uncRoot ??
@@ -174,7 +175,10 @@ export function joinPath(base: string, relative: string): string {
         ? "/"
         : "");
   const segments: string[] = [];
-  for (const part of `${base.slice(root.length)}/${relative}`.split(/[\\/]+/)) {
+  const parts = `${base.slice(root.length)}/${relative}`.split(
+    windows ? /[\\/]+/ : /\/+/,
+  );
+  for (const part of parts) {
     if (!part || part === ".") continue;
     if (part === "..") segments.pop();
     else segments.push(part);
