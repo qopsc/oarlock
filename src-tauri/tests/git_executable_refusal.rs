@@ -111,6 +111,9 @@ fn commit_refuses_configured_executable_classes() {
         ),
         ("commit.gpgSign", "true", "commit.gpgSign"),
         ("gpg.program", "sh ./probe.sh", "signing"),
+        ("merge.verifySignatures", "true", "merge.verifySignatures"),
+        ("tag.gpgSign", "true", "tag.gpgSign"),
+        ("push.gpgSign", "if-asked", "push.gpgSign"),
         ("gpg.ssh.defaultKeyCommand", "sh ./probe.sh", "signing"),
     ] {
         let fx = fixture();

@@ -711,6 +711,18 @@ pub fn push(
     })
 }
 
+/// `--shortstat` diffs every commit, so no diff driver or converter may run.
+const LOG_FLAGS: [&str; 7] = [
+    "log",
+    "--no-show-signature",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    // Full ref names in `%D`, so refs are classified by namespace.
+    "--decorate=full",
+    "--shortstat",
+];
+
 const LOG_FORMAT: &str = "%H%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%D%x1f%s";
 const MAX_LOG_LIMIT: u32 = 200;
 
@@ -740,17 +752,12 @@ pub fn log(
         }
         _ => None,
     };
-    let mut args: Vec<&OsStr> = vec![
-        OsStr::new("log"),
-        OsStr::new("--no-show-signature"),
-        OsStr::new("--no-color"),
-        // Full ref names in `%D`, so refs are classified by namespace.
-        OsStr::new("--decorate=full"),
-        OsStr::new("--shortstat"),
+    let mut args: Vec<&OsStr> = LOG_FLAGS.iter().map(OsStr::new).collect();
+    args.extend([
         OsStr::new(&count_arg),
         OsStr::new(&skip_arg),
         OsStr::new(&format_arg),
-    ];
+    ]);
     if let Some(sha) = anchor {
         args.push(OsStr::new(sha));
     }
@@ -1318,6 +1325,12 @@ mod tests {
         for c in " /:\\?\"'".chars() {
             assert!(!is_remote_name_char(c));
         }
+    }
+
+    #[test]
+    fn history_stats_never_run_a_diff_driver_or_converter() {
+        assert!(LOG_FLAGS.contains(&"--no-ext-diff"));
+        assert!(LOG_FLAGS.contains(&"--no-textconv"));
     }
 
     #[test]

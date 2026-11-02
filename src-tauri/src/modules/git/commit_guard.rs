@@ -67,6 +67,15 @@ fn executable_setting(
         ("gpg", "program" | "defaultkeycommand") if repository_scope => {
             Some("a Git signing program")
         }
+        ("merge", "verifysignatures") if simple && repository_scope && enabled(value) => {
+            Some("merge.verifySignatures")
+        }
+        ("tag", "gpgsign") if simple && repository_scope && enabled(value) => {
+            Some("tag.gpgSign")
+        }
+        ("push", "gpgsign") if simple && repository_scope && enabled(value) => {
+            Some("push.gpgSign")
+        }
         ("credential", "helper") if repository_scope => Some("credential.helper"),
         ("core", "sshcommand") if simple && repository_scope => Some("core.sshCommand"),
         ("core", "askpass") if simple && repository_scope => Some("core.askPass"),

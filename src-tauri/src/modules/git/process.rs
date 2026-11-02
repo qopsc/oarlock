@@ -588,6 +588,17 @@ fn capture_git(
 }
 
 const ISOLATED_GIT_ENV: &[&str] = &[
+    // Names a program Git would run; this app's own environment never picks one.
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_PAGER",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_ATTR_SOURCE",
     "GIT_GLOB_PATHSPECS",
     "GIT_NOGLOB_PATHSPECS",
     "GIT_ICASE_PATHSPECS",
@@ -1079,6 +1090,30 @@ mod tests {
             &WorkspaceEnv::Local,
         );
         args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn program_naming_environment_variables_are_removed_from_every_launch() {
+        let command = super::build_git_command(&WorkspaceEnv::Local, None, &[]).unwrap();
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "GIT_SSH_COMMAND",
+            "GIT_SSH",
+            "GIT_PROXY_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_PAGER",
+            "GIT_EXEC_PATH",
+            "GIT_TEMPLATE_DIR",
+            "GIT_ATTR_SOURCE",
+        ] {
+            assert!(removed.iter().any(|r| r == name), "{name} is inherited");
+        }
     }
 
     #[test]
