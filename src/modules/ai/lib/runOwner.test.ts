@@ -206,3 +206,11 @@ it("an admission that is refused still closes the owner's native record", async 
   await owner.close("error");
   expect(ended()).toEqual([owner.runId]);
 });
+
+it("an abandoned accepted owner does not block a retry of the same message", async () => {
+  const owner = beginRun("c13", { kind: "prepare" });
+  owner.accept("u1");
+  owner.abandon();
+  await vi.waitFor(() => expect(owner.phase).toBe("closed"));
+  expect(claimRun("c13", user("u1"))).toBeUndefined();
+});

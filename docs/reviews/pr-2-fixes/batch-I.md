@@ -26,12 +26,12 @@ H1 `evicted_through` is an option and the stale rule is strict; H2 created serve
 - Page-only `prepare` and `work` owners die with the page and have no native record; an OS call already started (keychain read, MCP spawn) is not interrupted.
 - `ai_run_mcp_open` is hard-failing for a begun-then-ended run; a failure to open a project still costs the run its project servers only (it logs and goes on), as before.
 - The metadata save is fsync, not `F_FULLFSYNC`; power loss is not covered.
-- Pre-existing and unrelated in this worktree: `packages/codemirror-vim/range.test.js` and `scrolling.test.js` cannot resolve `@replit/codemirror-vim-core/resumable`, and `src/app/dist-budget.test.ts` "bundles one shared Lezer highlighter" sees two copies. The worktree has no `node_modules` of its own; `node_modules` is a symlink to the main checkout's, which predates the workspace packages of this branch. They are install artifacts, not related to these changes.
+- A create enqueued before the first snapshot has `base` 0 and is dropped silently once a tombstone with a revision above 0 has been evicted; the page then sees its chat missing from the next snapshot.
+- Only `stop` and `deleted` record an accepted message as stopped; an abandoned owner (a failure before the transport claimed it) does not block Retry or regenerate of that message.
 
 ## 4. Verification (this worktree)
 
-- `bun run check-types`: no errors.
-- `bun run lint`: 81 warnings, no errors (no new ones in the files this batch touches beyond what biome already reported for the repository).
-- `bun run test`: 6202 passed, 2 skipped, 1 failed (`dist-budget`, above) plus the two vim package files that fail to load (above).
-- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: clean.
-- `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed): lib 1695 passed, 0 failed, 4 ignored; every integration target passed.
+After a real `bun install --frozen-lockfile` (the first run used a symlinked `node_modules`, which produced the vim-package, `dist-budget` and 81st lint warning artifacts):
+- `bun run check-types`: clean. `bun run lint`: 80 warnings, no errors. `bun run test`: 646 files, 6213 passed, 2 skipped (my re-run after the rework). `check:dist`: clean.
+- Size (reviewer's run): total 2,901,969 vs base 2,900,924 (+1,045); startup 258,167 (-13); terminal, WebGL and WASM unchanged. The base is already over two budgets on this machine.
+- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: clean. `cargo test --locked -- --test-threads=1`: lib 1695 passed, 0 failed, 4 ignored; all integration targets passed.

@@ -225,7 +225,12 @@ class Owner implements RunOwner {
 
   close(reason: CloseReason): Promise<void> {
     if (this.closing) return this.closing;
-    if (this.phase === "accepted" && this.chatId && this.userMessageId) {
+    if (
+      this.phase === "accepted" &&
+      (reason === "stop" || reason === "deleted") &&
+      this.chatId &&
+      this.userMessageId
+    ) {
       const stopped = stoppedMessages.get(this.chatId) ?? [];
       stopped.push(this.userMessageId);
       stoppedMessages.set(this.chatId, stopped.slice(-8));
