@@ -16,6 +16,7 @@ use tauri::plugin::{Plugin, TauriPlugin};
 use tauri::webview::PageLoadPayload;
 use tauri::{AppHandle, RunEvent, Runtime, Url, Webview, Window};
 
+use super::fs::native_store::{NATIVE_FILES, PAGE_OPENED_FILES};
 use super::windows;
 
 /// Longest store file name accepted; ours are about twenty characters.
@@ -109,15 +110,9 @@ fn refusal(command: &str, payload: &InvokeBody, window: &str) -> Option<String> 
 /// A store file the page in `window` may open: a plain file name, which the plugin resolves in
 /// the app's data folder, or that window's own spaces store when it is an extra app window.
 fn allowed_store_path(path: &str, window: &str) -> bool {
-    ![
-        "oarlock-mcp.json",
-        "oarlock-endpoints.json",
-        "oarlock-preferences.json",
-        "oarlock-themes.json",
-        "oarlock-custom-themes.json",
-        "oarlock-settings.json",
-    ]
-    .iter()
+    !NATIVE_FILES
+        .iter()
+        .filter(|native| !PAGE_OPENED_FILES.contains(native))
     .any(|native| path.eq_ignore_ascii_case(native))
         && (is_plain_store_name(path)
             || (window != windows::MAIN
@@ -164,13 +159,7 @@ mod tests {
     }
 
     /// Every store file the page opens (`STORE_PATH` in `src/`, and `spacesStorePath`).
-    const APP_STORES: &[&str] = &[
-        "oarlock-ai-sessions.json",
-        "oarlock-ai-snippets.json",
-        "oarlock-ai-todos.json",
-        "oarlock-ai-agents.json",
-        "oarlock-spaces.json",
-    ];
+    const APP_STORES: &[&str] = PAGE_OPENED_FILES;
 
     #[test]
     fn native_settings_cannot_be_opened_through_the_store_plugin() {
