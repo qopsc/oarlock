@@ -6,7 +6,7 @@ use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::parser::{parse_decorations, parse_porcelain_v2};
 use crate::modules::git::process::{
     decode_text, ensure_git_available, ensure_success, git_show_text, read_text_file,
-    run_git_capped, run_git_guarded,
+    run_git_in_capped,
 };
 use crate::modules::git::types::{
     DiscardEntry, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
@@ -263,9 +263,8 @@ fn list_untracked_in(
     dir: &str,
     budget: usize,
 ) -> Result<Option<Vec<String>>> {
-    let output = run_git_capped(
-        &repo_root.workspace,
-        Some(&repo_root.git_path),
+    let output = run_git_in_capped(
+        repo_root,
         [
             "ls-files",
             "--others",
@@ -381,21 +380,18 @@ pub fn diff_content(
     let original = if staged {
         let spec = original_rel.as_deref().unwrap_or(&rel_path);
         git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
+            &repo_root,
             &format!("HEAD:{spec}"),
         )?
     } else {
         git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
+            &repo_root,
             &format!(":{rel_path}"),
         )?
     };
     let modified = if staged {
         git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
+            &repo_root,
             &format!(":{rel_path}"),
         )?
     } else {
@@ -441,15 +437,23 @@ pub fn file_base(
         return Err(GitError::PathOutsideWorkspace(cwd.local_path));
     }
     ensure_git_available(&cwd.workspace)?;
-    let spec = format!("HEAD:./{name}");
     super::ownership::authorize_containing_metadata(registry, &cwd.local_path)?;
     let Some(location) = worktree::locate_work_tree(&cwd.workspace, &cwd.git_path)? else {
         return Ok(None);
     };
-    let _guarded = discovered_root(registry, &cwd, &location.toplevel)?;
-    let output = run_git_guarded(
-        &cwd.workspace,
-        Some(&cwd.git_path),
+    let guarded = discovered_root(registry, &cwd, &location.toplevel)?;
+    // The pinned run starts in the worktree root, so name the file from there.
+    let relative = cwd
+        .local_path
+        .strip_prefix(&guarded.local_path)
+        .map_err(|_| GitError::PathOutsideWorkspace(cwd.local_path.clone()))?;
+    let mut spec = String::from("HEAD:");
+    for part in relative.components() {
+        spec.push_str(&part.as_os_str().to_string_lossy());
+        spec.push('/');
+    }
+    spec.push_str(name);
+    let output = guarded.run(
         [
             OsStr::new("show"),
             OsStr::new("--no-show-signature"),
@@ -465,7 +469,7 @@ pub fn file_base(
         return Ok(None);
     }
     if output.exit_code != Some(0) {
-        return Ok(match git_show_text(&cwd.workspace, &cwd.git_path, &spec)? {
+        return Ok(match git_show_text(&guarded, &spec)? {
             TextSource::Text(text) => Some(text),
             TextSource::Missing | TextSource::Binary => None,
         });
@@ -949,16 +953,14 @@ pub fn commit_file_diff(
     let parent = super::branches::first_parent(&repo_root, sha)?;
     let original = match parent.as_deref() {
         Some(p) => git_show_text(
-            &repo_root.workspace,
-            &repo_root.git_path,
+            &repo_root,
             &format!("{p}:{original_rel}"),
         )?,
         None => TextSource::Missing,
     };
     let modified = git_show_text(
-        &repo_root.workspace,
-        &repo_root.git_path,
-        &format!("{sha}:{rel}"),
+            &repo_root,
+            &format!("{sha}:{rel}"),
     )?;
 
     let mut diff_args: Vec<OsString> = vec![
@@ -1094,6 +1096,36 @@ mod tests {
             .current_dir(dir)
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_preflight_reads_stay_pinned_to_the_acquired_git_directory() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        if !git(&a, &["init", "-q"]) || !git(&b, &["init", "-q"]) {
+            return;
+        }
+        std::fs::create_dir(a.join("d")).unwrap();
+        std::fs::write(a.join("d/x.txt"), "x").unwrap();
+        std::fs::write(a.join("file.txt"), "real\n").unwrap();
+        std::fs::write(b.join("file.txt"), "decoy\n").unwrap();
+        assert!(git(&a, &["add", "file.txt"]) && git(&a, &["commit", "-q", "-m", "a"]));
+        assert!(git(&b, &["add", "file.txt"]) && git(&b, &["commit", "-q", "-m", "b"]));
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&a).unwrap();
+        let repo = owned_repo_root(&registry, a.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        std::fs::rename(a.join(".git"), a.join(".git.moved")).unwrap();
+        std::fs::rename(b.join(".git"), a.join(".git")).unwrap();
+        assert!(
+            list_untracked_in(&repo, "d", 10).is_err(),
+            "untracked listing ran against a replaced Git directory"
+        );
+        assert!(
+            git_show_text(&repo, "HEAD:file.txt").is_err(),
+            "git show ran against a replaced Git directory"
+        );
     }
 
     #[test]

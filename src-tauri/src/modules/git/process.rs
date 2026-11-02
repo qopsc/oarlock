@@ -129,10 +129,8 @@ fn version_meets_minimum(found: &str, required: &str) -> bool {
     true
 }
 
-pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> Result<TextSource> {
-    let output = run_git_guarded(
-        workspace,
-        Some(repo_root),
+pub(crate) fn git_show_text(repo: &super::utils::ResolvedGitDirectory, spec: &str) -> Result<TextSource> {
+    let output = repo.run(
         [
             OsStr::new("show"),
             OsStr::new("--no-show-signature"),
@@ -161,7 +159,7 @@ pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> R
         } else {
             vec!["ls-tree", "-z", tree, "--", path]
         };
-        let entries = run_git_guarded(workspace, Some(repo_root), args, DEFAULT_TIMEOUT_SECS)?;
+        let entries = repo.run(args, DEFAULT_TIMEOUT_SECS)?;
         if entries.timed_out {
             return Err(GitError::TimedOut("git list entry"));
         }
@@ -171,18 +169,14 @@ pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> R
         // An unborn branch has no HEAD tree. Distinguish that from a broken
         // object by checking that its symbolic branch has no ref at all.
         if tree == "HEAD" && entries.exit_code != Some(0) {
-            let head = run_git_guarded(
-                workspace,
-                Some(repo_root),
+            let head = repo.run(
                 ["symbolic-ref", "-q", "HEAD"],
                 DEFAULT_TIMEOUT_SECS,
             )?;
             if head.exit_code == Some(0) && !head.timed_out && !head.truncated {
                 let name = String::from_utf8_lossy(&head.stdout).trim().to_owned();
                 if name.starts_with("refs/heads/") {
-                    let exists = run_git_guarded(
-                        workspace,
-                        Some(repo_root),
+                    let exists = repo.run(
                         ["show-ref", "--verify", "--quiet", &name],
                         DEFAULT_TIMEOUT_SECS,
                     )?;
@@ -302,22 +296,6 @@ where
     )
 }
 
-/// Like `run_git`, but kills git once it has produced `stdout_cap` bytes. For
-/// listings whose tail is not wanted, so a huge result costs a bounded walk.
-pub fn run_git_capped<I, S>(
-    workspace: &WorkspaceEnv,
-    cwd: Option<&str>,
-    args: I,
-    timeout_secs: u64,
-    stdout_cap: usize,
-) -> Result<GitOutput>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run_git_uncached(workspace, cwd, args, timeout_secs, stdout_cap, true, true)
-}
-
 fn run_git_uncached<I, S>(
     workspace: &WorkspaceEnv,
     cwd: Option<&str>,
@@ -377,8 +355,44 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_git_in_with(repo, args, timeout_secs, MAX_OUTPUT_BYTES, false)
+}
+
+/// Like `run_git_in`, but stops git once it has produced `stdout_cap` bytes.
+pub(crate) fn run_git_in_capped<I, S>(
+    repo: &super::utils::ResolvedGitDirectory,
+    args: I,
+    timeout_secs: u64,
+    stdout_cap: usize,
+) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_git_in_with(repo, args, timeout_secs, stdout_cap, true)
+}
+
+fn run_git_in_with<I, S>(
+    repo: &super::utils::ResolvedGitDirectory,
+    args: I,
+    timeout_secs: u64,
+    stdout_cap: usize,
+    stop_on_stdout_cap: bool,
+) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let Some(owner) = &repo.ownership else {
-        return run_git_guarded(&repo.workspace, Some(&repo.git_path), args, timeout_secs);
+        return run_git_uncached(
+            &repo.workspace,
+            Some(&repo.git_path),
+            args,
+            timeout_secs,
+            stdout_cap,
+            stop_on_stdout_cap,
+            true,
+        );
     };
     let args: Vec<OsString> = args
         .into_iter()
@@ -390,7 +404,7 @@ where
         cmd.env("GIT_NO_LAZY_FETCH", "1");
     }
     owner.configure(&mut cmd)?;
-    let result = capture_git(cmd, timeout_secs, MAX_OUTPUT_BYTES, false);
+    let result = capture_git(cmd, timeout_secs, stdout_cap, stop_on_stdout_cap);
     owner.validate()?;
     result
 }
@@ -710,6 +724,8 @@ mod tests {
     #[test]
     fn missing_entries_are_distinct_from_missing_git_objects() {
         use super::git_show_text;
+        use crate::modules::git::utils::owned_repo_root;
+        use crate::modules::workspace::WorkspaceRegistry;
         use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let repo = std::fs::canonicalize(dir.path()).unwrap();
@@ -729,26 +745,28 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@oarlock.local"]);
         git(&["config", "user.name", "Oarlock Test"]);
-        let root = repo.to_str().unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&repo).unwrap();
+        let resolved = owned_repo_root(&registry, repo.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
         assert!(matches!(
-            git_show_text(&WorkspaceEnv::Local, root, "HEAD:absent").unwrap(),
+            git_show_text(&resolved, "HEAD:absent").unwrap(),
             TextSource::Missing
         ));
         std::fs::write(repo.join("file.txt"), "tracked text").unwrap();
         git(&["add", "file.txt"]);
         git(&["commit", "-qm", "test"]);
         assert!(matches!(
-            git_show_text(&WorkspaceEnv::Local, root, "HEAD:absent").unwrap(),
+            git_show_text(&resolved, "HEAD:absent").unwrap(),
             TextSource::Missing
         ));
         assert!(matches!(
-            git_show_text(&WorkspaceEnv::Local, root, ":absent").unwrap(),
+            git_show_text(&resolved, ":absent").unwrap(),
             TextSource::Missing
         ));
         let blob = git(&["rev-parse", "HEAD:file.txt"]);
         std::fs::remove_file(repo.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
-        assert!(git_show_text(&WorkspaceEnv::Local, root, "HEAD:file.txt").is_err());
-        assert!(git_show_text(&WorkspaceEnv::Local, root, ":file.txt").is_err());
+        assert!(git_show_text(&resolved, "HEAD:file.txt").is_err());
+        assert!(git_show_text(&resolved, ":file.txt").is_err());
     }
 
     #[cfg(unix)]
