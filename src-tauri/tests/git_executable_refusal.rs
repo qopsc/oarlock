@@ -203,6 +203,74 @@ fn repository_config_loaded_by_global_include_is_refused() {
 }
 
 #[test]
+fn include_from_the_main_checkout_is_repository_scope_in_a_linked_worktree() {
+    use oarlock_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
+    use std::process::Command;
+    const CHILD: &str = "OARLOCK_S02R1_LINKED_CHILD";
+    if let Ok(linked) = std::env::var(CHILD) {
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(std::path::Path::new(&linked)).unwrap();
+        let main = std::path::Path::new(&linked).parent().unwrap().join("main");
+        registry.authorize(&main).unwrap();
+        let result = operations::commit(&registry, &linked, "test commit", &WorkspaceEnv::Local);
+        let error = result.err().expect("an include from the main checkout must be refused");
+        assert!(error.to_string().contains("filter"), "{error}");
+        return;
+    }
+    if !git_available() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let base_path = std::fs::canonicalize(base.path()).unwrap();
+    let main = base_path.join("main");
+    std::fs::create_dir(&main).unwrap();
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let mut command = Command::new("git");
+        command.current_dir(dir).args(args);
+        common::isolate_git_environment(&mut command);
+        assert!(command.output().unwrap().status.success(), "git {args:?}");
+    };
+    run(&main, &["init", "-q", "-b", "main"]);
+    run(&main, &["config", "user.email", "t@oarlock.local"]);
+    run(&main, &["config", "user.name", "T"]);
+    run(&main, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(main.join("file.txt"), "content\n").unwrap();
+    run(&main, &["add", "file.txt"]);
+    run(&main, &["commit", "-q", "-m", "init"]);
+    let linked = base_path.join("linked");
+    run(&main, &["worktree", "add", "-q", "-b", "feature", linked.to_str().unwrap()]);
+    std::fs::write(linked.join("staged.txt"), "x\n").unwrap();
+    run(&linked, &["add", "staged.txt"]);
+    std::fs::write(
+        main.join("included.conf"),
+        "[filter \"probe\"]\n clean = sh ./probe.sh\n",
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".gitconfig"),
+        format!("[include]\n path = {}\n", main.join("included.conf").display()),
+    )
+    .unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "include_from_the_main_checkout_is_repository_scope_in_a_linked_worktree",
+            "--nocapture",
+        ])
+        .env("HOME", home.path())
+        .env(CHILD, linked.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "child failed: {} {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[test]
 fn user_scope_lfs_signing_and_fsmonitor_settings_are_accepted() {
     use oarlock_lib::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
     use std::process::Command;

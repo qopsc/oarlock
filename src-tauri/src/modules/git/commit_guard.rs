@@ -233,8 +233,15 @@ fn inspect_repo_origins(repo: &ResolvedGitDirectory) -> Result<()> {
             } else {
                 repo.local_path.join(path)
             };
-            candidate.starts_with(&repo.local_path)
-                || std::fs::canonicalize(&candidate).is_ok_and(|p| p.starts_with(&repo.local_path))
+            let roots = match &repo.ownership {
+                Some(owner) => owner.content_roots(),
+                None => vec![repo.local_path.clone()],
+            };
+            let canonical = std::fs::canonicalize(&candidate).ok();
+            roots.iter().any(|root| {
+                candidate.starts_with(root)
+                    || canonical.as_ref().is_some_and(|path| path.starts_with(root))
+            })
         });
         let mut record = pair[1].to_vec();
         record.push(0);
