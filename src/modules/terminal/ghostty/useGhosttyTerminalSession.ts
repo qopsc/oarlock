@@ -50,7 +50,7 @@ import {
   ProgramClipboardWrite,
   runProgramClipboardWrite,
   writePrimarySelection,
-  writeTerminalClipboard,
+  copyTerminalSelection,
 } from "../lib/terminalClipboard";
 import { TerminalCwdReports } from "../lib/terminalCwdReports";
 import { useTerminalFontOffsets } from "../lib/terminalFontOffsets";
@@ -1385,7 +1385,7 @@ function createGhosttyInput(
       if (!text) return;
       void writePrimarySelection(text);
       if (mode === "clipboard")
-        void writeTerminalClipboard(text).catch(() => {});
+        void copyTerminalSelection(text);
     },
     onMiddleClick: () => {
       if (
@@ -1414,7 +1414,7 @@ function createGhosttyInput(
     onCopy: (clearSelection) => {
       const text = surface.getSelection();
       if (!text) return false;
-      void writeTerminalClipboard(text).catch(() => {});
+      void copyTerminalSelection(text);
       if (clearSelection) surface.clearSelection();
       return true;
     },
