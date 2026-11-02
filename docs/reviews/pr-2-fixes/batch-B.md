@@ -43,6 +43,11 @@ Branch `worktree-agent-af13c8f00acabbe47`, based on `review/codex-fixes` at fe14
 - S-05: `Access::may_open` makes no filesystem call. A granted root is stored under its authorized spelling and its resolved one (`grant_root` resolves it once, when the registry authorizes it), fonts likewise; a request is judged by name, and the opened handle is judged again. `a_name_through_a_link_matches_a_root_kept_under_both_spellings` runs with no resolver and includes `/net/host/share` and a nonexistent folder (refused by name); `granting_a_link_spelled_root_records_where_it_resolves` uses a real link; the production-wiring test now grants the link-spelled root.
 - Noted, not changed (Opus Lows): DNS eviction uses `try_lock`, so it can evict a slot whose `Arc` a caller already cloned, and two lookups of one host can briefly overlap (an `Arc::strong_count == 1` check would close it). The staging sweep in `secure_file.rs` assumes single-instance keeps one process per profile.
 
+## 2c. Dot-folder gap (final targeted round)
+
+- S-01: `forbid_directory("/", true)` stores `/**`, and the scope's `requireLiteralLeadingDot` keeps `**` out of any part starting with a dot, so a folder the dialog plugin allows at or below one (`~/.config/proj`, `~/.dotfiles`, `~/.local/src/app`) was still served by `asset:`. `install` now listens on Tauri's asset scope and, for every `Event::PathAllowed(path)`, calls `forbid_directory(path, true)` and `forbid_file(path)`; the pattern made from the allowed path names the dot part literally, so it matches. The root forbids stay. `on_scope_event` is the handler, tested on its own: `tauris_asset_scope_matches_nothing_whatever_the_dialog_grants` now shows the root forbids alone miss the three dot-named folders, that the handler forbids exactly the allowed path, that the resulting pattern matches files and subfolders under it with Tauri's match options, and that `PathForbidden` events do nothing. Limitation: a Tauri `Scope` cannot be built in a unit test, so the `listen` registration itself and a real `Scope::is_allowed` call are not exercised.
+- Deferred, unverified: the Windows forbid list (drive letters, `\\?\X:\`, `\\`) has not been run on Windows; the listener covers whatever the dialog plugin allows there.
+
 ## 3. AGENTS.md edits
 
 0. Anchor: "Two-process model", `workspace::*` bullet and "Frontend" Editor bullet, "The asset protocol serves nothing by configuration (`assetProtocol.scope` allows nothing): `asset_scope.rs` grants each root the workspace registry authorizes, recursively". Replace with: "The asset protocol serves nothing by configuration and is granted only the installed font faces `system_font_faces` returns; every preview (editor media, PDFs, Markdown images) loads through `oarlock-asset`, which serves the registry's authorized roots (`asset_scope::Access`, same dot-name rule, never the app's own data, config and local data folders), so a workspace file is never in Tauri's scope and `asset:` is not in `frame-src`."
@@ -59,12 +64,10 @@ Branch `worktree-agent-af13c8f00acabbe47`, based on `review/codex-fixes` at fe14
 
 ## 5. Checks run
 
-After the second rework (head 51dc7b6f plus this note). No `HOME` override was needed.
+After the final round (head: the commit after d876478a, plus this note). No `HOME` override was needed.
 
-- `bun run lint`: `Found 80 warnings.` (baseline)
-- `bun run check-types`: `tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json`, no errors
-- `bun run test`: `Test Files  643 passed (643)` / `Tests  6133 passed | 2 skipped (6135)`
-- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 6.89s`
-- `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed): `test result: ok. 1615 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 96.30s`, every other target `ok` with 0 failed
-- `bun run check:dist`: `startup graph clean`
-- `bun run size`: still over its limits, as at fe147a5. Primary terminal JS 98 kB against 95.79 kB (97.99 kB at fe147a5, so +0.01 kB from `fontFeatures.ts`); total client JS over by 14.73 kB (13.84 kB at fe147a5, so about +0.9 kB); startup 256.74 kB against 540 kB. No budget edited.
+- `cargo test --locked --lib -- asset_`: `test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 1574 filtered out; finished in 0.03s`
+- `cargo test --locked --lib -- system_fonts`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1617 filtered out; finished in 0.00s`
+- `cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 4.21s`
+- `bun run test -- src/app/contentSecurityPolicy src/modules/workspace`: `Test Files  6 passed (6)` / `Tests  25 passed (25)`
+- The full gate from the previous round (lint, check-types, 6133 frontend tests, 1615 Rust tests, check:dist) ran at d876478a; this round changed only `asset_scope.rs`. `bun run size` is over its limits as it is at fe147a5 (see 2b); no budget edited.

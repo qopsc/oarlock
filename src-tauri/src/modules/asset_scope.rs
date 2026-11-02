@@ -115,10 +115,13 @@ fn rooted(path: &Path, roots: &[PathBuf], literal_leading_dot: bool) -> bool {
 fn covers_ignoring_case(root: &Path, path: &Path, literal_leading_dot: bool) -> bool {
     let depth = root.components().count();
     !literal_leading_dot
-        || path.components().skip(depth).all(|component| match component {
-            Component::Normal(name) => !name.to_string_lossy().starts_with('.'),
-            _ => true,
-        })
+        || path
+            .components()
+            .skip(depth)
+            .all(|component| match component {
+                Component::Normal(name) => !name.to_string_lossy().starts_with('.'),
+                _ => true,
+            })
 }
 
 impl Access {
@@ -151,7 +154,9 @@ impl Access {
             .font_files
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        fonts.iter().any(|font| within(font, real) && within(real, font))
+        fonts
+            .iter()
+            .any(|font| within(font, real) && within(real, font))
     }
 
     /// Whether the opened file's resolved path may be served at all: a workspace file or a font.
@@ -194,7 +199,8 @@ impl Access {
             .font_files
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for spelling in std::iter::once(file.to_path_buf()).chain(std::fs::canonicalize(file).ok()) {
+        for spelling in std::iter::once(file.to_path_buf()).chain(std::fs::canonicalize(file).ok())
+        {
             if !fonts.contains(&spelling) {
                 fonts.push(spelling);
             }
@@ -239,9 +245,30 @@ fn forbidden_roots() -> Vec<PathBuf> {
     }
 }
 
+/// What to do with an event of Tauri's asset scope: whatever the dialog plugin (or anyone)
+/// allows is forbidden at once. The root forbids alone are not enough, because the scope sets
+/// `requireLiteralLeadingDot`, so `/**` never matches below a dot-named folder such as
+/// `~/.config/proj`; a pattern made from the allowed path itself names that folder literally.
+fn on_scope_event(event: &tauri::scope::fs::Event, forbid: impl Fn(&Path)) {
+    if let tauri::scope::fs::Event::PathAllowed(path) = event {
+        forbid(path);
+    }
+}
+
 /// Records every workspace root the registry has authorized and will authorize.
 pub fn install(app: &tauri::AppHandle) {
     let scope = app.asset_protocol_scope();
+    let forbidding = scope.clone();
+    scope.listen(move |event| {
+        on_scope_event(event, |path| {
+            if let Err(e) = forbidding.forbid_directory(path, true) {
+                log::warn!("asset scope: cannot forbid {}: {e}", path.display());
+            }
+            if let Err(e) = forbidding.forbid_file(path) {
+                log::warn!("asset scope: cannot forbid {}: {e}", path.display());
+            }
+        });
+    });
     for root in forbidden_roots() {
         if let Err(e) = scope.forbid_directory(&root, true) {
             log::warn!("asset scope: cannot forbid {}: {e}", root.display());
@@ -279,9 +306,18 @@ mod tests {
     #[test]
     fn the_apps_state_folders_are_recognized_by_their_resolved_path() {
         let state = paths(&["/home/me/.local/share/app", "/home/me/.config/app"]);
-        assert!(under_any(Path::new("/home/me/.config/app/oarlock-spaces.json"), &state));
-        assert!(under_any(Path::new("/home/me/.local/share/app/x/y.png"), &state));
-        assert!(!under_any(Path::new("/home/me/.config/application/x.png"), &state));
+        assert!(under_any(
+            Path::new("/home/me/.config/app/oarlock-spaces.json"),
+            &state
+        ));
+        assert!(under_any(
+            Path::new("/home/me/.local/share/app/x/y.png"),
+            &state
+        ));
+        assert!(!under_any(
+            Path::new("/home/me/.config/application/x.png"),
+            &state
+        ));
         assert!(!under_any(Path::new("/home/me/pictures/x.png"), &state));
         assert!(!under_any(Path::new("/home/me/pictures/x.png"), &[]));
     }
@@ -305,12 +341,21 @@ mod tests {
             Some(PathBuf::from("/vol/code/proj")),
         );
         let open = |p: &str, all| access.may_open(Path::new(p), all);
-        assert!(open("/home/me/code/proj/docs/a.png", false), "authorized spelling");
+        assert!(
+            open("/home/me/code/proj/docs/a.png", false),
+            "authorized spelling"
+        );
         assert!(open("/vol/code/proj/a.png", false), "resolved spelling");
         assert!(!open("/home/me/code/other/a.png", false));
-        assert!(!open("/net/host/share/a.png", false), "judged by name, never resolved");
+        assert!(
+            !open("/net/host/share/a.png", false),
+            "judged by name, never resolved"
+        );
         assert!(!open("/home/me/code/proj/../x.png", true), "`..` never");
-        assert!(open("/srv/photos/a.png", true), "any folder while all are allowed");
+        assert!(
+            open("/srv/photos/a.png", true),
+            "any folder while all are allowed"
+        );
         assert!(!open("/home/me/.ssh/id.png", true), "but not a dot name");
         assert!(!open("/nonexistent/dir/a.png", false));
     }
@@ -318,7 +363,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn granting_a_link_spelled_root_records_where_it_resolves() {
-        let tmp = tempfile::Builder::new().prefix("oarlock-grant-").tempdir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("oarlock-grant-")
+            .tempdir()
+            .unwrap();
         let real = std::fs::canonicalize(tmp.path()).unwrap();
         std::fs::create_dir(real.join("vol")).unwrap();
         std::os::unix::fs::symlink(real.join("vol"), real.join("code")).unwrap();
@@ -347,21 +395,76 @@ mod tests {
             require_literal_leading_dot: true,
             ..Default::default()
         };
-        for root in forbidden_roots() {
-            let forbid = glob::Pattern::new(&format!(
-                "{}**",
-                glob::Pattern::escape(&root.to_string_lossy())
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = if cfg!(windows) {
+            "C:\\Users\\me"
+        } else {
+            "/Users/me"
+        };
+        let join = |parts: &[&str]| {
+            let mut path = PathBuf::from(base);
+            path.extend(parts);
+            path
+        };
+        let pattern = |dir: &Path| {
+            glob::Pattern::new(&format!(
+                "{}{sep}**",
+                glob::Pattern::escape(&dir.to_string_lossy())
             ))
-            .unwrap();
-            let picked = if cfg!(windows) {
-                PathBuf::from("C:\\Users\\me\\site\\index.html")
-            } else {
-                PathBuf::from("/Users/me/site/index.html")
-            };
-            if root.to_string_lossy().starts_with(if cfg!(windows) { "C:" } else { "/" }) {
-                assert!(forbid.matches_path_with(&picked, options), "{root:?}");
-            }
+            .unwrap()
+        };
+        let roots = forbidden_roots();
+        let root_forbids: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                glob::Pattern::new(&format!(
+                    "{}**",
+                    glob::Pattern::escape(&root.to_string_lossy())
+                ))
+                .unwrap()
+            })
+            .collect();
+        let forbidden_by_roots = |file: &Path| {
+            root_forbids
+                .iter()
+                .any(|p| p.matches_path_with(file, options))
+        };
+
+        // An ordinary folder is covered by the root forbids alone.
+        assert!(forbidden_by_roots(&join(&["site", "index.html"])));
+
+        // A folder at or below a dot-named part is not: `**` never enters it. That is why the
+        // scope listener forbids each allowed path itself.
+        for dir in [
+            join(&[".config", "proj"]),
+            join(&[".dotfiles"]),
+            join(&[".local", "src", "app"]),
+        ] {
+            let file = dir.join("index.html");
+            assert!(!forbidden_by_roots(&file), "roots alone miss {dir:?}");
+            let forbidden = std::cell::RefCell::new(Vec::new());
+            on_scope_event(&tauri::scope::fs::Event::PathAllowed(dir.clone()), |path| {
+                forbidden.borrow_mut().push(path.to_path_buf())
+            });
+            let forbidden = forbidden.into_inner();
+            assert_eq!(forbidden, vec![dir.clone()]);
+            assert!(
+                pattern(&forbidden[0]).matches_path_with(&file, options),
+                "{dir:?}"
+            );
+            assert!(
+                pattern(&forbidden[0]).matches_path_with(&dir.join("sub").join("a.html"), options)
+            );
         }
+
+        // Events that are not grants forbid nothing.
+        let calls = std::cell::Cell::new(0);
+        on_scope_event(
+            &tauri::scope::fs::Event::PathForbidden(join(&["x"])),
+            |_| calls.set(calls.get() + 1),
+        );
+        assert_eq!(calls.get(), 0);
+
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         assert!(config["app"]["security"]["assetProtocol"]["scope"]["allow"]
