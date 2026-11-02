@@ -10,7 +10,8 @@ export function quoteShellPath(p: string, shell: DropShell): string {
     case "fish":
       return `'${p.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
     case "powershell":
-      return `'${p.replace(/'/g, "''")}'`;
+      // PowerShell's tokenizer ends a single-quoted string at any of these.
+      return `'${p.replace(/['‘’‚‛]/g, "$&$&")}'`;
     case "cmd":
       // Percent expansion and delayed ! expansion occur even inside quotes.
       // A literal double quote cannot occur in a Windows filename.

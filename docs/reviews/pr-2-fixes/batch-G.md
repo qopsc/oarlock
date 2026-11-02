@@ -40,3 +40,11 @@ Terminal migration status drop sentence, PTY shell integration dialect sentence,
 - `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile ... target(s)` with no warnings.
 - `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed): `test result: ok. 1673 passed; 0 failed; 4 ignored` for the library and `ok` for every integration binary.
 - No U+2014 in the diff against the base. `bun run size` was not run in this worktree.
+
+## 7. Final review follow-up
+
+- PowerShell quoting (Medium): PowerShell's tokenizer ends a single-quoted string at U+2018, U+2019, U+201A and U+201B as well as U+0027, so a path such as `x` + U+2019 + `; Invoke-Evil; ` + U+2019 closed the quote. `quoteShellPath` (and `quoteShellArg`'s Windows branch, the same bug in the shared helper) now double every character of that class. Tests, failing before the fix (4 typographic quotes failed, the ASCII case passed): `quoteShellPath.test.ts` "doubles the PowerShell quote delimiter: ..." for all five characters through `quoteShellPath` and `formatDroppedPaths`; `shellQuote.test.ts` "doubles the quote delimiter".
+- A throw inside the drop's slot action (from `paste` or `refuse`) is caught in `runShellDrop` and surfaces as the refusal notice, never `BoundedPtyWriter.fail()`. Test: "keeps the writer alive when pasting or the notice throws" (a throwing paste, then a throwing paste with a throwing notice; the writer takes a key afterwards in both).
+- AGENTS.md: the Review 98 harness sentence is followed by a line saying Review 107 (O-06) removed `probe.py` and the per-drop verification; the drop sentence now names the `exec` gap (`exec vim` without shell integration keeps the shell's pid as the foreground leader, `exec fish` inside zsh keeps the launched dialect, OSC 133 C catches the first with integration).
+- Not done (optional): a session-level test holding `pty_has_foreground_job`; the wiring in `dropPathsIntoGhosttySession` stays covered only through the pure pieces.
+- Checks: types clean; lint `Found 80 warnings.`; terminal tests `Test Files  156 passed (156)`, `Tests  2001 passed | 2 skipped (2003)`; full `bun run test` `Test Files  649 passed (649)`, `Tests  6251 passed | 2 skipped (6253)`.
