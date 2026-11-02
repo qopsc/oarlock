@@ -4624,8 +4624,8 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R113 | Open, Tier 2 | Manual release dispatch remains available on branches while release naming uses `github.ref_name`, and repair/manifest jobs are tag-gated. No release was dispatched. |
 | R116 | Open, Tier 2 | The benchmark export still applies the current working-tree diff in broad tracked files and links the current dependency tree despite describing a pristine revision. |
 | R118 | Open, Tier 2 | The IPC profiling harness still invokes obsolete watch removal and search request contracts. Its AI-specific profiling remains on hold. |
-| R122 | Open, Tier 2 | The shell-integration guide still says fish installs into the global `conf.d` directory, contrary to launch-only integration. |
-| R123 | Open, Tier 2 | The WebGL guide still says the terminals share one WASM instance; the current resource guide and implementation describe one instance per terminal. |
+| R122 | Closed | The shell-integration guide describes profile-specific launch-only fish integration, consistent with `apply_fish_init`. |
+| R123 | Closed | The WebGL guide now describes one WASM instance per terminal from a shared compiled module, consistent with the resource guide. |
 | R171 | AI/MCP on hold | The affected text-window tool belongs to the held AI backend. |
 | R177 | AI/MCP on hold | The affected environment parsing belongs to MCP configuration. |
 | R187 | AI/MCP on hold | The affected tool-policy map belongs to MCP configuration. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **6 closed; 19 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **8 closed; 17 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4663,3 +4663,7 @@ Validation: the focused terminal-link tests and full frontend suite passed (6,08
 Git's repository-relative names use `/` as the separator; a backslash is kept as part of a Unix filename. Source Control now preserves that identity in the change tree, labels, relative and absolute copy actions, and file-open target. Editor-context and repository-containment comparisons also preserve Unix backslashes. Existing Windows drive and UNC comparison tests continue to pass. The tree and context tests each failed before their corresponding fix.
 
 Validation: 48 focused Source Control tests and the full frontend suite passed (6,088 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, and strict Clippy passed. The tests exercise the path helpers and component inputs; packaged Finder/open and clipboard actions were not manually exercised.
+
+### R122 and R123 checkpoint — architecture-guide corrections
+
+The shell guide now describes launch-only, profile-specific fish integration; the WebGL guide describes one WASM instance per terminal from a shared compiled module. These documentation changes were checked against the current implementation and resource guide. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,088 tests (two skipped), types passed and lint remained at 80 warnings.

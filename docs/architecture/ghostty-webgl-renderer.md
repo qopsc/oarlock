@@ -124,7 +124,7 @@ one variant. Exact sizes, checksums, source pins, and rebuild commands live in
 
 The maintained bridge provides:
 
-- one shared WASM instance with independent, explicitly disposed terminals;
+- one WASM instance per terminal from a shared compiled module, with each instance disposed when its terminal closes;
 - Ghostty's `TinyIo`, avoiding the threaded IO implementation in a browser;
 - raw `Uint8Array` PTY input, replies, and parser-owned semantic events;
 - lossless parser-completion acknowledgements that bound native and IPC output
