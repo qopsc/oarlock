@@ -285,6 +285,13 @@ fn resolve_deleted_within_repo(repo_root: &Path, joined: &Path, rel: &str) -> Re
     }
 }
 
+/// The guard the work-tree-changing commands hand to the code that mutates files.
+pub(crate) fn store_guard(
+    dirs: &crate::modules::fs::native_store::StoreDirs,
+) -> impl Fn(&Path) -> std::result::Result<(), String> + '_ {
+    move |target| crate::modules::fs::native_store::refuse_write_in(dirs, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,11 +455,4 @@ mod tests {
         let err = resolve_within_repo(&tmp, "../outside.txt");
         assert!(matches!(err, Err(GitError::InvalidPath(_))));
     }
-}
-
-/// The guard the work-tree-changing commands hand to the code that mutates files.
-pub(crate) fn store_guard(
-    dirs: &crate::modules::fs::native_store::StoreDirs,
-) -> impl Fn(&Path) -> std::result::Result<(), String> + '_ {
-    move |target| crate::modules::fs::native_store::refuse_write_in(dirs, target)
 }
