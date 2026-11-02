@@ -139,3 +139,32 @@ Checks (worktree head after the commits above plus the docs commit):
   all integration binaries ok. Container (fresh `git archive`, uid 1000, `--init`): clippy `Finished` clean;
   `cargo test --locked -j1 --no-fail-fast -- --test-threads=1` lib `1698 passed; 3 failed; 4 ignored` (the same three
   environmental failures), every integration binary ok.
+
+### Final review Lows (fixed)
+
+- **Linux folder sync.** `sync_directory` opens `openat(dir, ".", O_RDONLY|O_DIRECTORY|O_CLOEXEC)` on Linux, because
+  cap-std's `O_PATH` handles cannot be fsynced (EBADF). Test `sync_directory_really_syncs_a_pinned_directory_on_linux`
+  (real sync, no injected function): fails before, passes after, in the container.
+- **Copy walk into its own staging.** `Walk.skip` holds the `(dev, ino)` of the staging location (`CopyArea::location_id`)
+  and `stage_folder` skips a directory with that identity. Test
+  `copying_a_repository_git_folder_into_itself_never_walks_into_its_own_staging` (`git init`, copy `.git` into `.git`
+  with rename on conflict): failed with "Copy folder exceeds maximum depth" before, passes after.
+- **Stale `.oarlock-staging`.** `sweep_stale_destination_child` (called from `Candidate` and `CopyArea` creation when
+  the chosen location is not the destination child) cleans and removes an existing private `.oarlock-staging`. Test
+  `a_stale_destination_child_is_swept_once_the_cache_is_usable`: fails before, passes after.
+
+### Known limitations (not fixed)
+
+- A copied file keeps the SELinux or SMACK label of its staging folder (an `O_TMPFILE` probe in the destination is the
+  eventual fix).
+- For `$HOME` dotfiles with no `.git` marker the cache and the `.oarlock-staging` fallback sit inside the bare
+  repository's work tree: the D-12 dotfiles clause is narrowed, not eliminated.
+- Copies to vfat or exfat with fixed `fmask`/`dmask` are expected to refuse files whose mode is not representable
+  (inferred, not mounted).
+- A new-file save still needs a staging location: a repository with a foreign `.git` and the cache on another mount
+  refuses brand-new files, and a cross-mount cache makes each such save create and remove `.oarlock-staging` (watcher
+  events).
+- A `.oarlock-staging` pre-created by another user in a sticky folder blocks saves there, safely.
+- `inherit_directory`, `prepare_inheritance` and `privatize_empty_probe` are dead on Linux.
+- `a_cross_mount_error_restages_in_the_next_location` proves a retry, not a different location, and
+  `same_mount_is_reflexive_and_distinguishes_volumes` never reaches the `stx_mnt_id` branch.

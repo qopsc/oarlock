@@ -5522,4 +5522,7 @@ paste and drop work as on macOS (see the Explorer mutation policy), and the save
 refuses SELinux and SMACK labelled files (`security.selinux` and `security.SMACK64*` are
 LSM-managed; other `security.*` and `trusted.*` names still refuse). Not run: a Linux desktop,
 SELinux enforcing, bind mounts and NFS (their `EXDEV` and `EINVAL` paths are covered by injected
-failures only).
+failures only). The Linux folder sync after a save or copy opens a readable descriptor on the folder
+(cap-std's `O_PATH` handle cannot be fsynced), a copy walk skips its own staging location (a
+repository's `.git` can be copied inside the repository), and a crashed save's `.oarlock-staging`
+is swept when a later operation picks another location.

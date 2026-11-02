@@ -159,6 +159,9 @@ struct Walk<'a> {
     sys: &'a Sys,
     env: &'a Env<'a>,
     item_dest: PathBuf,
+    /// `(dev, ino)` of the staging location holding this copy's own area: a copy of a
+    /// folder that contains it (a repository's `.git`) must not walk into itself.
+    skip: (u64, u64),
 }
 /// A folder published while still writable by its owner; `finish` gives it
 /// its final mode, rules and times once it sits at its destination.
@@ -309,8 +312,16 @@ fn stage_folder(
     })?;
     let children = Dir::from_std_file(listing);
     for entry in children.entries()? {
-        let child = entry?.file_name();
+        let entry = entry?;
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(true);
+        let child = entry.file_name();
         let handle = open_entry(source.as_raw_fd(), &cstr(&child)?)?;
+        if is_dir {
+            let meta = handle.metadata()?;
+            if (meta.dev(), meta.ino()) == walk.skip {
+                continue;
+            }
+        }
         // A name from a stale listing must still be the entry just opened.
         let path = source_path.join(&child);
         stage_node(
@@ -398,15 +409,16 @@ pub(super) fn copy_item(
             "Unsupported copy source",
         ));
     }
-    let walk = Walk {
-        sys,
-        env,
-        item_dest: env.destination.join(name),
-    };
     let mut before_publish = Some(before_publish);
     let mut from = 0;
     loop {
         let area = CopyArea::create_with_cache(env.dir, cache.clone(), from)?;
+        let walk = Walk {
+            sys,
+            env,
+            item_dest: env.destination.join(name),
+            skip: area.location_id()?,
+        };
         let staged = stage_node(
             handle,
             source,

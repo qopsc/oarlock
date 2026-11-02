@@ -443,3 +443,32 @@ fn staging_for_a_copy_is_on_the_destination_filesystem() {
     assert_eq!(staged_dev.unwrap(), fs::metadata(&dest).unwrap().dev());
     assert_eq!(fs::read(dest.join("file")).unwrap(), b"across");
 }
+
+#[test]
+fn copying_a_repository_git_folder_into_itself_never_walks_into_its_own_staging() {
+    let f = fixture();
+    let repo = f.src.join("repo");
+    fs::create_dir(&repo).unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .status()
+        .unwrap();
+    assert!(init.success());
+    let git_dir = Dir::open_ambient_dir(repo.join(".git"), cap_std::ambient_authority()).unwrap();
+    let env = Env {
+        dir: &git_dir,
+        destination: &repo.join(".git"),
+        rename_on_conflict: true,
+        validate: &ok_validate,
+        guard: &ok_guard,
+        link_ok: &ok_link,
+    };
+    let source = repo.join(".git");
+    let handle = open_source(&source).unwrap();
+    let name = copy_item(&source, &handle, OsStr::new(".git"), &env, &REAL, None, || {})
+        .expect("a backup of .git inside the repository must succeed");
+    let copy = repo.join(".git").join(&name);
+    assert!(copy.join("HEAD").exists());
+    assert!(!copy.join("oarlock-staging").exists(), "staging is not part of the copy");
+}

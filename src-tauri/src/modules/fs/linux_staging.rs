@@ -432,6 +432,24 @@ fn select(
 fn remove_destination_child(destination: &Dir) {
     let _ = destination.remove_dir(DEST_STAGING);
 }
+/// A crash can leave entries in a `.oarlock-staging`; when a better location is
+/// chosen later, nothing else would ever clear it. Only a private folder of ours
+/// is swept, and it is removed once empty.
+fn sweep_stale_destination_child(destination: &Dir, locations: &[Location], chosen: usize) {
+    let has_child = locations
+        .iter()
+        .any(|location| matches!(location, Location::DestinationChild));
+    if !has_child || matches!(locations[chosen], Location::DestinationChild) {
+        return;
+    }
+    if !matches!(destination.symlink_metadata(DEST_STAGING), Ok(meta) if meta.is_dir()) {
+        return;
+    }
+    if let Ok(stale) = private_child(destination, DEST_STAGING) {
+        let _ = cleanup(&stale);
+        remove_destination_child(destination);
+    }
+}
 
 pub(super) struct Candidate {
     file: File,
@@ -448,6 +466,7 @@ impl Candidate {
     fn create_with_cache(destination: &Dir, cache: Option<PathBuf>) -> io::Result<Self> {
         let locations = locations(destination, cache.as_deref())?;
         let (index, staging) = select(destination, &locations, 0)?;
+        sweep_stale_destination_child(destination, &locations, index);
         cleanup(&staging)?;
         let file = unnamed(destination, 0o600)?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -581,6 +600,7 @@ impl CopyArea {
     ) -> io::Result<Self> {
         let locations = locations(destination, cache.as_deref())?;
         let (index, parent) = select(destination, &locations, from)?;
+        sweep_stale_destination_child(destination, &locations, index);
         cleanup(&parent)?;
         let name = OsString::from(format!(
             "copy-{}-{:032x}.d",
@@ -617,6 +637,11 @@ impl CopyArea {
         AccessControl::privatize_directory(&this.area)?;
         this.verify()?;
         Ok(this)
+    }
+    /// `(dev, ino)` of the staging location folder that holds this area.
+    pub fn location_id(&self) -> io::Result<(u64, u64)> {
+        let meta = self.parent.dir_metadata()?;
+        Ok((meta.dev(), meta.ino()))
     }
     /// The location a retry after `EXDEV` must start from.
     pub fn next_location(&self) -> usize {
@@ -904,6 +929,26 @@ pub(super) mod tests {
         assert!(staging_path(&candidate).starts_with(&cache));
         let mode = fs::metadata(&cache).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o700);
+    }
+    #[test]
+    fn a_stale_destination_child_is_swept_once_the_cache_is_usable() {
+        let root = test_dir();
+        let work = root.path().join("work");
+        let cache = root.path().join("cache");
+        for dir in [&work, &cache] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+        let child = work.join(".oarlock-staging");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let leftover = child.join("123-00000000000000000000000000000001.tmp");
+        fs::write(&leftover, "draft").unwrap();
+        old(&leftover);
+        let dir = open_dir(&work);
+        let candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
+        assert_eq!(staging_path(&candidate), cache.join("oarlock-staging"));
+        assert!(!child.exists(), "the stale folder and its draft are gone");
     }
     #[test]
     fn unusable_cache_falls_back_to_a_private_destination_child_removed_after_publish() {

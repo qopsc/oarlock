@@ -203,6 +203,24 @@ impl Staged<'_> {
 }
 
 /// Makes the rename itself durable. On Apple `File::sync_all` is `F_FULLFSYNC`.
+#[cfg(target_os = "linux")]
+pub(super) fn sync_directory(dir: &Dir) -> io::Result<()> {
+    // cap-std opens directories with O_PATH, on which fsync fails with EBADF.
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { fs::File::from_raw_fd(fd) }.sync_all()
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(super) fn sync_directory(dir: &Dir) -> io::Result<()> {
     dir.try_clone()?.into_std_file().sync_all()
 }
@@ -230,6 +248,14 @@ mod tests {
         let staged = dest.stage(b"newer").unwrap();
         staged.persist(true).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"newer");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_directory_really_syncs_a_pinned_directory_on_linux() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+        sync_directory(&dir).expect("fsync of a pinned directory must succeed");
     }
 
     #[cfg(target_os = "macos")]
