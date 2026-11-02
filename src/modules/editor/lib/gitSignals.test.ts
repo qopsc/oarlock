@@ -2,9 +2,7 @@ import type { Tab } from "@/modules/tabs";
 import { describe, expect, it, vi } from "vitest";
 import {
   editorTabsUnder,
-  prepareFilesDiscard,
   notifyHeadMoved,
-  onFilesDiscarded,
   onHeadMoved,
   repoFilePath,
 } from "./gitSignals";
@@ -63,25 +61,6 @@ describe("editorTabsUnder", () => {
   });
 });
 
-describe("prepareFilesDiscard", () => {
-  it("tells listeners the absolute paths until they unsubscribe", () => {
-    const committed = vi.fn();
-    const listener = vi.fn(() => ({ complete: committed, dispose: vi.fn() }));
-    const off = onFilesDiscarded(listener);
-    const commit = prepareFilesDiscard("/repo", ["src/a.ts", "new/"]);
-    expect(committed).not.toHaveBeenCalled();
-    commit.complete();
-    expect(committed).toHaveBeenCalledOnce();
-    commit.dispose();
-    expect(listener).toHaveBeenCalledWith(["/repo/src/a.ts", "/repo/new/"], {
-      kind: "local",
-    });
-    off();
-    prepareFilesDiscard("/repo", ["src/a.ts"]);
-    expect(listener).toHaveBeenCalledOnce();
-  });
-});
-
 describe("notifyHeadMoved", () => {
   it("tells change gutters until they unsubscribe", () => {
     const listener = vi.fn();
@@ -94,29 +73,25 @@ describe("notifyHeadMoved", () => {
 });
 
 it("newly mounted documents join active discards only in the owning environment", async () => {
-  const { registerDiscardDocument } = await import("./gitSignals");
-  const prep = { complete: vi.fn(), dispose: vi.fn() };
-  const prepare = vi.fn(() => prep);
-  const discard = prepareFilesDiscard("/repo", ["file"], {
-    kind: "wsl",
-    distro: "Ubuntu",
-  });
+  const { registerDiscardDocument, prepareNativeDiscard } = await import(
+    "./gitSignals"
+  );
+  const candidate = { select: vi.fn(() => ({ complete: vi.fn(), dispose: vi.fn() })) };
+  const stage = vi.fn(() => candidate);
+  const round = prepareNativeDiscard({ kind: "wsl", distro: "Ubuntu" }, true);
   const other = registerDiscardDocument({
     path: "/repo/file",
     workspace: { kind: "wsl", distro: "Debian" },
-    prepare,
+    stage,
   });
-  expect(prepare).not.toHaveBeenCalled();
+  expect(stage).not.toHaveBeenCalled();
   const off = registerDiscardDocument({
     path: "/repo/file",
     workspace: { kind: "wsl", distro: "Ubuntu" },
-    prepare,
+    stage,
   });
-  expect(prepare).toHaveBeenCalledWith(true);
-  discard.complete();
-  discard.dispose();
-  expect(prep.complete).toHaveBeenCalledOnce();
-  expect(prep.dispose).not.toHaveBeenCalled();
+  expect(stage).toHaveBeenCalledWith(true);
+  round.dispose();
   off();
   other();
 });

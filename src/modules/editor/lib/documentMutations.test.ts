@@ -348,7 +348,7 @@ it("renames and deletion cancel final verification before applying their complet
         session.retarget(event.from, event.to);
         path = event.to;
         session.open(path);
-      } else {
+      } else if (event.kind === "deleted") {
         expect(event.paths).toContain(path);
         session.detach();
       }

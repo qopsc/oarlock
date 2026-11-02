@@ -4,6 +4,7 @@ import {
   documentRevisionChanged,
   editorQuitSealed,
 } from "./quitBarrier";
+import { awaitMutationSequence } from "./mutationFence";
 import { detectEol, type Eol, normalizeToLf, restoreEol } from "./eol";
 import type { RecoveryTarget } from "./recoveryTarget";
 
@@ -15,6 +16,7 @@ export type ReadResult =
       mtime: number;
       version?: string;
       aiContextAllowed?: boolean;
+      mutationSequence?: number;
     }
   | { kind: "binary"; size: number }
   | { kind: "toolarge"; size: number; limit: number };
@@ -516,22 +518,33 @@ export class DocumentSession {
     const revision = this.revision;
     this.io.read(path, this.force).then(
       (res) => {
-        if (epoch !== this.epoch || generation !== this.readGeneration) return;
-        if ((this.pendingDiscards?.size ?? 0) > 0 && !options?.discard) {
-          this.discardReadSuppressed = true;
-          return;
-        }
-        if (!force) {
-          if (!this.isDirty && revision === this.revision)
-            this.adopt(res, true);
-        } else if (this.revision === revision && !options?.preserve) {
-          this.adopt(res);
-        } else if (res.kind === "text") {
-          this.adoptDiskText(res.content, res.version, res.aiContextAllowed);
-          if (options?.discard && this.timer === null) this.armAutoSave();
-        } else if (options?.discard) {
-          this.detach();
-        }
+        const settle = () => {
+          if (epoch !== this.epoch || generation !== this.readGeneration) return;
+          if ((this.pendingDiscards?.size ?? 0) > 0 && !options?.discard) {
+            this.discardReadSuppressed = true;
+            return;
+          }
+          if (!force) {
+            if (!this.isDirty && revision === this.revision)
+              this.adopt(res, true);
+          } else if (this.revision === revision && !options?.preserve) {
+            this.adopt(res);
+          } else if (res.kind === "text") {
+            this.adoptDiskText(res.content, res.version, res.aiContextAllowed);
+            if (options?.discard && this.timer === null) this.armAutoSave();
+          } else if (options?.discard) {
+            this.detach();
+          }
+        };
+        // A read that saw a newer write than this window has heard of (Git
+        // Discard) waits for the announcement before it may be adopted.
+        const held = options?.discard
+          ? null
+          : awaitMutationSequence(
+              res.kind === "text" ? res.mutationSequence : undefined,
+            );
+        if (held) void held.then(settle);
+        else settle();
       },
       // Transient failures (e.g. ENOENT mid atomic-rename) must not replace
       // a healthy buffer with an error screen.

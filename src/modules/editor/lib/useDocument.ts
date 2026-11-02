@@ -136,7 +136,6 @@ export function useDocument({ path, onDirtyChange, onBindingChange }: Options) {
       registerDiscardDocument({
         path,
         workspace: workspaceEnvForPath(path, owner),
-        prepare: session.prepareDiscard,
         stage: session.stageDiscard,
       }),
     [session, path, owner],

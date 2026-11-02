@@ -1,18 +1,7 @@
-import {
-  currentWorkspaceEnv,
-  workspaceScopeKey,
-  type WorkspaceEnv,
-} from "@/modules/workspace/env";
+import { workspaceScopeKey, type WorkspaceEnv } from "@/modules/workspace/env";
 import type { DiscardCandidate, DiscardPreparation } from "./documentSession";
 import { pathKey } from "@/lib/pathKey";
 import type { Tab } from "@/modules/tabs";
-
-type Listener = (
-  paths: readonly string[],
-  workspace: WorkspaceEnv,
-) => DiscardPreparation;
-
-const listeners = new Set<Listener>();
 
 /** A git status path (repository-relative) as an absolute path. */
 export function repoFilePath(repoRoot: string, path: string): string {
@@ -38,8 +27,7 @@ export function editorTabsUnder(
 export type DiscardDocument = {
   path: string;
   workspace: WorkspaceEnv;
-  prepare: (preserve: boolean) => DiscardPreparation;
-  stage?: (preserve: boolean) => DiscardCandidate;
+  stage: (preserve: boolean) => DiscardCandidate;
 };
 const documents = new Set<DiscardDocument>();
 const activeDiscards = new Set<{
@@ -52,50 +40,6 @@ export function registerDiscardDocument(document: DiscardDocument): () => void {
   for (const discard of activeDiscards) discard.capture(document, true);
   return () => {
     documents.delete(document);
-  };
-}
-
-/** Capture at confirmation. Remote/late documents keep all their text. */
-export function prepareFilesDiscard(
-  repoRoot: string,
-  paths: readonly string[],
-  workspace: WorkspaceEnv = currentWorkspaceEnv(),
-  preserve = false,
-): DiscardPreparation {
-  const absolute = paths.map((path) => repoFilePath(repoRoot, path));
-  const roots = absolute.map(pathKey);
-  const commits =
-    paths.length === 0
-      ? []
-      : [...listeners].map((listener) => listener(absolute, workspace));
-  const scope = workspaceScopeKey(workspace);
-  const discard = {
-    capture: (document: DiscardDocument, keep: boolean) => {
-      if (workspaceScopeKey(document.workspace) !== scope) return;
-      const key = pathKey(document.path);
-      if (roots.some((root) => key === root || key.startsWith(`${root}/`)))
-        commits.push(document.prepare(keep));
-    },
-  };
-  for (const document of documents) discard.capture(document, preserve);
-  activeDiscards.add(discard);
-  let live = true;
-  const finish = (ok: boolean) => {
-    if (!live) return;
-    live = false;
-    activeDiscards.delete(discard);
-    for (const commit of commits) {
-      if (ok) commit.complete();
-      else commit.dispose();
-    }
-  };
-  return { complete: () => finish(true), dispose: () => finish(false) };
-}
-
-export function onFilesDiscarded(listener: Listener): () => void {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
   };
 }
 
@@ -113,37 +57,30 @@ export function onHeadMoved(listener: () => void): () => void {
   };
 }
 
+export type DiscardMatch = (paths: string[]) => Promise<boolean[]>;
+
 /** Native matching is operation-scoped: no identity cache can go stale after
  * symlink retargeting. Candidates hold revisions before the asynchronous read. */
 export function prepareNativeDiscard(
   workspace: WorkspaceEnv,
   preserve: boolean,
-  match: (id: string, token: string, paths: string[]) => Promise<boolean[]>,
 ): DiscardPreparation & {
-  ready: (id: string, token: string) => Promise<void>;
+  ready: (match: DiscardMatch) => Promise<void>;
 } {
   const candidates: {
     path: string;
     candidate: DiscardCandidate;
     selected?: DiscardPreparation;
   }[] = [];
-  let binding: { id: string; token: string } | undefined;
+  let match: DiscardMatch | undefined;
   let live = true;
   let failed: unknown;
   const pending = new Set<Promise<void>>();
   const select = (batch: typeof candidates) => {
-    if (!binding || !batch.length) return;
-    const { id, token } = binding;
+    if (!match || !batch.length) return;
+    const lookup = match;
     const task = Promise.resolve()
-      .then(() =>
-        live
-          ? match(
-              id,
-              token,
-              batch.map(({ path }) => path),
-            )
-          : [],
-      )
+      .then(() => (live ? lookup(batch.map(({ path }) => path)) : []))
       .then((matches) => {
         if (!live) return;
         if (
@@ -175,7 +112,7 @@ export function prepareNativeDiscard(
         candidate: document.stage(keep),
       };
       candidates.push(candidate);
-      if (binding) select([candidate]);
+      if (match) select([candidate]);
     },
   };
   for (const document of documents) discard.capture(document, preserve);
@@ -192,9 +129,9 @@ export function prepareNativeDiscard(
     }
   };
   return {
-    ready: async (id, token) => {
-      if (!binding) {
-        binding = { id, token };
+    ready: async (lookup) => {
+      if (!match) {
+        match = lookup;
         select(candidates.slice());
       }
       while (pending.size) await Promise.all([...pending]);

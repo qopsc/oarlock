@@ -1,7 +1,7 @@
 use tauri::{AppHandle, Manager};
 
 use crate::modules::git::types::{
-    GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
+    DiscardEntry, GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
     GitLogEntry, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
     GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeRemoveResult,
 };
@@ -170,10 +170,13 @@ pub async fn git_unstage(
 pub async fn git_discard(
     app: AppHandle,
     window: tauri::WebviewWindow,
-    token: String,
-    id: String,
+    repo_root: String,
+    entries: Vec<DiscardEntry>,
+    roots: Vec<String>,
+    workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
-    super::discard::execute(app, window.label().into(), token, id).await
+    let workspace = WorkspaceEnv::from_option(workspace);
+    super::discard::execute(app, window.label().into(), repo_root, entries, workspace, roots).await
 }
 
 #[tauri::command]

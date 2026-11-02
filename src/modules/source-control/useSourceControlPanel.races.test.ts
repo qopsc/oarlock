@@ -74,9 +74,6 @@ vi.mock("@/modules/spaces/lib/useSpaces", () => ({
   ),
 }));
 vi.mock("@/modules/ai/lib/native", async () => {
-  const { DiscardCoordinator } = await import(
-    "@/modules/editor/lib/discardCoordinator"
-  );
   const { prepareNativeDiscard } = await import(
     "@/modules/editor/lib/gitSignals"
   );
@@ -89,31 +86,19 @@ vi.mock("@/modules/ai/lib/native", async () => {
         entries: { path: string; untracked: boolean }[],
       ) => {
         fake.calls.push({ root, env: env() });
-        const client = new DiscardCoordinator({
-          prepare: (scope, preserve) =>
-            prepareNativeDiscard(
-              scope.workspace,
-              preserve,
-              async (_id, _token, paths) =>
-                paths.map((path) =>
-                  entries.some((entry) => path === `${root}/${entry.path}`),
-                ),
-            ),
-          problem: () => {},
-          invoke: async <T>(command: string) => {
-            if (command === "git_discard_begin") return "1" as T;
-            if (command === "git_discard") await fake.discard(root, entries);
-            if (command === "git_discard_cancel")
-              return { phase: "finished", ok: false } as T;
-            return undefined as T;
-          },
-        });
-        client.ready("test");
+        const round = prepareNativeDiscard(env(), false);
         try {
-          await client.execute({ repoRoot: root, entries, workspace: env() });
-        } finally {
-          client.dispose();
+          await round.ready(async (paths) =>
+            paths.map((path) =>
+              entries.some((entry) => path === `${root}/${entry.path}`),
+            ),
+          );
+          await fake.discard(root, entries);
+        } catch (error) {
+          round.dispose();
+          throw error;
         }
+        round.complete();
       },
       gitCommit: async (root: string, message: string) => {
         fake.calls.push({ root, env: env() });
@@ -473,7 +458,6 @@ it("discard preserves editor changes typed after confirmation while native Git i
   const stop = registerDiscardDocument({
     path: "/repo/same.txt",
     workspace: { kind: "local" },
-    prepare: session.prepareDiscard,
     stage: session.stageDiscard,
   });
   let finish!: () => void;
