@@ -18,6 +18,8 @@ describe("checkReadable — secret basenames", () => {
       "/work/.oarlock-save-0123",
       "C:\\work\\.OARLOCK-STAGE-0123.\\content",
       "/work/.oarlock-stage-0123",
+      "/work/.oarlock-staging/area/content",
+      "/home/me/.cache/oarlock-staging/area/content",
     ]) {
       expect(checkReadable(path)).toMatchObject({ ok: false });
       expect(checkWritable(path)).toMatchObject({ ok: false });
