@@ -21,7 +21,11 @@ export function useDocumentLanguage(
     changed(view);
   }, [view, source, ready, compartment, changed]);
   useEffect(() => {
-    if (!view || !ready) return;
+    if (!ready) return;
+    if (!view) {
+      void resolveLanguage(source).catch(() => {});
+      return;
+    }
     const owner = generation.current;
     let cancelled = false;
     void resolveLanguage(source)

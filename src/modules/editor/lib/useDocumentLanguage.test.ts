@@ -32,12 +32,20 @@ function render(
   useDocumentLanguage(target, source, ready, compartment, changed, failed);
 }
 beforeEach(() => {
-  render("", null);
+  render("", null, false);
   vi.clearAllMocks();
 });
-it("does not resolve before an editor exists", () => {
-  render("file.xml", null);
-  expect(fake.resolve).not.toHaveBeenCalled();
+it.each([null, view])(
+  "does not load a parser when syntax is disabled",
+  (target) => {
+    render("file.xml", target, false);
+    expect(fake.resolve).not.toHaveBeenCalled();
+  },
+);
+it("preloads a ready document while its editor is being created", () => {
+  fake.resolve.mockResolvedValue(null);
+  render("file.rs", null, true);
+  expect(fake.resolve).toHaveBeenCalledWith("file.rs");
 });
 it.each(["language", "close", "disable"])(
   "discards a pending parser on %s",

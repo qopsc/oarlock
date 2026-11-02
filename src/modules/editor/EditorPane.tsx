@@ -80,7 +80,6 @@ import {
   parseFiletype,
   vimFiletype,
 } from "./lib/documentLanguage";
-import { resolveLanguage } from "./lib/languageResolver";
 import { useDocumentLanguage } from "./lib/useDocumentLanguage";
 import { isPreviewTooLarge, mediaPreviewKind } from "./lib/mediaPreview";
 import { SearchCountHub, searchCountHub } from "./lib/searchCount";
@@ -712,11 +711,6 @@ export const EditorPane = memo(
 
     // Every consumer uses the same selected language id. Parser loading may be
     // asynchronous; never keep the previous language's parser while it loads.
-    useEffect(() => {
-      const source = overrideLanguage ? `dummy.${overrideLanguage}` : path;
-      void resolveLanguage(source).catch(() => {});
-    }, [path, overrideLanguage]);
-
     useDocumentLanguage(
       doc.status === "ready" ? editorView : null,
       overrideLanguage ? `dummy.${overrideLanguage}` : path,
