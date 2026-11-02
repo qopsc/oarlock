@@ -39,7 +39,7 @@ Terminal migration status drop sentence, PTY shell integration dialect sentence,
 - Size, measured by the reviewer against a base build of e7db16e3 (before the rework): +1,125 bytes total client JS, +349 primary terminal, +29 startup, WebGL and WASM unchanged. `.size-limit.json` is not changed here.
 - `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile ... target(s)` with no warnings.
 - `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed): `test result: ok. 1673 passed; 0 failed; 4 ignored` for the library and `ok` for every integration binary.
-- No U+2014 in the diff against the base. `bun run size` was not run in this worktree.
+- No U+2014 in the diff against the base.
 
 ## 7. Final review follow-up
 
