@@ -11,10 +11,10 @@ per-terminal frame loop, or per-pane GPU lifecycle.
 - Restty commit: `7700b14a7643ba9240818209ef1e0aa90d83ad77`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`, WebAssembly SIMD and scalar variants
-- SIMD artifact size: `1074998` bytes
-- Scalar artifact size: `1015961` bytes
-- SIMD SHA-256: `2c8ce7de75f8c03037ba878b784520d19f941cb10f8f2a900e269e5fa9e8d5e0`
-- Scalar SHA-256: `cc0331b242ca43d9bd2c5be4c3a764c1696fbcea814ec6181b663f881e5c601d`
+- SIMD artifact size: `1074803` bytes
+- Scalar artifact size: `1015766` bytes
+- SIMD SHA-256: `fa72b189db516cea69e55dfc71f492a7e81940a4d56c582c09d0a2660e871c20`
+- Scalar SHA-256: `b427483b6c7630aaf312845a42969226d48f64409eaf713a83fd1ef0095a8836`
 
 Oarlock-specific changes include:
 
@@ -22,8 +22,8 @@ Oarlock-specific changes include:
 - Ghostty `TinyIo`, avoiding the binary and runtime overhead of threaded I/O;
 - independent hard byte and line limits for scrollback;
 - a 256 KB maximum retained terminal-reply queue per terminal (raised for
-  Kitty clipboard answers); overflow fails the terminal instead of sending a
-  partial protocol response;
+  Kitty clipboard answers); a reply that does not fit is dropped whole (logged
+  once) and the terminal goes on, so a partial protocol response is never sent;
 - raw `Uint8Array` PTY writes and replies with no UTF-8 round trip;
 - prompt input capability for shells that need direct input instead of blocks;
 - native Ghostty key encoding and terminal mode queries in the same instance;

@@ -38,10 +38,10 @@ export const ADAPTED_GHOSTTY_COMMIT =
 export const ADAPTED_RESTTY_COMMIT =
   "7700b14a7643ba9240818209ef1e0aa90d83ad77";
 export const ADAPTED_GHOSTTY_WASM_SHA256 =
-  "2c8ce7de75f8c03037ba878b784520d19f941cb10f8f2a900e269e5fa9e8d5e0";
+  "fa72b189db516cea69e55dfc71f492a7e81940a4d56c582c09d0a2660e871c20";
 
 export const ADAPTED_GHOSTTY_SCALAR_WASM_SHA256 =
-  "cc0331b242ca43d9bd2c5be4c3a764c1696fbcea814ec6181b663f881e5c601d";
+  "b427483b6c7630aaf312845a42969226d48f64409eaf713a83fd1ef0095a8836";
 
 let wasmSimdAvailable: boolean | undefined;
 
@@ -780,8 +780,6 @@ export class OarlockGhosttyTerminal {
   drainOutputBytes(): Uint8Array {
     this.assertLive();
     const length = this.exports.restty_output_len(this.handle);
-    if (length === 0x7fff_ffff)
-      throw new Error("Terminal reply buffer overflow; terminal output stopped");
     if (length === 0) return emptyBytes;
     const pointer = this.exports.restty_output_ptr(this.handle);
     validateRange(this.memory.buffer, pointer, length);
