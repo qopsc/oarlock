@@ -48,7 +48,9 @@ fn open(root: &Path, path: &Path, write: bool) -> io::Result<std::fs::File> {
         return Err(io::Error::last_os_error());
     }
     let entry = unsafe { entry.assume_init() };
-    if entry.st_dev as u64 != metadata.dev() || entry.st_ino != metadata.ino()
+    #[allow(clippy::unnecessary_cast)]
+    let same_device = entry.st_dev as u64 == metadata.dev();
+    if !same_device || entry.st_ino != metadata.ino()
         || entry.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(io::Error::other("Store entry changed during open"));
     }
