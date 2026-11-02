@@ -35,7 +35,15 @@ it("verifies the macOS bundle before anything is uploaded to the release", () =>
   expect(steps[upload]).toContain('if [ -d "$artifact" ]');
   expect(steps[upload]).toContain('tar -czf "$archive"');
   expect(steps[upload]).toContain('${stem}_${ARCH}.app.tar.gz');
-  expect(steps[upload]).toContain('ARCH="${ARCH_TARGET%%-*}"');
+  expect(steps[upload]).toContain("x86_64) ARCH=x64 ;;");
+  expect(steps[upload]).toContain('*) ARCH="${ARCH_TARGET%%-*}" ;;');
+  // Both legs resolve to distinct names: Oarlock_x64.app.tar.gz and Oarlock_aarch64.app.tar.gz.
+  const arch = (target: string) =>
+    spawnSync("bash", ["-c", `case "\${T%%-*}" in x86_64) A=x64 ;; *) A="\${T%%-*}" ;; esac; echo "$A"`], {
+      encoding: "utf8", env: { ...process.env, T: target },
+    }).stdout.trim();
+  expect(arch("x86_64-apple-darwin")).toBe("x64");
+  expect(arch("aarch64-apple-darwin")).toBe("aarch64");
   expect(steps[upload]).toContain("ARCH_TARGET: ${{ matrix.rust-target }}");
   const publishing = steps.filter((step) => /tagName:/.test(step));
   expect(publishing).toHaveLength(1);

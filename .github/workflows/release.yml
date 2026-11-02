@@ -154,7 +154,11 @@ jobs:
           # tauri-action lists the .app directory, which it tars only when it
           # uploads itself. Tar it here under a per-architecture name so the two
           # macOS legs never clobber each other; files go up as they are.
-          ARCH="${ARCH_TARGET%%-*}"
+          # tauri-action names the Intel bundles x64.
+          case "${ARCH_TARGET%%-*}" in
+            x86_64) ARCH=x64 ;;
+            *) ARCH="${ARCH_TARGET%%-*}" ;;
+          esac
           printf '%s' "$ARTIFACT_PATHS" | jq -r '.[]' | while IFS= read -r artifact; do
             if [ -d "$artifact" ]; then
               case "$artifact" in
