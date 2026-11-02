@@ -37,6 +37,19 @@ struct Root {
     display: String,
 }
 
+/// Each walk gets its own budget, so one large root (a home folder, a monorepo) cannot starve
+/// the rest, and spending it only leaves the documents it would have found unresolved.
+#[derive(Clone, Copy)]
+struct Limits {
+    entries: usize,
+    time: Duration,
+}
+
+const LIMITS: Limits = Limits {
+    entries: 100_000,
+    time: Duration::from_secs(5),
+};
+
 fn version_identity(version: &str) -> Option<&str> {
     version
         .strip_prefix("v2:")?
@@ -72,6 +85,16 @@ fn reconcile(
     workspace: &WorkspaceEnv,
     authorize: impl Fn(&Path) -> Result<(), String>,
 ) -> Result<Vec<Binding>, String> {
+    reconcile_within(documents, roots, workspace, authorize, LIMITS)
+}
+
+fn reconcile_within(
+    documents: &[Document],
+    roots: &[Root],
+    workspace: &WorkspaceEnv,
+    authorize: impl Fn(&Path) -> Result<(), String>,
+    limits: Limits,
+) -> Result<Vec<Binding>, String> {
     let mut bindings: Vec<_> = documents
         .iter()
         .map(|doc| Binding {
@@ -89,15 +112,8 @@ fn reconcile(
                 continue;
             }
         }
-        if expected.is_none() {
-            if let Some(alternate) = doc.alternate_path.as_deref() {
-                let candidate = resolve_path(alternate, workspace)?;
-                if opened_identity(&candidate, &authorize).is_ok() {
-                    bindings[i].path = Some(alternate.to_owned());
-                    continue;
-                }
-            }
-        }
+        // Without a native version there is nothing to prove a file at the old name or at the
+        // rename destination is this document, so it stays unresolved rather than guessed.
         if let Some(identity) = expected {
             unresolved.entry(identity.to_owned()).or_default().push(i);
         }
@@ -105,30 +121,38 @@ fn reconcile(
     if unresolved.is_empty() {
         return Ok(bindings);
     }
-    let started = Instant::now();
-    let mut seen = 0usize;
     // A hard-linked file may have several names. Never choose one arbitrarily.
     let mut matches: HashMap<String, Option<String>> = HashMap::new();
-    for root in roots {
-        let walker = WalkBuilder::new(&root.path)
+    let mut visited: Vec<PathBuf> = Vec::new();
+    let mut scan = |walk_root: &Path, root: &Root| {
+        // Roots overlap with the former folders scanned first; a folder is read once.
+        if visited.iter().any(|done| walk_root.starts_with(done)) {
+            return;
+        }
+        visited.push(walk_root.to_path_buf());
+        let started = Instant::now();
+        let mut seen = 0usize;
+        let walker = WalkBuilder::new(walk_root)
             .hidden(false)
-            .ignore(false)
-            .git_ignore(false)
+            .ignore(true)
+            .git_ignore(true)
             .git_global(false)
-            .git_exclude(false)
+            .git_exclude(true)
+            .require_git(false)
             .parents(false)
             .follow_links(false)
+            .filter_entry(|entry| entry.file_name() != ".git")
             .build();
         for entry in walker {
             seen += 1;
-            if seen > 100_000 || started.elapsed() > Duration::from_secs(5) {
-                return Err("Document reconciliation exceeded its workspace scan limit. Retry after narrowing the workspace.".into());
+            if seen > limits.entries || started.elapsed() > limits.time {
+                return;
             }
-            let entry = entry.map_err(|e| format!("Could not reconcile workspace: {e}"))?;
+            let Ok(entry) = entry else { continue };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
-            let meta = entry.metadata().map_err(|e| e.to_string())?;
+            let Ok(meta) = entry.metadata() else { continue };
             if !might_match(&meta, &unresolved) {
                 continue;
             }
@@ -148,6 +172,23 @@ fn reconcile(
                 })
                 .or_insert(Some(path));
         }
+    };
+    // A rename usually stays in the folder the document came from: look there first.
+    for (i, doc) in documents.iter().enumerate() {
+        let former = resolve_path(&doc.path, workspace)
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .and_then(|dir| fs::canonicalize(dir).ok());
+        let Some(former) = former else { continue };
+        let Some(root) = roots.iter().find(|root| former.starts_with(&root.path)) else {
+            continue;
+        };
+        if bindings[i].path.is_none() {
+            scan(&former, root);
+        }
+    }
+    for root in roots {
+        scan(&root.path, root);
     }
     for (identity, indexes) in unresolved {
         if let Some(Some(path)) = matches.get(&identity) {
@@ -195,7 +236,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn partial_rename_without_identity_checks_source_before_destination() {
+    fn a_document_without_a_version_keeps_its_path_but_never_adopts_a_destination() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -214,17 +255,11 @@ mod tests {
         let find = || reconcile(&docs, &roots, &WorkspaceEnv::default(), |_| Ok(())).unwrap();
         assert_eq!(find()[0].path.as_deref(), source.to_str());
         fs::remove_file(&source).unwrap();
-        assert_eq!(find()[0].path.as_deref(), destination.to_str());
-        let destination_real = fs::canonicalize(&destination).unwrap();
-        let refused = reconcile(&docs, &roots, &WorkspaceEnv::default(), |path| {
-            if path == destination_real {
-                Err("outside authorized workspace".into())
-            } else {
-                Ok(())
-            }
-        })
-        .unwrap();
-        assert_eq!(refused[0].path, None);
+        assert_eq!(
+            find()[0].path,
+            None,
+            "a destination is never adopted without an identity to match"
+        );
         fs::remove_file(&destination).unwrap();
         assert_eq!(find()[0].path, None);
     }
@@ -306,5 +341,121 @@ mod tests {
         assert_eq!(find()[0].path.as_deref(), b.to_str());
         fs::hard_link(&b, temp.path().join("c")).unwrap();
         assert_eq!(find()[0].path, None);
+    }
+
+    fn versioned(dir: &Path, name: &str) -> (PathBuf, Document) {
+        let file = dir.join(name);
+        fs::write(&file, name).unwrap();
+        let handle = fs::File::open(&file).unwrap();
+        let version = document_save::version(&handle, name.as_bytes()).unwrap();
+        let doc = Document {
+            id: 1,
+            path: file.to_string_lossy().into(),
+            version: Some(version),
+            alternate_path: None,
+        };
+        (file, doc)
+    }
+
+    fn root(path: &Path) -> Root {
+        Root {
+            path: fs::canonicalize(path).unwrap(),
+            display: path.to_string_lossy().into(),
+        }
+    }
+
+    #[test]
+    fn ignored_folders_and_git_internals_are_not_walked() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(base.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(base.join(".git/objects")).unwrap();
+        fs::write(base.join(".gitignore"), "node_modules/\n").unwrap();
+        let (original, doc) = versioned(&base, "doc.txt");
+        let hidden = base.join("node_modules/pkg/doc.txt");
+        fs::rename(&original, &hidden).unwrap();
+        let roots = [root(&base)];
+        let found = reconcile(&[doc], &roots, &WorkspaceEnv::default(), |_| Ok(())).unwrap();
+        assert_eq!(found[0].path, None, "an ignored folder is outside the walk");
+    }
+
+    #[test]
+    fn each_root_has_its_own_budget_and_exhaustion_leaves_documents_unresolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let (big, small) = (base.join("big"), base.join("small"));
+        fs::create_dir_all(&big).unwrap();
+        fs::create_dir_all(&small).unwrap();
+        for n in 0..200 {
+            fs::write(big.join(format!("f{n}")), "x").unwrap();
+        }
+        let (original, doc) = versioned(&small, "doc.txt");
+        let moved = small.join("renamed.txt");
+        fs::rename(&original, &moved).unwrap();
+        let limits = Limits {
+            entries: 50,
+            time: Duration::from_secs(30),
+        };
+        let run = |roots: &[Root]| {
+            reconcile_within(&[doc_copy(&doc)], roots, &WorkspaceEnv::default(), |_| Ok(()), limits)
+        };
+        let only_big = run(&[root(&big)]).unwrap();
+        assert_eq!(only_big[0].path, None, "the exhausted walk does not fail the batch");
+        let both = run(&[root(&big), root(&small)]).unwrap();
+        assert_eq!(both[0].path.as_deref(), moved.to_str());
+    }
+
+    fn doc_copy(doc: &Document) -> Document {
+        Document {
+            id: doc.id,
+            path: doc.path.clone(),
+            version: doc.version.clone(),
+            alternate_path: doc.alternate_path.clone(),
+        }
+    }
+
+    #[test]
+    fn the_former_folder_is_searched_before_the_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let (aaa, zzz) = (base.join("aaa"), base.join("zzz"));
+        fs::create_dir_all(&aaa).unwrap();
+        fs::create_dir_all(&zzz).unwrap();
+        for n in 0..200 {
+            fs::write(aaa.join(format!("f{n}")), "x").unwrap();
+        }
+        let (original, doc) = versioned(&zzz, "doc.txt");
+        let moved = zzz.join("renamed.txt");
+        fs::rename(&original, &moved).unwrap();
+        let limits = Limits {
+            entries: 50,
+            time: Duration::from_secs(30),
+        };
+        let found = reconcile_within(
+            &[doc],
+            &[root(&base)],
+            &WorkspaceEnv::default(),
+            |_| Ok(()),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(found[0].path.as_deref(), moved.to_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_does_not_fail_the_batch() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let locked = base.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let (original, doc) = versioned(&base, "doc.txt");
+        let moved = base.join("renamed.txt");
+        fs::rename(&original, &moved).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = reconcile(&[doc], &[root(&base)], &WorkspaceEnv::default(), |_| Ok(()));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(found.unwrap()[0].path.as_deref(), moved.to_str());
     }
 }
