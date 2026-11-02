@@ -58,6 +58,7 @@ stdenv.mkDerivation {
     mkdir -p $out/bin $out/share
     cp -r usr/share/* $out/share/
     install -Dm755 usr/bin/oarlock $out/bin/oarlock
+    install -Dm755 usr/bin/oarlock-cli $out/bin/oarlock-cli
 
     wrapProgram $out/bin/oarlock \
       "''${gappsWrapperArgs[@]}" \

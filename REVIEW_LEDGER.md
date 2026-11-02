@@ -4620,8 +4620,8 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R086 | Closed; platform checks remain | AP002 binds completion to its terminal and workspace; existing ownership tests and real POSIX-shell checks are recorded in the depth checkpoint. Mounted GUI and Windows/WSL checks remain manual/port work. |
 | R093 | Open, Tier 2 | The optional WebGL shader path still does not check failed texture/framebuffer allocation or completeness. No driver-pressure reproduction was run. |
 | R095 | Open, Tier 2 | The terminal core still drops arbitrary leading reply bytes on overflow. The source confirms the behavior; no production burst reproduction is claimed. |
-| R112 | Open, Tier 2 | The Linux Nix install copies `usr/bin/oarlock` but not the declared `oarlock-cli` sidecar. No release payload was inspected in this pass. |
-| R113 | Open, Tier 2 | Manual release dispatch remains available on branches while release naming uses `github.ref_name`, and repair/manifest jobs are tag-gated. No release was dispatched. |
+| R112 | Closed; final-asset check manual | The Linux Nix install now copies the bundled CLI alongside the application. A fixture runs the actual install phase. |
+| R113 | Closed | The release workflow validates a version-tag ref before any publishing job; branch and non-version-tag dispatches fail the validation job. |
 | R116 | Open, Tier 2 | The benchmark export still applies the current working-tree diff in broad tracked files and links the current dependency tree despite describing a pristine revision. |
 | R118 | Open, Tier 2 | The IPC profiling harness still invokes obsolete watch removal and search request contracts. Its AI-specific profiling remains on hold. |
 | R122 | Closed | The shell-integration guide describes profile-specific launch-only fish integration, consistent with `apply_fish_init`. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **17 closed; 8 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **19 closed; 6 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4731,3 +4731,9 @@ Validation: the final real-Git filename and symlink regressions passed on macOS 
 New Window and Close Tab now receive their effective user bindings through the existing menu-shortcut plan instead of fixed accelerators. Disabled or conflicting bindings produce no accelerator. The existing menu snapshot gained two optional fields; old snapshots still deserialize. If a user binding claims the normally fixed Quit or Close Window chord, the custom binding takes precedence and the fixed action remains accessible from its menu item.
 
 Validation: frontend menu planning and bridge tests cover defaults, customization, disabled bindings and conflicts; native tests cover the new fields, old snapshot compatibility and fixed-key conflicts. The full macOS native suite and strict Clippy passed. The full frontend suite passed 6,098 tests (two skipped), types passed and lint remained at 80 warnings. Manual signed-release check: customize and clear New Window and Close Tab, exercise them from a terminal and a focused browser preview, and verify no old or duplicate action fires; also check a custom binding that claims a normally fixed menu chord.
+
+### R112 and R113 checkpoint — release packaging and dispatch
+
+The Linux Nix install phase now copies `oarlock-cli` beside `oarlock`; a fixture executes that actual phase with a simulated extracted package. The pinned Tauri bundler's [Debian implementation](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.3/crates/tauri-bundler/src/bundle/linux/debian.rs#L106-L120) places configured external binaries in `usr/bin`, but no final Oarlock release asset was available to inspect. The release workflow now validates that its ref is a `v` version tag before the publishing matrix can start; a shell-based regression exercises a version tag, branch and non-version tag without dispatching a release.
+
+Validation: both focused fixtures and the full frontend suite passed (6,100 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,586 library tests (four ignored) and all integration suites; strict Clippy passed. Nix is unavailable here, so a full Nix build remains manual. Manual release check: inspect the final Debian asset for `usr/bin/oarlock-cli`, generate its final hash, build/install the Nix package on Linux, and verify the helper is beside the wrapped executable and works. Trigger the release workflow only on the intended version tag.

@@ -7,7 +7,20 @@ on:
   workflow_dispatch:
 
 jobs:
+  validate-release-ref:
+    runs-on: namespace-profile-oarlock-linux-amd64
+    permissions: {}
+    steps:
+      - name: Require a version tag
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v?*) ;;
+            *) echo "::error::Run this workflow on a release tag beginning with v."; exit 1 ;;
+          esac
+
   publish-tauri:
+    needs: validate-release-ref
     permissions:
       actions: read
       contents: write
