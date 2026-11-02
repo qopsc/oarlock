@@ -203,24 +203,25 @@ impl Staged<'_> {
 }
 
 /// Makes the rename itself durable. On Apple `File::sync_all` is `F_FULLFSYNC`.
+#[cfg(target_os = "linux")]
 pub(super) fn sync_directory(dir: &Dir) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // cap-std opens directories with O_PATH, on which fsync fails with EBADF.
-        use std::os::fd::{AsRawFd, FromRawFd};
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        return unsafe { fs::File::from_raw_fd(fd) }.sync_all();
+    // cap-std opens directories with O_PATH, on which fsync fails with EBADF.
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    #[cfg(not(target_os = "linux"))]
+    unsafe { fs::File::from_raw_fd(fd) }.sync_all()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn sync_directory(dir: &Dir) -> io::Result<()> {
     dir.try_clone()?.into_std_file().sync_all()
 }
 
