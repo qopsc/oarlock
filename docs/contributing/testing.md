@@ -33,6 +33,7 @@ CI, release and the Nix-sources job run on [Namespace](https://namespace.so) run
 - Shell / terminal spawn (what shell launches, with which cwd, env, and login flags)
 - Workspace authorization (both the allow and deny side)
 - Git command layer (repo-root resolution, pathspec/argument guards, status parsing)
+  - Git guard suites must not read the developer's `$HOME` configuration (Git LFS, signing and fsmonitor settings there would change which cases pass). `tests/common/mod.rs` `isolate_home` is the one place that points `HOME`, `XDG_CONFIG_HOME` and `USERPROFILE` at an empty directory, once per test process, and every Git integration fixture goes through it; under `cfg(test)`, `build_git_command` and `process::test_git()` do the same for unit tests, so use them instead of `Command::new("git")`.
 - Filesystem mutation (atomic writes, symlink handling, no-data-loss on partial failure)
 - IPC command surface and AI tool surface
 - Pure logic with wide reach (cwd inheritance, tab/split tree transforms, OSC/prompt parsing, command guard)
@@ -90,6 +91,7 @@ When testing `src/modules/ai/lib/security.ts` or the Rust equivalents, cover:
 - A local fix with global blast radius must be caught by a test; review alone is not enough.
 - Test the deny path and the edge, not just the happy path.
 - Keep platform-specific tests behind the right `#[cfg(...)]` gate.
+- A guard that is only pinned by a source-text test (for example the native-store guard on work-tree commands) must also be exercised through the pure function it calls (`refuse_write_in` with a `StoreDirs` value); a source pin catches a dropped call, not behavior.
 
 ## See also
 

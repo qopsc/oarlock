@@ -54,7 +54,7 @@ Every command here that takes a path is refused outside the folders the workspac
 #### File
 
 - `fs_read_file` - read file contents
-- `fs_write_file` - write file contents
+- `fs_write_file` / `fs_save_document` - write file contents; both keep the project trust answer for the app's own calls only, never for `origin: "ai"`, and the AI's gates also refuse the secret-path deny-list natively (`Gates.protect_secrets`). `fs_save_document` takes the content-and-identity version the editor or the AI read and syncs the destination folder after the rename; a committed write whose version cannot be read back returns a `v2:unavailable:` placeholder version, so the next save conflicts and asks
 - `fs_stat` - file metadata
 - `fs_canonicalize` - canonical path
 - `fs_host_path` - host path of a workspace file (WSL share or drive), for asset URLs
@@ -63,7 +63,8 @@ Every command here that takes a path is refused outside the folders the workspac
 #### Mutate
 
 - `fs_create_file` / `fs_create_dir`
-- `fs_rename` / `fs_move` / `fs_delete` / `fs_delete_batch` / `fs_copy`
+- `fs_rename` / `fs_move` / `fs_delete` / `fs_delete_batch` / `fs_copy` - rename, move, delete and batch delete guard the authorized entry (resolved parent plus name) and look at the native-store guard again immediately before acting. They publish `fs:mutation` through path claims (`fs/mutation_events.rs`): operations on the same path, or a path and an ancestor, run one at a time from claim to publish, unrelated ones overlap, and the stream lock is never held across the filesystem call; a failed broadcast is logged and counted and the sequence still advances so windows see a gap
+- `fs_reconcile_documents` - finds open documents that moved, by identity: a budget per root (100,000 entries or 5 s), ignore files honored, `.git` skipped, the document's former folder walked first (once, only for unresolved documents, inside a shared 5 s deadline); a missing or unauthorized root is skipped; a document without a native version is never bound to a rename destination, and an unresolved one answers `path: null`
 
 #### Clipboard
 
@@ -71,7 +72,7 @@ Every command here that takes a path is refused outside the folders the workspac
 
 #### Watch
 
-- `fs_watch_add` / `fs_watch_remove` - directory change notifications (`fs:changed`): directories to watch plus the files whose own size or mtime should be reported. macOS uses one FSEvents stream over the covering roots with directory-level events and 0.1 s coalescing; Linux and Windows use non-recursive notify watches. Events are debounced 150 ms, at most 1 s.
+- `fs_watch_add` / `fs_watch_remove` - directory change notifications (`fs:changed`): directories to watch plus the files whose own size or mtime should be reported. macOS uses one FSEvents stream over the covering roots with directory-level events and 0.1 s coalescing; Linux and Windows use non-recursive notify watches. Events are debounced 150 ms, at most 1 s. The call registers every requested path it can and returns `unavailableDirectories` and `unavailableFiles` (with a reason: a deleted folder, an unauthorized one) for the rest; only an unusable environment fails it. The client does not announce unavailable paths and asks for them again on a health refresh or Retry.
 
 #### Search
 
@@ -89,7 +90,7 @@ Every command here that takes a path is refused outside the folders the workspac
 All git commands are gated through the workspace authorization registry.
 
 - `git_resolve_repo` / `git_panel_snapshot`
-- `git_status`
+- `git_status` - decoded per NUL record; an entry whose name is not UTF-8 is marked `unreadable` and shown as "Unreadable name", and the backend refuses actions on any entry containing U+FFFD
 - `git_diff` / `git_diff_content`
 - `git_file_base` - a file's committed (HEAD) text, for the editor's change gutter
 - `git_stage` / `git_unstage` / `git_discard`
@@ -106,7 +107,7 @@ Three distinct surfaces:
 
 - `shell_run_command` - one-shot subshell exec for AI tools
 - `shell_session_open` / `shell_session_run` / `shell_session_close` - persistent agent shell with state across calls
-- `shell_bg_spawn` / `shell_bg_logs` / `shell_bg_kill` / `shell_bg_list` - long-running background processes with bounded ring-buffer log capture
+- `shell_bg_spawn` / `shell_bg_logs` / `shell_bg_kill` / `shell_bg_list` - long-running background processes with bounded ring-buffer log capture; `logs` and `kill` take the chat id and refuse a job another chat started, `list` stays process-wide
 
 ### Workspace (`src-tauri/src/modules/workspace.rs`)
 
@@ -116,7 +117,7 @@ Three distinct surfaces:
 ### Network (`src-tauri/src/modules/net.rs`, `net/`)
 
 - `ai_http_stream` / `ai_http_cancel` / `ai_http_ack` - AI HTTP proxy with SSRF guard
-- `lm_ping` - local-model ping
+- `lm_ping` - local-model ping; like AI calls, whether the host may be private is decided natively from the host, not sent by the page
 - `markdown_remote_image` - one https image for the Markdown preview (public hosts only, redirects re-validated, images only, 16 MiB)
 
 ### AI sessions (`src-tauri/src/modules/ai_sessions.rs`)
@@ -130,7 +131,7 @@ Three distinct surfaces:
 - `skills_load` / `skills_read_file` - a usable skill's `SKILL.md` body and file list, or one of its text files, read only inside its real folder
 - `skills_set_enabled` / `skills_create` / `skills_edit` / `skills_delete` - turn a skill on or off, create one from the template, open its `SKILL.md` in the editor of the window in front, delete one of Oarlock's folder (to the trash)
 - `skills_install_git` / `skills_install_zip` / `skills_install_commit` / `skills_install_cancel` - stage skills from a Git repository or a zip the user picks, then install the reviewed ones
-- `project_trust_status` / `project_trust_decide` / `project_trust_list` / `project_trust_revoke` - what a project provides (its `AGENTS.md`, its skills, its `.mcp.json`) and the user's decision on each item, kept with its content hash
+- `project_trust_status` / `project_trust_decide` / `project_trust_list` / `project_trust_revoke` - (the root named must be a folder the workspace registry authorizes) what a project provides (its `AGENTS.md`, its skills, its `.mcp.json`) and the user's decision on each item, kept with its content hash
 - `project_memory_read` - the window's project `AGENTS.md` for an AI run, only while the user allows its current content (`project_memory.rs`)
 
 ### Language servers (`src-tauri/src/modules/lsp/`)
@@ -171,7 +172,7 @@ Three distinct surfaces:
 
 ### App windows (`src-tauri/src/modules/windows.rs`, `quick_terminal.rs`)
 
-- `app_window_open` / `app_window_ready` - open another app window; a page reports that it answers quit requests
+- `app_window_open` / `app_window_ready` - open another app window; a page reports that it answers quit requests. Startup restoration resolves a linked data directory once and pins it only when there is recovery work (a journal or a window to adopt); an ordinary launch reads `oarlock-windows.json` without pinning
 - `app_quit` / `app_quit_ready` - quit once every window has confirmed and saved its state
 - `quick_terminal_toggle` / `quick_terminal_set_hotkey` - the quick terminal window and its global hotkey
 
