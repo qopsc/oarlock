@@ -144,16 +144,19 @@ export async function removeBackground<FileValue>(gate: ImportGate, deps: Backgr
   const ticket = gate.begin();
   if (ticket === null) return false;
   try {
-    const before = await deps.snapshot();
-    if (!gate.save(ticket)) return false;
-    await deps.publish(null, before.revision);
-    const previous = before.values.backgroundImageId;
-    if (typeof previous === "string") {
-      try {
-        const now = await deps.latest();
-        if (now.values.backgroundImageId !== previous) await deps.removeFile(previous);
-      } catch { /* preserving an unused image is safer than deleting an active one */ }
-    }
-    return true;
+    const run = async (): Promise<boolean> => {
+      const before = await deps.snapshot();
+      if (!gate.save(ticket)) return false;
+      await deps.publish(null, before.revision);
+      const previous = before.values.backgroundImageId;
+      if (typeof previous === "string") {
+        try {
+          const now = await deps.latest();
+          if (now.values.backgroundImageId !== previous) await deps.removeFile(previous);
+        } catch { /* preserving an unused image is safer than deleting an active one */ }
+      }
+      return true;
+    };
+    return await (deps.withLock ? deps.withLock(run) : run());
   } finally { gate.finish(ticket); }
 }

@@ -141,6 +141,22 @@ it("removal publishes both fields together and retains the current image on fail
   expect(removeFile).toHaveBeenCalledExactlyOnceWith("old");
 });
 
+it("removal runs under the shared background lock", async () => {
+  const prefs = preferences();
+  const locked = vi.fn();
+  const lock = <T,>(run: () => Promise<T>): Promise<T> => {
+    locked();
+    return run();
+  };
+  const deps = {
+    snapshot: prefs.snapshot, latest: prefs.snapshot,
+    importFile: async () => ({ id: "unused" }), publish: prefs.publish,
+    removeFile: vi.fn().mockResolvedValue(undefined), withLock: lock,
+  };
+  expect(await removeBackground(new ImportGate(vi.fn()), deps)).toBe(true);
+  expect(locked).toHaveBeenCalledOnce();
+});
+
 it("a delayed removal cannot overwrite another window's newer background", async () => {
   const prefs = preferences();
   const captured = await prefs.snapshot();

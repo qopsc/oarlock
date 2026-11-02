@@ -42,3 +42,27 @@ it("resets only after successfully deleting the still-selected theme", async () 
     reset.mock.invocationCallOrder[0],
   );
 });
+it("removes the theme file before the selection moves, and still moves it if the file stays", async () => {
+  const order: string[] = [];
+  await deleteThemeSelection(
+    "theme-a",
+    async () => void order.push("catalog"),
+    () => "theme-a",
+    () => void order.push("reset"),
+    async () => void order.push("file"),
+  );
+  expect(order).toEqual(["catalog", "file", "reset"]);
+  const reset = vi.fn();
+  await expect(
+    deleteThemeSelection(
+      "theme-a",
+      async () => {},
+      () => "theme-a",
+      reset,
+      async () => {
+        throw Error("file busy");
+      },
+    ),
+  ).rejects.toThrow("file busy");
+  expect(reset).toHaveBeenCalledOnce();
+});
