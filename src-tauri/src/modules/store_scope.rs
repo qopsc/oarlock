@@ -373,6 +373,15 @@ mod tests {
     }
 
     #[test]
+    fn a_page_cannot_close_a_store_resource_it_guessed() {
+        // `plugin:resources|close` is not a store command, so the wrapper cannot see it: the
+        // capability denies it. Closing a backend store drops it from the plugin's table and
+        // the next backend `app.store()` would build a second instance over the same file.
+        let capability = include_str!("../../capabilities/default.json");
+        assert!(capability.contains("\"core:resources:deny-close\""));
+    }
+
+    #[test]
     fn the_two_secure_file_modules_are_the_same_file() {
         let store = include_bytes!("../../vendor/tauri-plugin-store/src/secure_file.rs");
         let window_state =
