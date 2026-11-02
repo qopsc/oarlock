@@ -1351,7 +1351,7 @@ function createGhosttyInput(
     }),
     gridShiftY: () => surface.gridShiftY(),
     onInput: () => noteGhosttyUserInput(session.leafId),
-    reserveInput: () => session.writer.reserveInput(),
+    reserveInput: (options) => session.writer.reserveInput(options),
     deferInput: (action, size, repeat) => session.writer.deferInput(action, size, repeat),
     onData: (bytes) => {
       if (

@@ -38,7 +38,7 @@ function setup(
     pointerTarget: new FakeElement() as unknown as HTMLElement,
     cellSize: () => ({ width: 10, height: 20 }), isMac: true,
     onCopy: () => false, onData: (bytes) => { writer.enqueue(bytes); },
-    reserveInput: () => writer.reserveInput(),
+    reserveInput: (options) => writer.reserveInput(options),
     deferInput: (action, size, repeat) => writer.deferInput(action, size, repeat),
     ...extra,
   });
@@ -192,4 +192,24 @@ it("drops held-key repeats past a small backlog behind a stalled read", () => {
   expect(writer.holdingInput).toBe(true);
   input.dispatchEvent(key({ key: "b", code: "KeyB" }));
   controller.dispose(); writer.dispose();
+});
+
+it("still sends a paste the user confirms after the slot deadline window", async () => {
+  vi.useFakeTimers();
+  try {
+    let answer!: (value: boolean) => void;
+    const refused = vi.fn();
+    const { input, sent, writer, controller } = setup({
+      confirmPaste: () => new Promise((resolve) => { answer = resolve; }),
+    }, refused);
+    controller.paste("echo one\necho two");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(refused).not.toHaveBeenCalled();
+    answer(true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sent).toEqual(["echo one\recho two"]);
+    controller.dispose(); writer.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
 });

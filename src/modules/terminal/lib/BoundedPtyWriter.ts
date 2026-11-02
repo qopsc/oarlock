@@ -132,14 +132,19 @@ export class BoundedPtyWriter {
   }
 
   /** Reserve this position before beginning an asynchronous input operation. */
-  reserveInput(): ((action: () => void, size?: number) => void) | null {
+  reserveInput(
+    options: { deadline?: boolean } = {},
+  ): ((action: () => void, size?: number) => void) | null {
     if (this.disposed || this.failed) return null;
     if (this.actions >= MAX_PENDING_ACTIONS) {
       this.onRefused("actions-full");
       return null;
     }
     const item: PendingAction = { kind: "action", run: null, active: true, size: 0, timer: null };
-    item.timer = setTimeout(() => this.release(item, "slot-timeout"), RESERVED_SLOT_DEADLINE_MS);
+    // A slot waiting on the user (a paste confirmation) has no deadline.
+    if (options.deadline !== false) {
+      item.timer = setTimeout(() => this.release(item, "slot-timeout"), RESERVED_SLOT_DEADLINE_MS);
+    }
     this.actions++;
     this.insert(item);
     return (action, size = 0) => {

@@ -164,7 +164,7 @@ export type GhosttyInputControllerOptions = {
   readonly gridShiftY?: () => number;
   readonly onData: (bytes: Uint8Array) => void;
   readonly onInput?: () => void;
-  readonly reserveInput?: () => ((action: () => void, size?: number) => void) | null;
+  readonly reserveInput?: (options?: { deadline?: boolean }) => ((action: () => void, size?: number) => void) | null;
   readonly deferInput?: (action: () => void, size?: number, repeat?: boolean) => boolean;
   /**
    * Copies the selection; false when nothing is selected, and the key goes
@@ -317,7 +317,7 @@ export class GhosttyInputController {
   private pasteText(text: string): void {
     const bracketed = this.options.model.modes().bracketedPaste;
     if (this.options.confirmPaste && isUnsafePaste(text, bracketed)) {
-      const reserved = this.options.reserveInput?.();
+      const reserved = this.options.reserveInput?.({ deadline: false });
       if (this.options.reserveInput && !reserved) return;
       const finish = reserved ?? ((action: () => void, _size?: number) => action());
       void Promise.resolve().then(() => this.options.confirmPaste?.(text) ?? false).then(
