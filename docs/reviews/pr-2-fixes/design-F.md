@@ -180,3 +180,26 @@ The old `verify-app.mjs` also verified the outer app's signature and team requir
 the step outright would leave the macOS release with no pre-upload signature check. I propose to keep a short inline
 `codesign` verify step (above). If Opus prefers no check, the release test's ordering assertion would instead compare
 build and upload only.
+
+## Revisions after design review
+
+1. `RepositoryPin::index_directory` (`ownership.rs:79`) has one caller, `index_publication.rs:123`. It is removed with
+   that module (it would otherwise be dead code under `-D warnings`). Its `directory` field stays: `validate` and
+   `configure` use it. Everything else `index_publication` imported has other users.
+2. `scripts/releaseWorkflow.test.ts` finds the verify step by its command, not only its name, and asserts it runs
+   `codesign --verify --deep --strict`, passes a requirement with `anchor apple generic`,
+   `certificate leaf[subject.OU]`, `$APPLE_TEAM_ID` and the bundle identifier, is gated on `startsWith(matrix.platform,
+   'macos')` and runs under `set -euo pipefail`. The step's bash is also extracted and run against a temporary
+   directory with zero and with two `.app` bundles (and a bad team id), expecting a non-zero exit.
+3. The step uses `-R="..."` (the leading `=` marks requirement text; `-R "..."` reads a file path), fails on an empty or
+   malformed `APPLE_TEAM_ID` (`^[A-Z0-9]{10}$`), requires exactly one `*.app` in
+   `src-tauri/target/$OARLOCK_RELEASE_TARGET/release/bundle/macos`, uses `set -euo pipefail` and reads the identifier
+   with `jq -r .identifier src-tauri/tauri.conf.json`.
+4. `Cargo.lock`: `sha1 0.10.7` has one dependent and no transitive user, so its entry is removed in the same commit as
+   the `Cargo.toml` edit (one plain `cargo build` regenerates it; `--locked` would fail). `cpufeatures` and `digest`
+   stay. The frozen-lock rule is lifted for this batch only.
+5. `ci.yml`: the `oven-sh/setup-bun@v2` step after `cargo nextest` exists only for the smoke step and goes with it.
+6. `candidate_policy.rs`: `Refusal` keeps one variant with `Display` and `Error`; the `IncompleteConfiguration` message
+   no longer mentions a candidate. The deleted hooks-outside-hooks-directory test stays covered by `commit_guard.rs`.
+7. `build.rs`: removing `configure_git_client` also drops the explicit Foundation and Security framework links; the
+   Darwin build proves the crates link them themselves. The batch note says so.
