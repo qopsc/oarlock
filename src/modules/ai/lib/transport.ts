@@ -1,4 +1,10 @@
-import { beginRun, claimRun, takePaused, type RunOwner } from "./runOwner";
+import {
+  beginRun,
+  claimRun,
+  restorePaused,
+  takePaused,
+  type RunOwner,
+} from "./runOwner";
 import {
   denyUnansweredApprovals,
   EXPIRED_APPROVAL_REASON,
@@ -101,13 +107,15 @@ export function createContextAwareTransport(deps: Deps) {
       }
     | undefined;
   const run = async (options: SendOptions) => {
-    // Keep a waiting approval lease intact when admission is refused.
+    // A waiting approval keeps its record when the run fails before it used it
+    // (restored in the finally below), unless Stop closed it.
     deps.assertReady();
     const chatId = deps.toolContext.getSessionId?.();
     const previous = takePaused(chatId ?? null);
     let owner: RunOwner | undefined;
     let mcpPromise: ReturnType<typeof mcpToolsForRun> | undefined;
     let transferred = false;
+    let previousClosed = false;
     const stillWanted = () => {
       options.abortSignal?.throwIfAborted();
       owner?.signal.throwIfAborted();
@@ -187,6 +195,7 @@ export function createContextAwareTransport(deps: Deps) {
       ]);
       // Acquire the continuation's record before releasing the approval pause's.
       await previous?.close("continued");
+      previousClosed = true;
       stillWanted();
       deps.assertReady();
       const envBlock = formatEnvBlock(live);
@@ -237,7 +246,9 @@ export function createContextAwareTransport(deps: Deps) {
       if (!transferred) {
         try {
           await mcpPromise?.catch(() => {});
-          await Promise.all([owner?.close("error"), previous?.close("continued")]);
+          if (previous && !previousClosed && previous.phase === "paused")
+            restorePaused(previous);
+          await owner?.close("error");
         } finally {
           owner?.setupDone();
         }

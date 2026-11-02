@@ -1,6 +1,7 @@
 import { cancelPreparation, closeChatRuns } from "../lib/runOwner";
 import { denyUnansweredApprovals } from "../lib/toolApprovals";
 import { invoke } from "@tauri-apps/api/core";
+import { networkPage } from "@/lib/networkPage";
 import { listen } from "@tauri-apps/api/event";
 import { create } from "zustand";
 import { toast } from "sonner";
@@ -120,7 +121,12 @@ export async function beginRunAdmission(
 ): Promise<void> {
   assertChatNotStopping(chatId);
   await initialize();
-  const status = await invoke<Status>("ai_run_begin", { runId, chatId });
+  const pageGeneration = await networkPage(new AbortController().signal);
+  const status = await invoke<Status>("ai_run_begin", {
+    runId,
+    chatId,
+    pageGeneration,
+  });
   adopt(status);
   if (status.blocked || useChatStop.getState().states[chatId]?.blocked)
     throw new Error(

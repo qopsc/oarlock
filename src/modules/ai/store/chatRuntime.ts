@@ -159,7 +159,7 @@ type OutgoingMessage = Parameters<Chat<UIMessage>["sendMessage"]>[0];
 export async function sendUserMessage(
   chat: Chat<UIMessage>,
   message: OutgoingMessage,
-  onAccepted?: (userMessageId?: string) => void,
+  onAccepted?: (userMessageId: string) => void,
 ): Promise<void> {
   // Keep context capture synchronous with submission. The transport checks the
   // shared native barrier before any work starts, including approval continuations.
@@ -167,8 +167,15 @@ export async function sendUserMessage(
   assertChatNotStopping(chat.id);
   const settled = denyUnansweredApprovals(chat.messages);
   if (settled !== chat.messages) chat.messages = settled;
+  // The transport claims the composer's owner by message id, and the SDK runs the transport
+  // before sendMessage returns, so a full message is accepted under its id first.
+  if (message && "parts" in message) {
+    const id = (message as { id?: string }).id ?? crypto.randomUUID();
+    onAccepted?.(id);
+    return chat.sendMessage({ ...message, id } as OutgoingMessage);
+  }
   const sent = chat.sendMessage(message);
-  onAccepted?.([...chat.messages].reverse().find((m) => m.role === "user")?.id);
+  onAccepted?.([...chat.messages].reverse().find((m) => m.role === "user")?.id ?? "");
   return sent;
 }
 

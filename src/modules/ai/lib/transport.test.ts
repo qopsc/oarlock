@@ -680,8 +680,35 @@ it("releases the superseded approval even when the next message fails before mod
   await expect(
     transport.sendMessages({ messages: [{ ...userMessage("new"), id: "u2" }] }),
   ).rejects.toThrow("context unavailable");
+  // The failed continuation did not use the paused approval's record, so it stays.
+  expect(ended()).toHaveLength(1);
+  expect(chatHasRuns("superseded-approval")).toBe(true);
+  const { closeChatRuns } = await import("./runOwner");
+  await closeChatRuns("superseded-approval", "stop");
   expect(ended()).toHaveLength(2);
   expect(chatHasRuns("superseded-approval")).toBe(false);
+});
+it("keeps a paused approval for the next continuation when a run fails before using it", async () => {
+  const { takePaused, restorePaused, closeChatRuns } = await import(
+    "./runOwner"
+  );
+  invokeMock.mockClear();
+  mcpMock.mockResolvedValueOnce(noTools);
+  aiMock.toUIMessageStream.mockReturnValueOnce(approvalStream());
+  const transport = createContextAwareTransport(sessionDeps("restore-paused"));
+  await drain(
+    await transport.sendMessages({ messages: [userMessage("hello")] }),
+  );
+  stopGate.mockRejectedValueOnce(new Error("64 runs are already open"));
+  await expect(
+    transport.sendMessages({ messages: [userMessage("hello")] }),
+  ).rejects.toThrow("64 runs");
+  const kept = takePaused("restore-paused");
+  expect(kept?.phase).toBe("paused");
+  if (kept) restorePaused(kept);
+  await closeChatRuns("restore-paused", "stop");
+  expect(takePaused("restore-paused")).toBeUndefined();
+  expect(ended()).toHaveLength(2);
 });
 it("rejects an approval continuation before releasing its pending record", async () => {
   const { closeChatRuns } = await import("./runOwner");
