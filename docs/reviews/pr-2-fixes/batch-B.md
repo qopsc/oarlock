@@ -21,14 +21,25 @@ Branch `worktree-agent-af13c8f00acabbe47`, based on `review/codex-fixes` at fe14
 
 ## 2. Findings left open, or closed differently than the review says
 
-- S-01, `frame-src`: `oarlock-asset:` stays in the app CSP. The PDF preview is an `<iframe>` in `EditorPane.tsx`, and a CSP source list cannot be scoped to one frame element. The exfiltration path is closed without it: the handler never answers a page, and (S-06) a framed site cannot present the token.
+- S-01, `frame-src`: `oarlock-asset:` stays in the app CSP (the PDF preview is an `<iframe>` in `EditorPane.tsx`, and a CSP source list cannot be scoped to one frame element). After the rework `asset:` and `https://asset.localhost` are gone from `frame-src`; `http:` and `https:` stay for dev servers.
 - S-06: the review offered `Sec-Fetch-Site: same-origin` or a per-page token; only the token is possible, since an image on `tauri://localhost` loading from `oarlock-asset://` is cross-site. `pty/gate.rs` is unchanged: the PTY scheme still takes requests without `Origin` on its own token, and the preview scheme now adds its own token check.
-- S-14, fonts: the `asset:` protocol keeps serving font faces and re-opens by path after Tauri's scope check (the race the review mentions). Only the app-state half is fixed. Serving fonts through the guarded scheme would need `font-src` and a font allowlist and is left for a decision.
-- S-12: the plugin save still does not share a lock with the native writers (the spaces store is written by the plugin only). A crash can leave a hidden `.<name>.<pid>.<n>.tmp` beside a store; nothing sweeps it. Spaces and window state stay on the plugin, as instructed.
+- S-14, fonts: the `asset:` protocol keeps serving the font faces it is granted and re-opens by path after Tauri's scope check (the race the review mentions). Only the app-state half is fixed. Serving fonts through the guarded scheme would need `font-src` and a font allowlist and is left for a decision.
+- S-12: the plugin save still does not share a lock with the native writers (the spaces store is written by the plugin only). Spaces and window state stay on the plugin, as instructed.
 - D-02, 503: an `<img>` error does not expose the status, so the retry covers every failure (three extra requests for a really missing file, then the latch). `PreviewPane.tsx`, `fontFeatures.ts` and `gate.rs` needed no change.
+
+## 2a. Rework after review (commits 6d076079, ef548a36, 9508b6e1, 1efd7c3a, a116a519)
+
+- S-01 rework (6d076079): workspace roots no longer enter Tauri's asset scope. They live in `Access` (`asset_scope.rs`), which only `oarlock-asset` reads; Tauri's scope holds the font faces `system_font_faces` grants (and forbids the app-state folders). `asset:` and `https://asset.localhost` are out of `frame-src`; `contentSecurityPolicy.test.ts` checks `asset://` is not framable and the two sources are absent. A workspace file is unreachable through `asset:` structurally, since nothing but `grant_file` writes to that scope.
+- S-05 rework (same commit, it shares the code): the pre-open judgement is `Access::may_open`. `..` is refused; a name under a root is passed to the post-open check; with all folders allowed only dot names are turned away; otherwise the name's folder is resolved once and judged (so `~/code` to a volume and macOS `/tmp` work). The production wiring (`may_open`, `serves_opened`) is what `protocol()` builds its closures from, and `a_workspace_file_reached_through_a_link_is_served_by_the_production_judgements` runs `respond_with` on it with a link-spelled root. The only filesystem touch before the open is that one folder resolution, for names not already under a root while the switch is off.
+- Low, same commit: refusals (`status_only`) carry `nosniff` and the sandbox CSP; the busy 503 carries `Retry-After` and the app origin; `rustfmt` run on `asset_all_folders.rs` and its tests.
+- S-03 rework (ef548a36): `NATIVE_FILES` now holds `oarlock-ai-sessions.before-message-files.json` and `secrets.json`, so the wrapper and `refuse_write` refuse both; the T-02 test iterates the list.
+- S-04 rework (9508b6e1): `plugin:resources|close` is not a store command, so the wrapper cannot see it. `core:resources:deny-close` is added to `capabilities/default.json` (no frontend code closes a resource) with a test.
+- S-12 rework (1efd7c3a): the first save of each store per run removes `.<name>.<pid>.<n>.tmp` files of another process; doc comment and test renamed (`a_save_refuses_a_link_and_leaves_its_target_alone`); both `secure_file.rs` copies still identical.
+- D-23 rework (a116a519): a full table evicts the oldest unheld host. If every slot is in use it passes the bound by the new host only.
 
 ## 3. AGENTS.md edits
 
+0. Anchor: "Two-process model", `workspace::*` bullet and "Frontend" Editor bullet, "The asset protocol serves nothing by configuration (`assetProtocol.scope` allows nothing): `asset_scope.rs` grants each root the workspace registry authorizes, recursively". Replace with: "The asset protocol serves nothing by configuration and is granted only the installed font faces `system_font_faces` returns; every preview (editor media, PDFs, Markdown images) loads through `oarlock-asset`, which serves the registry's authorized roots (`asset_scope::Access`, same dot-name rule, never the app's own data, config and local data folders), so a workspace file is never in Tauri's scope and `asset:` is not in `frame-src`."
 1. Anchor: "Two-process model", the `fs::tree::*` bullet, "While the app's switch is on, previews load through the `oarlock-asset` scheme (`asset_all_folders.rs`), which asks the switch on every request and never serves a dot name; the asset protocol's grants are never widened". Append: "The scheme answers only image, video, audio and PDF types and gives every other file `application/octet-stream`; all answers carry `nosniff`, and all but a PDF a sandboxing CSP. The requested name is judged before the open and the opened handle again after it. The URL carries the page generation native delivered to the app's page (`t=`), so a site framed in the preview cannot fetch or navigate to a file. Up to 64 requests are served in turn and a further 2048 wait up to 30 s (503 with `Retry-After` beyond that); the app's own data, config and local data folders are never served."
 2. Anchor: "Frontend", the Markdown preview bullet, "https images are fetched by `markdown_remote_image` and shown as object URLs shared by `RemoteImageCache`". Append: "A window loads 12 of them at once (the backend allows 16 per window) and the rest wait in the page; a failed local image is asked for again three times, 400 to 3000 ms apart, before the failure is kept (`MarkdownImageRetry.ts`)."
 3. Anchor: "`net::*`", "Classification (`net/ip.rs`) looks through IPv6 forms". Append: "Hostname lookups share one system lookup per host and keep the answer 10 s (2 s for a failure), so fifty images from one host take one resolver slot (`net/dns.rs`)."
@@ -36,18 +47,17 @@ Branch `worktree-agent-af13c8f00acabbe47`, based on `review/codex-fixes` at fe14
 
 ## 4. docs/architecture/security-model.md edits
 
-1. Section on the asset scope and previews (the text on `oarlock-asset`): add the content-type allowlist, `nosniff` and sandbox CSP, the pre-open name check, the `t=` page generation and why `Origin` alone is not enough (navigations and image loads send none), and the app-state exclusion. State that `oarlock-asset:` stays in `frame-src` for the PDF frame.
+1. Section on the asset scope and previews (the text on `oarlock-asset`): add the content-type allowlist, `nosniff` and sandbox CSP, the pre-open name check, the `t=` page generation and why `Origin` alone is not enough (navigations and image loads send none), and the app-state exclusion. State that `oarlock-asset:` stays in `frame-src` for the PDF frame, that Tauri's `asset:` scope holds font faces only (workspace roots live in `asset_scope::Access`), and that `asset:` is not framable.
 2. Section on the store plugin or native stores: the refusal list is `NATIVE_FILES` minus `PAGE_OPENED_FILES`, rid ownership per webview, and the atomic save. Say which stores are still plugin-written (spaces, AI sessions, snippets, todos, agents) and that no lock is shared with native writers.
 3. Section on native HTTP limits: DNS single-flight and TTLs, 16 images per window natively, 12 in the page, 503 with `Retry-After` from the preview scheme.
 
 ## 5. Checks run
 
-Head 31b25ff plus this note. No `HOME` override was needed: the Git guard suites passed on this machine.
+After the rework (head a116a519 plus this note). No `HOME` override was needed.
 
-- `bun run lint`: `Found 80 warnings.` (the recorded baseline; none in files touched here)
+- `bun run lint`: `Found 80 warnings.` (baseline)
 - `bun run check-types`: `tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json`, no errors
 - `bun run test`: `Test Files  643 passed (643)` / `Tests  6133 passed | 2 skipped (6135)`
-- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 12.78s`
-- `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed): `test result: ok. 1606 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 92.98s`, and every other target `ok` with 0 failed
-- `bun run check:dist`: `startup graph clean`
-- `bun run size`: fails on this branch and on fe147a5 alike. Primary terminal JS 97.99 kB against 95.79 kB (2.2 kB over both before and after; this batch does not touch it). Total client JS is over its limit by 14.59 kB here and 13.84 kB at fe147a5, so this batch adds about 0.75 kB gzipped (the page token, the retry state, the image queue). Startup JS 256.7 kB against 540 kB (+0.01 kB). No budget was edited.
+- `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile [unoptimized + debuginfo] target(s) in 11.59s`
+- `cd src-tauri && cargo test --locked -- --test-threads=1` (nextest is not installed): `test result: ok. 1611 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 80.17s`, every other target `ok` with 0 failed
+- `bun run size` is over its limits at fe147a5 as well (primary terminal 97.99 kB against 95.79 kB; total client JS over by 13.84 kB there); this batch adds about 0.75 kB gzipped to the total and nothing to startup or terminal. No budget edited. `bun run check:dist` was clean before the rework.
