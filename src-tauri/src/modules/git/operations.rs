@@ -374,21 +374,12 @@ pub fn diff_content(
 
     let original = if staged {
         let spec = original_rel.as_deref().unwrap_or(&rel_path);
-        git_show_text(
-            &repo_root,
-            &format!("HEAD:{spec}"),
-        )?
+        git_show_text(&repo_root, &format!("HEAD:{spec}"))?
     } else {
-        git_show_text(
-            &repo_root,
-            &format!(":{rel_path}"),
-        )?
+        git_show_text(&repo_root, &format!(":{rel_path}"))?
     };
     let modified = if staged {
-        git_show_text(
-            &repo_root,
-            &format!(":{rel_path}"),
-        )?
+        git_show_text(&repo_root, &format!(":{rel_path}"))?
     } else {
         read_text_file(&repo_root.local_path, &worktree_path)?
     };
@@ -761,7 +752,10 @@ pub fn log(
         return Err(GitError::TimedOut("git log"));
     }
     if output.truncated {
-        return Err(GitError::command("git log", "output was truncated; view history in the terminal"));
+        return Err(GitError::command(
+            "git log",
+            "output was truncated; view history in the terminal",
+        ));
     }
     if output.exit_code != Some(0) {
         if anchor.is_none() && super::branches::is_unborn_head(&repo_root)? {
@@ -958,16 +952,10 @@ pub fn commit_file_diff(
 
     let parent = super::branches::first_parent(&repo_root, sha)?;
     let original = match parent.as_deref() {
-        Some(p) => git_show_text(
-            &repo_root,
-            &format!("{p}:{original_rel}"),
-        )?,
+        Some(p) => git_show_text(&repo_root, &format!("{p}:{original_rel}"))?,
         None => TextSource::Missing,
     };
-    let modified = git_show_text(
-            &repo_root,
-            &format!("{sha}:{rel}"),
-    )?;
+    let modified = git_show_text(&repo_root, &format!("{sha}:{rel}"))?;
 
     let mut diff_args: Vec<OsString> = vec![
         "show".into(),
@@ -1128,7 +1116,10 @@ mod tests {
     fn post_preflight_reads_stay_pinned_to_the_acquired_git_directory() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        let (a, b) = (
+            a.path().canonicalize().unwrap(),
+            b.path().canonicalize().unwrap(),
+        );
         if !git(&a, &["init", "-q"]) || !git(&b, &["init", "-q"]) {
             return;
         }
@@ -1166,15 +1157,22 @@ mod tests {
         std::fs::write(root.join("f.txt"), "two\n").unwrap();
         let registry = WorkspaceRegistry::default();
         registry.authorize(&root).unwrap();
-        let repo = owned_repo_root(&registry, root.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        let repo =
+            owned_repo_root(&registry, root.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
         let marker = root.join("ran");
         let helper = format!("!touch {}", marker.display());
         assert!(git(&root, &["config", "credential.helper", &helper]));
         assert!(git(&root, &["config", "core.fsmonitor", "/usr/bin/true"]));
-        let entries = [DiscardEntry { path: "f.txt".into(), untracked: false }];
+        let entries = [DiscardEntry {
+            path: "f.txt".into(),
+            untracked: false,
+        }];
         let error = discard_owned(&registry, &repo, &entries).unwrap_err();
         assert!(error.to_string().contains("fsmonitor"), "{error}");
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "two\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "two\n"
+        );
         assert!(git(&root, &["config", "--unset", "core.fsmonitor"]));
         let error = run_network(&repo, ["ls-remote", "."]).err().unwrap();
         assert!(error.to_string().contains("credential.helper"), "{error}");
@@ -1186,7 +1184,10 @@ mod tests {
     fn a_local_remote_stays_pinned_for_the_whole_transfer() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        let (a, b) = (
+            a.path().canonicalize().unwrap(),
+            b.path().canonicalize().unwrap(),
+        );
         if !git(&a, &["init", "-q"]) || !git(&b, &["init", "-q"]) {
             return;
         }
@@ -1195,9 +1196,12 @@ mod tests {
         registry.authorize(&a).unwrap();
         registry.authorize(&b).unwrap();
         let repo = owned_repo_root(&registry, a.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
-        let pins =
-            super::super::remote_guard::inspect(&registry, &repo, super::super::remote_guard::RemoteAction::Fetch)
-                .unwrap();
+        let pins = super::super::remote_guard::inspect(
+            &registry,
+            &repo,
+            super::super::remote_guard::RemoteAction::Fetch,
+        )
+        .unwrap();
         assert_eq!(pins.len(), 1, "the local remote's pin was dropped");
         std::fs::rename(b.join(".git"), b.join(".git.moved")).unwrap();
         assert!(git(&b, &["init", "-q"]));
