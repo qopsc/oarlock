@@ -11,8 +11,11 @@ import {
 } from "react";
 import {
   DiagramCache,
+  MERMAID_MAX_TEXT,
+  diagramLimitError,
   mermaidConfig,
   observeDiagramVisibility,
+  scheduleDiagramRender,
   serialized,
   stripSvgLinks,
 } from "./mermaidRender";
@@ -76,35 +79,44 @@ export function MermaidDiagram({ code, pending, failed }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const near = useNearViewport(ref);
   const current = drawn?.key === key;
+  const tooLarge = code.length > MERMAID_MAX_TEXT;
 
   useEffect(() => {
-    if (!near || current) return;
+    if (!near || current || tooLarge) return;
     const cached = cache.get(key);
     if (cached !== undefined) {
       setDrawn({ key, svg: cached });
       return;
     }
     const render = new AbortController();
-    renderDiagram(code, mode, render.signal).then(
-      (svg) => {
-        if (!render.signal.aborted) {
-          cache.set(key, svg);
-          setDrawn({ key, svg });
-        }
-      },
-      (error: unknown) => {
-        if (!render.signal.aborted) setDrawn({ key, error });
-      },
-    );
-    return () => render.abort();
-  }, [near, current, key, code, mode]);
+    const cancelTimer = scheduleDiagramRender(() => {
+      void renderDiagram(code, mode, render.signal).then(
+        (svg) => {
+          if (!render.signal.aborted) {
+            cache.set(key, svg);
+            setDrawn({ key, svg });
+          }
+        },
+        (error: unknown) => {
+          if (!render.signal.aborted)
+            setDrawn({ key, error: diagramLimitError(error) });
+        },
+      );
+    });
+    return () => {
+      cancelTimer();
+      render.abort();
+    };
+  }, [near, current, key, code, mode, tooLarge]);
 
   // A stale drawing (the previous theme or source) stays up while the next
   // renders; a stale error does not.
   const shown = drawn && (current || "svg" in drawn) ? drawn : null;
   return (
     <div ref={ref}>
-      {shown === null ? (
+      {tooLarge ? (
+        failed(new Error("Diagram too large to render."))
+      ) : shown === null ? (
         pending
       ) : "svg" in shown ? (
         <div

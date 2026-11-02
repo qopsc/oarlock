@@ -23,6 +23,22 @@ export const MERMAID_SECURE_KEYS = [
 
 /** The app's UI font (`--font-sans` in globals.css). */
 const DIAGRAM_FONT = '"Inter Variable", sans-serif';
+export const MERMAID_MAX_TEXT = 20_000;
+export const MERMAID_MAX_EDGES = 200;
+export const MERMAID_DEBOUNCE_MS = 300;
+
+export function diagramLimitError(error: unknown): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  return /edge limit exceeded|maximum text size in diagram exceeded/i.test(message)
+    ? new Error("Diagram too large to render.")
+    : error;
+}
+
+/** Cancel pending work whenever the source, theme, or visibility changes. */
+export function scheduleDiagramRender(run: () => void): () => void {
+  const timer = setTimeout(run, MERMAID_DEBOUNCE_MS);
+  return () => clearTimeout(timer);
+}
 
 /**
  * Mermaid settings for untrusted diagrams (AI replies, files from disk):
@@ -37,6 +53,8 @@ export function mermaidConfig(mode: "light" | "dark"): MermaidConfig {
     htmlLabels: false,
     flowchart: { htmlLabels: false },
     suppressErrorRendering: true,
+    maxTextSize: MERMAID_MAX_TEXT,
+    maxEdges: MERMAID_MAX_EDGES,
     secure: MERMAID_SECURE_KEYS,
     theme: mode === "dark" ? "dark" : "default",
     fontFamily: DIAGRAM_FONT,

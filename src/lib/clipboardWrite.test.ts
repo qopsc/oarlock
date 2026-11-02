@@ -71,6 +71,7 @@ it("keeps the original page token through native image commit", async () => {
     headers: {
       "x-page-generation": "p1",
       "x-clipboard-ticket": "t1",
+      "x-clipboard-image-type": "image/png",
     },
   });
   expect(

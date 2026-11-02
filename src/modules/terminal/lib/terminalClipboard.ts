@@ -7,8 +7,8 @@ import { ClipboardWrite } from "@/lib/clipboardWrite";
 import { isTauri } from "@tauri-apps/api/core";
 
 /**
- * What a terminal program puts on the clipboard: text, or an image (any type
- * the webview decodes) with the text to put there should it not decode.
+ * What a terminal program puts on the clipboard: text, or an image with the
+ * text to put there should it not decode.
  */
 export type TerminalClipboardContent =
   | string
@@ -18,20 +18,24 @@ export type TerminalClipboardContent =
       readonly text?: string;
     };
 
-// Match native clipboard_image.rs before allocating a conversion canvas.
-const MAX_IMAGE_SIDE = 16_384;
-const MAX_IMAGE_RGBA_BYTES = 512 * 1024 * 1024;
-
-class ClipboardImageConversionError extends Error {}
-
 function imageCannotDecode(error: unknown): boolean {
   return (
-    error instanceof ClipboardImageConversionError ||
-    (typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === "image-decode")
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "image-decode"
   );
+}
+
+/** Policy refusals must be visible even for writes requested by a program. */
+export function clipboardImagePolicyMessage(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("code" in error))
+    return null;
+  if (error.code !== "image-limit" && error.code !== "image-unsupported")
+    return null;
+  return "message" in error && typeof error.message === "string"
+    ? error.message
+    : "Clipboard image was refused.";
 }
 
 export async function readTerminalClipboard(): Promise<string> {
@@ -82,17 +86,23 @@ export async function readClipboardImage(): Promise<Uint8Array | null> {
   return (await readTerminalClipboardSnapshot("always")).image;
 }
 
-/** Puts an image on the clipboard, converted to PNG when it is another type. */
+/** Puts a supported image on the clipboard through bounded native decoding. */
 async function putImage(
   data: Uint8Array<ArrayBuffer>,
   mime: string,
   write: ClipboardWrite,
 ): Promise<void> {
   if (!isTauri()) throw new Error("Clipboard images need the app");
+  const format = mime.toLowerCase();
+  if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(format))
+    throw Object.assign(
+      new Error(
+        "Unsupported clipboard image format. Use PNG, JPEG, GIF, or WebP.",
+      ),
+      { code: "image-unsupported" },
+    );
   await write.check();
-  const png =
-    mime.toLowerCase() === "image/png" ? data : await toPng(data, mime);
-  await write.image(png);
+  await write.image(data, format);
 }
 
 export async function writeClipboardImage(
@@ -115,7 +125,7 @@ export class ProgramClipboardWrite {
   private readonly write: ClipboardWrite;
   constructor(
     private readonly content: TerminalClipboardContent,
-    owner: AbortSignal,
+    private readonly owner: AbortSignal,
     private readonly primary = false,
   ) {
     this.write = new ClipboardWrite(primary, owner);
@@ -125,6 +135,9 @@ export class ProgramClipboardWrite {
   }
   dispose(): void {
     this.write.dispose();
+  }
+  policyMessage(error: unknown): string | null {
+    return this.owner.aborted ? null : clipboardImagePolicyMessage(error);
   }
   async run(): Promise<void> {
     invalidateClipboardImage();
@@ -147,6 +160,20 @@ export class ProgramClipboardWrite {
   }
 }
 
+/** Surface policy refusals while allowing the queue to continue after failure. */
+export async function runProgramClipboardWrite(
+  write: ProgramClipboardWrite,
+  notify: (message: string) => void,
+): Promise<void> {
+  try {
+    await write.run();
+  } catch (error) {
+    const message = write.policyMessage(error);
+    if (message) notify(message);
+    throw error;
+  }
+}
+
 /** Text or an image from a program, with text fallback only for decoding failures. */
 export async function writeTerminalClipboardContent(
   content: TerminalClipboardContent,
@@ -155,41 +182,4 @@ export async function writeTerminalClipboardContent(
   const write = new ProgramClipboardWrite(content, owner);
   write.prepare();
   await write.run();
-}
-
-/** An image the webview decodes, as PNG. */
-async function toPng(
-  data: Uint8Array<ArrayBuffer>,
-  mime: string,
-): Promise<Uint8Array> {
-  let bitmap: ImageBitmap;
-  try {
-    bitmap = await createImageBitmap(new Blob([data], { type: mime }));
-  } catch (error) {
-    throw new ClipboardImageConversionError(String(error));
-  }
-  try {
-    if (
-      bitmap.width > MAX_IMAGE_SIDE ||
-      bitmap.height > MAX_IMAGE_SIDE ||
-      bitmap.width * bitmap.height * 4 > MAX_IMAGE_RGBA_BYTES
-    ) {
-      throw new Error("the clipboard image is too large");
-    }
-    const canvas = document.createElement("canvas");
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error("No canvas to convert the image");
-    context.drawImage(bitmap, 0, 0);
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/png"),
-    );
-    if (!blob) throw new Error("The image could not be converted");
-    return new Uint8Array(await blob.arrayBuffer());
-  } catch (error) {
-    throw new ClipboardImageConversionError(String(error));
-  } finally {
-    bitmap.close();
-  }
 }

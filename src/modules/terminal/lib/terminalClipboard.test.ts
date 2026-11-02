@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ProgramClipboardWrite,
   readClipboardImage,
   readTerminalClipboard,
+  runProgramClipboardWrite,
   writeClipboardImage,
   writeTerminalClipboard,
   writeTerminalClipboardContent as writeContent,
@@ -13,6 +15,7 @@ const writeTerminalClipboardContent = (
 ) => writeContent(content, owner);
 vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "page" }));
 const order = vi.hoisted(() => ({ next: 0, latest: "", revision: 0 }));
+const imageHeaders = vi.hoisted(() => [] as (string | undefined)[]);
 const native = vi.hoisted(() => ({
   readText: vi.fn<() => Promise<string>>(),
   writeText: vi.fn<(text: string) => Promise<void>>(),
@@ -74,6 +77,8 @@ vi.mock("@tauri-apps/api/core", async (original) => ({
       frame.set(png, 4 + header.length);
       return frame.buffer;
     }
+    if (command === "clipboard_image_write")
+      imageHeaders.push(options?.headers?.["x-clipboard-image-type"]);
     if (
       command === "clipboard_image_write" &&
       options?.headers?.["x-clipboard-ticket"] !== order.latest
@@ -86,6 +91,7 @@ const web = { readText: vi.fn(), writeText: vi.fn() };
 
 beforeEach(() => {
   vi.resetAllMocks();
+  imageHeaders.length = 0;
   vi.stubGlobal("isTauri", true);
   vi.stubGlobal("navigator", { clipboard: web });
 });
@@ -166,13 +172,15 @@ describe("clipboard images", () => {
     await writeClipboardImage(png, "image/PNG");
     expect(ipc.invoke).toHaveBeenCalledWith("clipboard_image_write", png);
 
-    // The webview cannot decode this one (no createImageBitmap here).
+    // Native decoding fails; a program-provided text alternative is used.
+    ipc.invoke.mockRejectedValueOnce({ code: "image-decode", message: "bad image" });
     await writeTerminalClipboardContent({
       mime: "image/webp",
       data: png,
       text: "alt",
     });
     expect(native.writeText).toHaveBeenCalledWith("alt");
+    ipc.invoke.mockRejectedValueOnce({ code: "image-decode", message: "bad image" });
     await expect(
       writeTerminalClipboardContent({ mime: "image/webp", data: png }),
     ).rejects.toThrow();
@@ -180,29 +188,14 @@ describe("clipboard images", () => {
     expect(native.writeText).toHaveBeenLastCalledWith("plain");
   });
 
-  it("converts other image types to PNG through a canvas", async () => {
-    const converted = Uint8Array.of(1, 2, 3);
-    const close = vi.fn();
-    vi.stubGlobal(
-      "createImageBitmap",
-      vi.fn(async (blob: Blob) => {
-        expect(blob.type).toBe("image/jpeg");
-        return { width: 3, height: 2, close };
-      }),
-    );
-    const drawImage = vi.fn();
-    vi.stubGlobal("document", {
-      createElement: () => ({
-        getContext: () => ({ drawImage }),
-        toBlob: (done: (blob: Blob) => void, type: string) =>
-          done(new Blob([converted], { type })),
-      }),
-    });
+  it.each(["image/jpeg", "image/gif", "image/webp"])("sends %s to native decoding without a webview bitmap", async (mime) => {
+    const bitmap = vi.fn();
+    vi.stubGlobal("createImageBitmap", bitmap);
     ipc.invoke.mockResolvedValue(undefined);
-    await writeClipboardImage(png, "image/jpeg");
-    expect(drawImage).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledOnce();
-    expect(ipc.invoke).toHaveBeenCalledWith("clipboard_image_write", converted);
+    await writeClipboardImage(png, mime);
+    expect(bitmap).not.toHaveBeenCalled();
+    expect(ipc.invoke).toHaveBeenCalledWith("clipboard_image_write", png);
+    expect(imageHeaders).toEqual([mime]);
   });
 });
 
@@ -237,41 +230,48 @@ it("does not replace an image with fallback text when the OS write fails", async
   expect(native.writeText).not.toHaveBeenCalled();
 });
 
-it("refuses oversized decoded images before allocating a conversion canvas", async () => {
-  const close = vi.fn();
-  vi.stubGlobal(
-    "createImageBitmap",
-    vi.fn(async () => ({ width: 16385, height: 1, close })),
-  );
-  const createElement = vi.fn(() => ({
-    getContext: () => ({ drawImage: vi.fn() }),
-    toBlob: (done: (blob: Blob) => void) => done(new Blob([Uint8Array.of(1)])),
-  }));
-  vi.stubGlobal("document", { createElement });
-  await expect(
-    writeClipboardImage(Uint8Array.of(1), "image/jpeg"),
-  ).rejects.toThrow("too large");
-  expect(createElement).not.toHaveBeenCalled();
-  expect(close).toHaveBeenCalledOnce();
-  expect(ipc.invoke).not.toHaveBeenCalled();
+it.each(["image-limit", "image-unsupported"])("does not silently replace a refused image with fallback text (%s)", async (code) => {
+  const error = { code, message: "Clipboard image was refused." };
+  ipc.invoke.mockRejectedValue(error);
+  await expect(writeTerminalClipboardContent({ mime: "image/jpeg", data: Uint8Array.of(1), text: "alternative" })).rejects.toEqual(error);
+  expect(native.writeText).not.toHaveBeenCalled();
 });
 
-it("does not finish a program image conversion after its terminal closes", async () => {
+it.each(["image/svg+xml", "image/png\ninvalid"])("refuses unsupported MIME type %s before IPC", async (mime) => {
+  await expect(writeTerminalClipboardContent({ mime, data: Uint8Array.of(1), text: "alternative" }))
+    .rejects.toMatchObject({ code: "image-unsupported" });
+  expect(ipc.invoke).not.toHaveBeenCalledWith("clipboard_image_write", expect.anything());
+  expect(native.writeText).not.toHaveBeenCalled();
+});
+
+it.each(["image-limit", "image-unsupported"])("reports a program image policy refusal visibly (%s)", async (code) => {
+  const error = { code, message: "Clipboard image was refused." };
+  ipc.invoke.mockRejectedValue(error);
+  const notify = vi.fn();
+  const write = new ProgramClipboardWrite({ mime: "image/webp", data: Uint8Array.of(1) }, new AbortController().signal);
+  write.prepare();
+  await expect(runProgramClipboardWrite(write, notify)).rejects.toEqual(error);
+  expect(notify).toHaveBeenCalledExactlyOnceWith(error.message);
+});
+
+it("does not report stale policy refusals after terminal cancellation", () => {
+  const owner = new AbortController();
+  const write = new ProgramClipboardWrite("text", owner.signal);
+  owner.abort();
+  expect(write.policyMessage({ code: "image-limit", message: "too large" })).toBeNull();
+  write.dispose();
+});
+
+it("cancels an uncommitted native image write when its terminal closes", async () => {
   const { LatestClipboardWrite } = await import("./LatestClipboardWrite");
   const { TerminalRequestLifetime } = await import("./TerminalRequestLifetime");
   const lifetime = new TerminalRequestLifetime();
-  let convert!: (blob: Blob) => void;
-  vi.stubGlobal(
-    "createImageBitmap",
-    vi.fn(async () => ({ width: 1, height: 1, close: vi.fn() })),
-  );
-  vi.stubGlobal("document", {
-    createElement: () => ({
-      getContext: () => ({ drawImage: vi.fn() }),
-      toBlob: (done: (blob: Blob) => void) => {
-        convert = done;
-      },
-    }),
+  let release!: () => void;
+  let committed = false;
+  ipc.invoke.mockImplementationOnce(async () => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    if (!order.latest) throw new Error("cancelled");
+    committed = true;
   });
   let completed!: () => void;
   const done = new Promise<void>((resolve) => {
@@ -287,44 +287,32 @@ it("does not finish a program image conversion after its terminal closes", async
     }
   });
   queue.enqueue({ mime: "image/jpeg", data: Uint8Array.of(1) });
-  await vi.waitFor(() => expect(convert).toBeTypeOf("function"));
-  lifetime.dispose(); // The actual session cancels its lifetime on close; writes have no owner.
-  convert(new Blob([Uint8Array.of(2)]));
+  await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+  lifetime.dispose();
+  await vi.waitFor(() => expect(order.latest).toBe(""));
+  release();
   await done;
-  expect(ipc.invoke).not.toHaveBeenCalledWith(
-    "clipboard_image_write",
-    expect.anything(),
-  );
+  expect(committed).toBe(false);
 });
 
 it("does not let an older program image replace a newer explicit Copy", async () => {
-  let convert!: (blob: Blob) => void;
+  let release!: () => void;
   const commits: string[] = [];
   native.writeText.mockImplementation(async (text) => {
     commits.push(text);
   });
   ipc.invoke.mockImplementation(async () => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    if (!order.latest) throw new Error("superseded");
     commits.push("old program image");
-  });
-  vi.stubGlobal(
-    "createImageBitmap",
-    vi.fn(async () => ({ width: 1, height: 1, close: vi.fn() })),
-  );
-  vi.stubGlobal("document", {
-    createElement: () => ({
-      getContext: () => ({ drawImage: vi.fn() }),
-      toBlob: (done: (blob: Blob) => void) => {
-        convert = done;
-      },
-    }),
   });
   const older = writeTerminalClipboardContent({
     mime: "image/jpeg",
     data: Uint8Array.of(1),
   });
-  await vi.waitFor(() => expect(convert).toBeTypeOf("function"));
+  await vi.waitFor(() => expect(release).toBeTypeOf("function"));
   await writeTerminalClipboard("new user selection");
-  convert(new Blob([Uint8Array.of(2)]));
+  release();
   await expect(older).rejects.toThrow("superseded");
   expect(commits[commits.length - 1]).toBe("new user selection");
 });
@@ -353,21 +341,6 @@ it("propagates a structured native commit failure without writing alternative te
     }),
   ).rejects.toEqual(error);
   expect(native.writeText).not.toHaveBeenCalled();
-});
-
-it("checks total RGBA size before allocating a conversion canvas", async () => {
-  const close = vi.fn();
-  vi.stubGlobal(
-    "createImageBitmap",
-    vi.fn(async () => ({ width: 16384, height: 16384, close })),
-  );
-  const createElement = vi.fn();
-  vi.stubGlobal("document", { createElement });
-  await expect(
-    writeClipboardImage(Uint8Array.of(1), "image/webp"),
-  ).rejects.toThrow("too large");
-  expect(createElement).not.toHaveBeenCalled();
-  expect(close).toHaveBeenCalledOnce();
 });
 
 it("invalidates a cached image when an Oarlock Copy button writes new text", async () => {

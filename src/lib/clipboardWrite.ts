@@ -67,13 +67,14 @@ export class ClipboardWrite {
     this.committed = true;
   }
 
-  async image(png: Uint8Array): Promise<void> {
+  async image(data: Uint8Array, mime = "image/png"): Promise<void> {
     const ticket = await this.admission();
     if (!ticket) throw new Error("Clipboard images need the app");
-    await invoke("clipboard_image_write", png, {
+    await invoke("clipboard_image_write", data, {
       headers: {
         "x-page-generation": ticket.pageGeneration,
         "x-clipboard-ticket": ticket.ticket,
+        "x-clipboard-image-type": mime,
       },
     });
     this.committed = true;

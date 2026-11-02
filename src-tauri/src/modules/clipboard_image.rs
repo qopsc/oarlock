@@ -1,5 +1,5 @@
 //! Clipboard images for terminal programs (the Kitty clipboard protocol),
-//! as PNG writes through the clipboard plugin's long-lived clipboard, so
+//! through the clipboard plugin's long-lived clipboard, so
 //! images stay served on X11. Version-checked reads live in clipboard_read.
 
 use std::io::{self, Cursor, Write};
@@ -37,7 +37,12 @@ struct BoundedPng {
     limit: usize,
 }
 impl BoundedPng {
-    fn new(limit: usize) -> Self { Self { bytes: Vec::new(), limit } }
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
 }
 impl Write for BoundedPng {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -47,28 +52,63 @@ impl Write for BoundedPng {
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
-/// A PNG as RGBA pixels, refusing images too large to hold.
-fn decode_png(png: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    decode_png_limited(png, MAX_DECODED_BYTES)
-}
-
-fn decode_png_limited(png: &[u8], max_decoded_bytes: u64) -> Result<(Vec<u8>, u32, u32), String> {
-    let mut reader = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
+/// Check dimensions from the image header before decoding or allocating RGBA pixels.
+fn decode_image(
+    data: &[u8],
+    mime: &str,
+    max_decoded_bytes: u64,
+) -> Result<(Vec<u8>, u32, u32), ClipboardImageWriteError> {
+    let format = match mime.to_ascii_lowercase().as_str() {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::WebP,
+        _ => {
+            return Err(ClipboardImageWriteError::policy(
+                "image-unsupported",
+                "Unsupported clipboard image format. Use PNG, JPEG, GIF, or WebP.",
+            ))
+        }
+    };
+    if image::guess_format(data).ok() != Some(format) {
+        return Err(ClipboardImageWriteError::decode(
+            "Clipboard image does not match its declared format",
+        ));
+    }
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
     limits.max_alloc = Some(max_decoded_bytes);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|error| format!("not a usable PNG: {error}"))?;
-    let (width, height) = (image.width(), image.height());
+    let mut header = ImageReader::with_format(Cursor::new(data), format);
+    header.limits(limits.clone());
+    let (width, height) = header.into_dimensions().map_err(|error| {
+        if matches!(error, image::ImageError::Limits(_)) {
+            ClipboardImageWriteError::policy("image-limit", "Clipboard image is too large.")
+        } else {
+            ClipboardImageWriteError::decode(error)
+        }
+    })?;
     if u64::from(width) * u64::from(height) * 4 > max_decoded_bytes {
-        return Err("expanded clipboard image is too large".into());
+        return Err(ClipboardImageWriteError::policy(
+            "image-limit",
+            "Clipboard image is too large.",
+        ));
     }
+    let mut reader = ImageReader::with_format(Cursor::new(data), format);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|error| {
+        if matches!(error, image::ImageError::Limits(_)) {
+            ClipboardImageWriteError::policy("image-limit", "Clipboard image is too large.")
+        } else {
+            ClipboardImageWriteError::decode(error)
+        }
+    })?;
+    let (width, height) = (image.width(), image.height());
     Ok((image.into_rgba8().into_raw(), width, height))
 }
 
@@ -80,6 +120,12 @@ pub struct ClipboardImageWriteError {
 }
 
 impl ClipboardImageWriteError {
+    fn policy(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
     fn decode(message: impl ToString) -> Self {
         Self {
             code: "image-decode",
@@ -95,7 +141,7 @@ impl ClipboardImageWriteError {
     }
 }
 
-/// Body: a PNG, which replaces the clipboard's contents.
+/// Body: a supported image, which replaces the clipboard's contents.
 #[tauri::command]
 pub async fn clipboard_image_write(
     app: tauri::AppHandle,
@@ -112,6 +158,12 @@ pub async fn clipboard_image_write(
     };
     let page = header("x-page-generation")?;
     let ticket = header("x-clipboard-ticket")?;
+    let mime = request
+        .headers()
+        .get("x-clipboard-image-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/png")
+        .to_owned();
     let label = window.label().to_owned();
     app.state::<NetworkPages>()
         .with_page(&label, &page, || {
@@ -122,8 +174,14 @@ pub async fn clipboard_image_write(
     let permit = super::clipboard_work::budget()
         .image()
         .map_err(ClipboardImageWriteError::write)?;
-    let png = ipc_body::bytes_of(request.body(), MAX_PNG_BYTES, 0)
-        .map_err(ClipboardImageWriteError::decode)?
+    let data = ipc_body::bytes_of(request.body(), MAX_PNG_BYTES, 0)
+        .map_err(|error| {
+            if error.contains("exceeds") || error.contains("too large") {
+                ClipboardImageWriteError::policy("image-limit", "Clipboard image is too large.")
+            } else {
+                ClipboardImageWriteError::decode(error)
+            }
+        })?
         .into_owned();
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
@@ -133,7 +191,7 @@ pub async fn clipboard_image_write(
                     .check(&label, &page, &ticket, false)
             })
             .map_err(ClipboardImageWriteError::write)?;
-        let (rgba, width, height) = decode_png(&png).map_err(ClipboardImageWriteError::decode)?;
+        let (rgba, width, height) = decode_image(&data, &mime, MAX_DECODED_BYTES)?;
         let image = tauri::image::Image::new_owned(rgba, width, height);
         app.state::<ClipboardWrites>()
             .commit(
@@ -185,8 +243,8 @@ mod tests {
             .write_image(&vec![0; 1024 * 512], 1024, 512, ExtendedColorType::L8)
             .unwrap();
         // The source grayscale pixels fit in 1 MiB; their RGBA expansion does not.
-        let result = decode_png_limited(&png, 1024 * 1024);
-        assert_eq!(result.unwrap_err(), "expanded clipboard image is too large");
+        let error = decode_image(&png, "image/png", 1024 * 1024).unwrap_err();
+        assert_eq!(error.code, "image-limit");
     }
 
     #[test]
@@ -194,12 +252,15 @@ mod tests {
         let rgba: Vec<u8> = (0..4 * 3 * 2).map(|i| (i * 7) as u8).collect();
         let png = encode_png(&rgba, 3, 2).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(decode_png(&png).unwrap(), (rgba, 3, 2));
+        assert_eq!(
+            decode_image(&png, "image/png", MAX_DECODED_BYTES).unwrap(),
+            (rgba, 3, 2)
+        );
     }
 
     #[test]
     fn writes_refuse_what_is_not_a_reasonable_png() {
-        assert!(decode_png(b"not a png").is_err());
+        assert!(decode_image(b"not a png", "image/png", MAX_DECODED_BYTES).is_err());
         // A header claiming an image wider than the limit is refused before
         // any pixels are allocated.
         let wide = encode_png(&[0; 4], 1, 1).unwrap();
@@ -207,6 +268,66 @@ mod tests {
         // IHDR width (bytes 16..20), big-endian; the CRC no longer matches,
         // which the decoder may report first: either way it is refused.
         forged[16..20].copy_from_slice(&(MAX_SIDE + 1).to_be_bytes());
-        assert!(decode_png(&forged).is_err());
+        assert!(decode_image(&forged, "image/png", MAX_DECODED_BYTES).is_err());
+    }
+
+    #[test]
+    fn supported_formats_decode_and_gif_uses_its_first_frame() {
+        use image::{DynamicImage, Frame, ImageBuffer, Rgba};
+        let red = ImageBuffer::from_pixel(3, 2, Rgba([255, 0, 0, 255]));
+        for (format, mime) in [
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::Jpeg, "image/jpeg"),
+            (ImageFormat::WebP, "image/webp"),
+        ] {
+            let mut encoded = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(red.clone())
+                .write_to(&mut encoded, format)
+                .unwrap();
+            let (pixels, width, height) =
+                decode_image(encoded.get_ref(), mime, MAX_DECODED_BYTES).unwrap();
+            assert_eq!((width, height), (3, 2));
+            assert!(
+                pixels[0] > 200 && pixels[1] < 30 && pixels[2] < 30,
+                "{mime}"
+            );
+        }
+        let mut bytes = Vec::new();
+        {
+            let mut gif = image::codecs::gif::GifEncoder::new(&mut bytes);
+            gif.encode_frame(Frame::new(red)).unwrap();
+            gif.encode_frame(Frame::new(ImageBuffer::from_pixel(
+                3,
+                2,
+                Rgba([0, 0, 255, 255]),
+            )))
+            .unwrap();
+        }
+        let (pixels, width, height) = decode_image(&bytes, "image/gif", MAX_DECODED_BYTES).unwrap();
+        assert_eq!((width, height), (3, 2));
+        assert!(pixels[0] > 200 && pixels[2] < 30);
+    }
+
+    #[test]
+    fn oversized_headers_and_unsupported_formats_are_policy_errors() {
+        let wide = encode_png(&vec![0; (MAX_SIDE as usize + 1) * 4], MAX_SIDE + 1, 1).unwrap();
+        assert_eq!(
+            decode_image(&wide, "image/png", MAX_DECODED_BYTES)
+                .unwrap_err()
+                .code,
+            "image-limit"
+        );
+        assert_eq!(
+            decode_image(&wide, "image/svg+xml", MAX_DECODED_BYTES)
+                .unwrap_err()
+                .code,
+            "image-unsupported"
+        );
+        assert_eq!(
+            decode_image(&wide, "image/jpeg", MAX_DECODED_BYTES)
+                .unwrap_err()
+                .code,
+            "image-decode"
+        );
     }
 }

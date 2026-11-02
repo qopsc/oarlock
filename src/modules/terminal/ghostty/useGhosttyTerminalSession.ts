@@ -44,6 +44,7 @@ import {
 import {
   readPrimarySelection,
   ProgramClipboardWrite,
+  runProgramClipboardWrite,
   writePrimarySelection,
   writeTerminalClipboard,
 } from "../lib/terminalClipboard";
@@ -194,14 +195,18 @@ if (typeof window !== "undefined") {
   });
 }
 const textEncoder = new TextEncoder();
+const runClipboardWrite = (write: ProgramClipboardWrite) =>
+  runProgramClipboardWrite(write, (message) =>
+    toast.error("Could not copy terminal image", { description: message }),
+  );
 /** Program clipboard writes (OSC 52, Kitty), the latest of a burst kept. */
 const programClipboard = new LatestClipboardWrite<ProgramClipboardWrite>(
-  (write) => write.run(),
+  runClipboardWrite,
   (write) => write.prepare(),
   (write) => write.dispose(),
 );
 const programPrimary = new LatestClipboardWrite<ProgramClipboardWrite>(
-  (write) => write.run(),
+  runClipboardWrite,
   (write) => write.prepare(),
   (write) => write.dispose(),
 );

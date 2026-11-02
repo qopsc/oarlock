@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   DiagramCache,
+  MERMAID_DEBOUNCE_MS,
+  MERMAID_MAX_EDGES,
+  MERMAID_MAX_TEXT,
   MERMAID_SECURE_KEYS,
   mermaidConfig,
+  diagramLimitError,
   observeDiagramVisibility,
   serialized,
+  scheduleDiagramRender,
   stripSvgLinks,
 } from "./mermaidRender";
 import { diagramError } from "./MermaidViews";
@@ -19,6 +24,8 @@ describe("mermaidConfig", () => {
       expect(config.flowchart?.htmlLabels).toBe(false);
       expect(config.startOnLoad).toBe(false);
       expect(config.suppressErrorRendering).toBe(true);
+      expect(config.maxTextSize).toBe(MERMAID_MAX_TEXT);
+      expect(config.maxEdges).toBe(MERMAID_MAX_EDGES);
       expect(config.secure).toBe(MERMAID_SECURE_KEYS);
       expect(config.themeCSS).toBeUndefined();
       expect(config.dompurifyConfig).toBeUndefined();
@@ -51,6 +58,30 @@ describe("mermaidConfig", () => {
       ]),
     );
   });
+});
+
+it("reports Mermaid's resource limits as a clear size error", () => {
+  expect(diagramLimitError(new Error("Edge limit exceeded. 200 edges found")))
+    .toEqual(new Error("Diagram too large to render."));
+  expect(diagramLimitError(new Error("Maximum text size in diagram exceeded")))
+    .toEqual(new Error("Diagram too large to render."));
+  const parse = new Error("Parse error");
+  expect(diagramLimitError(parse)).toBe(parse);
+});
+
+it("debounces edits and cancels obsolete diagram work", () => {
+  vi.useFakeTimers();
+  try {
+    const render = vi.fn();
+    const cancel = scheduleDiagramRender(() => render("old"));
+    vi.advanceTimersByTime(MERMAID_DEBOUNCE_MS - 1);
+    cancel();
+    scheduleDiagramRender(() => render("new"));
+    vi.advanceTimersByTime(MERMAID_DEBOUNCE_MS);
+    expect(render).toHaveBeenCalledExactlyOnceWith("new");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 describe("stripSvgLinks", () => {
