@@ -33,16 +33,18 @@ D-14 and D-09 are one commit because both rewrite the same read and save path (`
 - Ownership exception: `scripts/ipc-profile/smoke.ts` lost its `createProxyFetch({ allowPrivateNetwork: true })` call (one import and one line) because S-21 removed that option; without it `check-types` fails.
 - Not run: Windows and Linux (the Windows-only `command.lock().unwrap()` in `background.rs` was changed by the same substitution but not compiled here). `cargo nextest` is not installed on this machine; `cargo test --locked` was used.
 
-## Rework after review (E-1 to E-6 and two Lows)
+## Rework after review (E-1 to E-8 and two Lows)
 
 | Item | Fix | Test | Commit |
 | --- | --- | --- | --- |
-| E-1 (S-18) | `describe` puts one `sets NAME=value` line per env entry before the command line; `ItemEntries` renders those lines unclamped and only clamps the command; the refused set gains `NPM_CONFIG_*`, `UV_*`, `PIP_*`, `GIT_*`, `HOME`, `XDG_CONFIG_HOME`, `ZDOTDIR`, `DOTNET_STARTUP_HOOKS`, `CLASSPATH`, `PERLLIB` (case-insensitive) | `ProjectTrustPrompt.test.tsx` "shows a server's environment even when its command line is long"; `mcp::project::tests` (prompt text, the new names) | c211743d |
+| E-1 (S-18) | `describe` puts one `sets NAME=value` line per env entry before the command line; `ItemEntries` renders those lines unclamped (E-7 later unclamped the command too); the refused set gains `NPM_CONFIG_*`, `UV_*`, `PIP_*`, `GIT_*`, `HOME`, `XDG_CONFIG_HOME`, `ZDOTDIR`, `DOTNET_STARTUP_HOOKS`, `CLASSPATH`, `PERLLIB` (case-insensitive) | `ProjectTrustPrompt.test.tsx` "shows a server's environment even when its command line is long"; `mcp::project::tests` (prompt text, the new names) | c211743d |
 | E-2 (D-14/D-09) | Plan mode always reads the file for `originalContent` and keeps the cached version as `baseVersion` | `fs.test.ts` "shows the plan review the file as it is, keeping the version the model read" | ef303bfd |
 | E-3 | `native.writeFile` sends `source: "ai"`. Consumers: `useEditorFileSync` reloads on any source but `"editor"`, so clean editors reload at once as for the old `fs_write_file` (no source); `useThemeFileEditing` ingests only `"editor"`, so AI edits to theme files are not taken as user saves, as before | `native.test.ts` (exact `fs_save_document` arguments) | 7682315a |
 | E-4 | `statusWhenAuthorized` waits for `authorizationSettled(root, env)` before `project_trust_status`; `SkillsWatcher` uses it | `statusWhenAuthorized.test.ts` | aeb7e329 |
 | E-5 | `fs_grep` and `fs_glob` with origin AI skip paths that fail `secret_paths::readable` (hidden names were already skipped by the walker, so the test uses `server.pem` and `credentials`); `tests/fs_search.rs` got thin shims for the new `protect_secrets` argument | `fs::grep::tests::the_ais_searches_skip_secret_files_and_the_apps_do_not` | cb688aa6, 9d180660 |
 | E-6 | A non-stale failure after another edit to the same file landed says the edit has to be rejected and asked for again | `planStore.test.ts` (the "no longer applies" case) | c0b5170d |
+| E-7 (S-18) | The command line is no longer clamped: it wraps with `whitespace-pre-wrap break-all` and the list scrolls, so a long quoted `sh -c` argument is visible to its end | `ProjectTrustPrompt.test.tsx` "shows a long quoted command argument to its end, unclipped" | d4e127a0 |
+| E-8 (S-20) | `workspace/authorize.ts` gains `onAuthorized(path, env, run)`, called when an authorization of exactly that path and environment succeeds; `SkillsWatcher` re-runs its status check then (`rerunWhenAuthorized`). `workspace/authorize.ts` is outside the stated ownership; this small hook was the only place that sees every authorization | `authorize.test.ts` "onAuthorized", `statusWhenAuthorized.test.ts` | c2820712 |
 | S-15 Low | `project_trust::tests::the_file_commands_pass_their_callers_origin_to_keeping_trust` reads the command sources (no mock app runtime is available without a `Cargo.toml` change) and asserts `fs_write_file`, `fs_save_document` and `fs_create_dir` pass `origin` and only `fs_create_file`, which takes none, names `Origin::App`. It catches a wrong or dropped argument, not behaviour. | same | dca166e6 |
 | Nit | The two terminal tests import `@/modules/terminal/lib/quoteShellPath` | existing tests | 07c17639 |
 
@@ -105,7 +107,7 @@ Run from the batch worktree. The machine has no global git-lfs or signing config
 - `bun run test`:
   ```
    Test Files  646 passed (646)
-        Tests  6153 passed | 2 skipped (6155)
+        Tests  6156 passed | 2 skipped (6158)
   ```
 - `cd src-tauri && cargo clippy --all-targets --locked -- -D warnings` ended `Finished \`dev\` profile [unoptimized + debuginfo] target(s)` with no warnings.
 - `cd src-tauri && cargo nextest run --locked`: `error: no such command: \`nextest\``. Fallback `cargo test --locked --no-fail-fast`:
