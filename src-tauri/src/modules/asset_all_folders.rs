@@ -88,7 +88,7 @@ pub fn protocol<R: Runtime>(
                 app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref()),
             )
         };
-        responder.respond(respond(&request, &origin, served));
+        responder.respond(respond_with(&request, &origin, &served, &served));
       });
     });
 }
@@ -218,9 +218,24 @@ fn parse_range(header: Option<&str>, len: u64) -> Range {
     }
 }
 
+/// `respond_with` where the requested name is not judged before the open, as the tests that
+/// stage a replacement inside the authorization callback need.
+#[cfg(test)]
 fn respond(
     request: &http::Request<Vec<u8>>,
     origin: &str,
+    served: impl Fn(&Path) -> bool,
+) -> http::Response<Vec<u8>> {
+    respond_with(request, origin, |_| true, served)
+}
+
+/// `requested_ok` judges the name before anything is opened, so a path outside every scope
+/// (an automounted host, a device node, a share that asks for credentials) is never touched;
+/// `served` then judges the opened handle's real path.
+fn respond_with(
+    request: &http::Request<Vec<u8>>,
+    origin: &str,
+    requested_ok: impl Fn(&Path) -> bool,
     served: impl Fn(&Path) -> bool,
 ) -> http::Response<Vec<u8>> {
     let head = request.method() == Method::HEAD;
@@ -230,6 +245,9 @@ fn respond(
     let Some(path) = requested_path(request.uri().path()) else {
         return status_only(StatusCode::BAD_REQUEST, Some(origin));
     };
+    if path.components().any(|part| part == Component::ParentDir) || !requested_ok(&path) {
+        return status_only(StatusCode::FORBIDDEN, Some(origin));
+    }
     // Authorize the opened object, not a pathname that could be changed before open.
     // Missing, unverifiable and unauthorized files all receive the same response.
     let Ok(file) = open_preview(&path) else {

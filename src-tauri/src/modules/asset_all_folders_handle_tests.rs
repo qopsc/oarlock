@@ -378,3 +378,65 @@ fn a_png_named_file_holding_html_is_inert_even_for_a_range() {
     assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
     assert_inert(&ranged);
 }
+
+#[test]
+fn a_path_outside_every_scope_is_refused_without_being_opened() {
+    use std::cell::Cell;
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("pic.png");
+    std::fs::write(&outside, PNG).unwrap();
+    let opened = Cell::new(false);
+    let response = respond_with(
+        &request(&outside, Method::GET),
+        "tauri://localhost",
+        |path| serves(path, false, false),
+        |_| {
+            opened.set(true);
+            true
+        },
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!opened.get(), "the handle was never authorized, so never opened");
+
+    let dot = tmp.path().join(".ssh").join("id.png");
+    let response = respond_with(
+        &request(&dot, Method::GET),
+        "tauri://localhost",
+        |path| serves(path, false, true),
+        |_| {
+            opened.set(true);
+            true
+        },
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!opened.get());
+}
+
+#[test]
+fn parent_components_are_refused_before_the_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a").join("..").join("pic.png");
+    std::fs::create_dir(tmp.path().join("a")).unwrap();
+    std::fs::write(tmp.path().join("pic.png"), PNG).unwrap();
+    let response = respond_with(
+        &request(&path, Method::GET),
+        "tauri://localhost",
+        |_| true,
+        |_| true,
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn a_scoped_path_is_still_judged_again_on_the_opened_handle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("pic.png");
+    std::fs::write(&file, PNG).unwrap();
+    let response = respond_with(
+        &request(&file, Method::GET),
+        "tauri://localhost",
+        |_| true,
+        |_| false,
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
