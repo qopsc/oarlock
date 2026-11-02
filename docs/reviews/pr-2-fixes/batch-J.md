@@ -8,7 +8,7 @@ Branch `worktree-agent-a30e54752baffb792`, based on `review/codex-fixes` at e7db
 | ID | What changed | Fix location | Tests |
 | --- | --- | --- | --- |
 | D-12 | A Linux save no longer links the candidate into the user's folder. Every mode stages under a private 0700 folder: the Git common directory, else the user cache (created 0700 when missing), and for a folder with no `.git` ancestor only, a 0700 `.oarlock-staging` child that is removed after publishing and left when not empty. The location must be on the destination's mount (`statx` mount id, `st_dev` as the fallback); `EXDEV` from `linkat` or `renameat2` moves to the next location. Cleanup scans only the private folder and examines at most 4,096 entries. | `fs/linux_staging.rs` (`locations`, `open_location`, `cache_location`, `Candidate::publish`, `cleanup_with_cap`) | `non_repository_stages_privately_and_never_in_the_users_directory`, `crash_between_link_and_rename_leaves_nothing_in_the_users_directory`, `cleanup_stops_at_the_entry_cap_without_error`, `a_missing_cache_directory_is_created_private`, `unusable_cache_falls_back_to_a_private_destination_child_removed_after_publish`, `a_non_empty_destination_child_is_left_in_place`, `a_foreign_git_marker_never_gets_a_destination_child_and_refuses_without_a_cache`, `same_mount_is_reflexive_and_distinguishes_volumes` |
-| D-12 (found in review) | `security.selinux` and `security.SMACK64*` no longer make every replacing save fail on an LSM host: they are skipped by `capture`, ignored by `verify`, never removed; a save copies the original's label to the staged file or refuses with a reason; a copy lets the kernel label. | `fs/access_control/extended.rs` (`lsm_managed`, `Labels`, `apply_with`) | `lsm_labels_are_classified_and_other_security_names_stay_refused` (classification only; no SELinux host was available) |
+| D-12 (found in review) | `security.selinux` and `security.SMACK64*` no longer make every replacing save fail on an LSM host: they are skipped by `capture`, ignored by `verify`, never removed; a save copies the original's label to the staged file or refuses with a reason; a copy gives the new file the label of its staging location (a rename keeps the label the file was created with; `restorecon` relabels). | `fs/access_control/extended.rs` (`lsm_managed`, `Labels`, `apply_with`) | `lsm_labels_are_classified_and_other_security_names_stay_refused` (classification only; no SELinux host was available) |
 | D-20 | Linux Explorer copy, paste and drop copy files, folders and links with mode, POSIX access and default ACLs, `user.*` xattrs, times and permitted ownership, staged privately on the destination's mount and published with `renameat2(RENAME_NOREPLACE)` through directory descriptors. | `fs/linux_copy.rs`, `fs/linux_staging.rs` (`CopyArea`, `remove_tree`, `rename_noreplace_at`), `fs/access_control.rs` (`capture_directory`, `apply_for_copy`, `finalize_for_copy`), `fs/copy_owned.rs` | see section 3 |
 | D-20 (macOS too) | A nested relative link is judged where the copy will put it, not only where it is now. | `fs/copy_owned.rs` (`nested_link_allowed`, `lexical_normalize`) | `a_relative_link_is_judged_where_the_copy_will_put_it`, `a_nested_relative_link_that_escapes_only_at_the_destination_refuses_the_folder` |
 
@@ -88,3 +88,38 @@ The volumes were made writable by uid 1000 once with a root `chown -R 1000:1000`
   vendored `unnecessary_cast` errors in `vendor/tauri-plugin-*/src/secure_file.rs`; the main crate was linted with
   `-p oarlock --no-deps -A unused-imports`.
 - A Linux desktop run of Explorer copy, paste and drop.
+
+## 6. Rework after review
+
+Verdict `rework 1, 2, 3, 4`; all four done.
+
+1. **Nested link through a conflict name (D-20, commit `25d99055`).** `nested_link_allowed` no longer compares the
+   normalized target with `item_dest` by name. `stays_inside_item` walks the written target from the link's folder and
+   counts depth below the copied item's root: a target that never rises above the root is accepted; anything that does
+   (or is not relative-normal) goes through `resolve_existing_prefix` and the registry. Regression:
+   `a_relative_link_cannot_reach_through_an_entry_that_forces_a_conflict_name` (`copy_owned_tests.rs`, macOS and Linux):
+   `dest/tree` is a link to an unauthorized folder, so `tree` is published as `tree copy`, and `tree/link -> ../tree/x`
+   must refuse the folder. It failed before the change and passes after it (macOS; it also runs in the container).
+2. **Staging folders on the AI deny-list (D-12, commit `50625412`).** `secretPaths.json` `componentPrefixes` gained
+   `.oarlock-staging` and `oarlock-staging`. Rust `internal_staging_is_never_an_ai_content_source` and the TypeScript
+   `blocks internal staging contents and placeholders for reads and writes` now include
+   `/work/.oarlock-staging/area/content` and `/home/me/.cache/oarlock-staging/area/content`.
+3. **Linux clippy (commit `0ba75467`).** `primary_selection.rs` imports only `WriteOrder` in the Linux module;
+   `secure_file.rs` (both vendored copies, still byte-identical) puts `#[allow(clippy::unnecessary_cast)]` on the
+   `st_dev as u64` comparison, which stays because `dev_t` is `i32` on macOS.
+4. **SELinux label (doc only).** Not cheap to fix (needs an `O_TMPFILE` label probe in the destination), so AGENTS.md and
+   section 1 now say a copy takes the label of its staging location and `restorecon` relabels.
+
+Checks (worktree head after the commits above plus the docs commit):
+
+- macOS `cargo clippy --all-targets --locked -- -D warnings`: `Finished dev profile` with no warnings.
+- macOS `cargo test --locked -- --test-threads=1`: lib `1678 passed; 0 failed; 4 ignored`, every integration binary ok.
+- Container (`oarlock-linux-ci`, uid 1000, `--init`, `git archive` tree) `cargo clippy --all-targets --locked -- -D warnings`:
+  `Finished dev profile` with no warnings.
+- Container `cargo test --locked -j1 --no-fail-fast -- --test-threads=1` (`-j1` because the default run was killed
+  by the linker, signal 9): lib `1697 passed; 3 failed; 4 ignored`. The failures are
+  `rustfmt_edition::resolves_package_defaults_and_workspace_inheritance` and the two `wsl_supervisor_*` tests, which
+  fail at the base too. Integration binaries are ok except `git_status_limits`
+  (`status_reports_unrepresentable_filenames_instead_of_an_empty_tree`: the bind-mounted macOS tree does not keep a
+  non-UTF-8 name; the test file is untouched by this batch).
+- TypeScript `bun run test src/modules/ai/lib/security.test.ts`: 68 passed. Rust `cargo test --locked secret_paths`: 2 passed.

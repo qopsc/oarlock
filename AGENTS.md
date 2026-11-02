@@ -4027,7 +4027,7 @@ without ownership evidence. No worker, timer, dependency or IPC request was adde
 directory/file handles and metadata probes exist only during an active write.
 
 The AI path checker also admitted internal staging names. Shared component-prefix
-rules now deny .oarlock-stage-* and legacy .oarlock-save-* paths for AI reads and
+rules now deny .oarlock-stage-*, .oarlock-staging, oarlock-staging and legacy .oarlock-save-* paths for AI reads and
 writes, native imports and document-context validation. This applies the existing
 no-bypass rule to draft copies, with matching Rust/TypeScript regressions.
 Original evidence is /tmp/oarlock-review76-{stage-before,stage-publication-before,
@@ -5328,8 +5328,8 @@ is unavailable. Linux rename, move and delete use the same checks. Linux copy
 entry by entry through `O_NOFOLLOW` handles (`copy_file_range` with a read/write
 fallback), keeps mode, POSIX access and default ACLs, `user.*` xattrs, times and,
 where permitted, ownership (a group that cannot be kept never widens access: its
-bits are cleared, or an ACL refuses the copy), lets SELinux and SMACK label the new
-file, keeps a copied folder writable by its owner until a directory-relative
+bits are cleared, or an ACL refuses the copy), gives the new file the SELinux or SMACK label of
+its staging location (a rename keeps the label it was created with; `restorecon` relabels), keeps a copied folder writable by its owner until a directory-relative
 `renameat2(RENAME_NOREPLACE)` has published it and only then sets its final mode,
 and refuses setuid and setgid files, special files, nested links that escape the
 authorized folders where they are or where the copy puts them (relative targets
