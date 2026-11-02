@@ -651,15 +651,27 @@ static GIT_PROGRAM: OnceLock<OsString> = OnceLock::new();
 /// The `git` found on `PATH` the first time Git is needed, as an absolute path,
 /// so a later `PATH` change or a planted earlier entry cannot swap the binary.
 fn git_program() -> &'static OsStr {
-    GIT_PROGRAM
-        .get_or_init(|| {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let name = if cfg!(windows) { "git.exe" } else { "git" };
-            find_on_path(name, &path)
-                .map(PathBuf::into_os_string)
-                .unwrap_or_else(|| OsString::from("git"))
-        })
-        .as_os_str()
+    pinned_program(&GIT_PROGRAM, || {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        find_on_path(if cfg!(windows) { "git.exe" } else { "git" }, &path)
+    })
+}
+
+/// A lookup that finds nothing is not remembered: the launch fails as "not installed"
+/// (the name cannot exist) and the next one looks again.
+const GIT_NOT_FOUND: &str = "oarlock-git-not-installed";
+
+fn pinned_program(
+    cell: &OnceLock<OsString>,
+    lookup: impl FnOnce() -> Option<PathBuf>,
+) -> &OsStr {
+    if let Some(found) = cell.get() {
+        return found;
+    }
+    match lookup() {
+        Some(path) => cell.get_or_init(|| path.into_os_string()),
+        None => OsStr::new(GIT_NOT_FOUND),
+    }
 }
 
 fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
@@ -1169,6 +1181,21 @@ mod tests {
         .unwrap();
         assert_eq!(super::find_on_path("git", &path), Some(second.join("git")));
         assert_eq!(super::find_on_path("absent-program", &path), None);
+    }
+
+    #[test]
+    fn a_failed_lookup_is_not_pinned_and_a_found_binary_is_never_replaced() {
+        use std::path::PathBuf;
+        use std::sync::OnceLock;
+        let cell = OnceLock::new();
+        let missing = super::pinned_program(&cell, || None);
+        assert!(!std::path::Path::new(missing).is_absolute());
+        assert_ne!(missing, "git", "a bare name would be searched on PATH at launch");
+        assert!(cell.get().is_none(), "a failed lookup was cached");
+        let found = super::pinned_program(&cell, || Some(PathBuf::from("/opt/tools/git")));
+        assert_eq!(found, "/opt/tools/git");
+        let later = super::pinned_program(&cell, || Some(PathBuf::from("/planted/git")));
+        assert_eq!(later, "/opt/tools/git");
     }
 
     #[test]
