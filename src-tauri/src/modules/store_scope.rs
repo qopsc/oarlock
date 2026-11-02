@@ -16,6 +16,7 @@ use tauri::plugin::{Plugin, TauriPlugin};
 use tauri::webview::PageLoadPayload;
 use tauri::{AppHandle, RunEvent, Runtime, Url, Webview, Window};
 
+use super::fs::native_store::{NATIVE_FILES, PAGE_OPENED_FILES};
 use super::windows;
 
 /// Longest store file name accepted; ours are about twenty characters.
@@ -109,15 +110,9 @@ fn refusal(command: &str, payload: &InvokeBody, window: &str) -> Option<String> 
 /// A store file the page in `window` may open: a plain file name, which the plugin resolves in
 /// the app's data folder, or that window's own spaces store when it is an extra app window.
 fn allowed_store_path(path: &str, window: &str) -> bool {
-    ![
-        "oarlock-mcp.json",
-        "oarlock-endpoints.json",
-        "oarlock-preferences.json",
-        "oarlock-themes.json",
-        "oarlock-custom-themes.json",
-        "oarlock-settings.json",
-    ]
-    .iter()
+    !NATIVE_FILES
+        .iter()
+        .filter(|native| !PAGE_OPENED_FILES.contains(native))
     .any(|native| path.eq_ignore_ascii_case(native))
         && (is_plain_store_name(path)
             || (window != windows::MAIN
@@ -164,13 +159,7 @@ mod tests {
     }
 
     /// Every store file the page opens (`STORE_PATH` in `src/`, and `spacesStorePath`).
-    const APP_STORES: &[&str] = &[
-        "oarlock-ai-sessions.json",
-        "oarlock-ai-snippets.json",
-        "oarlock-ai-todos.json",
-        "oarlock-ai-agents.json",
-        "oarlock-spaces.json",
-    ];
+    const APP_STORES: &[&str] = PAGE_OPENED_FILES;
 
     #[test]
     fn native_settings_cannot_be_opened_through_the_store_plugin() {
@@ -197,6 +186,46 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn every_native_owned_file_is_refused_unless_the_page_opens_it() {
+        for native in NATIVE_FILES {
+            let opened = PAGE_OPENED_FILES.contains(native);
+            for name in [
+                native.to_string(),
+                native.to_ascii_uppercase(),
+                native.replacen(".json", ".JSON", 1),
+            ] {
+                for window in ["main", "settings", "quick", "w-1"] {
+                    assert_eq!(
+                        load(json!(name), window).is_none(),
+                        opened,
+                        "{name} in {window}"
+                    );
+                    assert_eq!(
+                        refusal(
+                            "get_store",
+                            &InvokeBody::Json(json!({ "path": name })),
+                            window
+                        )
+                        .is_none(),
+                        opened,
+                        "{name} in {window}"
+                    );
+                }
+            }
+        }
+        for opened in PAGE_OPENED_FILES {
+            assert!(NATIVE_FILES.contains(opened), "{opened}");
+        }
+        for owned in [
+            "oarlock-ai-sessions.before-message-files.json",
+            "secrets.json",
+            "SECRETS.JSON",
+        ] {
+            assert!(load(json!(owned), "main").is_some(), "{owned}");
+        }
+    }
+
     #[test]
     fn every_store_the_app_opens_is_allowed_in_every_window() {
         for window in ["main", "w-1", "w-32", "settings", "quick"] {
@@ -341,6 +370,26 @@ mod tests {
             let args = InvokeBody::Json(json!({ "rid": 1, "key": "/etc/passwd" }));
             assert_eq!(refusal(command, &args, "main"), None, "{command}");
         }
+    }
+
+    #[test]
+    fn a_page_cannot_close_a_store_resource_it_guessed() {
+        // `plugin:resources|close` is not a store command, so the wrapper cannot see it: the
+        // capability denies it. Closing a backend store drops it from the plugin's table and
+        // the next backend `app.store()` would build a second instance over the same file.
+        let capability = include_str!("../../capabilities/default.json");
+        assert!(capability.contains("\"core:resources:deny-close\""));
+    }
+
+    #[test]
+    fn the_two_secure_file_modules_are_the_same_file() {
+        let store = include_bytes!("../../vendor/tauri-plugin-store/src/secure_file.rs");
+        let window_state =
+            include_bytes!("../../vendor/tauri-plugin-window-state/src/secure_file.rs");
+        assert!(
+            store == window_state,
+            "keep the store and window-state secure_file.rs byte-identical"
+        );
     }
 
     #[test]

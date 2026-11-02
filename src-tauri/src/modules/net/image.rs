@@ -8,20 +8,66 @@
 //! redirect hop validated again.
 
 use super::stream::{AiStreamState, StreamLease};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use futures_util::future::{AbortRegistration, Abortable};
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE, LOCATION};
 use tauri::ipc::{Channel, Response};
 use tauri::{Manager, State, WebviewWindow};
 
-/// Separate ownership from AI/MCP streams, with no new image-admission policy.
+/// Each buffered image can hold 16 MiB for twenty seconds, and a README may name hundreds, so
+/// a window gets this many at once; the page queues the rest (`remoteImages.ts`).
+const MAX_ACTIVE_PER_WINDOW: usize = 16;
+
+/// Separate ownership from AI/MCP streams, with a count of active loads per window.
 #[derive(Default)]
-pub struct ImageRequests(AiStreamState);
+pub struct ImageRequests {
+    streams: AiStreamState,
+    active: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// One of a window's places; frees it when the load ends.
+struct ActiveImage {
+    active: Arc<Mutex<HashMap<String, usize>>>,
+    owner: String,
+}
+
+impl Drop for ActiveImage {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = active.get_mut(&self.owner) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.owner);
+            }
+        }
+    }
+}
+
 impl ImageRequests {
     pub fn cancel_window(&self, owner: &str) {
-        self.0.cancel_window(owner);
+        self.streams.cancel_window(owner);
     }
-    fn start(&self, owner: &str, id: &str) -> Result<(StreamLease, AbortRegistration), String> {
-        self.0.start_bounded(owner, id, usize::MAX)
+
+    fn start(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> Result<(StreamLease, AbortRegistration, ActiveImage), String> {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if active.get(owner).copied().unwrap_or(0) >= MAX_ACTIVE_PER_WINDOW {
+            return Err("too many images loading at once".into());
+        }
+        let (lease, registration) = self.streams.start_bounded(owner, id, usize::MAX)?;
+        *active.entry(owner.to_owned()).or_default() += 1;
+        Ok((
+            lease,
+            registration,
+            ActiveImage {
+                active: self.active.clone(),
+                owner: owner.to_owned(),
+            },
+        ))
     }
 }
 
@@ -57,11 +103,13 @@ pub fn markdown_remote_image(
     }
     let url = validate_image_url(&url)?;
     // Synchronous registration: no filesystem/network wait before ownership.
-    let ticket = pages.with_page(window.label(), &page_generation, || {
+    let (lease, registration, slot) = pages.with_page(window.label(), &page_generation, || {
         state.start(window.label(), &request_id)
     })?;
     tauri::async_runtime::spawn(async move {
-        match load_owned(ticket, fetch_image(url)).await {
+        let result = load_owned((lease, registration), fetch_image(url)).await;
+        drop(slot);
+        match result {
             Ok(Some(bytes)) => {
                 let _ = on_event.send(Response::new(bytes));
             }
@@ -83,7 +131,7 @@ pub fn markdown_remote_image_cancel(
     request_id: String,
 ) -> Result<(), String> {
     pages.with_page(window.label(), &page_generation, || {
-        state.0.cancel(window.label(), &request_id);
+        state.streams.cancel(window.label(), &request_id);
         Ok(())
     })
 }
@@ -226,12 +274,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_window_gets_sixteen_images_at_once_and_a_place_frees_when_one_ends() {
+        let state = ImageRequests::default();
+        let mut held: Vec<_> = (0..MAX_ACTIVE_PER_WINDOW)
+            .map(|n| state.start("main", &format!("i{n}")).unwrap())
+            .collect();
+        assert!(
+            state.start("main", "seventeenth").is_err(),
+            "the 17th waits in the page"
+        );
+        assert!(state.start("w-2", "other").is_ok(), "another window has its own");
+        drop(held.pop());
+        let seventeenth = state.start("main", "seventeenth").unwrap();
+        held.clear();
+        assert!(state.active.lock().unwrap().get("main").is_some_and(|n| *n == 1));
+        drop(seventeenth);
+        assert!(state.active.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn cancellation_before_poll_prevents_io_and_releases_registration() {
         let state = ImageRequests::default();
-        let ticket = state.start("main", "image").unwrap();
+        let (lease, registration, _slot) = state.start("main", "image").unwrap();
+        let ticket = (lease, registration);
         assert!(state.start("main", "image").is_err());
-        state.0.cancel("main", "image");
+        state.streams.cancel("main", "image");
         let polled = std::sync::atomic::AtomicBool::new(false);
         let result = load_owned(ticket, async {
             polled.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -247,8 +315,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_one_window_does_not_cancel_another_windows_image() {
         let state = ImageRequests::default();
-        let first = state.start("main", "image").unwrap();
-        let other = state.start("w-a", "image").unwrap();
+        let (lease, registration, _first_slot) = state.start("main", "image").unwrap();
+        let first = (lease, registration);
+        let (lease, registration, _other_slot) = state.start("w-a", "image").unwrap();
+        let other = (lease, registration);
         state.cancel_window("main");
         assert!(load_owned(first, std::future::pending())
             .await
@@ -288,7 +358,8 @@ mod tests {
             assert!(read.is_err() || read.unwrap() == 0);
         });
         let state = ImageRequests::default();
-        let ticket = state.start("main", "image").unwrap();
+        let (lease, registration, _slot) = state.start("main", "image").unwrap();
+        let ticket = (lease, registration);
         let client = client_for(
             Profile::Fetch,
             "127.0.0.1",

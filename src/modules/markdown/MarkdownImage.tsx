@@ -12,6 +12,14 @@ import {
   useState,
 } from "react";
 import { LOCAL_IMAGE_PATH } from "./localImages";
+import {
+  afterError,
+  afterWait,
+  attemptSrc,
+  loadFor,
+  type LocalLoad,
+  retryDelay,
+} from "./MarkdownImageRetry";
 import { remoteImages } from "./remoteImages";
 
 type Props = ComponentProps<"img"> & {
@@ -85,13 +93,23 @@ export function MarkdownImage({ node: _node, src, alt, ...props }: Props) {
       ? src
       : null;
   const localUrl = useWorkspaceAssetUrl(localPath);
-  const [failedLocalUrl, setFailedLocalUrl] = useState<string | null>(null);
+  const [localLoadState, setLocalLoad] = useState<LocalLoad | null>(null);
+  const localLoad = localUrl === null ? null : loadFor(localLoadState, localUrl);
+  const waiting = localLoad?.phase === "waiting";
+  useEffect(() => {
+    if (localLoad === null || localLoad.phase !== "waiting") return;
+    const timer = setTimeout(
+      () => setLocalLoad(afterWait(localLoad)),
+      retryDelay(localLoad),
+    );
+    return () => clearTimeout(timer);
+  }, [localLoad]);
   const secureRemote = remote !== null && /^https:/i.test(remote);
   const image = useRemoteImage(secureRemote ? remote : null);
   const style = imageHeightStyle(props.height);
 
   if (localPath !== null) {
-    if (localUrl !== null && failedLocalUrl === localUrl) {
+    if (localLoad?.phase === "failed") {
       return (
         <span className="inline-block rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
           Image is too large to preview or could not be loaded. {" "}
@@ -101,9 +119,9 @@ export function MarkdownImage({ node: _node, src, alt, ...props }: Props) {
         </span>
       );
     }
-    return localUrl ? (
-      <img {...props} style={style} src={localUrl} alt={alt} onError={(event) => {
-        setFailedLocalUrl(localUrl);
+    return localLoad && !waiting ? (
+      <img {...props} style={style} src={attemptSrc(localLoad)} alt={alt} onError={(event) => {
+        setLocalLoad(afterError(localLoad));
         props.onError?.(event);
       }} />
     ) : null;

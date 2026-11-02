@@ -7,22 +7,28 @@
 //! A request is served when the asset protocol would serve the file, or, while the app may
 //! access all folders, when no name on the file's real path starts with a dot: the same rule
 //! the asset scope's `requireLiteralLeadingDot` applies below a granted root, so `~/.ssh` and
-//! `.env` stay out. A link is judged by where it leads. Like the asset protocol, any frame can
-//! request it; a request carrying a foreign `Origin` (a page in the preview reading it with
-//! `fetch`) is refused, and responses only name the app's own origin.
+//! `.env` stay out. A link is judged by where it leads. A request carrying a foreign `Origin` (a page in the preview reading it with
+//! `fetch`) is refused, and responses only name the app's own origin. Navigations and image
+//! loads carry no `Origin`, so the URL also names the page generation native delivered to the
+//! app's page (`t=`), which a frame it embeds cannot read.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use tauri::http::{self, header, HeaderValue, Method, StatusCode};
 use tauri::utils::mime_type::MimeType;
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
+use super::asset_scope::{Access, AssetScope};
+use super::net::page::NetworkPages;
 use super::pty::AllowedOrigins;
 use super::workspace::{Origin, WorkspaceRegistry};
+
+const SANDBOX_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 /// The scheme's name, as the page passes it to `convertFileSrc`.
 pub const SCHEME: &str = "oarlock-asset";
@@ -36,6 +42,9 @@ const SNIFF_BYTES: u64 = 8192;
 const MAX_WHOLE_PREVIEW: u64 = 50 * 1024 * 1024;
 const MAX_ACTIVE_PREVIEWS: usize = 2;
 const MAX_PENDING_PREVIEWS: usize = 64;
+/// How many requests may wait for a slot before the rest are told to retry.
+const MAX_WAITING_PREVIEWS: usize = 2048;
+const ADMISSION_WAIT: Duration = Duration::from_secs(30);
 
 static ORIGINS: OnceLock<AllowedOrigins> = OnceLock::new();
 
@@ -44,9 +53,35 @@ fn preview_budget() -> &'static Arc<tokio::sync::Semaphore> {
     BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_PREVIEWS)))
 }
 
+fn preview_waiting() -> &'static Arc<tokio::sync::Semaphore> {
+    static WAITING: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    WAITING.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_WAITING_PREVIEWS)))
+}
+
 fn preview_admission() -> &'static Arc<tokio::sync::Semaphore> {
     static ADMISSION: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     ADMISSION.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_PREVIEWS)))
+}
+
+/// Waits for one of the admission slots, or gives up after `wait`. WebKit starts every image of
+/// a page at once, so a document with more local images than slots has to be answered in turn,
+/// not refused.
+async fn admit(
+    slots: &Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::time::timeout(wait, slots.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()
+}
+
+fn busy(origin: &str) -> http::Response<Vec<u8>> {
+    let mut response = status_only(StatusCode::SERVICE_UNAVAILABLE, Some(origin));
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 pub fn protocol<R: Runtime>(
@@ -55,61 +90,86 @@ pub fn protocol<R: Runtime>(
     responder: UriSchemeResponder,
 ) {
     let app = ctx.app_handle().clone();
-    let Ok(admitted) = preview_admission().clone().try_acquire_owned() else {
-        responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
+    let label = ctx.webview_label().to_string();
+    // Refuse what is not the app's own page before it can take a place in the queue.
+    let origins = ORIGINS.get_or_init(|| {
+        AllowedOrigins::for_app(
+            app.config().build.dev_url.as_ref(),
+            tauri::is_dev(),
+            cfg!(windows),
+        )
+    });
+    let origin_header = request.headers().get(header::ORIGIN);
+    let Some(origin) = origins.check(origin_header.map(HeaderValue::as_bytes)) else {
+        responder.respond(status_only(StatusCode::FORBIDDEN, None));
+        return;
+    };
+    let belongs = app
+        .try_state::<NetworkPages>()
+        .is_some_and(|pages| page_admits(&pages, &label, request.uri().query()));
+    if !belongs {
+        responder.respond(status_only(StatusCode::FORBIDDEN, Some(&origin)));
+        return;
+    }
+    let Ok(waiting) = preview_waiting().clone().try_acquire_owned() else {
+        responder.respond(busy(&origin));
         return;
     };
     tauri::async_runtime::spawn(async move {
-      let Ok(worker) = preview_budget().clone().acquire_owned().await else {
-          responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
-          return;
-      };
-      // Opening and reading the file blocks; keep both permits until it finishes.
-      tauri::async_runtime::spawn_blocking(move || {
-        let _admitted = admitted;
-        let _worker = worker;
-        let origins = ORIGINS.get_or_init(|| {
-            AllowedOrigins::for_app(
-                app.config().build.dev_url.as_ref(),
-                tauri::is_dev(),
-                cfg!(windows),
-            )
-        });
-        let origin_header = request.headers().get(header::ORIGIN);
-        let Some(origin) = origins.check(origin_header.map(HeaderValue::as_bytes)) else {
-            responder.respond(status_only(StatusCode::FORBIDDEN, None));
+        let admitted = admit(preview_admission(), ADMISSION_WAIT).await;
+        drop(waiting);
+        let Some(admitted) = admitted else {
+            responder.respond(busy(&origin));
             return;
         };
-        let scope = app.asset_protocol_scope();
-        let served = |real: &Path| {
-            serves(
-                real,
-                scope_allows_opened(&scope, real),
-                app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref()),
-            )
+        let Ok(worker) = preview_budget().clone().acquire_owned().await else {
+            responder.respond(busy(&origin));
+            return;
         };
-        responder.respond(respond(&request, &origin, served));
-      });
+        // Opening and reading the file blocks; keep both permits until it finishes.
+        tauri::async_runtime::spawn_blocking(move || {
+            let _admitted = admitted;
+            let _worker = worker;
+            let all = || app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref());
+            let state = app.try_state::<AssetScope>();
+            let access = state.as_ref().map(|state| state.access());
+            let named = |path: &Path| may_open(access, path, all());
+            let served = |real: &Path| serves_opened(access, real, all());
+            responder.respond(respond_with(&request, &origin, named, served));
+        });
     });
 }
 
-// Tauri's is_allowed canonicalizes the supplied path again, which would allow
-// a changed entry to authorize a different open handle. Match the already
-// verified handle path directly, using the asset scope's configured options.
-fn scope_allows_opened(scope: &tauri::scope::fs::Scope, path: &Path) -> bool {
-    let options = glob::MatchOptions {
-        require_literal_separator: true,
-        require_literal_leading_dot: true,
-        ..Default::default()
-    };
-    !scope
-        .forbidden_patterns()
-        .iter()
-        .any(|pattern| pattern.matches_path_with(path, options))
-        && scope
-            .allowed_patterns()
-            .iter()
-            .any(|pattern| pattern.matches_path_with(path, options))
+/// The name a page asked for may be opened: the production judgement before the open.
+fn may_open(access: Option<&Access>, path: &Path, all_folders: bool) -> bool {
+    access.is_some_and(|access| !access.is_app_state(path) && access.may_open(path, all_folders))
+}
+
+/// The opened file's real path may be served: the production judgement after the open.
+fn serves_opened(access: Option<&Access>, real: &Path, all_folders: bool) -> bool {
+    access.is_some_and(|access| {
+        serves_file(
+            real,
+            access.is_app_state(real),
+            access.permits(real),
+            all_folders,
+        )
+    })
+}
+
+/// The `t` of a query: the page generation the app's own page put in the URL.
+fn page_token(query: Option<&str>) -> Option<&str> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("t="))
+        .filter(|token| !token.is_empty())
+}
+
+/// Whether the request comes from the current page of `label`. A frame the app embeds sends no
+/// `Origin` on a navigation or an image load, and cannot read the token off the app's page, so
+/// the token is what keeps a previewed site from asking for files by itself.
+fn page_admits(pages: &NetworkPages, label: &str, query: Option<&str>) -> bool {
+    page_token(query).is_some_and(|token| pages.with_page(label, token, || Ok(())).is_ok())
 }
 
 /// The app's setting, read for each request: the AI tools' setting never widens previews.
@@ -121,6 +181,16 @@ fn app_reaches_all(registry: Option<&WorkspaceRegistry>) -> bool {
 /// may access all folders and nothing on the path is a dot name.
 fn serves(real: &Path, asset_scope_allows: bool, all_folders: bool) -> bool {
     asset_scope_allows || (all_folders && !has_dot_name(real))
+}
+
+/// `serves`, except for the app's own state folders, which no setting opens to a preview.
+fn serves_file(
+    real: &Path,
+    in_app_state: bool,
+    asset_scope_allows: bool,
+    all_folders: bool,
+) -> bool {
+    !in_app_state && serves(real, asset_scope_allows, all_folders)
 }
 
 /// Whether a name on `path` starts with a dot, as a wildcard with `requireLiteralLeadingDot`
@@ -218,9 +288,24 @@ fn parse_range(header: Option<&str>, len: u64) -> Range {
     }
 }
 
+/// `respond_with` where the requested name is not judged before the open, as the tests that
+/// stage a replacement inside the authorization callback need.
+#[cfg(test)]
 fn respond(
     request: &http::Request<Vec<u8>>,
     origin: &str,
+    served: impl Fn(&Path) -> bool,
+) -> http::Response<Vec<u8>> {
+    respond_with(request, origin, |_| true, served)
+}
+
+/// `requested_ok` judges the name before anything is opened, so a path outside every scope
+/// (an automounted host, a device node, a share that asks for credentials) is never touched;
+/// `served` then judges the opened handle's real path.
+fn respond_with(
+    request: &http::Request<Vec<u8>>,
+    origin: &str,
+    requested_ok: impl Fn(&Path) -> bool,
     served: impl Fn(&Path) -> bool,
 ) -> http::Response<Vec<u8>> {
     let head = request.method() == Method::HEAD;
@@ -230,6 +315,9 @@ fn respond(
     let Some(path) = requested_path(request.uri().path()) else {
         return status_only(StatusCode::BAD_REQUEST, Some(origin));
     };
+    if path.components().any(|part| part == Component::ParentDir) || !requested_ok(&path) {
+        return status_only(StatusCode::FORBIDDEN, Some(origin));
+    }
     // Authorize the opened object, not a pathname that could be changed before open.
     // Missing, unverifiable and unauthorized files all receive the same response.
     let Ok(file) = open_preview(&path) else {
@@ -253,20 +341,32 @@ fn respond(
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
     match read(file, &real, &path, range, head, pdf_preview) {
-        Ok(file) => {
-            let mut response = file.response(origin);
-            if pdf_preview {
-                response.headers_mut().insert(
-                    header::X_CONTENT_TYPE_OPTIONS,
-                    HeaderValue::from_static("nosniff"),
-                );
-            }
-            response
-        }
+        Ok(file) => file.response(origin),
         Err(error) => {
             log::debug!("{SCHEME}: cannot read {}: {error}", real.display());
             status_only(StatusCode::NOT_FOUND, Some(origin))
         }
+    }
+}
+
+/// The only types a document in the app's webview may be given (fonts for the terminal's faces). Anything else, HTML above
+/// all (`MimeType::parse` falls back to it for an unknown extension), is data, never a page.
+fn inert_unless_media(mime: String) -> String {
+    let media = [
+        "image/",
+        "video/",
+        "audio/",
+        "font/",
+        "application/font-",
+        "application/x-font-",
+    ]
+    .iter()
+    .any(|prefix| mime.starts_with(prefix))
+        || mime == "application/pdf";
+    if media {
+        mime
+    } else {
+        "application/octet-stream".into()
     }
 }
 
@@ -317,12 +417,18 @@ fn read(
     }
     let size = meta.len();
     let requested_range = parse_range(range, size);
-    let image_or_pdf = |path: &Path| path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-        ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"]
-            .iter().any(|candidate| ext.eq_ignore_ascii_case(candidate))
-    });
+    let image_or_pdf = |path: &Path| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"]
+                    .iter()
+                    .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+            })
+    };
     let large_image_or_pdf = image_or_pdf(real) || image_or_pdf(requested);
-    if !head && size > MAX_WHOLE_PREVIEW
+    if !head
+        && size > MAX_WHOLE_PREVIEW
         && (large_image_or_pdf || matches!(requested_range, Range::Whole))
     {
         return Ok(too_large());
@@ -338,7 +444,9 @@ fn read(
     } else {
         MimeType::parse(&magic, &real.to_string_lossy())
     };
-    if !head && size > MAX_WHOLE_PREVIEW
+    let mime = inert_unless_media(mime);
+    if !head
+        && size > MAX_WHOLE_PREVIEW
         && (mime.starts_with("image/") || mime == "application/pdf")
     {
         return Ok(too_large());
@@ -396,15 +504,15 @@ impl Served {
     fn response(self, origin: &str) -> http::Response<Vec<u8>> {
         let mut builder = with_origin(http::Response::builder(), Some(origin))
             .status(self.status)
-            .header(header::CONTENT_TYPE, self.mime)
+            .header(header::CONTENT_TYPE, self.mime.as_str())
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, "content-range")
-            .header(header::CONTENT_LENGTH, self.len);
-        if self.status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
-            builder = builder.header(
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; sandbox",
-            );
+            .header(header::CONTENT_LENGTH, self.len)
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        // A PDF viewer cannot run inside a sandboxed document; every other answer, an SVG
+        // opened as a page included, may not run script or reach another origin.
+        if self.mime != "application/pdf" {
+            builder = builder.header(header::CONTENT_SECURITY_POLICY, SANDBOX_CSP);
         }
         if let Some(range) = self.content_range {
             builder = builder.header(header::CONTENT_RANGE, range);
@@ -429,6 +537,8 @@ fn with_origin(builder: http::response::Builder, origin: Option<&str>) -> http::
 fn status_only(status: StatusCode, origin: Option<&str>) -> http::Response<Vec<u8>> {
     with_origin(http::Response::builder(), origin)
         .status(status)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, SANDBOX_CSP)
         .body(Vec::new())
         .expect("static response headers are valid")
 }

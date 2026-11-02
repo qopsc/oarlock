@@ -20,7 +20,9 @@ fn oversized_image_is_refused_even_for_a_range_request() {
     let file = std::fs::File::create(&path).unwrap();
     file.set_len(50 * 1024 * 1024 + 1).unwrap();
     let mut request = request(&path, Method::GET);
-    request.headers_mut().insert(header::RANGE, HeaderValue::from_static("bytes=0-100"));
+    request
+        .headers_mut()
+        .insert(header::RANGE, HeaderValue::from_static("bytes=0-100"));
     let response = respond(&request, "tauri://localhost", |_| true);
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
@@ -32,20 +34,58 @@ fn large_video_keeps_existing_bounded_range_playback() {
     let file = std::fs::File::create(&path).unwrap();
     file.set_len(50 * 1024 * 1024 + 1).unwrap();
     let mut request = request(&path, Method::GET);
-    request.headers_mut().insert(header::RANGE, HeaderValue::from_static("bytes=0-15"));
+    request
+        .headers_mut()
+        .insert(header::RANGE, HeaderValue::from_static("bytes=0-15"));
     let response = respond(&request, "tauri://localhost", |_| true);
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.body().len(), 16);
 }
 
 #[test]
-fn preview_admission_is_bounded_and_releases_capacity() {
-    let permits: Vec<_> = (0..MAX_PENDING_PREVIEWS)
-        .map(|_| preview_admission().clone().try_acquire_owned().unwrap())
-        .collect();
-    assert!(preview_admission().clone().try_acquire_owned().is_err());
-    drop(permits);
-    assert!(preview_admission().clone().try_acquire_owned().is_ok());
+fn a_request_beyond_the_admission_slots_waits_for_one() {
+    tauri::async_runtime::block_on(async {
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_PREVIEWS));
+        let held: Vec<_> = (0..MAX_PENDING_PREVIEWS)
+            .map(|_| slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        let sixty_fifth = tokio::spawn({
+            let slots = slots.clone();
+            async move { admit(&slots, Duration::from_secs(5)).await.is_some() }
+        });
+        tokio::task::yield_now().await;
+        assert!(!sixty_fifth.is_finished(), "the 65th request waits");
+        drop(held);
+        assert!(
+            sixty_fifth.await.unwrap(),
+            "and is served once a slot frees"
+        );
+    });
+}
+
+#[test]
+fn a_request_that_waits_too_long_is_told_to_retry() {
+    tauri::async_runtime::block_on(async {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = slots.clone().try_acquire_owned().unwrap();
+        assert!(admit(&slots, Duration::from_millis(20)).await.is_none());
+    });
+    let response = busy("tauri://localhost");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "tauri://localhost"
+    );
+    assert_eq!(
+        response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+    assert!(response
+        .headers()
+        .contains_key(header::CONTENT_SECURITY_POLICY));
+    let refused = status_only(StatusCode::FORBIDDEN, None);
+    assert_eq!(refused.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 }
 
 fn request(path: &Path, method: Method) -> http::Request<Vec<u8>> {
@@ -304,4 +344,311 @@ fn pdf_alias_cannot_open_html_through_a_symlink() {
     let response = respond(&request(&alias, Method::GET), "tauri://localhost", |_| true);
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+}
+
+const HTML: &[u8] = b"<!DOCTYPE html><html><script>fetch('x')</script></html>";
+const PNG: &[u8] =
+    b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89";
+
+fn assert_inert(response: &http::Response<Vec<u8>>) {
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+    assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+}
+
+#[test]
+fn html_bytes_are_never_served_as_a_document_whatever_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in [
+        "notes.md",
+        "logo.png",
+        "README",
+        "page.html",
+        "clip.mp4",
+        "a.js",
+    ] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, HTML).unwrap();
+        let response = respond(&request(&path, Method::GET), "tauri://localhost", |_| true);
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        assert_inert(&response);
+        let head = respond(&request(&path, Method::HEAD), "tauri://localhost", |_| true);
+        assert_inert(&head);
+    }
+}
+
+#[test]
+fn image_media_and_pdf_keep_their_types_with_nosniff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = tmp.path().join("pic.png");
+    std::fs::write(&png, PNG).unwrap();
+    let response = respond(&request(&png, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+
+    let svg = tmp.path().join("pic.svg");
+    std::fs::write(
+        &svg,
+        b"<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>",
+    )
+    .unwrap();
+    let response = respond(&request(&svg, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+    assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+
+    let pdf = tmp.path().join("doc.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+    let response = respond(&request(&pdf, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+    assert_eq!(
+        response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+}
+
+#[test]
+fn a_png_named_file_holding_html_is_inert_even_for_a_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("evil.png");
+    std::fs::write(&path, HTML).unwrap();
+    let mut request = request(&path, Method::GET);
+    request
+        .headers_mut()
+        .insert(header::RANGE, HeaderValue::from_static("bytes=0-9"));
+    let ranged = respond(&request, "tauri://localhost", |_| true);
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_inert(&ranged);
+}
+
+#[test]
+fn a_path_outside_every_scope_is_refused_without_being_opened() {
+    use std::cell::Cell;
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("pic.png");
+    std::fs::write(&outside, PNG).unwrap();
+    let opened = Cell::new(false);
+    let response = respond_with(
+        &request(&outside, Method::GET),
+        "tauri://localhost",
+        |path| serves(path, false, false),
+        |_| {
+            opened.set(true);
+            true
+        },
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !opened.get(),
+        "the handle was never authorized, so never opened"
+    );
+
+    let dot = tmp.path().join(".ssh").join("id.png");
+    let response = respond_with(
+        &request(&dot, Method::GET),
+        "tauri://localhost",
+        |path| serves(path, false, true),
+        |_| {
+            opened.set(true);
+            true
+        },
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!opened.get());
+}
+
+#[test]
+fn parent_components_are_refused_before_the_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a").join("..").join("pic.png");
+    std::fs::create_dir(tmp.path().join("a")).unwrap();
+    std::fs::write(tmp.path().join("pic.png"), PNG).unwrap();
+    let response = respond_with(
+        &request(&path, Method::GET),
+        "tauri://localhost",
+        |_| true,
+        |_| true,
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn a_scoped_path_is_still_judged_again_on_the_opened_handle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("pic.png");
+    std::fs::write(&file, PNG).unwrap();
+    let response = respond_with(
+        &request(&file, Method::GET),
+        "tauri://localhost",
+        |_| true,
+        |_| false,
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn only_the_current_page_of_the_window_may_ask() {
+    let pages = NetworkPages::default();
+    assert!(
+        !page_admits(&pages, "main", Some("access=1&t=abc")),
+        "no page"
+    );
+    pages.begin("main", || {}).unwrap();
+    assert!(
+        !page_admits(&pages, "main", Some("t=abc")),
+        "not delivered yet"
+    );
+    let token = pages.finish("main").unwrap();
+    assert!(page_admits(
+        &pages,
+        "main",
+        Some(&format!("access=1&t={token}"))
+    ));
+    assert!(page_admits(
+        &pages,
+        "main",
+        Some(&format!("t={token}&access=0"))
+    ));
+    assert!(!page_admits(&pages, "main", None), "a frame with no token");
+    assert!(!page_admits(&pages, "main", Some("access=1")));
+    assert!(!page_admits(&pages, "main", Some("t=")));
+    assert!(!page_admits(&pages, "main", Some("t=guess")));
+    assert!(
+        !page_admits(&pages, "w-2", Some(&format!("t={token}"))),
+        "another window"
+    );
+    pages.begin("main", || {}).unwrap();
+    assert!(
+        !page_admits(&pages, "main", Some(&format!("t={token}"))),
+        "reloaded"
+    );
+}
+
+#[test]
+fn the_apps_own_state_is_never_a_preview_whatever_the_settings() {
+    let store = Path::new("/home/me/.config/app/oarlock-spaces.json");
+    let plain = Path::new("/home/me/Library/Application Support/app/project-trust.json");
+    for path in [store, plain] {
+        assert!(
+            !serves_file(path, true, true, true),
+            "granted and all folders"
+        );
+        assert!(!serves_file(path, true, false, true));
+    }
+    assert!(
+        serves_file(plain, false, false, true),
+        "the same name elsewhere"
+    );
+    assert!(serves_file(store, false, true, false));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_file_reached_through_a_link_is_served_by_the_production_judgements() {
+    use crate::modules::asset_scope::Access;
+    let tmp = tempfile::Builder::new()
+        .prefix("oarlock-link-")
+        .tempdir()
+        .unwrap();
+    let real = std::fs::canonicalize(tmp.path()).unwrap();
+    let project = real.join("volume").join("proj");
+    std::fs::create_dir_all(project.join("docs")).unwrap();
+    std::fs::write(project.join("docs").join("pic.png"), PNG).unwrap();
+    std::fs::write(real.join("outside.png"), PNG).unwrap();
+    let link = real.join("code");
+    std::os::unix::fs::symlink(real.join("volume"), &link).unwrap();
+    let access = Access::new(vec![], true);
+    access.grant_root(&link.join("proj"));
+    let ask = |path: &Path, all: bool| {
+        respond_with(
+            &request(path, Method::GET),
+            "tauri://localhost",
+            |named| may_open(Some(&access), named, all),
+            |opened| serves_opened(Some(&access), opened, all),
+        )
+    };
+    let spelled = link.join("proj").join("docs").join("pic.png");
+    assert_eq!(
+        ask(&spelled, false).status(),
+        StatusCode::OK,
+        "through the link"
+    );
+    assert_eq!(
+        ask(&project.join("docs").join("pic.png"), false).status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ask(&real.join("outside.png"), false).status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ask(
+            &link.join("proj").join("..").join("..").join("outside.png"),
+            false
+        )
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ask(&real.join("outside.png"), true).status(),
+        StatusCode::OK
+    );
+    let nobody = respond_with(
+        &request(&spelled, Method::GET),
+        "tauri://localhost",
+        |named| may_open(None, named, true),
+        |opened| serves_opened(None, opened, true),
+    );
+    assert_eq!(
+        nobody.status(),
+        StatusCode::FORBIDDEN,
+        "no asset state, no previews"
+    );
+}
+
+#[test]
+fn a_granted_font_face_is_served_as_a_font_and_nothing_beside_it() {
+    use crate::modules::asset_scope::Access;
+    let tmp = tempfile::Builder::new()
+        .prefix("oarlock-font-")
+        .tempdir()
+        .unwrap();
+    let dir = std::fs::canonicalize(tmp.path()).unwrap();
+    let face = dir.join("Mono.woff2");
+    std::fs::write(&face, b"wOF2\0\x01\0\0\0\0\0\0").unwrap();
+    std::fs::write(dir.join("Other.woff2"), b"wOF2\0\x01\0\0\0\0\0\0").unwrap();
+    let access = Access::new(vec![], true);
+    access.grant_font(&face);
+    let ask = |path: &Path| {
+        respond_with(
+            &request(path, Method::GET),
+            "tauri://localhost",
+            |named| may_open(Some(&access), named, false),
+            |opened| serves_opened(Some(&access), opened, false),
+        )
+    };
+    let served = ask(&face);
+    assert_eq!(served.status(), StatusCode::OK);
+    assert!(served.headers()[header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .contains("font"));
+    assert_eq!(
+        ask(&dir.join("Other.woff2")).status(),
+        StatusCode::FORBIDDEN
+    );
 }

@@ -97,18 +97,59 @@ beforeEach(() => {
   fake.openExternal.mockReset();
 });
 
-it("offers an external open action after a local image cannot be previewed", () => {
-  fake.localUrl = "oarlock-asset://large";
+type Img = ReactElement<{ src?: string; onError: (event: never) => void }>;
+const localProps = { src: "large.png", "data-local-path": "/repo/large.png" };
+
+function renderLocal() {
   fake.index = 0;
-  const image = MarkdownImage({ src: "large.png", "data-local-path": "/repo/large.png" }) as ReactElement<{ onError: (event: never) => void }>;
-  image.props.onError({} as never);
-  fake.index = 0;
-  const notice = MarkdownImage({ src: "large.png", "data-local-path": "/repo/large.png" }) as ReactElement<{ children: ReactElement[] }>;
-  expect(notice.type).toBe("span");
-  const button = notice.props.children.find((child) => typeof child === "object" && child?.type === "button") as ReactElement<{ onClick: () => void }>;
-  button.props.onClick();
-  expect(fake.openExternal).toHaveBeenCalledWith("/repo/large.png", { kind: "local" });
+  const element = MarkdownImage(localProps);
+  for (const effect of fake.effects.splice(0)) effect();
+  return element as Img | null;
+}
+
+it("asks for a refused local image again, further apart each time, and recovers", () => {
+  vi.useFakeTimers();
+  fake.localUrl = "oarlock-asset://img?access=0&t=p";
+  const first = renderLocal();
+  expect(first?.props.src).toBe("oarlock-asset://img?access=0&t=p");
+  first?.props.onError({} as never);
+  expect(renderLocal()).toBeNull();
+  vi.advanceTimersByTime(399);
+  expect(renderLocal()).toBeNull();
+  vi.advanceTimersByTime(1);
+  const second = renderLocal();
+  expect(second?.props.src).toBe("oarlock-asset://img?access=0&t=p&r=1");
+  second?.props.onError({} as never);
+  expect(renderLocal()).toBeNull();
+  vi.advanceTimersByTime(1200);
+  expect(renderLocal()?.props.src).toBe("oarlock-asset://img?access=0&t=p&r=2");
+  vi.useRealTimers();
 });
+
+it("keeps a local image failure after the retries and offers to open it externally", () => {
+  vi.useFakeTimers();
+  fake.localUrl = "oarlock-asset://large";
+  for (const delay of [400, 1200, 3000]) {
+    renderLocal()?.props.onError({} as never);
+    expect(renderLocal()).toBeNull();
+    vi.advanceTimersByTime(delay);
+  }
+  renderLocal()?.props.onError({} as never);
+  fake.index = 0;
+  const notice = MarkdownImage(localProps) as ReactElement<{
+    children: ReactElement[];
+  }>;
+  expect(notice.type).toBe("span");
+  const button = notice.props.children.find(
+    (child) => typeof child === "object" && child?.type === "button",
+  ) as ReactElement<{ onClick: () => void }>;
+  button.props.onClick();
+  expect(fake.openExternal).toHaveBeenCalledWith("/repo/large.png", {
+    kind: "local",
+  });
+  vi.useRealTimers();
+});
+
 afterEach(() => {
   unmount();
   vi.restoreAllMocks();

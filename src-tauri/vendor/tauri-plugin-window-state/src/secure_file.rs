@@ -2,8 +2,8 @@
 use std::{io, path::Path};
 
 #[cfg(unix)]
-fn open(root: &Path, path: &Path, write: bool) -> io::Result<std::fs::File> {
-    use std::{ffi::CString, fs::{self, File, OpenOptions}, os::{fd::{AsRawFd, FromRawFd}, unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}}}, path::Component};
+fn open_dir(root: &Path, path: &Path, write: bool) -> io::Result<(std::fs::File, std::ffi::CString)> {
+    use std::{ffi::CString, fs::{self, File, OpenOptions}, os::{fd::{AsRawFd, FromRawFd}, unix::{ffi::OsStrExt, fs::OpenOptionsExt}}, path::Component};
     let relative = path.strip_prefix(root).map_err(|_| io::Error::other("Store lies outside its data directory"))?;
     let parent = relative.parent().ok_or_else(|| io::Error::other("Store has no parent"))?;
     let name = CString::new(path.file_name().ok_or_else(|| io::Error::other("Store has no name"))?.as_bytes())
@@ -25,6 +25,13 @@ fn open(root: &Path, path: &Path, write: bool) -> io::Result<std::fs::File> {
         if fd < 0 { return Err(io::Error::last_os_error()); }
         dir = unsafe { File::from_raw_fd(fd) };
     }
+    Ok((dir, name))
+}
+
+#[cfg(unix)]
+fn open(root: &Path, path: &Path, write: bool) -> io::Result<std::fs::File> {
+    use std::{fs::File, os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt}};
+    let (dir, name) = open_dir(root, path, write)?;
     let flags = if write { libc::O_WRONLY } else { libc::O_RDONLY } | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
     let mut fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 && write && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
@@ -60,11 +67,86 @@ pub fn read(root: &Path, path: &Path) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Removes the staging files an earlier run of the app left beside `name`, once per store and
+/// run, so a crash never keeps a folder from being removed. Only the exact names this module
+/// makes (`.<name>.<pid>.<n>.tmp`) of another process are touched.
+#[cfg(unix)]
+fn sweep_stale(dir: &std::fs::File, path: &Path, name: &std::ffi::CStr) {
+    use std::{collections::HashSet, os::fd::AsRawFd, sync::{Mutex, PoisonError}};
+    static SWEPT: Mutex<Option<HashSet<std::path::PathBuf>>> = Mutex::new(None);
+    if !SWEPT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(HashSet::new)
+        .insert(path.to_path_buf())
+    {
+        return;
+    }
+    let Some(parent) = path.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let prefix = format!(".{}.", name.to_string_lossy());
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = file.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".tmp")) else { continue };
+        let mut parts = rest.split('.');
+        let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) else { continue };
+        if pid.parse::<u32>().is_err() || n.parse::<u64>().is_err() || pid == std::process::id().to_string() {
+            continue;
+        }
+        if let Ok(entry_name) = std::ffi::CString::new(file) {
+            unsafe { libc::unlinkat(dir.as_raw_fd(), entry_name.as_ptr(), 0) };
+        }
+    }
+}
+
+/// Replaces the store by staging the bytes in a private file beside it, flushing them and
+/// renaming over the old entry, so a crash leaves the old or the new file, never a cut one.
+/// A link or a hard-linked store is refused, never written through.
+#[cfg(unix)]
 pub fn write(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    let mut file = open(root, path, true)?;
-    file.set_len(0)?;
-    file.write_all(bytes)
+    use std::{fs::File, io::Write, os::fd::{AsRawFd, FromRawFd}, sync::atomic::{AtomicU64, Ordering}};
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    let (dir, name) = open_dir(root, path, true)?;
+    let mut entry = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let found = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), entry.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } == 0;
+    if found {
+        let entry = unsafe { entry.assume_init() };
+        if entry.st_mode & libc::S_IFMT != libc::S_IFREG || entry.st_nlink != 1 {
+            return Err(io::Error::other("Store must be a regular file with no hard-link aliases"));
+        }
+    } else if io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
+        return Err(io::Error::last_os_error());
+    }
+    sweep_stale(&dir, path, &name);
+    let staged = std::ffi::CString::new(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ))
+    .map_err(|_| io::Error::other("Invalid store name"))?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), staged.as_ptr(), flags, 0o600) };
+    if fd < 0 { return Err(io::Error::last_os_error()); }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let published = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if unsafe { libc::renameat(dir.as_raw_fd(), staged.as_ptr(), dir.as_raw_fd(), name.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if published.is_err() {
+        unsafe { libc::unlinkat(dir.as_raw_fd(), staged.as_ptr(), 0) };
+        return published;
+    }
+    dir.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn write(_: &Path, _: &Path, _: &[u8]) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Safe store access is unavailable on this platform"))
 }
 
 #[cfg(all(test, unix))]
@@ -110,6 +192,79 @@ mod tests {
         let normal = data.join("normal/nested/store.json");
         write(&data, &normal, b"new").unwrap();
         assert_eq!(read(&data, &normal).unwrap(), b"new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_whole_and_leaves_no_staging_file() {
+        use std::io::Read;
+        let root = std::env::temp_dir().join(format!("oarlock-atomic-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let target = root.join("oarlock-spaces.json");
+        write(&root, &target, b"first").unwrap();
+        let mut reader = fs::File::open(&target).unwrap();
+        write(&root, &target, b"second, and longer").unwrap();
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "first", "a reader of the old file is not cut by the save");
+        assert_eq!(read(&root, &target).unwrap(), b"second, and longer");
+        let names: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["oarlock-spaces.json"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_old_file_and_removes_its_staging_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("oarlock-failed-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let target = root.join("store.json");
+        write(&root, &target, b"kept").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = write(&root, &target, b"lost");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        if failed.is_ok() {
+            // Running as a user that ignores directory permissions (root): nothing to prove.
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"kept");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_first_save_removes_staging_files_a_crashed_run_left() {
+        let root = std::env::temp_dir().join(format!("oarlock-sweep-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let target = root.join("store.json");
+        let stale = root.join(".store.json.1.7.tmp");
+        let mine = root.join(format!(".store.json.{}.9.tmp", std::process::id()));
+        let other = root.join(".other.json.1.7.tmp");
+        let odd = root.join(".store.json.x.7.tmp");
+        for file in [&stale, &mine, &other, &odd] {
+            fs::write(file, b"left").unwrap();
+        }
+        write(&root, &target, b"new").unwrap();
+        assert!(!stale.exists());
+        assert!(mine.exists() && other.exists() && odd.exists(), "only this store's strays of another run");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_refuses_a_link_and_leaves_its_target_alone() {
+        let root = std::env::temp_dir().join(format!("oarlock-link-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let target = root.join("native.json");
+        fs::write(&target, b"original").unwrap();
+        let link = root.join("alias.json");
+        symlink(&target, &link).unwrap();
+        assert!(write(&root, &link, b"changed").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const core = vi.hoisted(() => ({
   invoke: vi.fn(async (): Promise<unknown> => []),
@@ -128,6 +128,12 @@ describe("declared faces", () => {
 });
 
 describe("feature families", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "window",
+      Object.assign(new EventTarget(), { __OARLOCK_NETWORK_PAGE__: "tok" }),
+    );
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -225,12 +231,12 @@ describe("feature families", () => {
     expect(faces).toEqual([
       {
         family: nerd,
-        source: 'url("asset://localhost/fonts/Nerd-Regular.ttf")',
+        source: 'url("asset://localhost/fonts/Nerd-Regular.ttf?access=0&t=tok")',
         descriptors: { weight: "400", style: "normal", stretch: "100%", featureSettings: settings },
       },
       {
         family: nerd,
-        source: 'url("asset://localhost/fonts/Nerd-BoldItalic.ttf")',
+        source: 'url("asset://localhost/fonts/Nerd-BoldItalic.ttf?access=0&t=tok")',
         descriptors: { weight: "700", style: "italic", stretch: "100%", featureSettings: settings },
       },
     ]);
@@ -286,7 +292,7 @@ describe("feature families", () => {
     expect(added).toEqual([
       {
         family: nerd,
-        source: 'url("asset://localhost/Users/me/Library/Fonts/Meslo-Regular.ttf")',
+        source: 'url("asset://localhost/Users/me/Library/Fonts/Meslo-Regular.ttf?access=0&t=tok")',
         descriptors: { weight: "400", style: "normal", stretch: "100%", featureSettings: "normal" },
       },
     ]);

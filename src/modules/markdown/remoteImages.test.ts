@@ -171,4 +171,77 @@ describe("RemoteImageCache", () => {
     active.release();
     expect(revoke).toHaveBeenCalledWith(await active.url);
   });
+
+  it("loads a limited number of images at once and starts the next as one ends", async () => {
+    const finish: (() => void)[] = [];
+    const load = vi.fn(
+      (url: string) =>
+        new Promise<Blob>((resolve) => {
+          finish.push(() => resolve(new Blob([url])));
+        }),
+    );
+    let n = 0;
+    const cache = new RemoteImageCache(load, () => `blob:${++n}`, vi.fn(), 2, 1e9, 2);
+    const leases = ["a", "b", "c", "d"].map((url) => cache.acquire(url));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(load.mock.calls.map((call) => call[0])).toEqual(["a", "b"]);
+    finish[0]();
+    await leases[0].url;
+    await Promise.resolve();
+    expect(load.mock.calls.map((call) => call[0])).toEqual(["a", "b", "c"]);
+    finish[1]();
+    await leases[1].url;
+    await Promise.resolve();
+    expect(load.mock.calls.map((call) => call[0])).toEqual(["a", "b", "c", "d"]);
+    finish[2]();
+    finish[3]();
+    await Promise.all(leases.map((lease) => lease.url));
+  });
+
+  it("never starts an image whose consumer left the queue", async () => {
+    const finish: (() => void)[] = [];
+    const load = vi.fn(
+      (url: string) =>
+        new Promise<Blob>((resolve) => {
+          finish.push(() => resolve(new Blob([url])));
+        }),
+    );
+    const cache = new RemoteImageCache(load, () => "blob:x", vi.fn(), 2, 1e9, 1);
+    const first = cache.acquire("a");
+    const queued = cache.acquire("b");
+    const later = cache.acquire("c");
+    queued.url.catch(() => {});
+    await Promise.resolve();
+    await Promise.resolve();
+    queued.release();
+    finish[0]();
+    await first.url;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(load.mock.calls.map((call) => call[0])).toEqual(["a", "c"]);
+    finish[1]();
+    await later.url;
+  });
+
+  it("keeps a README's fifty badges from one host within the window's image budget", async () => {
+    let running = 0;
+    let peak = 0;
+    const load = vi.fn(async (url: string) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      running--;
+      return new Blob([url]);
+    });
+    let n = 0;
+    const cache = new RemoteImageCache(load, () => `blob:${++n}`, vi.fn());
+    const leases = Array.from({ length: 50 }, (_, i) =>
+      cache.acquire(`https://img.shields.io/badge/${i}`),
+    );
+    const urls = await Promise.all(leases.map((lease) => lease.url));
+    expect(urls).toHaveLength(50);
+    expect(load).toHaveBeenCalledTimes(50);
+    expect(peak).toBeLessThanOrEqual(12);
+  });
 });

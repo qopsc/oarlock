@@ -1,6 +1,8 @@
 import { useOwnedWorkspace } from "./owner";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { assetSrc } from "./assetSrc";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { networkPage } from "@/lib/networkPage";
 import { useAllFolders } from "./allFolders";
 import {
   currentWorkspaceEnv,
@@ -8,15 +10,20 @@ import {
   workspaceScopeKey,
 } from "./env";
 
-/**
- * The backend's guarded scheme checks scope and read limits on every request,
- * preserves the asset scope's dot-folder rule, and validates PDF content.
- */
-const ALL_FOLDERS_SCHEME = "oarlock-asset";
+type PageWindow = Window & { __OARLOCK_NETWORK_PAGE__?: string };
 
-/** A host path as a URL the webview loads it from. */
-function assetSrc(hostPath: string, allFolders: boolean): string {
-  return `${convertFileSrc(hostPath, ALL_FOLDERS_SCHEME)}?access=${allFolders ? 1 : 0}`;
+/**
+ * The page generation native delivers once the document has loaded. The
+ * guarded scheme refuses a URL without it, so a site framed in the preview
+ * cannot ask for files by navigating to one.
+ */
+function pageToken(): string | null {
+  return (window as PageWindow).__OARLOCK_NETWORK_PAGE__ || null;
+}
+
+function subscribePageToken(notify: () => void): () => void {
+  window.addEventListener("oarlock:network-page", notify);
+  return () => window.removeEventListener("oarlock:network-page", notify);
 }
 
 /**
@@ -28,30 +35,39 @@ export async function workspaceAssetUrl(
   path: string,
   workspace: WorkspaceEnv = currentWorkspaceEnv(),
   allFolders = false,
+  signal: AbortSignal = new AbortController().signal,
 ): Promise<string> {
-  if (workspace.kind !== "wsl") return assetSrc(path, allFolders);
+  const token = await networkPage(signal);
+  if (workspace.kind !== "wsl") return assetSrc(path, allFolders, token);
   const host = await invoke<string>("fs_host_path", { path, workspace });
-  return assetSrc(host, allFolders);
+  return assetSrc(host, allFolders, token);
 }
 
 /**
- * `workspaceAssetUrl` for render: null until a WSL path is mapped. Follows
- * "Allow the app to access all folders", so a change reloads previews and
- * the guarded scheme checks the updated access setting.
+ * `workspaceAssetUrl` for render: null until the page generation arrives and,
+ * for a WSL path, until it is mapped. Follows "Allow the app to access all
+ * folders", so a change reloads previews and the guarded scheme checks the
+ * updated access setting.
  */
 export function useWorkspaceAssetUrl(path: string | null): string | null {
   const workspace = useOwnedWorkspace();
   const allFolders = useAllFolders((s) => s.app);
+  const token = useSyncExternalStore(
+    subscribePageToken,
+    pageToken,
+    pageToken,
+  );
   const key =
     path === null
       ? null
-      : `${workspaceScopeKey(workspace)}\0${allFolders}\0${path}`;
+      : `${workspaceScopeKey(workspace)}\0${allFolders}\0${token}\0${path}`;
   const [mapped, setMapped] = useState<{ key: string; url: string } | null>(
     null,
   );
 
   useEffect(() => {
-    if (path === null || key === null || workspace.kind !== "wsl") return;
+    if (path === null || key === null || token === null) return;
+    if (workspace.kind !== "wsl") return;
     let cancelled = false;
     workspaceAssetUrl(path, workspace, allFolders).then(
       (url) => {
@@ -62,9 +78,9 @@ export function useWorkspaceAssetUrl(path: string | null): string | null {
     return () => {
       cancelled = true;
     };
-  }, [path, key, workspace, allFolders]);
+  }, [path, key, token, workspace, allFolders]);
 
-  if (path === null) return null;
-  if (workspace.kind !== "wsl") return assetSrc(path, allFolders);
+  if (path === null || token === null) return null;
+  if (workspace.kind !== "wsl") return assetSrc(path, allFolders, token);
   return mapped?.key === key ? mapped.url : null;
 }

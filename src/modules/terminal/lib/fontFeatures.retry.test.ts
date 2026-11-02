@@ -6,7 +6,7 @@ import { subscribeFontFeatures, withFontFeatures } from "./fontFeatures";
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 it("retries a failed installed-font lookup after returning to the window", async () => {
   vi.useFakeTimers();
-  const window = new EventTarget();
+  const window = Object.assign(new EventTarget(), { __OARLOCK_NETWORK_PAGE__: "tok" });
   vi.stubGlobal("window", window);
   vi.stubGlobal("FontFace", class {});
   vi.stubGlobal("document", { baseURI: "https://app.test/", styleSheets: [], fonts: { add: () => undefined } });

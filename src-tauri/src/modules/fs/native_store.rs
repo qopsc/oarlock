@@ -61,12 +61,23 @@ fn write_with_policy(
     })
 }
 
-const NATIVE_FILES: &[&str] = &[
+/// Every store file the backend owns, which no workspace write may touch.
+pub(crate) const NATIVE_FILES: &[&str] = &[
     "oarlock-preferences.json", "oarlock-settings.json", "oarlock-themes.json",
     "oarlock-custom-themes.json", "oarlock-endpoints.json", "oarlock-mcp.json",
     "project-trust.json", "oarlock-windows.json", "oarlock-spaces.json", "skills-state.json",
     "oarlock-ai-sessions.json", "oarlock-ai-snippets.json", "oarlock-ai-todos.json",
     "oarlock-ai-agents.json", "oarlock-subagents.json",
+    "oarlock-ai-sessions.before-message-files.json",
+    // The keychain fallback file; Linux keeps it in the folder the store plugin resolves.
+    "secrets.json",
+];
+
+/// The members of `NATIVE_FILES` the page still opens through the store plugin (`STORE_PATH` in
+/// `src/`); the plugin wrapper refuses every other one.
+pub(crate) const PAGE_OPENED_FILES: &[&str] = &[
+    "oarlock-spaces.json", "oarlock-ai-sessions.json", "oarlock-ai-snippets.json",
+    "oarlock-ai-todos.json", "oarlock-ai-agents.json",
 ];
 
 /// The native stores and store trees a workspace write must not reach, resolved from the app's
