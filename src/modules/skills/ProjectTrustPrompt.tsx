@@ -241,8 +241,9 @@ function MemoryPreview({ item }: { item: TrustItem }) {
   );
 }
 
-/** A server's detail is its environment, one line each and never clipped, then the command
- *  line or URL, which may be clamped: a long command must not push the environment out of view. */
+/** A server's detail is its environment, one line each, then the command line or URL. Nothing
+ *  is clipped: the approving user must see a long quoted argument to its end, and the list
+ *  scrolls. */
 function EntryDetail({ detail }: { detail: string }) {
   if (!detail) return null;
   const lines = detail.split("\n");
@@ -254,7 +255,7 @@ function EntryDetail({ detail }: { detail: string }) {
           {lines.join("\n")}
         </span>
       ) : null}
-      <span className="line-clamp-2 text-[10.5px] text-muted-foreground">
+      <span className="whitespace-pre-wrap break-all text-[10.5px] text-muted-foreground">
         {command}
       </span>
     </>
