@@ -366,7 +366,7 @@ image on the clipboard (PNG, JPEG, GIF first frame and WebP decoded natively
 under limits), its text written instead should a supported image not decode.
 Unsupported and oversized images show a refusal. Files dragged over a pane whose program registered for drops (Kitty
 OSC 72) go to the program as a copy, offered as `text/uri-list` and
-`text/plain`; elsewhere a drop inserts the paths quoted for the pane's own shell (POSIX, fish, PowerShell or cmd literal syntax), only when the command bar has a known argument boundary and the native check confirms the pane's shell (its launched executable and sole foreground process group; a WSL pane's paths are translated with `wslpath`), and is otherwise refused with a visible notice.
+`text/plain`; elsewhere a drop is pasted as the paths quoted for the shell the pane launched (POSIX, fish, PowerShell or cmd literal syntax, `quoteShellPath`), as one bracketed paste in input order through a reserved input slot (`terminal/lib/shellPathDrop.ts`), and is refused with a visible notice only when a program other than the shell owns the foreground (`leafShellAtPrompt`), the shell is not a recognized one, or the paths cannot be quoted for it. Typing or focus changes while the drop is prepared do not cancel it (`dropOwnership.ts`). A block tab at its prompt inserts at the command bar's cursor instead, and only at a known argument boundary. Host paths (OS or explorer drops) reach a WSL pane as `/mnt/<drive>/...`; paths from another environment, and host paths with no drive, are refused. A WSL pane cannot be asked about its foreground (`pty_has_foreground_job` sees only the Windows side), so it accepts a drop only after shell integration reported a prompt for the current shell (OSC 133 A seen since spawn) and no command is running; without integration it refuses.
 
 The adapted Ghostty revision is pinned in `packages/ghostty-core/adapted/UPSTREAM.md`.
 Both SIMD and scalar artifacts are shipped; the loader fetches only the variant
@@ -519,7 +519,7 @@ PTY shells are bootstrapped via injected init scripts in `src-tauri/src/modules/
 
 `pty/shell_init.rs` is split into `#[cfg(unix)]` / `#[cfg(windows)]` modules - keep new platform-specific code in the right cfg arm.
 
-Shells advertise `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=oarlock` and `TERM_PROGRAM_VERSION=<app version>` (the XTVERSION reply is `oarlock <version>`; WSL gets them through `WSLENV`). The identity of whatever terminal launched Oarlock (Ghostty, iTerm2, kitty, WezTerm, VS Code, tmux, a parent Oarlock, ...) is removed first by the pure `pty/terminal_env.rs`; user configuration never is. A non-UTF-8 `LC_ALL` is left as the user set it (with a logged warning); `LC_CTYPE` or `LANG` get a UTF-8 locale when they are the effective setting. Details in `docs/architecture/pty-shell-integration.md`.
+Shells advertise `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=oarlock` and `TERM_PROGRAM_VERSION=<app version>` (the XTVERSION reply is `oarlock <version>`; WSL gets them through `WSLENV`). The shell's quoting dialect (`posix`, `fish`, `powershell`, `cmd`) is chosen from the launched executable once at spawn (`pty/shell_dialect.rs`; for WSL from the chosen Linux shell's name) and read by the page through `pty_shell_dialect` for dropped paths, the breadcrumb `cd` and path completion, cached per pty; nothing verifies the process per drop. The identity of whatever terminal launched Oarlock (Ghostty, iTerm2, kitty, WezTerm, VS Code, tmux, a parent Oarlock, ...) is removed first by the pure `pty/terminal_env.rs`; user configuration never is. A non-UTF-8 `LC_ALL` is left as the user set it (with a logged warning); `LC_CTYPE` or `LANG` get a UTF-8 locale when they are the effective setting. Details in `docs/architecture/pty-shell-integration.md`.
 
 ConPTY on Windows requires `CONPTY_LIFECYCLE_LOCK` (Mutex) around `openpty + spawn_command` in `session.rs`. Concurrent spawns leave one of the resulting PTYs with a stalled output pipe. Don't remove the lock without verifying first-tab stability under fast tab spam. The lock must never be held across anything that waits on the frontend: the waiter lets the reader overdraft the output queue (`close_pseudoconsole`) before taking the lock for `ClosePseudoConsole`, so a backlog the page has not acknowledged cannot stall other `pty_open` calls.
 
@@ -5381,7 +5381,9 @@ is not installed) in its worktree; the merged head was re-run by the merger, wit
 in the fix status of the review document. Windows and Linux were not run, and the Windows leg of
 the S-01 scope forbid list and the Windows-only lock change in `shell/background.rs` are untested.
 
-Deferred by decision, with no fix in these batches: O-01, O-06, O-08, O-09, O-10 and O-15
+Batch G restored OS file drops into plain terminals (O-06): paths are quoted for the shell dialect captured at spawn and pasted through the ordered input writer, refused only when a program other than the shell owns the foreground (a WSL pane needs a prompt reported by shell integration), and the per-drop native process verification of Review 98 is gone; `docs/reviews/pr-2-fixes/batch-G.md` records it.
+
+Deferred by decision, with no fix in these batches: O-01, O-08, O-09, O-10 and O-15
 (each proposes deleting a mechanism built on an earlier approved decision, which the owner deferred
 to a separate decision), O-07 (D-11 only adds a toast when a seal refuses a close; the quit barrier is
 unchanged), D-12 (its module is `cfg(target_os = "linux")` and only the Darwin target is installed

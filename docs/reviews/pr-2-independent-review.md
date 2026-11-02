@@ -738,8 +738,8 @@ locale name plus `.UTF-8` when that locale exists.
 **O-06** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `over-engineering`, `compat` ·
 `src/modules/terminal/ghostty/useGhosttyTerminalSession.ts:540-556`, `src/modules/terminal/lib/terminalSessionApi.ts:92`,
 `src-tauri/src/modules/pty/path_drop.rs` (296 lines), `src-tauri/src/modules/pty/path_drop/wsl.rs`
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in batch G (owner decision to restore plain-terminal drops); see
+`docs/reviews/pr-2-fixes/batch-G.md`
 
 `dropPathsIntoGhosttySession` requires `getMode() === "prompt"` and a `pathInsertion` capture
 that only the block-mode command bar registers. Plain terminals, the default tab kind, now show
