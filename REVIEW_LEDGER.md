@@ -4595,3 +4595,43 @@ R103/R242 validation: the full macOS native suite passed 1,578 library tests (fo
 R103 compatibility decision pending: the current guard in commit `a76bb18` visibly refuses SVG and other formats that macOS ImageIO cannot inspect, and animated backgrounds on Linux, although Oarlock previously accepted them. A decision is needed whether to accept these restrictions or preserve those formats through a stronger boundary. The user has been asked; the restrictions are not treated as approved. The work remains on the review branch and the PR remains a draft.
 
 R103 refactor validation after the interruption: the full macOS native suite passed 1,578 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,083 tests (two skipped), types passed and lint stayed at 80 warnings. All 10 unchanged focused image tests passed in a freshly rebuilt offline Linux container; two previously recorded unrelated Linux warnings remained.
+
+### Compatibility, data semantics and UI: revalidation (31 members)
+
+Tiers follow the user's impact order: data loss/corruption, wrong result, stuck or retained work, cosmetic. The table reflects current code; a source check is not a packaged-app reproduction. Windows/WSL and AI/MCP remain held as requested.
+
+| ID | Disposition | Evidence |
+| --- | --- | --- |
+| R001 | Open, Tier 2, dormant | The updater is disabled, but its Linux commands still name only x86-64 packages. Revalidate when enabling updates. |
+| R007 | Open, Tier 2 | The native macOS New Window and Close Tab items still use fixed accelerators outside the configurable accelerator map. |
+| R023 | Windows/WSL port | The mount translation is WSL-specific and outside this release. |
+| R032 | Windows/WSL port | The affected polling path is WSL-specific and outside this release. |
+| R043 | Open, Tier 2 | The safe search keymap is still higher precedence than the editor's Ctrl+G Go to Line binding on Linux; the Windows case is port work. |
+| R044 | Open, Tier 2 | The core package is now a tracked workspace package, but its declared types still refer to ignored `dist` files. A copy without `dist` reproduces TS2307 on both imports. The app's clean build has not been shown to fail. |
+| R048 | Open, Tier 2 | Current URI helpers turn `/repo/a\\b.rs` into `file:///repo/a/b.rs` and turn a localhost URI into a relative path. A direct helper probe reproduced both. |
+| R049 | Open, Tier 2 | Native shell-environment capture retains each shell's first result, including failure, while the UI offers redetection. |
+| R053 | Open, Tier 2 | Preset installation hints still offer macOS-specific commands on Linux. Windows guidance is port work. |
+| R055 | Open, Tier 2 | Status still converts invalid UTF-8 to an empty string. A disposable Linux repository with a non-UTF-8 filename produced invalid UTF-8 in real Git's status output; macOS refused creation of that filename. |
+| R056 | Open, Tier 2 | The shared path guard still refuses Unix filenames containing colons or control characters, although Git status can name them. |
+| R057 | Open, Tier 2 | `git_show_text` still discards the output truncation flag, and log parsing can consume a capped response as complete. No large-output reproduction was run in this pass. |
+| R063 | Open, Tier 2 | Source Control still changes backslashes into separators for grouping and opening. A direct tree helper probe placed Unix `a\\b.txt` under folder `a`. |
+| R072 | Open, Tier 2 | The shell locale check accepts any UTF-8 variable even if a higher-priority non-UTF-8 variable wins, and changes only `LANG`. |
+| R082 | Open, Tier 2 | A direct terminal-link helper probe changed POSIX `/repo/folder\\name/child.txt` into `/repo/folder/name/child.txt`. |
+| R086 | Closed; platform checks remain | AP002 binds completion to its terminal and workspace; existing ownership tests and real POSIX-shell checks are recorded in the depth checkpoint. Mounted GUI and Windows/WSL checks remain manual/port work. |
+| R093 | Open, Tier 2 | The optional WebGL shader path still does not check failed texture/framebuffer allocation or completeness. No driver-pressure reproduction was run. |
+| R095 | Open, Tier 2 | The terminal core still drops arbitrary leading reply bytes on overflow. The source confirms the behavior; no production burst reproduction is claimed. |
+| R112 | Open, Tier 2 | The Linux Nix install copies `usr/bin/oarlock` but not the declared `oarlock-cli` sidecar. No release payload was inspected in this pass. |
+| R113 | Open, Tier 2 | Manual release dispatch remains available on branches while release naming uses `github.ref_name`, and repair/manifest jobs are tag-gated. No release was dispatched. |
+| R116 | Open, Tier 2 | The benchmark export still applies the current working-tree diff in broad tracked files and links the current dependency tree despite describing a pristine revision. |
+| R118 | Open, Tier 2 | The IPC profiling harness still invokes obsolete watch removal and search request contracts. Its AI-specific profiling remains on hold. |
+| R122 | Open, Tier 2 | The shell-integration guide still says fish installs into the global `conf.d` directory, contrary to launch-only integration. |
+| R123 | Open, Tier 2 | The WebGL guide still says the terminals share one WASM instance; the current resource guide and implementation describe one instance per terminal. |
+| R171 | AI/MCP on hold | The affected text-window tool belongs to the held AI backend. |
+| R177 | AI/MCP on hold | The affected environment parsing belongs to MCP configuration. |
+| R187 | AI/MCP on hold | The affected tool-policy map belongs to MCP configuration. |
+| R191 | Open, Tier 2 | A failed Markdown refresh still returns the previous ready state without a stale/error indicator; an existing test asserts that behavior. |
+| R200 | Open, Tier 2 | The built-in Vim `:set` implementation still processes only `setArgs[0]`; a mounted-editor reproduction remains outstanding. |
+| R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
+| R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
+
+Counts: **1 closed; 24 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
