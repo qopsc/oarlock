@@ -170,6 +170,20 @@ it("window close retains the stored dirty guard when no live editor exists", asy
   expect(fake.close).not.toHaveBeenCalled();
   expect(fake.states[0]).toMatchObject({ dirtyEditors: 1 });
 });
+it("a close refused by another window's quit seal says so", async () => {
+  const { sealEditors, releaseEditors } = await import("@/modules/editor/lib/quitBarrier");
+  useAppCloseGuard({ current: [editor(1)] }, () => false);
+  for (const effect of fake.effects) effect();
+  expect(sealEditors("other-window-verification")).toBe(true);
+  try {
+    await fake.onClose?.({ preventDefault: vi.fn() });
+    await settle();
+    expect(fake.close).not.toHaveBeenCalled();
+    expect(fake.toast).toHaveBeenCalledWith("Can't close yet", expect.anything());
+  } finally {
+    releaseEditors("other-window-verification");
+  }
+});
 it("window close accepts a completed save before the dirty badge clears", async () => {
   useAppCloseGuard({ current: [editor(1, true)] }, () => false);
   for (const effect of fake.effects) effect();
