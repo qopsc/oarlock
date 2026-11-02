@@ -167,6 +167,24 @@ describe("menuShortcutPlan", () => {
     });
   });
 
+  it("matches the table the native menu is first built with", async () => {
+    const { readFileSync } = await import("node:fs");
+    const native = readFileSync("src-tauri/src/modules/app_menu.rs", "utf8");
+    const table = menuShortcutPlan({}, mac).accelerators;
+    for (const key of [
+      table.newWindow,
+      table.closeTab,
+      table.newTab,
+      table.nextTab,
+      table.previousTab,
+      table.commandPalette,
+      table.toggleAi,
+    ]) {
+      expect(native).toContain(`"${key}"`);
+    }
+    expect(native).toContain("Cmd+Digit{n}");
+  });
+
   it("follows the user's own bindings", () => {
     const { accelerators } = menuShortcutPlan(
       {

@@ -35,7 +35,28 @@ fn is_guarded_quit(id: &MenuId) -> bool {
 /// rest are AppKit's own items. The shortcut items get their keys once a
 /// window sends the user's bindings (`app_menu_set_shortcuts`).
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    build_with(app, &MenuAccelerators::default())
+    let defaults = macos_defaults();
+    let menu = build_with(app, &defaults)?;
+    *CARRIED.lock().unwrap_or_else(PoisonError::into_inner) = Some(defaults);
+    Ok(menu)
+}
+
+/// The keys the menu carries before any window has sent the user's bindings, so New Window
+/// and Close Tab have theirs from the first frame. `menuShortcuts.test.ts` ("gives the menu
+/// the macOS defaults") holds the same table and checks this file against it.
+fn macos_defaults() -> MenuAccelerators {
+    serde_json::from_value::<MenuAccelerators>(serde_json::json!({
+        "newWindow": "Cmd+Shift+KeyN",
+        "closeTab": "Cmd+KeyW",
+        "newTab": "Cmd+KeyT",
+        "selectTab": (1..=9).map(|n| format!("Cmd+Digit{n}")).collect::<Vec<_>>(),
+        "nextTab": "Ctrl+Tab",
+        "previousTab": "Ctrl+Shift+Tab",
+        "commandPalette": "Cmd+KeyP",
+        "toggleAi": "Cmd+KeyI",
+    }))
+    .map(MenuAccelerators::validated)
+    .unwrap_or_default()
 }
 
 /// An app shortcut's item: it runs in the window in front with the handler its
@@ -271,8 +292,25 @@ pub fn app_menu_set_shortcuts(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_guarded_quit, GUARDED_QUIT_MENU_ID};
+    use super::{is_guarded_quit, macos_defaults, GUARDED_QUIT_MENU_ID};
+    use crate::modules::menu_shortcuts::MenuShortcut;
     use tauri::menu::MenuId;
+
+    #[test]
+    fn the_menu_is_built_with_the_default_keys_before_any_page_sends_bindings() {
+        let defaults = macos_defaults();
+        assert_eq!(defaults.new_window(), Some("Cmd+Shift+KeyN"));
+        assert_eq!(defaults.close_tab(), Some("Cmd+KeyW"));
+        assert_eq!(defaults.of(MenuShortcut::NewTab), Some("Cmd+KeyT"));
+        assert_eq!(
+            defaults.of(MenuShortcut::SelectTab { tab: 9 }),
+            Some("Cmd+Digit9")
+        );
+        assert_eq!(defaults.of(MenuShortcut::NextTab), Some("Ctrl+Tab"));
+        assert_eq!(defaults.of(MenuShortcut::PreviousTab), Some("Ctrl+Shift+Tab"));
+        assert_eq!(defaults.of(MenuShortcut::CommandPalette), Some("Cmd+KeyP"));
+        assert_eq!(defaults.of(MenuShortcut::ToggleAi), Some("Cmd+KeyI"));
+    }
 
     #[test]
     fn only_guarded_quit_id_requests_window_close() {
