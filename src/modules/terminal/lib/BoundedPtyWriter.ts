@@ -25,7 +25,15 @@ const MAX_PENDING_ACTIONS = 256;
 /** Held-key repeats queue behind a reserved slot only up to this many. */
 const MAX_DEFERRED_REPEATS = 32;
 
-type PendingBytes = { kind: "bytes"; bytes: Uint8Array; reply: boolean; valid?: () => boolean; cancelled?: () => void };
+type PendingBytes = {
+  kind: "bytes";
+  bytes: Uint8Array;
+  reply: boolean;
+  valid?: () => boolean;
+  cancelled?: () => void;
+  /** Called once with whether the PTY took the bytes. */
+  settled?: (delivered: boolean) => void;
+};
 type PendingAction = {
   kind: "action";
   run: (() => void) | null;
@@ -53,6 +61,7 @@ export class BoundedPtyWriter {
   private actions = 0;
   private actionBytes = 0;
   private insertion: number | null = null;
+  private lastTaken: PendingBytes[] = [];
 
   /**
    * `onError` is for a PTY write that failed: the writer stops until
@@ -100,7 +109,10 @@ export class BoundedPtyWriter {
   }
 
   clear(): void {
-    for (const item of this.queue) if (item.kind === "action") this.retire(item);
+    for (const item of this.queue) {
+      if (item.kind === "action") this.retire(item);
+      else item.settled?.(false);
+    }
     this.queue.length = 0;
     this.inputBytes = 0;
     this.replyBytes = 0;
@@ -182,7 +194,13 @@ export class BoundedPtyWriter {
    * so a large answer goes through and a program that does not read its
    * input still cannot grow the queue without bound.
    */
-  enqueue(bytes: Uint8Array, reply = false, valid?: () => boolean, cancelled?: () => void): boolean {
+  enqueue(
+    bytes: Uint8Array,
+    reply = false,
+    valid?: () => boolean,
+    cancelled?: () => void,
+    settled?: (delivered: boolean) => void,
+  ): boolean {
     if (this.disposed || this.failed || bytes.byteLength === 0) return false;
     const queued = reply ? this.replyBytes : this.inputBytes + this.actionBytes;
     const limit = reply ? MAX_REPLY_BYTES : MAX_INPUT_UNIT_BYTES;
@@ -195,7 +213,7 @@ export class BoundedPtyWriter {
       }
       return false;
     }
-    this.insert({ kind: "bytes", bytes, reply, valid, cancelled });
+    this.insert({ kind: "bytes", bytes, reply, valid, cancelled, settled });
     if (reply) this.replyBytes += bytes.byteLength;
     else this.inputBytes += bytes.byteLength;
     void this.flush();
@@ -240,15 +258,19 @@ export class BoundedPtyWriter {
           this.queue.shift();
           if (first.reply) this.replyBytes -= first.bytes.byteLength;
           else this.inputBytes -= first.bytes.byteLength;
+          first.settled?.(false);
           try { first.cancelled?.(); } catch (error) { this.fail(error); return; }
           continue;
         }
         const pty = this.pty;
         const generation = this.generation;
         const batch = this.takeBatch();
+        const taken = this.lastTaken;
         try {
           await pty.write(batch);
+          for (const item of taken) item.settled?.(true);
         } catch (error) {
+          for (const item of taken) item.settled?.(false);
           if (generation !== this.generation) continue;
           this.fail(error);
           return;
@@ -278,6 +300,7 @@ export class BoundedPtyWriter {
 
     if (count === 0) count = 1;
     const taken = this.queue.splice(0, count) as PendingBytes[];
+    this.lastTaken = taken;
     for (const { bytes, reply } of taken) {
       if (reply) this.replyBytes -= bytes.byteLength;
       else this.inputBytes -= bytes.byteLength;

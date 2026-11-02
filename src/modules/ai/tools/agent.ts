@@ -1,8 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { useAgentStore } from "@/modules/agents/store/agentStore";
 import { useManagedAgentsStore } from "@/modules/agents/store/managedAgentsStore";
-import { captureGhosttyInputOwner } from "@/modules/terminal";
+import { captureGhosttyInputOwner, leafHasForegroundProcess } from "@/modules/terminal";
 import type { ToolContext } from "./context";
 
 // Claude Code's TUI treats a trailing CR in the same write chunk as the text
@@ -82,10 +81,12 @@ export function buildManagedAgentTools(ctx: ToolContext) {
         if (hasControlChars(oneLine)) {
           return { error: "instruction contains control characters" };
         }
-        if (!useAgentStore.getState().sessions[managed.leafId]) {
+        // The agent record goes stale in shells without OSC 133 integration,
+        // so what the PTY says about its foreground decides.
+        if (!(await leafHasForegroundProcess(managed.leafId))) {
           return {
             error:
-              "the agent in this terminal is not running (it may have exited); spawn a new one with spawn_coding_agent",
+              "the agent in this terminal is not running (its shell is at the prompt); spawn a new one with spawn_coding_agent",
           };
         }
         const owner = captureGhosttyInputOwner(managed.leafId);
@@ -94,10 +95,11 @@ export function buildManagedAgentTools(ctx: ToolContext) {
           return { error: "agent terminal is no longer available (closed?)" };
         }
         await new Promise((resolve) => setTimeout(resolve, SUBMIT_DELAY_MS));
-        if (!owner.active() || !owner.write("\r")) {
+        const stillRunning = owner.active() && (await leafHasForegroundProcess(managed.leafId));
+        if (!stillRunning || !(await owner.writeDelivered("\r"))) {
           return {
             error:
-              "the terminal changed after the instruction was typed, so it was typed but not submitted; ask the user to press Enter in the agent terminal or resend",
+              "the instruction was typed but not submitted because the terminal changed or the agent stopped; ask the user to check the agent terminal before sending anything else",
           };
         }
         store.bumpRound(managed.leafId);

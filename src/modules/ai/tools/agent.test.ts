@@ -21,11 +21,7 @@ const terminalMock = vi.hoisted(() => ({
   capture: vi.fn(),
   active: true,
 }));
-const armed = vi.hoisted(() => ({ sessions: {} as Record<number, unknown> }));
-
-vi.mock("@/modules/agents/store/agentStore", () => ({
-  useAgentStore: { getState: () => ({ sessions: armed.sessions }) },
-}));
+const foreground = vi.hoisted(() => ({ running: [true] as boolean[], calls: 0 }));
 
 vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
   useManagedAgentsStore: {
@@ -40,6 +36,10 @@ vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
 
 vi.mock("@/modules/terminal", () => ({
   captureGhosttyInputOwner: terminalMock.capture,
+  leafHasForegroundProcess: async () => {
+    const index = Math.min(foreground.calls++, foreground.running.length - 1);
+    return foreground.running[index];
+  },
 }));
 
 import { buildManagedAgentTools } from "./agent";
@@ -99,9 +99,11 @@ beforeEach(() => {
   terminalMock.capture.mockImplementation((leafId: number) => ({
     write: (text: string) => terminalMock.writeToSession(leafId, text),
     active: () => terminalMock.active,
+    writeDelivered: async (text: string) => terminalMock.writeToSession(leafId, text),
   }));
   terminalMock.active = true;
-  armed.sessions = { 3: { status: "waiting" } };
+  foreground.running = [true];
+  foreground.calls = 0;
 });
 
 describe("spawn_coding_agent", () => {
@@ -189,13 +191,46 @@ describe("send_to_agent", () => {
     expect(storeMock.bumpRound).not.toHaveBeenCalled();
   });
 
-  it("refuses to type into a terminal whose agent is not running", async () => {
+  it("refuses to type when the shell is at its prompt, whatever the agent record says", async () => {
     storeMock.getBySessionId.mockReturnValue(AGENT);
-    armed.sessions = {};
+    foreground.running = [false];
     const r = await run("send_to_agent", makeContext(), { instruction: "fix it" });
     expect(r.error).toContain("not running");
     expect(terminalMock.capture).not.toHaveBeenCalled();
     expect(terminalMock.writeToSession).not.toHaveBeenCalled();
+  });
+
+  it("does not press Enter when the agent exited while the instruction was typed", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    foreground.running = [true, false];
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain("typed but not submitted");
+    expect(r.error).not.toContain("resend");
+    expect(terminalMock.writeToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("types into an agent whose shell has no integration record", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(200);
+    expect((await pending).ok).toBe(true);
+  });
+
+  it("reports failure when the Enter is cancelled before delivery", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    terminalMock.capture.mockImplementation((leafId: number) => ({
+      write: (text: string) => terminalMock.writeToSession(leafId, text),
+      active: () => true,
+      writeDelivered: async () => false,
+    }));
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain("not submitted");
   });
 
   it("rejects an instruction with control characters", async () => {

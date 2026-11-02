@@ -200,7 +200,7 @@ it("still sends a paste the user confirms after the slot deadline window", async
   try {
     let answer!: (value: boolean) => void;
     const refused = vi.fn();
-    const { input, sent, writer, controller } = setup({
+    const { sent, writer, controller } = setup({
       confirmPaste: () => new Promise((resolve) => { answer = resolve; }),
     }, refused);
     controller.paste("echo one\necho two");

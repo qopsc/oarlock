@@ -192,6 +192,26 @@ describe("BoundedPtyWriter", () => {
     expect(writer.enqueue(new Uint8Array(40 * KiB * KiB), true)).toBe(true);
   });
 
+  it("settles a write once the PTY took it, or false when it is dropped", async () => {
+    const { pty, release } = stalledPty();
+    const writer = new BoundedPtyWriter(() => undefined);
+    writer.attach(pty);
+    const done = vi.fn();
+    writer.enqueue(Uint8Array.of(1), false, () => true, undefined, done);
+    await vi.waitFor(() => expect(pty.write).toHaveBeenCalled());
+    expect(done).not.toHaveBeenCalled();
+    release();
+    await vi.waitFor(() => expect(done).toHaveBeenCalledWith(true));
+    const dropped = vi.fn();
+    writer.enqueue(Uint8Array.of(2), false, () => false, undefined, dropped);
+    await vi.waitFor(() => expect(dropped).toHaveBeenCalledWith(false));
+    const cleared = vi.fn();
+    writer.detach();
+    writer.enqueue(Uint8Array.of(3), false, undefined, undefined, cleared);
+    writer.clear();
+    expect(cleared).toHaveBeenCalledWith(false);
+  });
+
   it("stays failed after a real write error until detached", async () => {
     const failed = vi.fn();
     const writer = new BoundedPtyWriter(failed);

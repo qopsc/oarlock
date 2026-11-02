@@ -438,9 +438,21 @@ export function captureGhosttyInputOwner(leafId: number) {
   const write = (data: string, valid: () => boolean = () => true) =>
     session.writer.enqueue(textEncoder.encode(data), false,
       () => owner.active() && valid(), cancelled);
+  /** Resolves true once the PTY took the bytes; false if refused, cancelled or failed. */
+  const writeDelivered = (data: string, valid: () => boolean = () => true) =>
+    new Promise<boolean>((resolve) => {
+      const queued = session.writer.enqueue(
+        textEncoder.encode(data), false,
+        () => owner.active() && valid(),
+        () => { cancelled(); resolve(false); },
+        resolve,
+      );
+      if (!queued) resolve(false);
+    });
   return {
     ...owner,
     write,
+    writeDelivered,
     schedule: (prepare: () => Promise<string>, valid: () => boolean = () => true) =>
       scheduleOwnedInput(session.writer, owner, prepare, valid, write, cancelled,
         (error) => toast.error("Could not send terminal input", { description: String(error) })),
