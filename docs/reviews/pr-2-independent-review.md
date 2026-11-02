@@ -34,7 +34,7 @@ and are scored in the claims table near the end; none was taken on trust.
 
 ## Summary
 
-The four security fixes hold their core promise on macOS: Git is launched through one guarded
+The findings below have been addressed on this branch (the batch notes are in `docs/reviews/pr-2-fixes/`); per-finding status follows each entry, and this summary describes the code as reviewed. The four security fixes hold their core promise on macOS: Git is launched through one guarded
 launcher with a fresh per-command preflight, remote URLs are read NUL-framed and refused on
 control characters, the forked store plugin opens its files directory-bound without following
 links, and the guarded preview scheme authorizes the handle it opened. Each fix has a hole next
@@ -68,6 +68,7 @@ to the fixed spot, and the data-loss work has one large gap that no revision mac
 **S-01** · High · ledger BLOCKER (same untrusted-content boundary as R240) · 8.0 · CONFIRMED ·
 `security` · `src-tauri/src/modules/asset_all_folders.rs:251`, `:334-339`, `src-tauri/src/modules/pty/gate.rs:92-94`,
 `src/modules/preview/PreviewPane.tsx:159-172`, `src-tauri/tauri.conf.json:31`
+Status: fixed in cec8d8a (batch B); test html_bytes_are_never_served_as_a_document_whatever_the_name
 
 The R240 fix sniffs content only when the requested extension is `.pdf`. Every other request is
 typed by `MimeType::parse`, whose fallback for an unknown extension is `text/html`
@@ -103,6 +104,8 @@ frame.
 **S-15** · High · ledger BLOCKER · 8.0 · CONFIRMED · `security` ·
 `src-tauri/src/modules/project_trust.rs:777-800`, `src-tauri/src/modules/fs/file.rs:329`, `src-tauri/src/modules/fs/mutate.rs:331`,
 `src/modules/mcp/lib/projectServers.ts:103-118`
+Status: fixed in 2c28542 (batch E); test
+the_ais_own_writes_ask_again_where_the_editors_keep_the_answer
 
 `keeping_trust` is called from `fs_write_file` and `fs_create_file` regardless of the command's
 `origin`. When the previous `.mcp.json` held nothing (absent, blank, no servers) the write is
@@ -127,6 +130,8 @@ Fix: skip `keeping_trust` for `Origin::Ai` on the `McpJson` and skills kinds (an
 
 **S-02** · High · ledger MAJOR · 7.5 · CONFIRMED · `over-engineering`, `compat` ·
 `src-tauri/src/modules/git/commit_guard.rs:50-59`, `:226`
+Status: fixed in e284cbf (batch A); test
+git_executable_refusal.rs::user_scope_lfs_signing_and_fsmonitor_settings_are_accepted
 
 `executable_setting` refuses `filter.*.clean/smudge/process`, `gpg.program`, `gpg.<format>.program`
 and `core.fsmonitor` in every scope, and `inspect_repo_origins` applies the table to user-wide
@@ -153,6 +158,8 @@ and `commit.gpgSign=false` invocation overrides for the rest.
 
 **D-01** · High · ledger MAJOR · 7.5 · CONFIRMED · `data-loss` · `src/app/App.tsx:1541-1551`,
 `src/modules/tabs/lib/useTabs.ts:955-974`, `:579-606`, `src/modules/spaces/SpaceSwitcher.tsx:335`, `:527-533`, `src/modules/spaces/lib/useSpaces.ts:103-110`
+Status: fixed in 1f96a5a (batch D); test useTabCloseGuards.revisions.test.ts "deleting a space with
+a dirty editor asks before it commits"
 
 `handleDeleteSpace` calls `useSpaces.remove`, which deletes the persisted space state, then
 `removeTabsForSpace`, which plans the removal of every tab in the space and disposes every
@@ -172,6 +179,7 @@ running terminals prompt, and call `remove` only after the user confirms.
 
 **D-14** · High · ledger MAJOR · 7.5 · CONFIRMED · `data-loss` · ledger: open as R169 ·
 `src/modules/ai/store/planStore.ts:66-98`, `src/modules/ai/tools/edit.ts:84-102`, `src-tauri/src/modules/fs/file.rs:304-345`
+Status: fixed in 2738438 (batch E); test planStore.test.ts "same-file edits and stale versions"
 
 In plan mode `edit` computes `proposedContent` from the file as it is on disk at the time of the
 call and enqueues it. `applyAll` later writes each queued `proposedContent` through
@@ -192,6 +200,8 @@ mismatch; apply same-file edits onto the running candidate instead of the origin
 **P-01** · High · ledger MAJOR · 7.5 · CONFIRMED · `data-loss`, `security` ·
 `packages/ghostty-core/adapted/wasm/src/oarlock.zig:993-997`, `:2437`, `:2792`, `packages/ghostty-core/lib/adapted/OarlockGhostty.ts:782-784`,
 `src/modules/terminal/lib/PtyOutputReceiver.ts:146-170`
+Status: fixed in 98dadfb (batch C); test AdaptedGhosttyProtocols.test.ts "drops the reply that does
+not fit, keeps whole replies and survives"
 
 Commit `8c91d28` replaced truncation of the reply queue with a `reply_overflow` flag. The flag
 is set when a parse slice's replies would exceed 256 KiB and is never cleared: the only writer
@@ -214,6 +224,7 @@ Fix: drop the offending reply and clear the flag at the end of `restty_write` or
 **P-02** · High · ledger MAJOR · 7.0 · CONFIRMED · `data-loss` ·
 `src/modules/terminal/lib/BoundedPtyWriter.ts:120-131`, `:146-151`, `src/modules/terminal/ghostty/input/GhosttyInputController.ts:313-333`, `:855-885`,
 `src-tauri/src/modules/pty/session.rs` (writer thread, unbounded `write_all`)
+Status: fixed in 6eb3ea9 (batch C); test BoundedPtyWriter.test.ts "refuses input past its budget"
 
 `enqueue` now calls `this.fail()` when the pending bytes would exceed 256 KiB; `failed` is sticky
 until `detach` (shell exit or respawn) and raises the persistent "Terminal input stopped.
@@ -235,6 +246,7 @@ reserve `fail()` for real `pty_write` errors.
 **D-02** · High · ledger MAJOR · 7.0 · CONFIRMED · `data-loss`, `compat` ·
 `src-tauri/src/modules/asset_all_folders.rs:36-37`, `:58-66`, `src/modules/markdown/MarkdownImage.tsx:88-107`,
 `src/modules/workspace/assetUrl.ts:12-19`
+Status: fixed in 61bc191 (batch B); test a_request_beyond_the_admission_slots_waits_for_one
 
 All workspace image, media and PDF previews now load through the guarded scheme. The handler
 admits at most 64 pending requests with `try_acquire_owned` and answers the rest with 503 and no
@@ -253,6 +265,7 @@ as retryable in `MarkdownImage` rather than latching it.
 
 **D-15** · High · ledger MAJOR · 7.0 · PLAUSIBLE (traced, not run) · `compat` ·
 `src/modules/editor/GitDiffPane.tsx:203`, `:219`, `src/modules/editor/lib/watchWorkingDiff.ts:59-78`, `src-tauri/src/modules/fs/watch.rs:725-733`
+Status: fixed in 96bb200 (batch D); test a_file_deleted_with_its_folder_is_reported_not_fatal
 
 The working-diff pane starts its reader only after `watch.ready` resolves, and `ready` calls
 `fs_watch_add` with the file's parent directory in `paths` and the file in `files`. Native
@@ -270,6 +283,7 @@ and load the diff before the watch settles.
 
 **D-16** · High · ledger MAJOR · 7.0 · PLAUSIBLE (traced, not run) · `compat` ·
 `src-tauri/src/modules/windows/restore.rs:38-44`, `:476-490`, `src-tauri/src/lib.rs:386-389`
+Status: fixed in 3787319 (batch D); test a_symlinked_data_directory_starts_and_adopts
 
 `windows::restore` runs on every launch, not only when a journal or adoption exists, and `run`
 begins with `pin_root`, which opens the app-data directory with `O_DIRECTORY | O_NOFOLLOW`. A
@@ -285,6 +299,8 @@ is recovery work to do.
 **D-22** · High · ledger MAJOR · 7.0 · CONFIRMED (traced; restore path not run) · `compat`, `data-loss` ·
 `src-tauri/src/modules/fs/watch.rs:500-507`, `:720-733`, `src/modules/explorer/lib/watch.ts:98-140`,
 `src/modules/editor/useEditorFileSync.ts:112-124`, `src/modules/editor/lib/fileWatchTargets.ts:17`
+Status: fixed in 612a69c (batch D); test
+failed_watch_preparation_names_the_directories_it_could_not_watch
 
 `prepare_dirs` now returns an error for any directory it cannot canonicalize, and `fs_watch_add`
 fails the whole batch. The editor file-sync client adds every open editor and Markdown tab's folder
@@ -306,6 +322,7 @@ or split the frontend batch per path on failure and notify only for paths that s
 
 **S-03** · Medium · ledger MAJOR · 5.5 · CONFIRMED · `security` · ledger: open as R216 ·
 `src-tauri/src/modules/store_scope.rs:111-126`, `src-tauri/src/modules/fs/native_store.rs:64-70`
+Status: fixed in 8f97b01 (batch B); test every_native_owned_file_is_refused_unless_the_page_opens_it
 
 The store wrapper refuses six file names; the native inventory used by the workspace write guard
 lists fifteen. `project-trust.json`, `skills-state.json`, `oarlock-windows.json`,
@@ -321,6 +338,7 @@ that the two cannot diverge (T-02).
 
 **S-04** · Medium · ledger MAJOR · 5.0 · CONFIRMED · `security` ·
 `src-tauri/vendor/tauri-plugin-store/src/lib.rs:148-175`, `src-tauri/src/modules/ai_subagents.rs:1`, `src-tauri/src/modules/ai_metadata.rs:107`
+Status: fixed in 7536024 (batch B); test grant_tests::a_webview_reaches_only_the_stores_it_opened
 
 Every rid command resolves `app.resources_table().get::<Store>(rid)` without checking which
 webview opened the store. Stores the backend opens receive small sequential ids, so a page can
@@ -334,6 +352,7 @@ move backend-only stores off the plugin.
 
 **S-05** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `security` · `src-tauri/src/modules/asset_all_folders.rs:235-244`,
 `:273-283`
+Status: fixed in 3afb85e (batch B); test a_path_outside_every_scope_is_refused_without_being_opened
 
 The handler opens the requested path first and authorizes the opened handle afterwards. The open
 follows symlinks and happens for any absolute path, so a request from a frame makes the process
@@ -348,6 +367,7 @@ opened handle as now.
 
 **S-06** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `security` · `src-tauri/src/modules/pty/gate.rs:92-94`,
 `src-tauri/src/modules/asset_all_folders.rs:71-82`
+Status: fixed in 493c253 (batch B); test only_the_current_page_of_the_window_may_ask
 
 `AllowedOrigins::check` returns the app origin for any request without an `Origin` header. The
 comment justifies this for the PTY scheme, where the token is the credential. The preview scheme
@@ -361,6 +381,8 @@ per-page token in the URL, as the PTY scheme has.
 
 **S-07** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `security` · `src-tauri/src/modules/git/operations.rs:213`,
 `src-tauri/src/modules/git/worktree.rs:503`, `src-tauri/src/modules/git/branches.rs:250`, `src-tauri/src/modules/git/commit_guard.rs:318-352`
+Status: fixed in 70dc926 (batch A); test
+process.rs::submodule_recursion_is_off_for_every_guarded_command
 
 The preflight inspects the superproject's config and hooks only. `status` passes
 `--ignore-submodules=none`, and `switch`, `pull`, `fetch`, `push` and `worktree add` recurse into
@@ -377,6 +399,7 @@ submodule.
 
 **S-16** · Medium · ledger MAJOR · 5.0 · CONFIRMED · `security` · `src-tauri/src/modules/fs/file.rs:304-345`,
 `src/modules/ai/lib/security.ts`, `src/modules/ai/tools/fs.ts`, `src/modules/ai/tools/edit.ts`
+Status: fixed in d432776 (batch E); test ai_gates_refuse_secret_paths_natively_and_app_gates_do_not
 
 `AGENTS.md` says the secret-path deny-list "applies on both read and write and is never
 bypassed". Natively, `fs_write_file` and `fs_create_dir` with `origin: "ai"` consult no deny-list;
@@ -391,6 +414,7 @@ and opened path for read, write, create and canonicalize.
 
 **S-17** · Medium · ledger MAJOR · 5.0 · CONFIRMED · `security` · `src/modules/ai/tools/tools.ts:103-105`,
 `src/modules/ai/tools/shell.ts:218-232`, `src-tauri/src/modules/shell/mod.rs:532-543`
+Status: fixed in 9187280 (batch E); test a_job_is_reachable_only_from_the_chat_that_started_it
 
 `bash_kill` and `bash_logs` are gated `none` and the job registry is process-wide, keyed by small
 sequential handles with no chat or window ownership. A model in chat B can stop or read chat A's
@@ -403,6 +427,7 @@ approvable.
 
 **S-18** · Medium · ledger MAJOR · 5.0 · CONFIRMED · `security` · `src-tauri/src/modules/mcp/project.rs:283-300`,
 `src-tauri/src/modules/mcp/mod.rs:258-286`, `src-tauri/src/modules/mcp/stdio.rs:244-249`
+Status: fixed in f30f72f (batch E); test a_project_server_cannot_set_a_variable_that_loads_code
 
 A project `.mcp.json` entry's `env` map is applied verbatim to the server process but never shown
 in the trust prompt, which lists the command line, URL and `${VAR}` names only. A benign-looking
@@ -416,6 +441,7 @@ Fix: show env names and values in `describe`; refuse loader variables (`DYLD_*`,
 
 **S-19** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `security` · `src-tauri/src/modules/fs/attachment.rs:180-205`,
 `:207-230`
+Status: fixed in 8a11211 (batch E); test only_a_path_the_picker_issued_can_authorize_and_only_once
 
 `ai_import_attachment` takes `picked: true` from the page and, when set, calls
 `registry.authorize_opened` on any absolute path before the `Origin::Ai` gate. The picker command
@@ -429,6 +455,7 @@ tokens per picked path.
 
 **S-20** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `security` · `src-tauri/src/modules/project_trust.rs:203-216`,
 `:1255-1315`, `src-tauri/src/modules/skills/mod.rs:614-640`, `:670-737`, `src-tauri/src/modules/mcp/project.rs:441-460`
+Status: fixed in 3a62735 (batch E); test a_root_the_registry_does_not_authorize_is_not_a_project
 
 `project_trust_status`, `project_trust_decide`, `skills_list/load/read_file` and
 `mcp_project_servers` take a page-supplied root with no workspace-registry gate, unlike
@@ -442,6 +469,7 @@ Fix: `authorized_existing(&project.real)` in the `resolve_project` callers.
 
 **S-21** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `security` · `src/modules/ai/lib/agent.ts:62`,
 `src/modules/ai/lib/endpointModels.ts:6`, `src-tauri/src/modules/net.rs:282`, `:98-114`, `src-tauri/src/modules/mcp/mod.rs:729`
+Status: fixed in 0a11e55 (batch E); test a_host_keeps_the_class_it_first_had
 
 Custom endpoint calls and model browsing pass `allowPrivateNetwork: true` from the page and the
 proxy honors it, whereas MCP derives `allow_private` natively from the configured host. A public
@@ -454,6 +482,8 @@ Fix: compute `allow_private` natively from the configured host for AI endpoints 
 
 **D-03** · Medium · ledger MAJOR · 5.0 · PLAUSIBLE (not reproduced with a power cut) · `data-loss` ·
 `src-tauri/src/modules/fs/destination.rs:163-185`, `src-tauri/src/modules/fs/private_staging.rs:318-331`
+Status: fixed in d1de502 (batch D); test
+the_folder_is_synced_after_the_rename_and_a_failed_sync_does_not_fail_the_save
 
 The document save path fsyncs the candidate's content, renames it over the destination, and
 returns. The parent directory is never synced, and on macOS `fsync` does not reach the platter
@@ -468,6 +498,8 @@ returning the new version.
 
 **D-04** · Medium · ledger MAJOR · 4.5 · PLAUSIBLE · `data-loss` · `src-tauri/src/modules/fs/document_save.rs:309`,
 `src-tauri/src/modules/preferences.rs:413-421`, `src/settings/sections/importPublication.ts:110-118`, `:136`
+Status: fixed in ef7333f (batch D); test
+a_committed_write_whose_version_cannot_be_read_is_still_a_success
 
 `write_checked` computes the returned version from the published handle after the rename; that
 `fstat` can fail after the commit point, so a committed write surfaces as an error. The preference
@@ -483,6 +515,7 @@ the wrapping; never delete a candidate on an ambiguous outcome.
 
 **D-05** · Medium · ledger MAJOR · 5.5 · CONFIRMED · `data-loss` · `src-tauri/src/modules/fs/reconcile.rs:85-101`,
 `:114-136`, `src/modules/editor/lib/documentMutations.ts:135-142`, `src/modules/editor/lib/recoveryTarget.ts:12-15`, `:34-37`, `src/app/App.tsx:931-938`
+Status: fixed in 2f475e1 (batch D); test ignored_folders_and_git_internals_are_not_walked
 
 When a versioned open document no longer resolves at its path, reconciliation walks every
 workspace root with ignore files disabled and hidden files included, under one shared limit of
@@ -503,6 +536,8 @@ and require identity for every binding.
 
 **D-06** · Medium · ledger MAJOR · 4.5 · CONFIRMED (occurrence needs rename timing) · `data-loss` ·
 `src/modules/editor/lib/documentSession.ts:122-135`, `:445-477`, `:741-749`
+Status: fixed in db303b4 (batch D); test documentSession.test.ts "a rename during a coordinated
+discard still reads the discarded baseline"
 
 `retarget` calls `release(from)`, which sets `pendingDiscards = undefined`, and bumps `epoch`.
 The discard coordinator's later `complete()` sees a changed epoch and returns without the forced
@@ -517,6 +552,8 @@ Fix: carry `pendingDiscards` across `retarget` and key the completion check on
 
 **D-08** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `data-loss` · `src/app/App.tsx:1124-1130`, `:1478-1482`,
 `src/modules/tabs/lib/useTabs.ts:1682-1753`
+Status: fixed in 71780e3 (batch D); test useTabCloseGuards.revisions.test.ts "closing a split pane
+asks first when a program runs in it"
 
 `handleCloseTabOrPane` closes the active pane of a split terminal through `closeActivePane`,
 skipping the `confirmRunningTerminal` check that `handleClose` applies to a single-pane tab. Cmd+W
@@ -529,6 +566,7 @@ Fix: run `leafHasForegroundProcess` for the target leaf before `closeActivePane`
 
 **D-09** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `data-loss` · ledger: open as R169 ·
 `src-tauri/src/modules/fs/file.rs:304-345`, `src/modules/ai/lib/native.ts:233`
+Status: fixed in 2738438 (batch E); test fs.test.ts (write_file cases)
 
 `fs_write_file`, the AI `write_file` and non-plan `edit` path, takes no expected version. It
 validates origin, the native-store guard and that the destination entry did not move, then
@@ -541,6 +579,8 @@ Fix: send the version from the AI read cache and route through `fs_save_document
 
 **D-17** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `data-loss` · `src-tauri/src/modules/fs/mutation_events.rs:89-121`,
 `:139-151`, `:177-193`, `:307-311`, `src-tauri/src/modules/fs/mutate.rs:495-560`
+Status: fixed in 4887ffe (batch A); test
+mutation_events.rs::a_running_mutation_does_not_hold_the_stream_lock
 
 `apply_tracked` holds the process-wide stream mutex across the filesystem mutation and the
 publish, `fs_delete` and `fs_delete_batch` run `remove_dir_all` inside it, and recovery `begin`
@@ -555,6 +595,8 @@ ticket.
 
 **D-18** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `data-loss` · `src/app/App.tsx:901-909`,
 `src/app/hooks/useTabCloseGuards.ts:229-251`, `src/app/components/CloseDialogs.tsx:275-304`
+Status: fixed in 1b3c5c2 (batch D); test useTabCloseGuards.revisions.test.ts "a deleted dirty draft
+the same event detached raises no delete dialog"
 
 After a native delete the mutation handler detaches a dirty draft (banner: Restore file, Save
 As), and `handlePathsDeleted` then sees it dirty and opens "The file has been deleted. Close
@@ -567,6 +609,8 @@ Fix: do not raise the delete dialog for tabs the same event just detached.
 
 **D-19** · Medium · ledger MAJOR · 4.0 · CONFIRMED (not load-tested) · `data-loss`, `compat` ·
 `src-tauri/src/modules/net/image.rs:24`, `src/modules/markdown/MarkdownImage.tsx:40`, `src/modules/markdown/remoteImages.ts:39`
+Status: fixed in d3bfcbc (batch B); test
+a_window_gets_sixteen_images_at_once_and_a_place_frees_when_one_ends
 
 A README with N distinct `https://` images starts N concurrent native fetches, each buffering up
 to 16 MiB for up to 20 s; the native admission is `start_bounded(.., usize::MAX)` and the page
@@ -579,6 +623,7 @@ Fix: a per-window cap of 16 with page-side queueing.
 **D-23** · Medium · ledger MAJOR · 4.5 · CONFIRMED (traced, not load-tested) · `compat` ·
 `src-tauri/src/modules/net/dns.rs:33-39`, `src-tauri/src/modules/net.rs:50-55`, `src-tauri/src/modules/net/image.rs:22-24`, `:143-146`,
 `src/modules/markdown/remoteImages.ts:49-52`, `src/modules/markdown/MarkdownImage.tsx:56-59`
+Status: fixed in 8a525e8 (batch B); test fifty_lookups_of_one_host_make_one_resolver_call
 
 The DNS gate admits 8 active lookups and 32 queued callers and answers the 41st with an immediate
 "resolver is busy" error. There is no DNS cache, every image fetch resolves its host, image
@@ -593,6 +638,8 @@ loader's own concurrency and queue instead of letting the gate refuse.
 
 **O-11** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `compat` · `src-tauri/src/modules/fs/formatter/rustfmt_edition.rs:52`, `:66-90`,
 `src-tauri/src/modules/fs/formatter.rs:324-326`
+Status: fixed in 0bd3ff6 (batch D); test
+an_unreachable_workspace_or_unreadable_manifest_falls_back_to_the_default_edition
 
 The rustfmt edition lookup walks ancestors only while `gates.reaches` and otherwise errors "Cannot
 find an authorized Cargo workspace"; an unparsable or oversized ancestor manifest errors too. A
@@ -610,6 +657,7 @@ is unreachable or a manifest cannot be read; build the argument vector with the 
 **S-12** · Medium · ledger MAJOR · 4.5 · CONFIRMED (crash not reproduced) · `security`, `data-loss` ·
 `src-tauri/vendor/tauri-plugin-store/src/secure_file.rs:63-68`, `src-tauri/vendor/tauri-plugin-store/src/store.rs:316-318`,
 `src-tauri/vendor/tauri-plugin-window-state/src/secure_file.rs`, `src/modules/spaces/lib/store.ts:29`, `src/modules/spaces/lib/useSpacesBoot.ts:220`
+Status: fixed in 97f1b98 (batch B); test a_save_replaces_the_file_whole_and_leaves_no_staging_file
 
 The plugin fork's save opens the existing store `O_WRONLY`, truncates with `set_len(0)` and writes,
 with no staging, no fsync, no rename and no lock shared with the native writers. The spaces store
@@ -626,6 +674,7 @@ revisioned store like preferences; keep one shared `secure_file` module.
 
 **A-01** · Medium · ledger MAJOR · 4.0 · CONFIRMED (narrow) · `compat` · `src/modules/ai/tools/agent.ts:74-90`,
 `src/modules/terminal/lib/inputOwnership.ts:17-35`, `src/modules/terminal/ghostty/input/GhosttyInputController.ts:362`
+Status: fixed in 237b321 (batch C); test agent.test.ts "submits after the delay"
 
 `send_to_agent` writes the instruction, then `"\r"` 90 ms later under the same owner. `active()`
 requires unchanged `inputRevision` (bumped by every keydown in that terminal, bare modifiers
@@ -640,6 +689,8 @@ Fix: write `instruction + "\r"` as one owned write and refuse when no armed agen
 
 **P-03** · Medium · ledger MAJOR · 4.5 · PLAUSIBLE (stall frequency unmeasured) · `data-loss` ·
 `src/modules/terminal/lib/BoundedPtyWriter.ts:81-111`, `:160`, `src/modules/terminal/ghostty/input/GhosttyInputController.ts:389-428`, `src-tauri/src/modules/clipboard_read.rs:9`
+Status: fixed in 6eb3ea9 (batch C); test BoundedPtyWriter.test.ts "drops a reserved slot past the
+action cap"
 
 A reserved slot at the head of the input queue blocks all later input until `finish`, with no
 deadline on the slot itself. The Cmd+V snapshot slot is held for the native clipboard read (15 s
@@ -654,6 +705,8 @@ a deadline on reserved slots.
 
 **O-01** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/git/candidate_index.rs`,
 `index_publication.rs`, `candidate_object.rs`, `worker.rs`, `src-tauri/git-worker/*`, `scripts/git-worker/build.mjs`, `.github/workflows/release.yml`
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
 
 1,362 lines of Rust (`candidate_index`, `index_publication`, `candidate_object`) have no
 production caller; `candidate_policy` is used only for its NUL-config parser. The Objective-C XPC
@@ -669,6 +722,7 @@ enable, or delete them until the executor is scheduled; keep `parse_config` wher
 ---
 
 **O-02** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `compat` · `src-tauri/src/modules/pty/shell_init.rs:138-159`
+Status: fixed in b840eb9 (batch C); test utf8_locale_leaves_an_explicit_lc_all_alone
 
 `ensure_utf8_locale` finds the first non-empty of `LC_ALL`, `LC_CTYPE`, `LANG` in the inherited
 environment; when its value is not UTF-8 it overwrites that same variable with the platform
@@ -684,6 +738,8 @@ locale name plus `.UTF-8` when that locale exists.
 **O-06** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `over-engineering`, `compat` ·
 `src/modules/terminal/ghostty/useGhosttyTerminalSession.ts:540-556`, `src/modules/terminal/lib/terminalSessionApi.ts:92`,
 `src-tauri/src/modules/pty/path_drop.rs` (296 lines), `src-tauri/src/modules/pty/path_drop/wsl.rs`
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
 
 `dropPathsIntoGhosttySession` requires `getMode() === "prompt"` and a `pathInsertion` capture
 that only the block-mode command bar registers. Plain terminals, the default tab kind, now show
@@ -702,6 +758,8 @@ the shell owns the foreground; delete the per-drop pgrp verification.
 
 **O-07** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src/modules/editor/lib/quitBarrier.ts`,
 `src/app/hooks/quitApproval.ts`, `src-tauri/src/modules/windows/quit.rs` (verification phase), `src/modules/editor/lib/documentMutations.ts:120-166`
+Status: deferred (batch D): the quit seal is unchanged; only the D-11 toast for a refused close
+landed
 
 The quit seal, inert overlay, 6 s watchdog, deferred lifecycle map and the rule that a mutation
 batch cancels an active seal close one window: the IPC latency between a window's final answer
@@ -716,6 +774,8 @@ machinery.
 
 **O-08** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src/modules/editor/lib/discardCoordinator.ts`,
 `src-tauri/src/modules/git/discard.rs` (1,094 lines)
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
 
 Non-originating windows always preserve their buffers (`preserve = true`), so the per-window
 prepare barrier, 5 s native timeout, settled acknowledgements and 2 s polling buy nothing over a
@@ -728,6 +788,8 @@ Fix: emit begin and end events on the mutation stream and delete the coordinator
 
 **O-09** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/fs/mutation_events.rs:139-193`,
 `src/modules/editor/lib/recoveryTarget.ts`
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
 
 Native recovery pins (`fs_recovery_begin`, `changed`, `end`, each pinning a `Destination` under
 the stream mutex) defend Restore and Save As against a same-user alias rename mid-write, which
@@ -740,6 +802,8 @@ Fix: keep the local tracker; delete the native pins.
 
 **O-10** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/mcp/credentials.rs` (573 lines),
 `src/modules/ai/lib/chatWork.ts`, `src/modules/ai/lib/mcpRunLeases.ts`, `src/modules/ai/lib/ownedStream.ts`, `src-tauri/src/modules/mcp/leases.rs`, `src-tauri/src/modules/ai_metadata.rs:126-133`
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
 
 The `credentialVersion` namespace rotation with staged copy and retire duplicates
 `secretsRevision`, which already pins launches to a saved configuration; per-secret accounts
@@ -755,6 +819,8 @@ drop the gate.
 
 **T-01** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `test-quality` · `src-tauri/src/modules/git/worktree.rs:364`, `:521`,
 `src-tauri/src/modules/git/discard.rs:22`, `src-tauri/src/modules/git/commands.rs:399-418`
+Status: fixed in fa07ad0 (batch A); test
+commands.rs::every_work_tree_changing_command_passes_the_native_store_guard
 
 Worktree add, worktree remove and discard execution take the native-store guard as a closure.
 The tests inject a closure and assert it is called; the production wiring in `commands.rs`, which
@@ -769,6 +835,7 @@ the resolved repository.
 
 **T-02** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `test-quality` · `src-tauri/src/modules/store_scope.rs:222-260`,
 `src-tauri/src/modules/fs/native_store.rs:64-70`
+Status: fixed in 49e7007 (batch B); test every_native_owned_file_is_refused_unless_the_page_opens_it
 
 The store wrapper's test keeps the JS `LazyStore` call sites in sync with the allowed names, but
 no test compares the wrapper's refusal list with `NATIVE_FILES`. The lists already diverge
@@ -780,6 +847,8 @@ Fix: one test that iterates `NATIVE_FILES` and asserts `allowed_store_path` refu
 
 **T-04** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `test-quality` · `src/modules/terminal/lib/BoundedPtyWriter.test.ts:33-48`,
 `src/modules/terminal/lib/orderedPaste.test.ts`
+Status: fixed in 6eb3ea9 (batch C); test orderedPaste.test.ts "keeps the terminal alive when keys
+pile up behind a stalled clipboard read"
 
 The writer test's comment says "no more replies are taken; typing still is", but after the refused
 reply the writer is permanently failed (the test's `onError` is a no-op), so the final input
@@ -797,11 +866,17 @@ Fix: assert that a refused reply leaves `enqueue(input)` true and `failed` false
 `run_git_guarded` with directory discovery and no `GIT_DIR`/`GIT_WORK_TREE` pin, unlike every other post-preflight launch.
 Needs a `.git` swap by another process. Fix: route through `ResolvedGitDirectory::run`.
 
+Status: fixed in 0d59983 (batch A); test
+operations.rs::post_preflight_reads_stay_pinned_to_the_acquired_git_directory
+
 **S-09** · Low · MINOR · 3.0 · CONFIRMED · `security` · `src-tauri/src/modules/git/process.rs:442-446`,
 `src-tauri/src/modules/git/discard.rs:31`, `:382`, `src-tauri/src/modules/git/remote_guard.rs:353`, `src-tauri/src/modules/git/worktree.rs:539-555`.
 Four preflight-to-execution windows: network commands keep `credential.helper`, `core.sshCommand` and `core.askPass`
 un-overridden; Discard preflights at begin and executes later without it; the local remote's pin is dropped before the
 transfer; forced worktree removal never preflights the target. All need a same-user process between check and use.
+
+Status: fixed in b53c4e6 (batch A); test
+operations.rs::discard_and_network_launches_recheck_the_configuration_at_execution
 
 **S-10** · Low · MINOR · 2.5 · CONFIRMED · `security` · `src-tauri/src/modules/git/process.rs:572-599`,
 `src-tauri/src/modules/git/operations.rs:735-745`, `src-tauri/src/modules/git/commit_guard.rs:58`. Program-naming environment
@@ -810,24 +885,34 @@ variables are not removed (`GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND`, `G
 `--no-ext-diff --no-textconv`; `merge.verifySignatures`, `tag.gpgSign` and `push.gpgSign` are not in the table. These
 come from the app's own environment or run the user's own `gpg`.
 
+Status: fixed in 98c8e64 (batch A); test
+process.rs::program_naming_environment_variables_are_removed_from_every_launch
+
 **S-11** · Low · MINOR · 2.5 · CONFIRMED · `security` · `src-tauri/src/modules/git/process.rs:626`,
 `src-tauri/git-worker/apple_git.m:85`. Source Control runs whatever `git` is first on `PATH`; the verified Apple Git is
 only probed. Fix: resolve once and pin, or drop the probe with O-01.
+Status: fixed in 937f241 (batch A); test process.rs::every_launch_uses_the_binary_resolved_once
 
 **S-13** · Low · MINOR · 2.0 · CONFIRMED · `security` · `src-tauri/src/modules/fs/mutate.rs:412-422`, `:370`, `:510`.
 Rename, move and delete check protected identities once and then act by path, and `fs_move` checks `resolve_path(from)`
 rather than the authorized target; a static alias is caught by the inode comparison.
+Status: fixed in 46578a2 (batch A); test
+mutate.rs::move_guards_the_authorized_entries_and_checks_again_before_acting
 
 **S-14** · Low · MINOR · 2.0 · CONFIRMED · `security` · `src-tauri/src/modules/asset_scope.rs:83-87`,
 `src/modules/terminal/lib/fontFeatures.ts:433`, `src-tauri/src/modules/asset_all_folders.rs:116-133`. Tauri's `asset:`
 protocol stays enabled for font faces with workspace-root grants and re-opens by path after its scope check; with "all
 folders" on, the app's own state files have no dot names and are served to previews.
 
+Status: fixed in 79b2d15 (batch B); test the_apps_own_state_is_never_a_preview_whatever_the_settings
+
 **S-22** · Low · MINOR · 3.0 · CONFIRMED · `security` · `src-tauri/src/modules/shell/mod.rs:437`, `:470`,
 `src-tauri/src/modules/shell/session.rs:65`, `:113`, `:137`, `src-tauri/src/modules/shell/background.rs:31`, `:80`,
 `src-tauri/src/modules/net/page.rs:17`, `src-tauri/src/modules/net/stream.rs:85-161`. Poisoned-lock `unwrap`s on hot
 paths and inside `on_page_load` on the main thread, against the `AGENTS.md` rule; one pump panic makes every later
 `bash_logs` panic, and a main-thread panic ends the app. Fix: `unwrap_or_else(PoisonError::into_inner)`.
+
+Status: fixed in 2539f01 (batch E); test a_poisoned_cwd_lock_does_not_end_later_commands
 
 **S-23** · Low · MINOR · 2.5 · CONFIRMED · `security` · `src-tauri/src/modules/shell/mod.rs:411-416`, `:636`,
 `src-tauri/src/modules/shell/session.rs:37-50`, `:160-190`, `src-tauri/src/modules/skills/files.rs:64-78`,
@@ -836,6 +921,10 @@ passing `spawn_cwd`; the cwd frame is produced by builtins the command controls 
 ending in `\` joins the wrapper's `__oarlock_rc=$?` line; skills `files.rs` stats then re-opens by path; every
 `read_skill_file` rehashes the whole project skills tree; install tokens are process-global across windows.
 
+Status: partly fixed in 234bef8 (batch E); open: `read_skill_file` still rehashes the whole project
+skills tree, `resolve_inside` still canonicalizes by path before the open, and a shell function
+named `command` can still change what the cwd wrapper prints
+
 **S-24** · Low · MINOR · 2.5 · CONFIRMED · `compat` · `src-tauri/src/modules/mcp/settings.rs:437-444`,
 `src-tauri/src/modules/mcp/oauth/mod.rs:336-420`, `src/modules/ai/agents/trackedSubagent.ts:100-123`,
 `src-tauri/src/modules/ai_subagents.rs:333-360`. `mcp_settings_mutate` holds the process-wide settings lock while
@@ -843,10 +932,16 @@ awaiting each server's refresh lock, which a token refresh holds for up to 30 s,
 save app-wide; a subagent whose final update IPC fails stays `running`, so every later Stop waits 30 s and blocks the
 chat until the Retry toast is found.
 
+Status: partly fixed in ff21944 (batch E); open: a subagent's final status that fails all three
+retries still leaves the record running until the Retry toast is used
+
 **D-07** · Low · MINOR · 2.0 · CONFIRMED · `data-loss` · `src/app/hooks/useTabCloseGuards.ts:209-214`, `:229-234`.
 Single-tab `confirmClose` and `confirmDeleteClose` dispose without the revision recheck the many-tab path performs. The
 dialogs are modal, so user input cannot land meanwhile; only a discard completion or a formatter adoption could change the
 buffer. Recorded for symmetry with AP013, not as a reachable loss.
+
+Status: fixed in 2e0543a (batch D); test useTabCloseGuards.revisions.test.ts "a single-tab
+confirmation asks again when the buffer changed after the prompt"
 
 **D-10** · Low · MINOR · 3.0 · CONFIRMED · `data-loss` · `src/settings/sections/ThemesSection.tsx:174-186`,
 `src/settings/sections/importPublication.ts:142-159`, `src/modules/settings/store.ts:861-887`, `src/modules/theme/themeDeletion.ts:8-9`.
@@ -856,10 +951,15 @@ failure between steps is a leftover `.oarlock-theme` that re-creates the theme o
 bypasses the import lock and barrier; `setBackgroundKind` and `setBackgroundImageId` remain exported two-step writers
 with no caller. Fix: delete the file before the selection reset.
 
+Status: fixed in b7199b5 (batch D); test themeDeletion.test.ts (order test)
+
 **D-11** · Low · MINOR · 2.5 · CONFIRMED · `data-loss` · `src/app/hooks/useAppCloseGuard.ts:200-205`,
 `src/modules/editor/lib/quitBarrier.ts:13-16`. `closeWindow` returns silently when `sealEditors` fails (another window's
 verification seal, or `editorMutationsPending()` during any reconcile including the initial one); the close click
 produces no feedback and repeats do nothing until the seal clears.
+
+Status: fixed in 99550b8 (batch D); test useCloseGuards.races.test.ts "a close refused by another
+window's quit seal says so"
 
 **D-12** · Low (Linux, secondary) · MINOR · 3.0 · CONFIRMED · `data-loss` · `src-tauri/src/modules/fs/linux_staging.rs:263-281`,
 `:329-363`, `:113-166`. In hidden-sibling mode the candidate, already widened to the destination's final mode and ACL,
@@ -867,14 +967,22 @@ is linked into the user's directory before the rename, so a crash in that window
 sees only `.git` ancestors, so a bare dotfiles repository shows the sibling; the cleanup scans the whole destination
 directory on every save with no entry cap.
 
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
+
 **D-13** · Low (Linux, secondary) · MINOR · 2.0 · CONFIRMED · `compat` · `src-tauri/src/modules/git/operations.rs:225-227`.
 One filename with invalid UTF-8 anywhere in the work tree fails the entire `git status` read. macOS refuses such names.
 Fix: decode per NUL-separated record and mark the bad entry.
+Status: fixed in 6c20981 (batch A); test
+parser.rs::one_invalid_utf8_name_is_marked_and_the_rest_of_the_status_is_kept
 
 **D-20** · Low (Linux, secondary; documented) · MINOR · 3.0 · CONFIRMED · `compat` · ledger: R028 closed for macOS only ·
 `src-tauri/src/modules/fs/copy_owned.rs:302-309`, `src-tauri/src/modules/fs/copy.rs:32-53`. Explorer copy, paste and OS
 drop return `Unsupported` for every item off macOS with no fallback. Recorded because it ships as a per-item failure
 rather than a disabled action.
+
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
 
 **D-21** · Low · MINOR · 2.5 · CONFIRMED · `data-loss` · `src/modules/editor/lib/recoveryTarget.ts:12-15`,
 `src/modules/editor/lib/documentMutations.ts:128`, `:150`, `src/modules/spaces/lib/useSpacePersistence.ts`. Any reconcile
@@ -882,20 +990,32 @@ start invalidates every in-flight recovery, so a Save As overlapping an unrelate
 interrupted" (draft retained); a scrollback persistence failure now fails the whole close flush and shows the
 "application state may be lost" warning for a convenience file.
 
+Status: fixed in 10fde4e (batch D); test recoveryTarget.test.ts "a recovery with native history
+survives an unrelated reconcile"
+
 **P-04** · Low · MINOR · 3.0 · CONFIRMED · `data-loss` · `src-tauri/src/modules/clipboard_write.rs:34-52`,
 `src/modules/terminal/ghostty/useGhosttyTerminalSession.ts:1410`. One `latest` slot per selection: a program's OSC 52
 write that lands between the user's Cmd+C begin and commit supersedes the user's copy, and
 `writeTerminalClipboard(text).catch(() => {})` swallows it. Approved ordering, but the loss should toast.
+
+Status: fixed in ec4acb7 (batch C); test terminalClipboard.test.ts "tells the user when a program's
+write took the clipboard first"
 
 **P-05** · Low · MINOR · 2.0 · CONFIRMED · `compat` · `src/modules/terminal/ghostty/input/GhosttyInputController.ts:362`.
 `inputRevision` bumps on every keydown including bare modifiers and arrow repeats, so app-driven input captured through
 `captureGhosttyInputOwner` (breadcrumb `cd`, Rerun, a queued launcher command) is cancelled by a Shift press. Count only
 keys that produce bytes.
 
+Status: fixed in 90b59c5 (batch C); test GhosttyInputController.test.ts "counts a key as input only
+when it types something"
+
 **O-03** · Low · MINOR · 2.0 · CONFIRMED (narrow) · `compat` · `src-tauri/src/modules/app_menu.rs:38`, `:104-120`,
 `src/modules/shortcuts/lib/menuBridge.ts:24-31`. The menu is built with `MenuAccelerators::default()` (all `None`) and
 the bridge sends the bindings at page start, so New Window and Close Tab lack a key equivalent only in the sub-second
 window before the first app page's bridge runs. Fix: seed `build()` with the platform default table.
+
+Status: fixed in 079efb4 (batch D); test
+the_menu_is_built_with_the_default_keys_before_any_page_sends_bindings
 
 **O-12** · Low · MINOR · 2.5 · CONFIRMED · `over-engineering` · `src/modules/theme/bgImageStore.ts:54-62`,
 `src/modules/theme/inspectBackgroundImage.ts:11-16`, `src-tauri/src/modules/background_image.rs:214-249`,
@@ -904,31 +1024,48 @@ window before the first app page's bridge runs. Fix: seed `build()` with the pla
 already-stored bytes guards only against a tampered IndexedDB, a same-user actor. Fix: inspect at import only and store
 an inspected marker or content hash with the blob.
 
+Status: fixed in 9d07c3b (batch D); test bgImageSafety.test.ts "hands a saved background back
+without inspecting it again at startup"
+
 **O-13** · Low · MINOR · 2.0 · CONFIRMED · `compat` · `src/modules/markdown/MermaidDiagram.tsx:92-105`,
 `src/modules/markdown/mermaidRender.ts:38-41`, `:121-146`. The 300 ms debounce applies to the first render and to theme
 switches, not only to edits, and a render that completes after the window was hidden is discarded instead of cached, so
 switching away and back re-renders every diagram after another 300 ms. Fix: debounce only when a previous key is drawn;
 cache completed results even when aborted.
 
+Status: fixed in 525128f (batch D); test mermaidRender.test.ts "render timing"
+
 **O-14** · Low · MINOR · 2.5 · CONFIRMED · `compat` · `.github/workflows/release.yml:109-139`. The helper and app
 signature verification runs after `tauri-action` has created the draft release and uploaded the bundle; a failed check
 fails the job but leaves the unverified `.app` and `.dmg` attached to the draft. The tag guard gates both publishing
 jobs and `OARLOCK_DISTRIBUTION_BUILD=1` is on the step that needs it. Fix: build, verify, then upload.
+
+Status: fixed in 5bfbcc6 (batch D); test releaseWorkflow.test.ts "verifies the macOS bundle before
+anything is uploaded to the release"
 
 **O-15** · Low · MINOR · 2.0 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/themes.rs:402-419`, `:448-456`.
 `verify_disk` re-reads and re-parses the whole catalog (up to 50 MiB) on every snapshot and mutation and makes any
 external change fatal until restart. Under the approved model a same-user writer is best effort and the conditional
 writer already checks identity and version at publish. Fix: drop `verify_disk` from reads.
 
+Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
+no further reason
+
 **T-05** · Low · MINOR · 2.0 · CONFIRMED · `test-quality` · `src/modules/markdown/MarkdownImage.lifecycle.test.tsx:100-104`.
 The lifecycle test asserts the local-image failure latch by calling `onError` on a bare element, so it locks in the
 no-retry behavior behind D-02 rather than proving recovery; no test covers `fs_watch_add` with one missing directory
 among valid ones (D-22) or the DNS gate under a burst of same-host image loads (D-23).
 
+Status: fixed in 61bc191 (batch B); test MarkdownImage.lifecycle.test.tsx (retry and latch,
+fifty-badge burst)
+
 **O-04** · Low · MINOR · 2.0 · CONFIRMED · `test-quality` · `src-tauri/tests/git_entrypoint_guard.rs`,
 `src-tauri/tests/common`. The guard suites read the real `$HOME/.gitconfig` through production code while fixture
 isolation covers only fixture commands; on any machine with Git LFS or global signing the positive cases fail (see S-02).
 Fix: point `HOME` at a temporary directory for the test process.
+
+Status: fixed in 813fd65 (batch A); test
+git_fixture_isolation.rs::git_fixture_isolates_home_from_the_users_git_configuration
 
 **O-05** · Low · MINOR · 1.0 · CONFIRMED · `compat` · `src/modules/ai/components/AiStatusBarControls.tsx`,
 `src/modules/ai/lib/native.ts`, `src/modules/ai/tools/shell.ts`, `src/modules/terminal/block/lib/safePathCompletion.ts:2`,
@@ -936,6 +1073,8 @@ Fix: point `HOME` at a temporary directory for the test process.
 `src/modules/terminal/lib/terminalLinkTargets.ts:160-167`. Six added lines contain an em-dash and three added imports reach
 across modules with `../../lib/quoteShellPath`, against `AGENTS.md`; the Windows-path predicate is re-implemented in four
 places, one of which already omits the UNC half.
+
+Status: fixed in aac608c (batch E); test src/lib/windowsPath.test.ts
 
 ## Claims the second reviewers refuted
 
