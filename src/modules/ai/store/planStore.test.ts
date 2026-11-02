@@ -335,6 +335,7 @@ describe("plan mode store", () => {
       expect(results[0]).toEqual({ id: "q-1", ok: true });
       expect(results[1]).toMatchObject({ id: "q-2", ok: false });
       expect(results[1].error).toMatch(/old_string not found/);
+      expect(results[1].error).toMatch(/rejected and asked for again/);
     });
 
     it("creates a new file only if it still does not exist", async () => {

@@ -78,6 +78,7 @@ export const usePlanStore = create<PlanState>((set, get) => ({
       // Rejected or discarded while earlier writes were running.
       if (!get().queue.some((x) => x.id === q.id)) continue;
       processed.add(q.id);
+      let state: FileState | undefined;
       try {
         const workspace = q.workspace;
         const client = workspace ? createNative(() => workspace) : native;
@@ -97,7 +98,7 @@ export const usePlanStore = create<PlanState>((set, get) => ({
           await client.createDir(safety.canonical);
         } else {
           const key = JSON.stringify([workspace ?? null, safety.canonical]);
-          let state = files.get(key);
+          state = files.get(key);
           if (!state) {
             state = await loadFileState(client, safety.canonical);
             files.set(key, state);
@@ -106,7 +107,11 @@ export const usePlanStore = create<PlanState>((set, get) => ({
         }
         results.push({ id: q.id, ok: true });
       } catch (e) {
-        results.push({ id: q.id, ok: false, error: failureText(e) });
+        results.push({
+          id: q.id,
+          ok: false,
+          error: failureText(e) + redoNote(e, state),
+        });
       }
     }
     // Edits the agent queued during the writes were not reviewed: keep them.
@@ -175,6 +180,15 @@ async function applyToFile(
     if (e instanceof StaleFileError) state.refused = e.message;
     throw e;
   }
+}
+
+/** An edit that failed for its own reason after another edit to the same file landed was
+ *  derived from the file as it was: it stays queued, but only to be rejected and asked again. */
+function redoNote(e: unknown, state: FileState | undefined): string {
+  if (e instanceof StaleFileError || !state) return "";
+  return state.version === state.startVersion
+    ? ""
+    : " Another edit to this file landed first and changed it, so this one has to be rejected and asked for again.";
 }
 
 function failureText(e: unknown): string {
