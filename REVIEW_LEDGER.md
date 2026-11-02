@@ -4603,7 +4603,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | ID | Disposition | Evidence |
 | --- | --- | --- |
 | R001 | Open, Tier 2, dormant | The updater is disabled, but its Linux commands still name only x86-64 packages. Revalidate when enabling updates. |
-| R007 | Open, Tier 2 | The native macOS New Window and Close Tab items still use fixed accelerators outside the configurable accelerator map. |
+| R007 | Closed; packaged check manual | The native New Window and Close Tab menu accelerators now follow effective user bindings and collision handling. |
 | R023 | Windows/WSL port | The mount translation is WSL-specific and outside this release. |
 | R032 | Windows/WSL port | The affected polling path is WSL-specific and outside this release. |
 | R043 | Closed | Ctrl+G reaches Go to Line before safe search, while Vim remains first; a CodeMirror precedence regression reproduced the conflict. Windows runtime validation remains port work. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **16 closed; 9 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **17 closed; 8 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4725,3 +4725,9 @@ Validation: the Vim adapter tests and full frontend suite passed (6,096 passed, 
 Unix Git operations now accept valid filenames containing colons, tabs, newlines and literal backslashes. NUL and dot-component traversal remain rejected; parent symlinks remain refused, and Git continues to receive literal pathspecs. Windows retains its previous stricter validation as port work. Real-Git regressions stage, preview and unstage these names, including a name resembling Git glob magic, check that another file is not staged, and refuse a colon-named symlink leading outside the repository.
 
 Validation: the final real-Git filename and symlink regressions passed on macOS and in the offline Linux container. The focused Git operation, 32-entry-point and 15 remote-scope suites passed. The full macOS native suite passed 1,584 library tests (four ignored) and all integration suites; the final two-test Git regression was rerun after strengthening its assertions. Strict Clippy passed. The full frontend suite passed 6,096 tests (two skipped), types passed and lint remained at 80 warnings. Linux retained its previously noted unrelated warnings.
+
+### R007 checkpoint — configurable native menu shortcuts
+
+New Window and Close Tab now receive their effective user bindings through the existing menu-shortcut plan instead of fixed accelerators. Disabled or conflicting bindings produce no accelerator. The existing menu snapshot gained two optional fields; old snapshots still deserialize. If a user binding claims the normally fixed Quit or Close Window chord, the custom binding takes precedence and the fixed action remains accessible from its menu item.
+
+Validation: frontend menu planning and bridge tests cover defaults, customization, disabled bindings and conflicts; native tests cover the new fields, old snapshot compatibility and fixed-key conflicts. The full macOS native suite and strict Clippy passed. The full frontend suite passed 6,098 tests (two skipped), types passed and lint remained at 80 warnings. Manual signed-release check: customize and clear New Window and Close Tab, exercise them from a terminal and a focused browser preview, and verify no old or duplicate action fires; also check a custom binding that claims a normally fixed menu chord.

@@ -14,11 +14,9 @@ use super::windows;
 const GUARDED_QUIT_MENU_ID: &str = "oarlock.quit";
 const QUIT_ACCELERATOR: &str = "Command+Q";
 const NEW_WINDOW_MENU_ID: &str = "oarlock.new-window";
-const NEW_WINDOW_ACCELERATOR: &str = "Command+Shift+N";
 const OPEN_FOLDER_MENU_ID: &str = "oarlock.open-folder";
 const OPEN_FOLDER_EVENT: &str = "oarlock:open-folder-requested";
 const CLOSE_TAB_MENU_ID: &str = "oarlock.close-tab";
-const CLOSE_TAB_ACCELERATOR: &str = "Command+W";
 const CLOSE_WINDOW_MENU_ID: &str = "oarlock.close-window";
 const CLOSE_WINDOW_ACCELERATOR: &str = "Command+Shift+W";
 const MENU_SHORTCUT_EVENT: &str = "oarlock:menu-shortcut";
@@ -92,7 +90,7 @@ fn build_with<R: Runtime>(
                 GUARDED_QUIT_MENU_ID,
                 format!("Quit {name}"),
                 true,
-                Some(QUIT_ACCELERATOR),
+                (!accelerators.claims("Cmd+KeyQ")).then_some(QUIT_ACCELERATOR),
             )?,
         ],
     )?;
@@ -110,7 +108,7 @@ fn build_with<R: Runtime>(
                 NEW_WINDOW_MENU_ID,
                 "New Window",
                 true,
-                Some(NEW_WINDOW_ACCELERATOR),
+                accelerators.new_window(),
             )?,
             &MenuItem::with_id(
                 app,
@@ -125,14 +123,14 @@ fn build_with<R: Runtime>(
                 CLOSE_TAB_MENU_ID,
                 "Close Tab",
                 true,
-                Some(CLOSE_TAB_ACCELERATOR),
+                accelerators.close_tab(),
             )?,
             &MenuItem::with_id(
                 app,
                 CLOSE_WINDOW_MENU_ID,
                 "Close Window",
                 true,
-                Some(CLOSE_WINDOW_ACCELERATOR),
+                (!accelerators.claims("Cmd+Shift+KeyW")).then_some(CLOSE_WINDOW_ACCELERATOR),
             )?,
         ],
     )?;

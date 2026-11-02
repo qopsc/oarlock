@@ -138,8 +138,26 @@ describe("menuAccelerator", () => {
 });
 
 describe("menuShortcutPlan", () => {
+  it("keeps New Window and Close Tab aligned with custom bindings", () => {
+    const { accelerators } = menuShortcutPlan({
+      "window.new": [{ meta: true, alt: true, key: "n" }],
+      "tab.close": [{ meta: true, alt: true, key: "w" }],
+    }, mac);
+    expect(accelerators).toMatchObject({ newWindow: "Cmd+Alt+KeyN", closeTab: "Cmd+Alt+KeyW" });
+  });
+
+  it("removes disabled and reassigned window/tab menu accelerators", () => {
+    const { accelerators, chords } = menuShortcutPlan({
+      "window.new": [],
+      "view.zenMode": [{ meta: true, key: "w" }],
+    }, mac);
+    expect(accelerators).toMatchObject({ newWindow: null, closeTab: null });
+    expect(chords).not.toContainEqual({ meta: true, key: "w" });
+  });
   it("gives the menu the macOS defaults", () => {
     expect(menuShortcutPlan({}, mac).accelerators).toEqual({
+      newWindow: "Cmd+Shift+KeyN",
+      closeTab: "Cmd+KeyW",
       newTab: "Cmd+KeyT",
       selectTab: [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `Cmd+Digit${n}`),
       nextTab: "Ctrl+Tab",
@@ -201,11 +219,11 @@ describe("menuShortcutPlan", () => {
           !!c.shift === !!binding.shift &&
           !!c.alt === !!binding.alt,
       );
-    expect(chords).toHaveLength(14);
+    expect(chords).toHaveLength(16);
     expect(carried({ meta: true, key: "t" })).toBe(true);
     expect(carried({ meta: true, key: "9" })).toBe(true);
     expect(carried({ ctrl: true, shift: true, key: "Tab" })).toBe(true);
-    expect(carried({ meta: true, key: "w" })).toBe(false);
+    expect(carried({ meta: true, key: "w" })).toBe(true);
   });
 });
 

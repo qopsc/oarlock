@@ -14,6 +14,8 @@ const MAX_ACCELERATOR_LEN: usize = 48;
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MenuAccelerators {
+    new_window: Option<String>,
+    close_tab: Option<String>,
     new_tab: Option<String>,
     /// Tab 1 to Tab 9.
     select_tab: [Option<String>; 9],
@@ -28,6 +30,8 @@ impl MenuAccelerators {
     /// leaves its item without a key equivalent.
     pub fn validated(self) -> Self {
         Self {
+            new_window: valid(self.new_window),
+            close_tab: valid(self.close_tab),
             new_tab: valid(self.new_tab),
             select_tab: self.select_tab.map(valid),
             next_tab: valid(self.next_tab),
@@ -35,6 +39,18 @@ impl MenuAccelerators {
             command_palette: valid(self.command_palette),
             toggle_ai: valid(self.toggle_ai),
         }
+    }
+
+    pub fn new_window(&self) -> Option<&str> { self.new_window.as_deref() }
+    pub fn close_tab(&self) -> Option<&str> { self.close_tab.as_deref() }
+
+    /// A user binding takes precedence over a fixed menu key equivalent.
+    pub fn claims(&self, accelerator: &str) -> bool {
+        self.new_window.iter().chain(self.close_tab.iter())
+            .chain(self.new_tab.iter()).chain(self.select_tab.iter().flatten())
+            .chain(self.next_tab.iter()).chain(self.previous_tab.iter())
+            .chain(self.command_palette.iter()).chain(self.toggle_ai.iter())
+            .any(|value| value.eq_ignore_ascii_case(accelerator))
     }
 
     /// The key equivalent of the item that runs `shortcut`.
@@ -183,6 +199,8 @@ mod tests {
 
     fn defaults() -> serde_json::Value {
         json!({
+            "newWindow": "Cmd+Shift+KeyN",
+            "closeTab": "Cmd+KeyW",
             "newTab": "Cmd+KeyT",
             "selectTab": (1..=9).map(|n| format!("Cmd+Digit{n}")).collect::<Vec<_>>(),
             "nextTab": "Ctrl+Tab",
@@ -196,6 +214,8 @@ mod tests {
     fn takes_the_key_equivalents_the_page_sends() {
         let accelerators: MenuAccelerators = serde_json::from_value(defaults()).unwrap();
         let accelerators = accelerators.validated();
+        assert_eq!(accelerators.new_window(), Some("Cmd+Shift+KeyN"));
+        assert_eq!(accelerators.close_tab(), Some("Cmd+KeyW"));
         assert_eq!(accelerators.of(MenuShortcut::NewTab), Some("Cmd+KeyT"));
         assert_eq!(
             accelerators.of(MenuShortcut::SelectTab { tab: 9 }),
@@ -208,6 +228,28 @@ mod tests {
         assert_eq!(accelerators.of(MenuShortcut::ToggleAi), None);
         assert_eq!(accelerators.of(MenuShortcut::SelectTab { tab: 0 }), None);
         assert_eq!(accelerators.of(MenuShortcut::SelectTab { tab: 10 }), None);
+    }
+
+    #[test]
+    fn older_snapshots_without_window_and_close_keys_remain_readable() {
+        let mut value = defaults();
+        value.as_object_mut().unwrap().remove("newWindow");
+        value.as_object_mut().unwrap().remove("closeTab");
+        let accelerators: MenuAccelerators = serde_json::from_value(value).unwrap();
+        assert_eq!(accelerators.new_window(), None);
+        assert_eq!(accelerators.close_tab(), None);
+    }
+
+    #[test]
+    fn custom_keys_can_take_precedence_over_fixed_menu_keys() {
+        let mut value = defaults();
+        value["newWindow"] = json!("Cmd+KeyQ");
+        value["closeTab"] = json!("Cmd+Shift+KeyW");
+        let accelerators: MenuAccelerators = serde_json::from_value(value).unwrap();
+        let accelerators = accelerators.validated();
+        assert!(accelerators.claims("Cmd+KeyQ"));
+        assert!(accelerators.claims("Cmd+Shift+KeyW"));
+        assert!(!accelerators.claims("Cmd+KeyO"));
     }
 
     #[test]
@@ -237,7 +279,7 @@ mod tests {
     #[test]
     fn refuses_another_shape() {
         let mut extra = defaults();
-        extra["closeTab"] = json!("Cmd+KeyW");
+        extra["unexpected"] = json!("Cmd+KeyW");
         assert!(serde_json::from_value::<MenuAccelerators>(extra).is_err());
         let mut short = defaults();
         short["selectTab"] = json!(["Cmd+Digit1"]);

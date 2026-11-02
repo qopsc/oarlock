@@ -30,6 +30,8 @@ export type MenuShortcut =
  * this shape.
  */
 type MenuAccelerators = {
+  newWindow: string | null;
+  closeTab: string | null;
   newTab: string | null;
   /** Tab 1 to Tab 9. */
   selectTab: (string | null)[];
@@ -138,7 +140,7 @@ export function menuShortcutPlan(
     userBindings[id] ??
     shortcuts.find((shortcut) => shortcut.id === id)?.defaultBindings ??
     [];
-  const carry = (id: MenuShortcutId, bindings: readonly KeyBinding[]) => {
+  const carry = (id: ShortcutId, bindings: readonly KeyBinding[]) => {
     for (const binding of bindings) {
       const accelerator = menuAccelerator(binding);
       if (accelerator === null) continue;
@@ -152,6 +154,8 @@ export function menuShortcutPlan(
   const selectBindings = bindingsOf("tab.selectByIndex");
   return {
     accelerators: {
+      newWindow: carry("window.new", bindingsOf("window.new")),
+      closeTab: carry("tab.close", bindingsOf("tab.close")),
       newTab: carry("tab.new", bindingsOf("tab.new")),
       selectTab: TAB_DIGITS.map((key) =>
         carry(
