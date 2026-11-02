@@ -11,7 +11,11 @@ use super::{
 };
 use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 use cap_std::fs::Dir;
-use std::{ffi::OsString, fs, io, path::Path};
+use std::{
+    ffi::OsString,
+    fs, io,
+    path::{Path, PathBuf},
+};
 type CopyGuard<'a> = dyn Fn(&Path) -> Result<(), String> + 'a;
 
 #[cfg(test)]
@@ -105,7 +109,7 @@ struct CopyContext<'a> {
     root: &'a Path,
     registry: &'a WorkspaceRegistry,
     rename_on_conflict: bool,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     guard: Option<&'a CopyGuard<'a>>,
 }
 impl CopyContext<'_> {
@@ -136,7 +140,12 @@ fn open_regular(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn open_regular(path: &Path) -> io::Result<fs::File> {
+    super::linux_copy::open_source(path)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn open_regular(path: &Path) -> io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
@@ -153,8 +162,126 @@ fn open_regular(_path: &Path) -> io::Result<fs::File> {
     ))
 }
 
+/// Lexical resolution: `..` pops a component, `.` is dropped, nothing touches disk.
+pub(super) fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push(component);
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The longest existing prefix of `path`, resolved, followed by the rest as written.
+fn resolve_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+    let mut rest = Vec::new();
+    let mut prefix = path;
+    loop {
+        match fs::canonicalize(prefix) {
+            Ok(real) => return Ok(rest.iter().rev().fold(real, |acc, part| acc.join(part))),
+            Err(_) => {
+                let (Some(parent), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+                    return Err(io::Error::other(
+                        "Cannot verify a symbolic link in the copied folder",
+                    ));
+                };
+                rest.push(name.to_os_string());
+                prefix = parent;
+            }
+        }
+    }
+}
+
+/// A `..` after a named component is not a lexical step on disk: when that name is
+/// a link, `..` follows the link's target. Such targets are refused outright.
+fn parent_after_name(written: &Path) -> bool {
+    use std::path::Component;
+    let mut named = false;
+    for component in written.components() {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a relative target, walked from the link's folder, never rises above the
+/// copied item's root. Judged by depth, never by comparing names: the item may be
+/// published under a conflict name that differs from the one assumed here.
+fn stays_inside_item(written: &Path, link_dest_dir: &Path, item_dest: &Path) -> bool {
+    use std::path::Component;
+    let Ok(below) = link_dest_dir.strip_prefix(item_dest) else {
+        return false;
+    };
+    let mut depth = below.components().count() as isize;
+    for component in written.components() {
+        match component {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            _ => return false,
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// A link inside a copied folder is kept only if it stays within the authorized
+/// folders both where it is now and where the copy will put it: a relative
+/// target such as `../../x` resolves differently after the move.
+pub(super) fn nested_link_allowed(
+    source_link: &Path,
+    link_dest_dir: &Path,
+    item_dest: &Path,
+    registry: &WorkspaceRegistry,
+) -> io::Result<()> {
+    let escapes =
+        || io::Error::other("A symbolic link in the copied folder escapes authorized folders");
+    let target = fs::canonicalize(source_link)
+        .map_err(|_| io::Error::other("Cannot verify a symbolic link in the copied folder"))?;
+    if !registry.gates(Origin::App).reaches(&target) {
+        return Err(escapes());
+    }
+    let written = fs::read_link(source_link)?;
+    if written.is_absolute() {
+        return Ok(());
+    }
+    if parent_after_name(&written) {
+        return Err(escapes());
+    }
+    if stays_inside_item(&written, link_dest_dir, item_dest) {
+        return Ok(());
+    }
+    let lexical = lexical_normalize(&link_dest_dir.join(&written));
+    if !registry
+        .gates(Origin::App)
+        .reaches(&resolve_existing_prefix(&lexical)?)
+    {
+        return Err(escapes());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
-fn check_tree(path: &Path, registry: &WorkspaceRegistry, depth: usize) -> io::Result<()> {
+fn check_tree(
+    path: &Path,
+    depth: usize,
+    context: &CopyContext<'_>,
+    item_dest: &Path,
+    rel: &Path,
+) -> io::Result<()> {
     if depth > 128 {
         return Err(io::Error::other("Copy folder exceeds maximum depth"));
     }
@@ -167,16 +294,15 @@ fn check_tree(path: &Path, registry: &WorkspaceRegistry, depth: usize) -> io::Re
             ensure_supported_mode(&path)?;
         }
         if kind.is_symlink() {
-            let target = fs::canonicalize(&path).map_err(|_| {
-                io::Error::other("Cannot verify a symbolic link in the copied folder")
-            })?;
-            if !registry.gates(Origin::App).reaches(&target) {
-                return Err(io::Error::other(
-                    "A symbolic link in the copied folder escapes authorized folders",
-                ));
-            }
+            nested_link_allowed(&path, &item_dest.join(rel), item_dest, context.registry)?;
         } else if kind.is_dir() {
-            check_tree(&path, registry, depth + 1)?;
+            check_tree(
+                &path,
+                depth + 1,
+                context,
+                item_dest,
+                &rel.join(entry.file_name()),
+            )?;
         } else if !kind.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -262,7 +388,13 @@ fn copy_file(
             if context.destination.starts_with(source) {
                 return Err(io::Error::other("Cannot copy a folder into itself"));
             }
-            check_tree(source, context.registry, 0)?;
+            check_tree(
+                source,
+                0,
+                context,
+                &context.destination.join(name),
+                Path::new(""),
+            )?;
         } else if kind.is_file() {
             ensure_supported_mode(source)?;
         } else if !kind.is_symlink() {
@@ -301,7 +433,38 @@ fn copy_file(
             }
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        if kind.is_dir() && context.destination.starts_with(source) {
+            return Err(io::Error::other("Cannot copy a folder into itself"));
+        }
+        let validate = || context.validate().map_err(io::Error::other);
+        let guard = |target: &Path| match context.guard {
+            Some(guard) => guard(target).map_err(io::Error::other),
+            None => Ok(()),
+        };
+        let link_ok = |link: &Path, folder: &Path, item: &Path| {
+            nested_link_allowed(link, folder, item, context.registry)
+        };
+        let env = super::linux_copy::Env {
+            dir: context.dir,
+            destination: context.destination,
+            rename_on_conflict: context.rename_on_conflict,
+            validate: &validate,
+            guard: &guard,
+            link_ok: &link_ok,
+        };
+        super::linux_copy::copy_item(
+            source,
+            &file,
+            name,
+            &env,
+            &super::linux_copy::REAL,
+            dirs::cache_dir(),
+            before_publish,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (kind, before_publish, name);
         return Err(io::Error::new(

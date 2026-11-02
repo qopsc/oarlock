@@ -965,8 +965,10 @@ is linked into the user's directory before the rename, so a crash in that window
 sees only `.git` ancestors, so a bare dotfiles repository shows the sibling; the cleanup scans the whole destination
 directory on every save with no entry cap.
 
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in de62e431 (batch J); tests linux_staging.rs
+non_repository_stages_privately_and_never_in_the_users_directory,
+crash_between_link_and_rename_leaves_nothing_in_the_users_directory,
+cleanup_stops_at_the_entry_cap_without_error
 
 **D-13** · Low (Linux, secondary) · MINOR · 2.0 · CONFIRMED · `compat` · `src-tauri/src/modules/git/operations.rs:225-227`.
 One filename with invalid UTF-8 anywhere in the work tree fails the entire `git status` read. macOS refuses such names.
@@ -979,8 +981,10 @@ parser.rs::one_invalid_utf8_name_is_marked_and_the_rest_of_the_status_is_kept
 drop return `Unsupported` for every item off macOS with no fallback. Recorded because it ships as a per-item failure
 rather than a disabled action.
 
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in 0a1883a1 (batch J); tests linux_copy_tests.rs
+file_copy_keeps_content_mode_acl_xattrs_and_times,
+folder_copy_keeps_nested_metadata_and_applies_folder_metadata_after_children,
+a_read_only_top_level_folder_is_copied_without_privileges
 
 **D-21** · Low · MINOR · 2.5 · CONFIRMED · `data-loss` · `src/modules/editor/lib/recoveryTarget.ts:12-15`,
 `src/modules/editor/lib/documentMutations.ts:128`, `:150`, `src/modules/spaces/lib/useSpacePersistence.ts`. Any reconcile

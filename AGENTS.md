@@ -4024,10 +4024,14 @@ opening its shared TemporaryItems parent, so cleanup rechecks the directory's
 identity through its returned path; a separate same-user process can race that
 final check. Linux opens an `O_TMPFILE` in the target directory and holds a file
 lock until publication. Existing files are linked through a private Git common
-directory on the same filesystem, a hidden sibling outside repositories, or a
-private same-filesystem cache fallback. Before each save, only matching regular
-staging entries older than one minute whose locks are available are removed; no
-journal or startup sweep is used. A file in a repository with no safe staging
+directory on the same filesystem, or a private same-filesystem cache fallback
+(the user cache directory, created 0700 when missing; for a folder with no `.git`
+ancestor only, a 0700 `.oarlock-staging` child of the folder as a last resort,
+removed after publishing and left alone while it holds anything); a link in any of
+them goes through a mount-id check (`statx`), and `EXDEV` moves to the next
+location. Before each save, only matching regular staging entries older than one
+minute whose locks are available are removed, examining at most 4,096 entries of
+the private staging folder; no journal or startup sweep is used. A file in a repository with no safe staging
 location is refused. Other platforms retain their existing safe-refusal policy.
 The operation-owned directory is private before content is linked into it. No editor placeholder or content file
 is created in the worktree. New-file inheritance is reproduced with an empty
@@ -4050,7 +4054,7 @@ without ownership evidence. No worker, timer, dependency or IPC request was adde
 directory/file handles and metadata probes exist only during an active write.
 
 The AI path checker also admitted internal staging names. Shared component-prefix
-rules now deny .oarlock-stage-* and legacy .oarlock-save-* paths for AI reads and
+rules now deny .oarlock-stage-*, .oarlock-staging, oarlock-staging and legacy .oarlock-save-* paths for AI reads and
 writes, native imports and document-context validation. This applies the existing
 no-bypass rule to draft copies, with matching Rust/TypeScript regressions.
 Original evidence is /tmp/oarlock-review76-{stage-before,stage-publication-before,
@@ -5345,8 +5349,20 @@ metadata-preserving copy operation followed by a no-replace publication. Nested
 links escaping authorized folders are refused; links are not traversed. A folder
 copy reads entries as encountered, so concurrent external edits can produce mixed
 versions. Copies are refused when a suitable private same-volume staging location
-is unavailable. Linux rename, move and delete use the same checks; metadata-safe
-copy remains unavailable there pending validation. Windows remains a later port.
+is unavailable. Linux rename, move and delete use the same checks. Linux copy
+(`fs/linux_copy.rs`) stages in a private per-operation folder (`copy-<pid>-<hex>.d`,
+`flock`ed, swept when stale) in the same private location as saves, copies
+entry by entry through `O_NOFOLLOW` handles (`copy_file_range` with a read/write
+fallback), keeps mode, POSIX access and default ACLs, `user.*` xattrs, times and,
+where permitted, ownership (a group that cannot be kept never widens access: its
+bits are cleared, or an ACL refuses the copy), gives the new file the SELinux or SMACK label of
+its staging location (a rename keeps the label it was created with; `restorecon` relabels), keeps a copied folder writable by its owner until a directory-relative
+`renameat2(RENAME_NOREPLACE)` has published it and only then sets its final mode,
+and refuses setuid and setgid files, special files, nested links that escape the
+authorized folders where they are or where the copy puts them (relative targets
+are resolved against the destination, on macOS too), and filesystems without
+`RENAME_NOREPLACE`. It was validated in a Linux container as an unprivileged user,
+not on a desktop. Windows remains a later port.
 
 Review follow-up: tab and active-tab mutations update their shared refs before
 React publishes a render, so returned pane IDs and disposal do not depend on
@@ -5486,3 +5502,12 @@ Native keeps one record per run (`mcp/runs.rs`), removes it on `ai_run_end`, rel
 destruction and Stop (`revoke_chat`, in a cleanup sequence a test drives with a fake). MCP credentials
 use revision-keyed accounts and metadata saves durably with at most 256 tombstones (see above).
 
+Linux (D-12, D-20, batch J; D-12, D-20, built and tested in a `linux/arm64` container, Rust 1.99.1, image
+`oarlock-linux-ci`, as uid 1000): Linux saves now stage privately in every mode (no hidden
+sibling in the user's folder), with cache creation, a mount-id check and a private
+`.oarlock-staging` last resort; cleanup examines at most 4,096 entries. Linux Explorer copy,
+paste and drop work as on macOS (see the Explorer mutation policy), and the save path no longer
+refuses SELinux and SMACK labelled files (`security.selinux` and `security.SMACK64*` are
+LSM-managed; other `security.*` and `trusted.*` names still refuse). Not run: a Linux desktop,
+SELinux enforcing, bind mounts and NFS (their `EXDEV` and `EINVAL` paths are covered by injected
+failures only).

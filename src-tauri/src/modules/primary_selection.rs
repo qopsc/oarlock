@@ -65,7 +65,7 @@ mod linux {
 
     use arboard::{Clipboard, Error, LinuxClipboardKind, SetExtLinux};
 
-    use super::{check_size, WriteOrder};
+    use super::WriteOrder;
 
     /// Both clipboards are created on first use and kept for the app's
     /// lifetime: on X11 the selection is served by arboard's background

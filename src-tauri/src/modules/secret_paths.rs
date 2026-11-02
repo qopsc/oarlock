@@ -60,6 +60,8 @@ mod tests {
             "/work/.oarlock-save-0123",
             r"C:\work\.OARLOCK-STAGE-0123.\content",
             "/work/.oarlock-stage-0123",
+            "/work/.oarlock-staging/area/content",
+            "/home/me/.cache/oarlock-staging/area/content",
         ] {
             assert!(!readable(Path::new(path)), "{path}");
         }
