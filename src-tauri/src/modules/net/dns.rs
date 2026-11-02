@@ -113,6 +113,22 @@ impl Lookups {
                     })
                     .unwrap_or(true)
             });
+            if hosts.len() >= MAX_HOSTS {
+                // Everything left is fresh or in use: drop the oldest answer nobody holds. If
+                // every slot is in use the table passes the bound by the new host only.
+                let oldest = hosts
+                    .iter()
+                    .filter_map(|(host, slot)| {
+                        slot.try_lock()
+                            .ok()
+                            .map(|held| (host.clone(), held.as_ref().map(|(at, _)| *at)))
+                    })
+                    .min_by_key(|(_, at)| *at)
+                    .map(|(host, _)| host);
+                if let Some(host) = oldest {
+                    hosts.remove(&host);
+                }
+            }
         }
         hosts.entry(host.to_owned()).or_default().clone()
     }
@@ -397,5 +413,22 @@ mod tests {
             .resolve(&resolver, "new.example", || Ok(vec![]))
             .await;
         assert_eq!(lookups.hosts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_table_of_fresh_hosts_drops_its_oldest_for_a_new_one() {
+        let resolver = Resolver::new(ACTIVE, QUEUED);
+        let lookups = Lookups::new();
+        for i in 0..MAX_HOSTS {
+            let _ = lookups
+                .resolve(&resolver, &format!("h{i}.example"), || Ok(vec![]))
+                .await;
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        let _ = lookups.resolve(&resolver, "new.example", || Ok(vec![])).await;
+        let hosts = lookups.hosts.lock().unwrap();
+        assert_eq!(hosts.len(), MAX_HOSTS);
+        assert!(!hosts.contains_key("h0.example"));
+        assert!(hosts.contains_key("new.example") && hosts.contains_key("h1.example"));
     }
 }
