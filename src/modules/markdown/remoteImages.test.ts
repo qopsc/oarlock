@@ -223,4 +223,25 @@ describe("RemoteImageCache", () => {
     finish[1]();
     await later.url;
   });
+
+  it("keeps a README's fifty badges from one host within the window's image budget", async () => {
+    let running = 0;
+    let peak = 0;
+    const load = vi.fn(async (url: string) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      running--;
+      return new Blob([url]);
+    });
+    let n = 0;
+    const cache = new RemoteImageCache(load, () => `blob:${++n}`, vi.fn());
+    const leases = Array.from({ length: 50 }, (_, i) =>
+      cache.acquire(`https://img.shields.io/badge/${i}`),
+    );
+    const urls = await Promise.all(leases.map((lease) => lease.url));
+    expect(urls).toHaveLength(50);
+    expect(load).toHaveBeenCalledTimes(50);
+    expect(peak).toBeLessThanOrEqual(12);
+  });
 });
