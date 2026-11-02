@@ -88,6 +88,7 @@ fn search_tree(
     matcher: &RegexMatcher,
     globs: &Option<GlobSet>,
     cap: usize,
+    protect_secrets: bool,
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> GrepResponse {
     let walker = WalkBuilder::new(root_path)
@@ -127,6 +128,9 @@ fn search_tree(
                 return WalkState::Continue;
             }
             let path = dent.path();
+            if protect_secrets && !crate::modules::secret_paths::readable(path) {
+                return WalkState::Continue;
+            }
             let rel = match path.strip_prefix(&root_path) {
                 Ok(r) => to_canon(r),
                 Err(_) => return WalkState::Continue,
@@ -218,6 +222,7 @@ pub async fn fs_grep(
             case_insensitive,
             max_results,
             workspace,
+            origin.unwrap_or_default() == Origin::Ai,
         )
     })
     .await
@@ -230,6 +235,7 @@ pub fn run_grep(
     case_insensitive: Option<bool>,
     max_results: Option<usize>,
     workspace: Option<WorkspaceEnv>,
+    protect_secrets: bool,
 ) -> Result<GrepResponse, String> {
     if pattern.is_empty() {
         return Err("empty pattern".into());
@@ -258,6 +264,7 @@ pub fn run_grep(
         &matcher,
         &globs,
         cap,
+        protect_secrets,
         &|| false,
     ))
 }
@@ -288,7 +295,7 @@ pub fn run_grep_interactive(
         .map_err(|e| format!("bad pattern: {e}"))?;
 
     Ok(search_tree(
-        &root_path, &root, &workspace, &matcher, &None, cap, cancel,
+        &root_path, &root, &workspace, &matcher, &None, cap, false, cancel,
     ))
 }
 
@@ -315,7 +322,13 @@ pub async fn fs_glob(
 ) -> Result<GlobResponse, String> {
     blocking(move || {
         authorized_root(&app, &root, workspace.as_ref(), origin.unwrap_or_default())?;
-        run_glob(pattern, root, max_results, workspace)
+        run_glob(
+            pattern,
+            root,
+            max_results,
+            workspace,
+            origin.unwrap_or_default() == Origin::Ai,
+        )
     })
     .await
 }
@@ -325,6 +338,7 @@ pub fn run_glob(
     root: String,
     max_results: Option<usize>,
     workspace: Option<WorkspaceEnv>,
+    protect_secrets: bool,
 ) -> Result<GlobResponse, String> {
     if pattern.is_empty() {
         return Err("empty pattern".into());
@@ -362,6 +376,9 @@ pub fn run_glob(
             continue;
         }
         let path = dent.path();
+        if protect_secrets && !crate::modules::secret_paths::readable(path) {
+            continue;
+        }
         let rel = match path.strip_prefix(&root_path) {
             Ok(r) => to_canon(r),
             Err(_) => continue,
@@ -406,7 +423,7 @@ mod tests {
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
         let workspace = WorkspaceEnv::from_option(None);
         let root = dir.path().to_string_lossy().to_string();
-        let result = search_tree(dir.path(), &root, &workspace, &matcher, &None, 100, &|| {
+        let result = search_tree(dir.path(), &root, &workspace, &matcher, &None, 100, false, &|| {
             false
         });
         assert!(result.truncated);
@@ -436,6 +453,7 @@ mod tests {
             &matcher,
             &None,
             100,
+            false,
             &|| false,
         );
         assert_eq!(live.hits.len(), 1, "uncancelled search finds the match");
@@ -447,9 +465,32 @@ mod tests {
             &matcher,
             &None,
             100,
+            false,
             &|| true,
         );
         assert!(stopped.hits.is_empty(), "cancelled search yields nothing");
+    }
+
+    #[test]
+    fn the_ais_searches_skip_secret_files_and_the_apps_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("notes.txt"), "TOKEN in notes\n").unwrap();
+        std::fs::write(root.join("server.pem"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(root.join("credentials"), "TOKEN key\n").unwrap();
+        let text = root.to_string_lossy().into_owned();
+
+        let ai = run_grep("TOKEN".into(), text.clone(), None, None, None, None, true).unwrap();
+        let hits: Vec<&str> = ai.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert_eq!(hits, ["notes.txt"]);
+
+        let app = run_grep("TOKEN".into(), text.clone(), None, None, None, None, false).unwrap();
+        let seen: Vec<&str> = app.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert!(seen.contains(&"notes.txt") && seen.contains(&"server.pem"));
+
+        let all = run_glob("**/*".into(), text.clone(), None, None, true).unwrap();
+        let listed: Vec<&str> = all.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert_eq!(listed, ["notes.txt"]);
     }
 
     #[test]
@@ -471,6 +512,7 @@ mod tests {
             &matcher,
             &None,
             2000,
+            false,
             &cancel,
         );
         assert!(out.cancelled);
