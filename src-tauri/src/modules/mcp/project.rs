@@ -168,16 +168,63 @@ pub fn parse(bytes: &[u8], project_key: &str) -> Result<Vec<ProjectEntry>, Strin
         .ok_or("its mcpServers is not an object")?;
     Ok(import::parse_map(servers)
         .into_iter()
-        .map(|raw| ProjectEntry {
-            id: server_id(project_key, &raw.name),
-            variables: raw
-                .transport
-                .as_ref()
-                .map(entry_variables)
-                .unwrap_or_default(),
-            raw,
+        .map(|mut raw| {
+            if raw.problem.is_none() {
+                raw.problem = loader_variable_problem(raw.transport.as_ref());
+            }
+            ProjectEntry {
+                id: server_id(project_key, &raw.name),
+                variables: raw
+                    .transport
+                    .as_ref()
+                    .map(entry_variables)
+                    .unwrap_or_default(),
+                raw,
+            }
         })
         .collect())
+}
+
+/// Whether a variable name changes what the program it starts loads or runs (a dynamic loader's,
+/// an interpreter's startup options, the search path). A project file may not set one: the prompt
+/// shows the command the user reads, and these run other code beside it.
+fn is_loader_variable(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    name.starts_with("DYLD_")
+        || name.starts_with("LD_")
+        || name.starts_with("PYTHON")
+        || matches!(
+            name.as_str(),
+            "PATH"
+                | "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "BASH_ENV"
+                | "ENV"
+                | "JAVA_TOOL_OPTIONS"
+                | "JDK_JAVA_OPTIONS"
+                | "_JAVA_OPTIONS"
+        )
+}
+
+fn loader_variable_problem(transport: Option<&RawTransport>) -> Option<String> {
+    let Some(RawTransport::Stdio { env, .. }) = transport else {
+        return None;
+    };
+    let names: Vec<&str> = env
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| is_loader_variable(name))
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "it sets {}, which changes what the program loads; set it in your own environment instead",
+            names.join(", ")
+        )
+    })
 }
 
 /// A project's `.mcp.json` as read.
@@ -256,11 +303,27 @@ fn quote(word: &str) -> String {
 pub fn describe(entry: &ProjectEntry) -> String {
     let what = match (&entry.raw.transport, &entry.raw.problem) {
         (_, Some(problem)) => return format!("Cannot be used: {problem}"),
-        (Some(RawTransport::Stdio { command, args, .. }), _) => std::iter::once(command)
-            .chain(args)
-            .map(|w| quote(w))
-            .collect::<Vec<_>>()
-            .join(" "),
+        (
+            Some(RawTransport::Stdio {
+                command, args, env, ..
+            }),
+            _,
+        ) => {
+            let line = std::iter::once(command)
+                .chain(args)
+                .map(|w| quote(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if env.is_empty() {
+                line
+            } else {
+                let set: Vec<String> = env
+                    .iter()
+                    .map(|(name, value)| format!("{name}={}", quote(value)))
+                    .collect();
+                format!("{line} · sets {}", set.join(", "))
+            }
+        }
         (Some(RawTransport::Remote { sse, url, .. }), _) => {
             format!("{} {url}", if *sse { "SSE" } else { "Remote (HTTP)" })
         }
@@ -1005,12 +1068,52 @@ mod tests {
         assert!(describe(&entries[1]).starts_with("Cannot be used"));
         assert_eq!(
             describe(&entries[2]),
-            "npx -y db-mcp --url ${DB_URL:-postgres://localhost} · reads DB_URL, TOKEN from your environment"
+            "npx -y db-mcp --url ${DB_URL:-postgres://localhost} · sets TOKEN=${TOKEN} · reads DB_URL, TOKEN from your environment"
         );
         assert!(parse(b"[]", "/p").is_err());
         assert!(parse(b"{nope", "/p").is_err());
         assert!(parse(br#"{"mcpServers": 3}"#, "/p").is_err());
         assert!(parse(b"{}", "/p").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_prompt_shows_the_environment_a_server_is_started_with() {
+        let text = r#"{"mcpServers": {"db": {"command": "npx", "args": ["-y", "db-mcp"],
+            "env": {"REGION": "eu", "API_URL": "https://x.example/${TENANT}"}}}}"#;
+        let entries = parse(text.as_bytes(), "/p").unwrap();
+        assert_eq!(
+            describe(&entries[0]),
+            "npx -y db-mcp · sets API_URL=https://x.example/${TENANT}, REGION=eu · reads TENANT from your environment"
+        );
+    }
+
+    #[test]
+    fn a_project_server_cannot_set_a_variable_that_loads_code() {
+        for name in [
+            "NODE_OPTIONS",
+            "node_options",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "PATH",
+            "PYTHONSTARTUP",
+            "PERL5OPT",
+            "RUBYOPT",
+            "BASH_ENV",
+        ] {
+            let text = format!(
+                r#"{{"mcpServers": {{"x": {{"command": "npx", "env": {{"{name}": "--require ./x.js"}}}}}}}}"#
+            );
+            let entries = parse(text.as_bytes(), "/p").unwrap();
+            let problem = entries[0].raw.problem.as_deref().unwrap_or("");
+            assert!(problem.contains(name), "{name}: {problem}");
+            assert!(describe(&entries[0]).starts_with("Cannot be used"));
+        }
+        let ok = parse(
+            br#"{"mcpServers": {"x": {"command": "npx", "env": {"TOKEN": "t", "LANG": "C"}}}}"#,
+            "/p",
+        )
+        .unwrap();
+        assert!(ok[0].raw.problem.is_none());
     }
 
     #[test]
