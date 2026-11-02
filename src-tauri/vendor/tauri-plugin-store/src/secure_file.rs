@@ -67,9 +67,41 @@ pub fn read(root: &Path, path: &Path) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Removes the staging files an earlier run of the app left beside `name`, once per store and
+/// run, so a crash never keeps a folder from being removed. Only the exact names this module
+/// makes (`.<name>.<pid>.<n>.tmp`) of another process are touched.
+#[cfg(unix)]
+fn sweep_stale(dir: &std::fs::File, path: &Path, name: &std::ffi::CStr) {
+    use std::{collections::HashSet, os::fd::AsRawFd, sync::{Mutex, PoisonError}};
+    static SWEPT: Mutex<Option<HashSet<std::path::PathBuf>>> = Mutex::new(None);
+    if !SWEPT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(HashSet::new)
+        .insert(path.to_path_buf())
+    {
+        return;
+    }
+    let Some(parent) = path.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let prefix = format!(".{}.", name.to_string_lossy());
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = file.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".tmp")) else { continue };
+        let mut parts = rest.split('.');
+        let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) else { continue };
+        if pid.parse::<u32>().is_err() || n.parse::<u64>().is_err() || pid == std::process::id().to_string() {
+            continue;
+        }
+        if let Ok(entry_name) = std::ffi::CString::new(file) {
+            unsafe { libc::unlinkat(dir.as_raw_fd(), entry_name.as_ptr(), 0) };
+        }
+    }
+}
+
 /// Replaces the store by staging the bytes in a private file beside it, flushing them and
 /// renaming over the old entry, so a crash leaves the old or the new file, never a cut one.
-/// The rename replaces a link itself instead of writing through it.
+/// A link or a hard-linked store is refused, never written through.
 #[cfg(unix)]
 pub fn write(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::{fs::File, io::Write, os::fd::{AsRawFd, FromRawFd}, sync::atomic::{AtomicU64, Ordering}};
@@ -85,6 +117,7 @@ pub fn write(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     } else if io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
         return Err(io::Error::last_os_error());
     }
+    sweep_stale(&dir, path, &name);
     let staged = std::ffi::CString::new(format!(
         ".{}.{}.{}.tmp",
         name.to_string_lossy(),
@@ -203,7 +236,26 @@ mod tests {
     }
 
     #[test]
-    fn a_save_replaces_a_link_instead_of_writing_through_it() {
+    fn the_first_save_removes_staging_files_a_crashed_run_left() {
+        let root = std::env::temp_dir().join(format!("oarlock-sweep-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let target = root.join("store.json");
+        let stale = root.join(".store.json.1.7.tmp");
+        let mine = root.join(format!(".store.json.{}.9.tmp", std::process::id()));
+        let other = root.join(".other.json.1.7.tmp");
+        let odd = root.join(".store.json.x.7.tmp");
+        for file in [&stale, &mine, &other, &odd] {
+            fs::write(file, b"left").unwrap();
+        }
+        write(&root, &target, b"new").unwrap();
+        assert!(!stale.exists());
+        assert!(mine.exists() && other.exists() && odd.exists(), "only this store's strays of another run");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_refuses_a_link_and_leaves_its_target_alone() {
         let root = std::env::temp_dir().join(format!("oarlock-link-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
