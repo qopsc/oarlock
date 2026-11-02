@@ -141,6 +141,15 @@ mod tests {
             super::super::arguments("rustfmt", file.to_str().unwrap(), "", edition).unwrap()
         };
         let args = args_for("2021");
+        if std::process::Command::new("rustfmt")
+            .arg("--version")
+            .output()
+            .map(|out| !out.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("rustfmt is not installed; the live edition checks are skipped");
+            return;
+        }
         let content = "fn main() { let gen = 1; }";
         let run = |args: &[String]| {
             super::super::run(

@@ -112,7 +112,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
@@ -159,7 +159,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
