@@ -151,7 +151,7 @@ fn serves_opened(access: Option<&Access>, real: &Path, all_folders: bool) -> boo
         serves_file(
             real,
             access.is_app_state(real),
-            access.in_workspace(real),
+            access.permits(real),
             all_folders,
         )
     })
@@ -349,12 +349,19 @@ fn respond_with(
     }
 }
 
-/// The only types a document in the app's webview may be given. Anything else, HTML above
+/// The only types a document in the app's webview may be given (fonts for the terminal's faces). Anything else, HTML above
 /// all (`MimeType::parse` falls back to it for an unknown extension), is data, never a page.
 fn inert_unless_media(mime: String) -> String {
-    let media = ["image/", "video/", "audio/"]
-        .iter()
-        .any(|prefix| mime.starts_with(prefix))
+    let media = [
+        "image/",
+        "video/",
+        "audio/",
+        "font/",
+        "application/font-",
+        "application/x-font-",
+    ]
+    .iter()
+    .any(|prefix| mime.starts_with(prefix))
         || mime == "application/pdf";
     if media {
         mime

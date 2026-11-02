@@ -36,30 +36,32 @@ function allows(directive: string, url: string): boolean {
   });
 }
 
-const assetUrls = {
-  unix: `asset://localhost/${encodeURIComponent("/home/me/pic.png")}`,
-  windows: `http://asset.localhost/${encodeURIComponent("C:\\Users\\me\\pic.png")}`,
-  windowsHttps: `https://asset.localhost/${encodeURIComponent("C:\\pic.png")}`,
-};
+// Every workspace file and font face loads through the backend's own scheme
+// (asset_all_folders.rs): Tauri's asset protocol types files by extension (HTML for an
+// unknown one), sends no sandbox or token, and the dialog plugin grants it every picked folder.
+const guardedUrls = [
+  `oarlock-asset://localhost/${encodeURIComponent("/home/me/pic.png")}`,
+  `http://oarlock-asset.localhost/${encodeURIComponent("C:\\Users\\me\\pic.png")}`,
+  `https://oarlock-asset.localhost/${encodeURIComponent("C:\\pic.png")}`,
+];
 
 describe("content security policy", () => {
   it.each(["img-src", "media-src", "font-src"])(
-    "%s allows workspace files on every platform",
+    "%s allows workspace files and fonts on every platform",
     (directive) => {
-      for (const url of Object.values(assetUrls)) {
+      for (const url of guardedUrls) {
         expect(allows(directive, url), url).toBe(true);
       }
     },
   );
 
-  // Tauri's asset protocol serves only font faces, types files by extension (HTML for an
-  // unknown one) and adds no sandbox, so a framed page must not be able to navigate to it.
-  it("does not let a frame load from the asset protocol", () => {
-    // `http:` and `https:` stay for dev servers, which also name the Windows spellings of
-    // asset.localhost; the scope behind those holds font faces only.
-    expect(allows("frame-src", assetUrls.unix)).toBe(false);
-    expect(sources("frame-src")).not.toContain("asset:");
-    expect(sources("frame-src")).not.toContain("https://asset.localhost");
+  it("names no source of Tauri's asset protocol in any directive", () => {
+    for (const directive of ["img-src", "media-src", "font-src", "frame-src"]) {
+      for (const source of sources(directive)) {
+        expect(source, directive).not.toMatch(/^(https?:\/\/)?asset(:|\.localhost)/);
+      }
+    }
+    expect(allows("frame-src", "asset://localhost/x")).toBe(false);
   });
 
   // While "Allow the app to access all folders" is on, previews load through

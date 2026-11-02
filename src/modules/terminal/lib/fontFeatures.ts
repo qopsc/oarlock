@@ -1,6 +1,8 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { useLayoutEffect, useState, useSyncExternalStore } from "react";
 import { IS_MAC } from "@/lib/platform";
+import { networkPage } from "@/lib/networkPage";
+import { assetSrc } from "@/modules/workspace/assetSrc";
 import { derivedNames, retainFamilies, touchFamily, trackFamily } from "./fontFeatureCache";
 
 /**
@@ -426,11 +428,12 @@ async function declareInstalled(
       return;
     }
     const name = derivedFamilyName(family);
+    const page = await networkPage(new AbortController().signal);
     for (const face of faces) {
-      // Each face loads from its file the first time it is drawn.
+      // Each face loads from its file the first time it is drawn, through the guarded scheme.
       const derivedFace = new FontFace(
         name,
-        `url("${convertFileSrc(face.path)}")`,
+        `url("${assetSrc(face.path, false, page)}")`,
         {
           weight: String(face.weight),
           style: face.style,

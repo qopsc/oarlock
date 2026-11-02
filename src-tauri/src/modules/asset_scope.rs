@@ -2,19 +2,22 @@
 //! (`tauri.conf.json`), so a script in a webview cannot read an arbitrary file that way; the
 //! backend grants, at runtime:
 //!
-//! - each installed font face `system_font_faces` hands the terminal, as a single file, to
-//!   Tauri's `asset:` protocol. Nothing else is ever in that scope: Tauri types a file by its
-//!   extension (HTML for an unknown one) and adds neither a sandbox nor a page token, so
-//!   previews do not go through it.
+//! Tauri's own `asset:` protocol cannot be switched off (the `protocol-asset` feature must
+//! match the config), and it types a file by its extension (HTML for an unknown one), adds
+//! neither a sandbox nor a page token, and the dialog plugin grants every folder the user
+//! picks to it. So its scope is made to match nothing: every filesystem root is forbidden
+//! (`forbidden_roots`), and a forbidden pattern beats any allowed one. Everything loads
+//! through `oarlock-asset` (`asset_all_folders.rs`), which judges requests with `Access`:
 //!
-//! Previews load through `oarlock-asset` (`asset_all_folders.rs`), which serves every
-//! authorized workspace root, recursively, as the registry authorizes it (`Access`): the
-//! editor's image, video, audio and PDF previews and the Markdown preview's images. A WSL root
-//! is registered by its host path (the share or the drive), which is also what `fs_host_path`
-//! turns a WSL file into for its asset URL. The configured scope's `requireLiteralLeadingDot`
-//! still decides dot names, so on every platform a granted home folder does not expose
-//! `~/.ssh`; Tauri's default skips dot names only on Unix, which on Windows would serve
-//! `C:\Users\me\.ssh`.
+//! - every authorized workspace root, recursively, as the registry authorizes it: the editor's
+//!   image, video, audio and PDF previews and the Markdown preview's images. A WSL root is
+//!   registered by its host path (the share or the drive), which is also what `fs_host_path`
+//!   turns a WSL file into for its asset URL. A root is kept under its authorized spelling and
+//!   its resolved one, so a request is judged by its name alone, with no disk access.
+//! - each installed font face `system_font_faces` hands the terminal, as a single file.
+//!
+//! The configured scope's `requireLiteralLeadingDot` still decides dot names below a root, so
+//! on every platform a granted home folder does not expose `~/.ssh`.
 //!
 //! "Allow the app to access all folders" adds no root: `oarlock-asset` asks the setting on
 //! every request.
@@ -27,12 +30,8 @@ use tauri::Manager;
 
 use super::workspace::WorkspaceRegistry;
 
-/// Tauri's asset protocol: only the font faces the backend chose are granted to it. A workspace
-/// file is never in its scope, because it types files by extension (HTML for an unknown one),
-/// sends no sandbox and needs no page token; previews go through `oarlock-asset`, which judges
-/// requests with `Access`.
+/// The app's previews and fonts, served by `oarlock-asset`.
 pub struct AssetScope {
-    scope: tauri::scope::fs::Scope,
     access: Access,
 }
 
@@ -44,6 +43,7 @@ pub struct Access {
     app_state: Vec<PathBuf>,
     literal_leading_dot: bool,
     granted_roots: Mutex<Vec<PathBuf>>,
+    font_files: Mutex<Vec<PathBuf>>,
 }
 
 /// Whether the configured scope's wildcards skip names that start with a dot, as Tauri
@@ -127,6 +127,7 @@ impl Access {
             app_state,
             literal_leading_dot,
             granted_roots: Mutex::new(Vec::new()),
+            font_files: Mutex::new(Vec::new()),
         }
     }
 
@@ -144,45 +145,59 @@ impl Access {
         rooted(real, &roots, self.literal_leading_dot)
     }
 
-    /// Whether a request for the name `path`, as the page wrote it, may be opened. The name may
-    /// run through a link (`~/code` to a volume, macOS `/tmp`), so it is judged by where its
-    /// folder leads; the opened file is judged again by `served`. With every folder allowed only
-    /// dot names and `..` are turned away here.
-    pub fn may_open(&self, path: &Path, all_folders: bool) -> bool {
-        self.may_open_with(path, all_folders, |dir| std::fs::canonicalize(dir).ok())
+    /// Whether the resolved `real` is a font face the backend handed out.
+    pub fn is_font(&self, real: &Path) -> bool {
+        let fonts = self
+            .font_files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        fonts.iter().any(|font| within(font, real) && within(real, font))
     }
 
-    fn may_open_with(
-        &self,
-        path: &Path,
-        all_folders: bool,
-        resolve: impl Fn(&Path) -> Option<PathBuf>,
-    ) -> bool {
+    /// Whether the opened file's resolved path may be served at all: a workspace file or a font.
+    pub fn permits(&self, real: &Path) -> bool {
+        self.in_workspace(real) || self.is_font(real)
+    }
+
+    /// Whether a request for the name `path`, as the page wrote it, may be opened. Judged by the
+    /// name alone, with no disk access: roots are kept under their authorized and resolved
+    /// spellings, so a name through a link (`~/code` to a volume, macOS `/tmp`) matches one of
+    /// them, and a name that matches none never reaches the filesystem. The opened file is
+    /// judged again by `serves_opened`. With every folder allowed only dot names and `..` are
+    /// turned away here.
+    pub fn may_open(&self, path: &Path, all_folders: bool) -> bool {
         if path.components().any(|part| part == Component::ParentDir) {
             return false;
         }
-        if self.in_workspace(path) {
-            return true;
-        }
-        if all_folders {
-            return !has_dot_name(path);
-        }
-        let Some(parent) = path.parent() else {
-            return false;
-        };
-        let Some(file) = path.file_name() else {
-            return false;
-        };
-        resolve(parent).is_some_and(|dir| self.in_workspace(&dir.join(file)))
+        self.permits(path) || (all_folders && !has_dot_name(path))
     }
 
     pub(crate) fn grant_root(&self, root: &Path) {
+        self.grant_root_as(root, std::fs::canonicalize(root).ok());
+    }
+
+    fn grant_root_as(&self, root: &Path, resolved: Option<PathBuf>) {
         let mut granted = self
             .granted_roots
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if needs_grant(root, &granted, self.literal_leading_dot) {
-            granted.push(root.to_path_buf());
+        for spelling in std::iter::once(root.to_path_buf()).chain(resolved) {
+            if needs_grant(&spelling, &granted, self.literal_leading_dot) {
+                granted.push(spelling);
+            }
+        }
+    }
+
+    /// Lets `oarlock-asset` serve one file, such as a font face the backend chose.
+    pub(crate) fn grant_font(&self, file: &Path) {
+        let mut fonts = self
+            .font_files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for spelling in std::iter::once(file.to_path_buf()).chain(std::fs::canonicalize(file).ok()) {
+            if !fonts.contains(&spelling) {
+                fonts.push(spelling);
+            }
         }
     }
 }
@@ -199,17 +214,39 @@ impl AssetScope {
         &self.access
     }
 
-    /// Lets the webview load one file, such as a font face the backend chose.
+    /// Lets the webview load one file through `oarlock-asset`, such as a font face.
     pub fn grant_file(&self, file: &Path) {
-        if let Err(e) = self.scope.allow_file(file) {
-            log::warn!("asset scope: cannot grant {}: {e}", file.display());
-        }
+        self.access.grant_font(file);
+    }
+}
+
+/// The roots whose whole tree Tauri's asset scope must refuse: `/`, or every drive letter and
+/// the UNC and verbatim prefixes on Windows.
+fn forbidden_roots() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        let mut roots: Vec<PathBuf> = ('A'..='Z')
+            .flat_map(|drive| {
+                [
+                    PathBuf::from(format!("{drive}:\\")),
+                    PathBuf::from(format!("\\\\?\\{drive}:\\")),
+                ]
+            })
+            .collect();
+        roots.push(PathBuf::from("\\\\"));
+        roots
+    } else {
+        vec![PathBuf::from("/")]
     }
 }
 
 /// Records every workspace root the registry has authorized and will authorize.
 pub fn install(app: &tauri::AppHandle) {
     let scope = app.asset_protocol_scope();
+    for root in forbidden_roots() {
+        if let Err(e) = scope.forbid_directory(&root, true) {
+            log::warn!("asset scope: cannot forbid {}: {e}", root.display());
+        }
+    }
     let paths = app.path();
     let app_state: Vec<PathBuf> = [
         paths.app_data_dir(),
@@ -220,13 +257,7 @@ pub fn install(app: &tauri::AppHandle) {
     .flatten()
     .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
     .collect();
-    for dir in &app_state {
-        if let Err(e) = scope.forbid_directory(dir, true) {
-            log::warn!("asset scope: cannot forbid {}: {e}", dir.display());
-        }
-    }
     app.manage(AssetScope {
-        scope,
         access: Access::new(
             app_state,
             literal_leading_dot(&app.config().app.security.asset_protocol.scope),
@@ -267,22 +298,75 @@ mod tests {
     }
 
     #[test]
-    fn a_name_through_a_link_is_judged_by_where_its_folder_leads() {
+    fn a_name_through_a_link_matches_a_root_kept_under_both_spellings() {
         let access = Access::new(vec![], true);
-        access.grant_root(Path::new("/vol/code/proj"));
-        let resolve = |dir: &Path| {
-            dir.strip_prefix("/home/me/code")
-                .ok()
-                .map(|rest| Path::new("/vol/code").join(rest))
-        };
-        let open = |p: &str, all| access.may_open_with(Path::new(p), all, resolve);
-        assert!(open("/home/me/code/proj/docs/a.png", false), "link-spelled root");
-        assert!(open("/vol/code/proj/a.png", false), "the root as granted");
+        access.grant_root_as(
+            Path::new("/home/me/code/proj"),
+            Some(PathBuf::from("/vol/code/proj")),
+        );
+        let open = |p: &str, all| access.may_open(Path::new(p), all);
+        assert!(open("/home/me/code/proj/docs/a.png", false), "authorized spelling");
+        assert!(open("/vol/code/proj/a.png", false), "resolved spelling");
         assert!(!open("/home/me/code/other/a.png", false));
-        assert!(!open("/etc/hosts", false), "nothing resolves it into a root");
+        assert!(!open("/net/host/share/a.png", false), "judged by name, never resolved");
         assert!(!open("/home/me/code/proj/../x.png", true), "`..` never");
         assert!(open("/srv/photos/a.png", true), "any folder while all are allowed");
         assert!(!open("/home/me/.ssh/id.png", true), "but not a dot name");
+        assert!(!open("/nonexistent/dir/a.png", false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn granting_a_link_spelled_root_records_where_it_resolves() {
+        let tmp = tempfile::Builder::new().prefix("oarlock-grant-").tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(real.join("vol")).unwrap();
+        std::os::unix::fs::symlink(real.join("vol"), real.join("code")).unwrap();
+        let access = Access::new(vec![], true);
+        access.grant_root(&real.join("code"));
+        assert!(access.may_open(&real.join("code").join("a.png"), false));
+        assert!(access.in_workspace(&real.join("vol").join("a.png")));
+    }
+
+    #[test]
+    fn font_faces_are_served_by_their_exact_file_only() {
+        let access = Access::new(vec![], true);
+        access.grant_font(Path::new("/Library/Fonts/Mono.ttf"));
+        assert!(access.may_open(Path::new("/Library/Fonts/Mono.ttf"), false));
+        assert!(access.permits(Path::new("/Library/Fonts/Mono.ttf")));
+        assert!(!access.permits(Path::new("/Library/Fonts/Other.ttf")));
+        assert!(!access.permits(Path::new("/Library/Fonts/Mono.ttf.html")));
+        assert!(!access.permits(Path::new("/Library/Fonts")));
+    }
+
+    #[test]
+    fn tauris_asset_scope_matches_nothing_whatever_the_dialog_grants() {
+        // The dialog plugin allows every folder the user picks; a forbidden pattern wins.
+        let options = glob::MatchOptions {
+            require_literal_separator: true,
+            require_literal_leading_dot: true,
+            ..Default::default()
+        };
+        for root in forbidden_roots() {
+            let forbid = glob::Pattern::new(&format!(
+                "{}**",
+                glob::Pattern::escape(&root.to_string_lossy())
+            ))
+            .unwrap();
+            let picked = if cfg!(windows) {
+                PathBuf::from("C:\\Users\\me\\site\\index.html")
+            } else {
+                PathBuf::from("/Users/me/site/index.html")
+            };
+            if root.to_string_lossy().starts_with(if cfg!(windows) { "C:" } else { "/" }) {
+                assert!(forbid.matches_path_with(&picked, options), "{root:?}");
+            }
+        }
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert!(config["app"]["security"]["assetProtocol"]["scope"]["allow"]
+            .as_array()
+            .is_some_and(|allow| allow.is_empty()));
     }
 
     #[test]

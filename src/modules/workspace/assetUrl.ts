@@ -1,5 +1,6 @@
 import { useOwnedWorkspace } from "./owner";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { assetSrc } from "./assetSrc";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { networkPage } from "@/lib/networkPage";
 import { useAllFolders } from "./allFolders";
@@ -8,12 +9,6 @@ import {
   type WorkspaceEnv,
   workspaceScopeKey,
 } from "./env";
-
-/**
- * The backend's guarded scheme checks scope and read limits on every request,
- * preserves the asset scope's dot-folder rule, and validates PDF content.
- */
-const ALL_FOLDERS_SCHEME = "oarlock-asset";
 
 type PageWindow = Window & { __OARLOCK_NETWORK_PAGE__?: string };
 
@@ -29,11 +24,6 @@ function pageToken(): string | null {
 function subscribePageToken(notify: () => void): () => void {
   window.addEventListener("oarlock:network-page", notify);
   return () => window.removeEventListener("oarlock:network-page", notify);
-}
-
-/** A host path as a URL the webview loads it from. */
-function assetSrc(hostPath: string, allFolders: boolean, token: string) {
-  return `${convertFileSrc(hostPath, ALL_FOLDERS_SCHEME)}?access=${allFolders ? 1 : 0}&t=${encodeURIComponent(token)}`;
 }
 
 /**

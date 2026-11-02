@@ -572,7 +572,7 @@ fn a_workspace_file_reached_through_a_link_is_served_by_the_production_judgement
     let link = real.join("code");
     std::os::unix::fs::symlink(real.join("volume"), &link).unwrap();
     let access = Access::new(vec![], true);
-    access.grant_root(&project);
+    access.grant_root(&link.join("proj"));
     let ask = |path: &Path, all: bool| {
         respond_with(
             &request(path, Method::GET),
@@ -617,5 +617,38 @@ fn a_workspace_file_reached_through_a_link_is_served_by_the_production_judgement
         nobody.status(),
         StatusCode::FORBIDDEN,
         "no asset state, no previews"
+    );
+}
+
+#[test]
+fn a_granted_font_face_is_served_as_a_font_and_nothing_beside_it() {
+    use crate::modules::asset_scope::Access;
+    let tmp = tempfile::Builder::new()
+        .prefix("oarlock-font-")
+        .tempdir()
+        .unwrap();
+    let dir = std::fs::canonicalize(tmp.path()).unwrap();
+    let face = dir.join("Mono.woff2");
+    std::fs::write(&face, b"wOF2\0\x01\0\0\0\0\0\0").unwrap();
+    std::fs::write(dir.join("Other.woff2"), b"wOF2\0\x01\0\0\0\0\0\0").unwrap();
+    let access = Access::new(vec![], true);
+    access.grant_font(&face);
+    let ask = |path: &Path| {
+        respond_with(
+            &request(path, Method::GET),
+            "tauri://localhost",
+            |named| may_open(Some(&access), named, false),
+            |opened| serves_opened(Some(&access), opened, false),
+        )
+    };
+    let served = ask(&face);
+    assert_eq!(served.status(), StatusCode::OK);
+    assert!(served.headers()[header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .contains("font"));
+    assert_eq!(
+        ask(&dir.join("Other.woff2")).status(),
+        StatusCode::FORBIDDEN
     );
 }
