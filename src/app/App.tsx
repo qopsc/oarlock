@@ -177,7 +177,7 @@ import {
   WorkspaceInputBar,
 } from "./components/WorkspaceInputBar";
 import { WorkspaceSurface } from "./components/WorkspaceSurface";
-import { hasOpenPathTab, renamedPath, spacesEmptiedByTabs } from "./hooks/tabCloseGuards";
+import { hasOpenPathTab, spacesEmptiedByTabs } from "./hooks/tabCloseGuards";
 import { aiToggleAction } from "./hooks/aiToggle";
 import { useAppCloseGuard } from "./hooks/useAppCloseGuard";
 import { useOpenFolder } from "./hooks/useOpenFolder";
@@ -920,12 +920,12 @@ export default function App() {
       detached,
     );
     for (const id of plan.refresh) editorRefs.current.get(id)?.reload();
-  }, async (scope, isLive, failedEvent) => {
+  }, async (scope, isLive) => {
     const spaces = useSpaces.getState().spaces;
     const groups = new Map<string, {
       workspace: WorkspaceEnv;
       roots: Set<string>;
-      documents: { id: number; path: string; version?: string; alternatePath?: string; snapshot: BindingSnapshot | null }[];
+      documents: { id: number; path: string; version?: string; snapshot: BindingSnapshot | null }[];
     }>();
     for (const tab of tabsRef.current) {
       if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
@@ -949,15 +949,12 @@ export default function App() {
         if (slash >= 0) group.roots.add(tab.path.slice(0, slash) || "/");
       }
       const snapshot = editorRefs.current.get(tab.id)?.bindingSnapshot() ?? null;
-      const alternatePath = failedEvent?.kind === "renamed"
-        ? renamedPath(tab.path, failedEvent.from, failedEvent.to) ?? undefined
-        : undefined;
-      group.documents.push({ id: tab.id, path: tab.path, version: snapshot?.version, alternatePath, snapshot });
+      group.documents.push({ id: tab.id, path: tab.path, version: snapshot?.version, snapshot });
     }
     for (const group of groups.values()) {
       const results = await invoke<{ id: number; path: string | null }[]>("fs_reconcile_documents", {
         workspace: group.workspace, roots: [...group.roots],
-        documents: group.documents.map(({ id, path, version, alternatePath }) => ({ id, path, version, alternatePath })),
+        documents: group.documents.map(({ id, path, version }) => ({ id, path, version })),
       });
       if (!isLive()) return;
       flushSync(() => { for (const result of results) {

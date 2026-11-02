@@ -22,7 +22,6 @@ pub struct Document {
     id: u64,
     path: String,
     version: Option<String>,
-    alternate_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -246,7 +245,6 @@ mod tests {
             id: 1,
             path: source.to_string_lossy().into(),
             version: None,
-            alternate_path: Some(destination.to_string_lossy().into()),
         }];
         let roots = vec![Root {
             path: temp.path().into(),
@@ -274,7 +272,6 @@ mod tests {
             id: 1,
             path: source.to_string_lossy().into(),
             version: None,
-            alternate_path: None,
         }];
         let roots = vec![Root {
             path: temp.path().into(),
@@ -296,7 +293,6 @@ mod tests {
             id: 1,
             path: source.to_string_lossy().into(),
             version: Some(version),
-            alternate_path: None,
         }];
         let roots = vec![Root {
             path: temp.path().into(),
@@ -331,7 +327,6 @@ mod tests {
             id: 1,
             path: a.to_string_lossy().into(),
             version: Some(version),
-            alternate_path: None,
         }];
         let roots = vec![Root {
             path: temp.path().into(),
@@ -352,7 +347,6 @@ mod tests {
             id: 1,
             path: file.to_string_lossy().into(),
             version: Some(version),
-            alternate_path: None,
         };
         (file, doc)
     }
@@ -410,7 +404,6 @@ mod tests {
             id: doc.id,
             path: doc.path.clone(),
             version: doc.version.clone(),
-            alternate_path: doc.alternate_path.clone(),
         }
     }
 

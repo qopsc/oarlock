@@ -270,6 +270,11 @@ struct WatchPath {
     path: String,
     handle: String,
 }
+/// A directory as requested and as canonicalized.
+type WatchedDirs = Vec<(String, PathBuf)>;
+/// A file's canonical directory and key, its requested spelling and its baseline stamp.
+type WatchedFile = (String, String, String, Option<FileStamp>);
+
 /// A requested path that could not be watched. It never fails the rest of the batch: a
 /// restored tab whose folder was deleted must not cost every other editor its watch.
 #[derive(Debug, PartialEq, serde::Serialize)]
@@ -506,7 +511,7 @@ fn prepare_dirs(
     gates: Gates<'_>,
     workspace: &WorkspaceEnv,
     paths: Vec<String>,
-) -> Result<(Vec<(String, PathBuf)>, Vec<Unavailable>), String> {
+) -> Result<(WatchedDirs, Vec<Unavailable>), String> {
     let mut dirs = Vec::with_capacity(paths.len());
     let mut unavailable = Vec::new();
     for raw in paths {
@@ -553,7 +558,7 @@ fn prepare_files(
     gates: Gates<'_>,
     workspace: &WorkspaceEnv,
     raws: Vec<String>,
-) -> (Vec<(String, String, String, Option<FileStamp>)>, Vec<Unavailable>) {
+) -> (Vec<WatchedFile>, Vec<Unavailable>) {
     let mut watched = Vec::with_capacity(raws.len());
     let mut unavailable = Vec::new();
     for raw in raws {
