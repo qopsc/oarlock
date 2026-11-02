@@ -9,6 +9,7 @@ vi.mock("@/modules/skills/catalog", () => ({
 vi.mock("./chatStop", () => ({
   assertChatNotStopping: () => {},
   assertChatCanStart: async () => {},
+  beginRunAdmission: async () => {},
   stopChat: vi.fn(),
 }));
 vi.mock("ai", async (original) => ({

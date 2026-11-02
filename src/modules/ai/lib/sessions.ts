@@ -329,7 +329,8 @@ export function sessionDelta(
   };
 }
 
-const pendingMetadata = new Set<SessionDelta>();
+type PendingDelta = SessionDelta & { base: number };
+const pendingMetadata = new Set<PendingDelta>();
 let latestSnapshot: SessionSnapshot = { revision: -1, sessions: [] };
 const metadataListeners = new Set<(sessions: SessionMeta[]) => void>();
 function publishMetadata(snapshot = latestSnapshot) {
@@ -433,7 +434,10 @@ export function saveSessionsList(
   sessions: SessionMeta[],
   previous: SessionMeta[] = [],
 ): Promise<void> {
-  const delta = sessionDelta(sessions, previous);
+  const delta = {
+    ...sessionDelta(sessions, previous),
+    base: Math.max(0, latestSnapshot.revision),
+  };
   pendingMetadata.add(delta);
   return commitMetadata();
 }

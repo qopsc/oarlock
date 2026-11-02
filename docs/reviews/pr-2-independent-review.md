@@ -803,8 +803,8 @@ Fix: keep the local tracker; delete the native pins.
 
 **O-10** · Medium · ledger MAJOR · 4.0 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/mcp/credentials.rs` (573 lines),
 `src/modules/ai/lib/chatWork.ts`, `src/modules/ai/lib/mcpRunLeases.ts`, `src/modules/ai/lib/ownedStream.ts`, `src-tauri/src/modules/mcp/leases.rs`, `src-tauri/src/modules/ai_metadata.rs:126-133`
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in batch I (`pr-2-fixes/batch-I.md`): one run owner per turn with one native record, revision-keyed
+credential accounts, durable chat metadata with at most 256 tombstones; tests listed in the batch note
 
 The `credentialVersion` namespace rotation with staged copy and retire duplicates
 `secretsRevision`, which already pins launches to a saved configuration; per-secret accounts

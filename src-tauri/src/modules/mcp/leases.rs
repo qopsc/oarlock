@@ -2,11 +2,16 @@
 use crate::modules::project_trust::OpenProject;
 use std::collections::HashMap;
 use std::sync::Arc;
+/// One agent turn. It exists from `ai_run_begin` to `ai_run_end`, a Stop of its chat, or a reload.
+pub(super) struct Record {
+    window: String,
+    chat_id: String,
+    project: Option<OpenProject>,
+}
 #[derive(Default)]
 pub(super) struct Leases {
     owners: HashMap<String, Arc<()>>,
-    entries: HashMap<u64, (String, OpenProject)>,
-    next: u64,
+    runs: HashMap<String, Record>,
     closed: bool,
 }
 impl Leases {
@@ -23,61 +28,105 @@ impl Leases {
                 .get(label)
                 .is_some_and(|live| Arc::ptr_eq(live, owner))
     }
+    pub fn begin_run(
+        &mut self,
+        label: &str,
+        owner: &Arc<()>,
+        run_id: &str,
+        chat_id: &str,
+    ) -> Result<(), String> {
+        if !self.is_live(label, owner) {
+            return Err("mcp: the owning page closed or reloaded".into());
+        }
+        if self.runs.contains_key(run_id) {
+            return Err("mcp: this run is already registered".into());
+        }
+        if self.runs.values().filter(|r| r.window == label).count() >= 64 {
+            return Err("mcp: too many active runs in this window".into());
+        }
+        self.runs.insert(
+            run_id.into(),
+            Record {
+                window: label.into(),
+                chat_id: chat_id.into(),
+                project: None,
+            },
+        );
+        Ok(())
+    }
+    /// Publishes (or clears) the run's project. A run that ended, was revoked, or belongs to a
+    /// reloaded page cannot gain one.
+    pub fn set_run_project(
+        &mut self,
+        label: &str,
+        owner: &Arc<()>,
+        run_id: &str,
+        project: Option<OpenProject>,
+    ) -> Result<(), String> {
+        if !self.is_live(label, owner) {
+            return Err("mcp: the owning page closed or reloaded".into());
+        }
+        match self.runs.get_mut(run_id) {
+            Some(record) if record.window == label => {
+                record.project = project;
+                Ok(())
+            }
+            _ => Err("mcp: this run has ended".into()),
+        }
+    }
+    /// Whether the run held a project.
+    pub fn end_run(&mut self, label: &str, run_id: &str) -> bool {
+        if self.runs.get(run_id).is_some_and(|r| r.window == label) {
+            return self
+                .runs
+                .remove(run_id)
+                .is_some_and(|record| record.project.is_some());
+        }
+        false
+    }
+    /// Stop: every record of the chat in every window. Whether one held a project.
+    pub fn revoke_chat(&mut self, chat_id: &str) -> bool {
+        let mut held = false;
+        self.runs.retain(|_, record| {
+            if record.chat_id == chat_id {
+                held |= record.project.is_some();
+                false
+            } else {
+                true
+            }
+        });
+        held
+    }
+    #[cfg(test)]
+    pub fn run_count(&self, chat_id: &str) -> usize {
+        self.runs.values().filter(|r| r.chat_id == chat_id).count()
+    }
     pub fn all_projects(&self) -> Vec<OpenProject> {
         let mut projects = HashMap::new();
-        for (_, project) in self.entries.values() {
+        for project in self.runs.values().filter_map(|r| r.project.as_ref()) {
             projects
                 .entry(project.key.clone())
                 .or_insert_with(|| project.clone());
         }
         projects.into_values().collect()
     }
-    pub fn insert(
-        &mut self,
-        label: &str,
-        owner: &Arc<()>,
-        project: OpenProject,
-    ) -> Result<u64, String> {
-        if !self.is_live(label, owner) {
-            return Err("mcp: the owning page closed or reloaded".into());
-        }
-        if self
-            .entries
-            .values()
-            .filter(|(window, _)| window == label)
-            .count()
-            >= 64
-        {
-            return Err("mcp: too many active project runs in this window".into());
-        }
-        self.next = self
-            .next
-            .checked_add(1)
-            .ok_or("mcp: run handles exhausted")?;
-        self.entries.insert(self.next, (label.into(), project));
-        Ok(self.next)
-    }
-    pub fn remove(&mut self, label: &str, id: u64) {
-        if self
-            .entries
-            .get(&id)
-            .is_some_and(|(window, _)| window == label)
-        {
-            self.entries.remove(&id);
-        }
-    }
     pub fn close(&mut self) {
         self.closed = true;
         self.owners.clear();
-        self.entries.clear();
+        self.runs.clear();
     }
     pub fn release_window(&mut self, label: &str) {
         self.owners.remove(label);
-        self.entries.retain(|_, (owner, _)| owner != label);
+        self.runs.retain(|_, record| record.window != label);
     }
     pub fn projects(&self, label: &str) -> Vec<OpenProject> {
         let mut projects = HashMap::new();
-        for (_, project) in self.entries.values().filter(|(owner, _)| owner == label) {
+        for project in self
+            .runs
+            .values()
+            .filter(|r| r.window == label)
+            .filter_map(|r| r.project.as_ref())
+        {
             projects
                 .entry(project.key.clone())
                 .or_insert_with(|| project.clone());
@@ -97,48 +146,70 @@ mod tests {
         }
     }
     #[test]
-    fn shared_project_survives_until_its_last_run_and_is_window_scoped() {
-        let mut leases = Leases::default();
-        let owner = leases.owner("a");
-        let first = leases.insert("a", &owner, project("/p")).unwrap();
-        let second = leases.insert("a", &owner, project("/p")).unwrap();
-        leases.remove("b", first);
-        assert_eq!(leases.projects("a").len(), 1);
-        leases.remove("a", first);
-        assert_eq!(leases.projects("a").len(), 1);
-        leases.remove("a", second);
-        assert!(leases.projects("a").is_empty());
-    }
-    #[test]
-    fn capacity_is_per_window_and_shutdown_revokes_even_pending_starts() {
-        let mut leases = Leases::default();
-        let owner = leases.owner("a");
-        let mut ids = Vec::new();
-        for _ in 0..64 {
-            ids.push(leases.insert("a", &owner, project("/p")).unwrap());
-        }
-        assert!(leases.insert("a", &owner, project("/p")).is_err());
-        let other = leases.owner("b");
-        assert!(leases.insert("b", &other, project("/q")).is_ok());
-        leases.remove("a", ids[0]);
-        assert!(leases.insert("a", &owner, project("/p")).is_ok());
-        leases.close();
-        assert!(leases.all_projects().is_empty());
-        assert!(!leases.is_live("a", &owner));
-        let after_shutdown = leases.owner("a");
-        assert!(leases.insert("a", &after_shutdown, project("/p")).is_err());
-    }
-    #[test]
-    fn reload_revokes_pending_leases_and_old_release_cannot_touch_new_runs() {
+    fn page_reload_revokes_records_and_pending_starts() {
         let mut leases = Leases::default();
         let old = leases.owner("a");
-        leases.release_window("a");
-        let new = leases.owner("a");
-        assert!(leases.insert("a", &old, project("/p")).is_err());
-        let id = leases.insert("a", &new, project("/q")).unwrap();
-        leases.remove("a", id + 1);
-        assert_eq!(leases.projects("a")[0].key, "/q");
+        leases.begin_run("a", &old, "run1", "chat").unwrap();
+        leases
+            .set_run_project("a", &old, "run1", Some(project("/p")))
+            .unwrap();
         leases.release_window("a");
         assert!(leases.projects("a").is_empty());
+        assert_eq!(leases.run_count("chat"), 0);
+        let new = leases.owner("a");
+        assert!(leases.begin_run("a", &old, "run2", "chat").is_err());
+        assert!(leases
+            .set_run_project("a", &old, "run1", Some(project("/p")))
+            .is_err());
+        leases.begin_run("a", &new, "run3", "chat").unwrap();
+        assert!(!leases.end_run("a", "run1"));
+        assert_eq!(leases.run_count("chat"), 1);
+    }
+    #[test]
+    fn stop_revokes_every_record_of_the_chat_in_every_window_and_leaves_other_chats() {
+        let mut leases = Leases::default();
+        let (a, b) = (leases.owner("a"), leases.owner("b"));
+        leases.begin_run("a", &a, "r1", "chat").unwrap();
+        leases.begin_run("b", &b, "r2", "chat").unwrap();
+        leases.begin_run("a", &a, "r3", "other").unwrap();
+        leases
+            .set_run_project("b", &b, "r2", Some(project("/p")))
+            .unwrap();
+        assert!(leases.revoke_chat("chat"));
+        assert_eq!(leases.run_count("chat"), 0);
+        assert_eq!(leases.run_count("other"), 1);
+        assert!(leases.projects("b").is_empty());
+        assert!(leases
+            .set_run_project("b", &b, "r2", Some(project("/p")))
+            .is_err());
+    }
+    #[test]
+    fn a_foreign_window_cannot_end_or_open_another_windows_run() {
+        let mut leases = Leases::default();
+        let (a, b) = (leases.owner("a"), leases.owner("b"));
+        leases.begin_run("a", &a, "r1", "chat").unwrap();
+        assert!(leases
+            .set_run_project("b", &b, "r1", Some(project("/p")))
+            .is_err());
+        leases.end_run("b", "r1");
+        assert_eq!(leases.run_count("chat"), 1);
+        leases.end_run("a", "r1");
+        assert_eq!(leases.run_count("chat"), 0);
+        assert!(leases
+            .set_run_project("a", &a, "r1", Some(project("/p")))
+            .is_err());
+    }
+    #[test]
+    fn run_capacity_is_per_window_and_counts_runs_without_projects() {
+        let mut leases = Leases::default();
+        let a = leases.owner("a");
+        for n in 0..64 {
+            leases.begin_run("a", &a, &format!("r{n}"), "chat").unwrap();
+        }
+        assert!(leases.begin_run("a", &a, "extra", "chat").is_err());
+        let b = leases.owner("b");
+        assert!(leases.begin_run("b", &b, "other", "chat").is_ok());
+        leases.end_run("a", "r0");
+        assert!(leases.begin_run("a", &a, "extra", "chat").is_ok());
     }
 }

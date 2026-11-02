@@ -76,7 +76,7 @@ Skills follow the Agent Skills format (as Claude Code and Codex use it): a folde
 
 Conversations are organized into sessions (`src/modules/ai/lib/sessions.ts`):
 
-- `oarlock-ai-sessions.json` (`tauri-plugin-store`) holds only session metadata and the active id.
+- `oarlock-ai-sessions.json` (`tauri-plugin-store`) holds only session metadata and the active id. `ai_sessions_mutate` saves each transaction (`store.save()`) before it publishes it, so a mutation survives an app crash (fsync, not `F_FULLFSYNC`); the revision persists, at most 256 deletion tombstones are kept, and each queued delta carries the `base` revision it was built from so a creation older than an evicted tombstone is dropped.
 - Message arrays live in per-session `conversations/session-<id>.json` files owned by Rust (`src-tauri/src/modules/ai_sessions.rs`, commands `ai_session_load` / `ai_session_save` / `ai_session_delete`). Writes are atomic, keep a `.bak` of the previous version, and set a damaged file aside as `.corrupt`.
 - Each native load returns a little-endian u32 revision before the raw JSON bytes. Saves carry `expectedRevision` in `x-oarlock-session` and return the next revision. The native I/O gate checks and increments revisions atomically, including on deletion. A stale window cannot replace another window's messages or resurrect a deleted conversation; its save error offers **Save a copy**, retaining that window's messages in a separate conversation. Disk files remain plain JSON.
 
@@ -144,6 +144,7 @@ AI-proposed file edits open in an `ai-diff` tab. The user accepts or rejects per
 ## Invariants
 
 - Keep the Vercel AI SDK v7 chat shape (`streamText`, tools, `toolApproval`, step limits); the rest of the UI depends on it.
+- One run owner per agent turn (`lib/runOwner.ts`): the stream, the native run record and the composer preparation are released through its one `close()`, which Stop, chat deletion (local or from another window), completion and failure all reach.
 - Keys only via `secrets_*` commands; never disk, settings store, or `localStorage`.
 - New providers must justify their bundle cost and unique value.
 - Mutating tools require approval unless the conversation is in Auto-approve; the coding-agent tools always do, and no mode skips a deny-list. Read-only tools still pass the deny-list.

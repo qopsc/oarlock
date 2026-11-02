@@ -47,11 +47,11 @@ it("blocks the next turn until SDK stop, pending starts, shell cleanup and nativ
   const { stopChat, assertChatCanStart, useChatStop } = await import(
     "./chatStop"
   );
-  const { beginChatWork } = await import("../lib/chatWork");
+  const { trackWork } = await import("../lib/runOwner");
   await assertChatCanStart("chat");
   const sdk = deferred(),
     native = deferred();
-  const started = beginChatWork("chat");
+  const started = trackWork("chat");
   const captured = vi.fn(() => sdk.promise);
   mock.invoke.mockImplementation(async (name: string) => {
     if (name === "ai_chat_register") return { ...status };
@@ -154,10 +154,12 @@ it("rejects a stale register reply when another window begins stopping during th
 
 it("waits for a paused approval's MCP lease before acknowledging remote Stop", async () => {
   const { assertChatCanStart } = await import("./chatStop");
-  const { holdMcpRun, hasMcpRunLeases } = await import("../lib/mcpRunLeases");
+  const { beginRun, chatHasRuns } = await import("../lib/runOwner");
   const cleanup = deferred();
   const release = vi.fn(() => cleanup.promise);
-  holdMcpRun("chat", release);
+  const paused = beginRun("chat", { kind: "turn" });
+  paused.adopt("native run", release);
+  paused.pause();
   await assertChatCanStart("chat");
   mock.listeners.get("ai:chat-stop")?.({
     payload: { chatId: "chat", token: 42 },
@@ -174,7 +176,7 @@ it("waits for a paused approval's MCP lease before acknowledging remote Stop", a
       error: null,
     }),
   );
-  expect(hasMcpRunLeases("chat")).toBe(false);
+  expect(chatHasRuns("chat")).toBe(false);
 });
 
 it("denies unanswered approvals when stopping an idle chat", async () => {

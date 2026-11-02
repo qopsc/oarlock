@@ -3,65 +3,60 @@ import type { WorkspaceEnv } from "@/modules/workspace/env";
 import { loadServers, loadProjectRecords } from "./configStore";
 import { projectConfigs, type ProjectServers } from "./projectServers";
 
-/** A native lease captures the submitted project, independent of navigation. */
+export type RunScope = {
+  /** The native run record the project attaches to (see `ai_run_begin`). */
+  runId: string;
+  /** Settles once that record exists. */
+  ready: Promise<void>;
+};
+
+async function openProject(
+  scope: RunScope,
+  root: string | null,
+  workspace: WorkspaceEnv,
+) {
+  await scope.ready;
+  return invoke<{ projectKey: string | null; projects: ProjectServers[] }>(
+    "ai_run_mcp_open",
+    { runId: scope.runId, root, workspace },
+  );
+}
+
+/** Clears the run's project: the run has no MCP tools to keep callable. */
+export async function clearRunProject(
+  scope: RunScope,
+  workspace: WorkspaceEnv,
+): Promise<void> {
+  await openProject(scope, null, workspace).catch(() => {});
+}
+
+/** A native run record captures the submitted project, independent of navigation. */
 export async function captureRunServers(
   root: string | null,
   workspace: WorkspaceEnv,
-  ownLease?: (release: () => Promise<void>) => () => Promise<void>,
+  scope?: RunScope,
 ) {
-  let releaseOwned: (() => Promise<void>) | undefined;
-  const opened = invoke<{
-    lease: number | null;
-    projectKey: string | null;
-    projects: ProjectServers[];
-  }>("mcp_run_open", { root, workspace })
-    .catch((error) => {
-      console.warn("[mcp] project servers unavailable", error);
-      return { lease: null, projectKey: null, projects: [] };
-    })
-    .then((run) => {
-      if (run.lease !== null)
-        releaseOwned = ownLease?.(() =>
-          invoke("mcp_run_release", { lease: run.lease }),
-        );
-      return run;
-    });
-  let released = false;
-  let releasing: Promise<void> | undefined;
-  const release = () => {
-    if (released) return Promise.resolve();
-    releasing ??= opened
-      .then(async (run) => {
-        if (run.lease !== null)
-          await (releaseOwned?.() ??
-            invoke("mcp_run_release", { lease: run.lease }));
-        released = true;
-      })
-      .finally(() => {
-        releasing = undefined;
-      });
-    return releasing;
+  const [run, servers, records] = await Promise.all([
+    scope
+      ? openProject(scope, root, workspace).catch((error) => {
+          console.warn("[mcp] project servers unavailable", error);
+          return { projectKey: null, projects: [] as ProjectServers[] };
+        })
+      : Promise.resolve({
+          projectKey: null,
+          projects: [] as ProjectServers[],
+        }),
+    loadServers(),
+    loadProjectRecords(),
+  ]);
+  const project = projectConfigs(run.projects, records);
+  return {
+    servers: [...servers, ...project],
+    offeredIds: new Set([
+      ...servers.map((s) => s.id),
+      ...project
+        .filter((s) => s.projectKey === run.projectKey)
+        .map((s) => s.id),
+    ]),
   };
-  try {
-    const [run, servers, records] = await Promise.all([
-      opened,
-      loadServers(),
-      loadProjectRecords(),
-    ]);
-    const project = projectConfigs(run.projects, records);
-    return {
-      retainsProject: run.lease !== null,
-      servers: [...servers, ...project],
-      offeredIds: new Set([
-        ...servers.map((s) => s.id),
-        ...project
-          .filter((s) => s.projectKey === run.projectKey)
-          .map((s) => s.id),
-      ]),
-      release,
-    };
-  } catch (error) {
-    await release().catch(() => {});
-    throw error;
-  }
 }

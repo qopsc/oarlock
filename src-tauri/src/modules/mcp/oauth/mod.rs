@@ -657,12 +657,7 @@ fn validate_global_discovery(
     {
         return Err("MCP server URL changed; reopen settings".into());
     }
-    Ok(serde_json::json!([
-        saved["transport"],
-        saved["secretsRevision"],
-        saved["credentialVersion"]
-    ])
-    .to_string())
+    Ok(serde_json::json!([saved["transport"], saved["secretsRevision"]]).to_string())
 }
 
 async fn discover_metadata(

@@ -678,8 +678,15 @@ UI actions that create tabs refuse to run in a different space from their owner.
 Shared conversation metadata uses native `ai_sessions_mutate` transactions
 (`modules/ai_metadata.rs`), with individual creates, field patches and deletions.
 No window writes a replacement history list. Native revision numbers order
-snapshots and notifications; deletion tombstones prevent stale creation from
-reviving a removed chat. Failed local metadata transactions retry in order.
+snapshots and notifications and are saved with the list (`sessionsGate`:
+revision, tombstones, the highest evicted tombstone revision). Each transaction
+is saved (`store.save()`: private temp file, `sync_all`, rename, folder sync)
+before it is published, so a mutation survives an app crash; it is fsync, not
+the `F_FULLFSYNC` of the message files, so power loss is not covered. At most 256
+deletion tombstones are kept. Every queued delta carries the `base` revision of
+the snapshot it was built from, fixed when it is enqueued; a creation whose base
+is older than an evicted tombstone is dropped, because it cannot prove it did not
+revive a deleted chat. Failed local metadata transactions retry in order.
 A deletion received from another window stops and releases every matching local
 chat, including background chats, and cancels pending message persistence.
 
@@ -742,6 +749,9 @@ owns foreground sessions and admitted background starts. The frontend drains sta
 work and discards idle cached shells too. A cancelled turn cannot reopen an old shell
 or let a delayed bulk Stop reach the next turn. Context is captured before asynchronous
 admission; approval continuations still belong to that original context.
+Native Stop also removes the chat's run records itself (`mcp/runs.rs`,
+`revoke_chat`, next to the foreground cleanup and before any early return), so a
+window that never answers cannot leave a project retained.
 
 Managed commands must run in foreground mode, without daemonization, `setsid`, or
 self-detachment. This is a supported-program contract, not Unix process containment:
@@ -799,14 +809,20 @@ loading, lazy runtime loading and listener installation. Model startup also rech
 cancellation after asynchronous project-memory and skill preparation. Existing shared
 MCP servers are not stopped by a rejected run.
 
-Active AI turns retain their submitted project's MCP servers through native,
-window-owned run leases (`mcp/leases.rs`). Space changes update the visible catalog
+Active AI turns retain their submitted project's MCP servers through one native
+run record per turn (`mcp/runs.rs` over `mcp/leases.rs`): `ai_run_begin` admits the
+run past the Stop barrier and inserts its record under the barrier's lock,
+`ai_run_mcp_open` attaches the project (and fails once the run has ended or the page
+reloaded), `ai_run_end` removes it. The page holds one object per turn
+(`ai/lib/runOwner.ts`) that registers once and releases everything (stream, record,
+preparation) through one `close()`. Space changes update the visible catalog
 but keep those servers callable by their original turns; another project's tools
 are excluded from the turn's snapshot. Native launch and per-message trust checks
 accept only a window's current or retained project and still validate the current
 file hash and server entry. Revoking trust or changing the entry revokes access.
-Completion, failure and Stop release the lease; close/reload revoke all leases and
-pending starts from that page lifetime. Settings includes retained projects so
+Completion, failure, Stop and chat deletion close the owner; Stop also revokes the
+records natively; close/reload revoke all records and pending starts from that page
+lifetime. Settings includes retained projects so
 users can still revoke them. Empty configurations retain no project or worker;
 leases are bounded to 64 per window, and the MCP SDK remains lazy. Configuration
 refreshes ignore superseded replies, so a delayed space-switch refresh cannot stop
@@ -833,9 +849,10 @@ PowerShell writes cwd metadata as explicit UTF-8 bytes rather than its console
 codepage. A host with only cmd.exe receives a clear error before a persistent AI
 command executes; the PowerShell metadata script is never handed to cmd.exe.
 
-MCP ownership includes pending tool approvals. The stream records unanswered approval
-requests; a clean approval pause transfers the lease to its chat rather than releasing
-it. A continuation acquires its new lease before releasing the paused one, preserving
+MCP ownership includes pending tool approvals. The owner's stream wrapper records
+unanswered approval requests; a clean approval pause leaves the owner `paused` under
+its chat rather than closing it. A continuation begins its own owner and opens its
+record before it closes the paused one, preserving
 the same server session across navigation. New messages, errors, Stop and deletion
 release it; failed release IPC stays reachable for Retry Stop. Paused chats with
 project leases are excluded from chat-LRU eviction, preserving their captured context;
@@ -855,8 +872,13 @@ Approval-pause retention and idle Stop recovery add about 0.6 kB gzipped client 
 (2809.830 kB total; budget 2810 kB), without a dependency or idle polling. Startup,
 terminal and WASM budgets remain unchanged.
 
-Composer submissions have cancellable preparation (`ai/lib/composerWork.ts`). Stop
-cancels it synchronously in every owning window; chat, space or environment changes
+Composer submissions have cancellable preparation (`ai/lib/runOwner.ts`; `composerWork.ts`
+is the facade voice and imports use). The submit-time owner registers with native
+(`ai_run_begin`), is accepted with the id of the user message handed to the chat
+(`accept`, which drops the preparation-scoped watchers once) and is claimed by the
+transport's run for that message id (`claimRun`); a continuation or regenerate never
+takes it, a stopped one is not replaced, and one nothing claims is closed. Stop
+cancels preparation synchronously in every owning window; chat, space or environment changes
 cancel it through subscriptions present only while preparation is pending. Returning
 to the old space cannot revive a cancelled submission. Native skill reads may finish,
 but their results cannot send a turn. MCP prompt fetches carry the abort signal;
@@ -923,9 +945,14 @@ These discovery and approval corrections add 179 bytes of gzipped client JS
 remain unchanged.
 
 MCP credential saves (`mcp/credentials.rs`) validate the entire transaction before
-keychain access. Replacement accounts use a native random namespace; unchanged
-secrets are copied into it, and only an atomic settings-file replacement publishes
-that namespace. Failed staging or persistence keeps the previous configuration,
+keychain access. Replacement accounts are keyed by the server's `secretsRevision`
+(`<account>@r<revision>`; revision 0 is the bare account, and a created server starts at 1 so
+its imported or entered values at the bare accounts are only copy sources). Stale accounts at
+the new revision are deleted first, unchanged secrets are copied into it, and only an atomic
+settings-file replacement publishes the revision. A legacy `credentialVersion` is read until
+the server's next credential save drops it; a server saved on an unreleased build between
+those schemes (revision above 0, secrets at the bare account) fails with the missing-secret
+error and its secret is entered again. Failed staging or persistence keeps the previous configuration,
 secrets and OAuth records active. Cleanup retires only unreferenced accounts;
 a cleanup failure can leave unreachable keychain entries, never activate them.
 Deletion commits before retiring credentials. Imports may stage only new global
@@ -936,12 +963,12 @@ replacement, so they cannot race with configuration persistence.
 Global MCP launches accept a server id and revision and read their command, URL
 and credentials from the native saved configuration. HTTP sessions check their
 revision before requests and again under the OAuth credential lock before reading
-or refreshing tokens. OAuth accounts and token caches use the same namespace;
+or refreshing tokens. OAuth accounts and token caches use the same revision;
 transport or credential changes invalidate pending sign-ins and require a fresh
 sign-in. Sign-in preparation, refresh and configuration publication share a
 per-server lock; waiting for the browser does not hold it. Late token reads cannot
-repopulate a retired namespace. A lazy native index holds only revisions and
-namespaces, avoiding full configuration clones on each HTTP request. Independent
+repopulate a retired revision. A lazy native index holds only revisions and
+legacy versions, avoiding full configuration clones on each HTTP request. Independent
 On/Off, trust and tool choices continue to merge without rotating credentials.
 No dependency, worker or polling timer is added.
 
@@ -5414,3 +5441,15 @@ component test (batch D). The `REVIEW_LEDGER.md` closure texts for R076 ("persis
 queue overflow") and R095 ("fails visibly on reply-buffer overflow") no longer describe the behavior:
 overflow is now a transient notice for input and a dropped, logged reply, and only a failed
 `pty_write` is persistent.
+
+### Review 108: one run owner, revision-keyed credentials, durable chat metadata (O-10)
+
+One page object per agent turn (`ai/lib/runOwner.ts`) replaces `chatWork`, `mcpRunLeases`,
+`ownedStream` and the composer-work registry: it registers once with native (`ai_run_begin`),
+adopts the stream, the native record and the preparation watchers, and releases them through one
+idempotent `close()` on completion, failure, Stop, deletion and abandonment (a failed release stays
+reachable for Retry Stop). Navigation ends only preparation; running and paused turns survive it.
+Native keeps one record per run (`mcp/runs.rs`), removes it on `ai_run_end`, reload, window
+destruction and Stop (`revoke_chat`, in a cleanup sequence a test drives with a fake). MCP credentials
+use revision-keyed accounts and metadata saves durably with at most 256 tombstones (see above).
+

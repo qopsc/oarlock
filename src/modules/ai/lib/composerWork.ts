@@ -1,34 +1,15 @@
-const pending = new Map<string, Set<AbortController>>();
+import { beginRun, cancelPreparation } from "./runOwner";
 
+/** Composer work that is not a message turn (voice, imports): a page-only run owner. */
 export function beginComposerWork(chatId: string) {
-  const controller = new AbortController();
-  const work = pending.get(chatId) ?? new Set();
-  work.add(controller);
-  pending.set(chatId, work);
-  let finished = false;
-  const cleanups: (() => void)[] = [];
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    work.delete(controller);
-    if (!work.size && pending.get(chatId) === work) pending.delete(chatId);
-    controller.signal.removeEventListener("abort", finish);
-    for (const cleanup of cleanups) cleanup();
-    cleanups.length = 0;
-  };
-  controller.signal.addEventListener("abort", finish, { once: true });
+  const owner = beginRun(chatId, { kind: "prepare" });
   return {
-    signal: controller.signal,
-    cancel: () => controller.abort(),
-    finish,
-    onFinish(cleanup: () => void) {
-      if (finished) cleanup();
-      else cleanups.push(cleanup);
-    },
+    signal: owner.signal,
+    cancel: () => owner.cancel("navigated"),
+    finish: () => void owner.close("complete"),
+    onFinish: (cleanup: () => void) => owner.onPrepared(cleanup),
   };
 }
 export type ComposerWork = ReturnType<typeof beginComposerWork>;
 
-export function cancelComposerWork(chatId: string) {
-  for (const work of [...(pending.get(chatId) ?? [])]) work.abort();
-}
+export const cancelComposerWork = cancelPreparation;

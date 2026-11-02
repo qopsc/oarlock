@@ -1,4 +1,4 @@
-import { hasMcpRunLeases } from "../lib/mcpRunLeases";
+import { chatHasRuns } from "../lib/runOwner";
 import { stopChat } from "./chatStop";
 import type { Chat, UIMessage } from "@ai-sdk/react";
 import { toast } from "sonner";
@@ -214,7 +214,7 @@ export function touchChat(id: string, c: Chat<UIMessage>) {
       key === id ||
       key === activeId ||
       isRunning(chat) ||
-      hasMcpRunLeases(key)
+      chatHasRuns(key)
     )
       continue;
     flushPersistEntry(key);

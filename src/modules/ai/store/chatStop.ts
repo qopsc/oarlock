@@ -1,11 +1,9 @@
-import { cancelComposerWork } from "../lib/composerWork";
+import { cancelPreparation, closeChatRuns } from "../lib/runOwner";
 import { denyUnansweredApprovals } from "../lib/toolApprovals";
-import { releaseChatMcpRuns } from "../lib/mcpRunLeases";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { create } from "zustand";
 import { toast } from "sonner";
-import { drainChatWork } from "../lib/chatWork";
 import { chats } from "./chatStore";
 
 type Status = {
@@ -23,7 +21,7 @@ function stopLocal(
   chatId: string,
   stop?: () => Promise<void> | void,
 ): Promise<void> {
-  cancelComposerWork(chatId);
+  cancelPreparation(chatId);
   const existing = localStops.get(chatId);
   if (existing) return existing;
   const chat = chats.get(chatId);
@@ -43,8 +41,7 @@ function stopLocal(
         chat.messages,
         "Approval closed: the user stopped this chat.",
       );
-    await drainChatWork(chatId);
-    await releaseChatMcpRuns(chatId);
+    await closeChatRuns(chatId, "stop");
     const { settleShellClosures } = await import("../tools/shell");
     await settleShellClosures(chatId);
   })();
@@ -111,6 +108,21 @@ export async function assertChatCanStart(chatId: string): Promise<void> {
     useChatStop.getState().states[chatId]?.blocked ||
     stopping.has(chatId)
   )
+    throw new Error(
+      status.error ??
+        "This chat is still stopping. Wait for cleanup before sending another turn.",
+    );
+}
+/** Registers a run with native and admits it past the Stop barrier in one call. */
+export async function beginRunAdmission(
+  chatId: string,
+  runId: string,
+): Promise<void> {
+  assertChatNotStopping(chatId);
+  await initialize();
+  const status = await invoke<Status>("ai_run_begin", { runId, chatId });
+  adopt(status);
+  if (status.blocked || useChatStop.getState().states[chatId]?.blocked)
     throw new Error(
       status.error ??
         "This chat is still stopping. Wait for cleanup before sending another turn.",

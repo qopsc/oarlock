@@ -42,6 +42,22 @@ impl Control {
             error: stop.and_then(|s| s.error.clone()),
         }
     }
+    fn admit_in<T>(
+        &mut self,
+        window: &str,
+        chat_id: &str,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.status(chat_id).blocked {
+            return Err("This chat is stopping; no new work may start yet.".into());
+        }
+        self.chats
+            .entry(chat_id.into())
+            .or_default()
+            .owners
+            .insert(window.into());
+        operation()
+    }
     fn begin(&mut self, id: &str) -> Option<(u64, Vec<String>)> {
         let chat = self.chats.entry(id.into()).or_default();
         if chat.stop.as_ref().is_some_and(|s| s.running) {
@@ -106,6 +122,49 @@ pub fn admit<T>(
         return Err("This chat is stopping; no new work may start yet.".into());
     }
     Ok(operation())
+}
+
+/// Registers the window as an owner of the chat and runs `operation`, both under the lock that
+/// Stop takes to block the chat, so a run record is never inserted after Stop revoked the chat.
+/// Lock order: this lock, then the run records'.
+pub fn admit_register<T>(
+    app: &tauri::AppHandle,
+    window: &str,
+    chat_id: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, serde_json::Value), String> {
+    if !valid_id(chat_id) {
+        return Err("Invalid conversation id".into());
+    }
+    let holder = app.state::<ChatControl>();
+    let mut state = holder.0.lock().unwrap_or_else(|e| e.into_inner());
+    let value = state.admit_in(window, chat_id, operation)?;
+    Ok((value, serde_json::json!(state.status(chat_id))))
+}
+
+/// What Stop does after asking the windows to clean up. Revoking the chat's run records comes
+/// first and does not depend on a window answering or on an emission having succeeded.
+pub(crate) struct CleanupSteps<'a> {
+    pub revoke_runs: &'a dyn Fn(),
+    pub foreground: &'a dyn Fn(),
+    pub background: &'a dyn Fn(),
+    pub subagents: &'a dyn Fn(),
+}
+pub(crate) fn run_cleanup(
+    steps: &CleanupSteps,
+    background: bool,
+    subagents: bool,
+    emission_error: Option<String>,
+) -> Result<(), String> {
+    (steps.revoke_runs)();
+    (steps.foreground)();
+    if background {
+        (steps.background)();
+    }
+    if subagents {
+        (steps.subagents)();
+    }
+    emission_error.map_or(Ok(()), Err)
 }
 
 #[tauri::command]
@@ -205,18 +264,23 @@ fn stop(app: &tauri::AppHandle, id: &str, background: bool, subagents: bool) -> 
                 emission_error = Some(error.to_string());
             }
         }
-        app.state::<super::shell::ShellState>()
-            .stop_chat_foreground(id);
-        if background {
-            app.state::<super::shell::ShellState>()
-                .kill_chat_background(id);
-        }
-        if subagents {
-            super::ai_subagents::cancel_chat(app, id);
-        }
-        if let Some(error) = emission_error {
-            return Err(error);
-        }
+        run_cleanup(
+            &CleanupSteps {
+                revoke_runs: &|| super::mcp::runs::revoke_chat(app, id),
+                foreground: &|| {
+                    app.state::<super::shell::ShellState>()
+                        .stop_chat_foreground(id)
+                },
+                background: &|| {
+                    app.state::<super::shell::ShellState>()
+                        .kill_chat_background(id)
+                },
+                subagents: &|| super::ai_subagents::cancel_chat(app, id),
+            },
+            background,
+            subagents,
+            emission_error,
+        )?;
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut state = holder.0.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -266,6 +330,59 @@ fn stop(app: &tauri::AppHandle, id: &str, background: bool, subagents: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    #[test]
+    fn stop_revokes_run_records_even_when_an_emission_failed_and_before_anything_waits() {
+        for (background, subagents) in [(false, false), (true, true)] {
+            let log = RefCell::new(Vec::new());
+            let step = |name: &'static str| {
+                let log = &log;
+                move || log.borrow_mut().push(name)
+            };
+            let (revoke, foreground, bg, sub) =
+                (step("revoke"), step("foreground"), step("background"), step("subagents"));
+            let result = run_cleanup(
+                &CleanupSteps {
+                    revoke_runs: &revoke,
+                    foreground: &foreground,
+                    background: &bg,
+                    subagents: &sub,
+                },
+                background,
+                subagents,
+                Some("emit failed".into()),
+            );
+            assert_eq!(result, Err("emit failed".into()));
+            let log = log.borrow();
+            assert_eq!(log[0], "revoke");
+            assert_eq!(log.contains(&"background"), background);
+            assert_eq!(log.contains(&"subagents"), subagents);
+        }
+    }
+    #[test]
+    fn ai_run_begin_is_refused_while_the_chat_is_stopping() {
+        let mut state = Control::default();
+        let ran = RefCell::new(0);
+        state.admit_in("w", "chat", || {
+            *ran.borrow_mut() += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(*ran.borrow(), 1);
+        state.begin("chat").unwrap();
+        assert!(state.admit_in("w", "chat", || {
+            *ran.borrow_mut() += 1;
+            Ok(())
+        }).is_err());
+        assert_eq!(*ran.borrow(), 1);
+        assert!(state.admit_in("w", "other", || Ok(())).is_ok());
+    }
+    #[test]
+    fn stop_passes_the_real_revocation_to_its_cleanup_sequence() {
+        let source = include_str!("ai_chat_control.rs");
+        let from = source.find("fn stop(app").unwrap();
+        let stop = &source[from..from + source[from..].find("#[cfg(test)]").unwrap()];
+        assert!(stop.contains("revoke_runs: &|| super::mcp::runs::revoke_chat(app, id)"));
+    }
     #[test]
     fn barrier_waits_for_every_owner_and_failure_requires_retry() {
         let mut state = Control::default();
