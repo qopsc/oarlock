@@ -277,6 +277,30 @@ describe("GhosttyInputController", () => {
     controller.dispose();
   });
 
+  it("counts a key as input only when it types something, not a bare modifier", () => {
+    const input = new FakeTextArea();
+    const onInput = vi.fn();
+    const controller = new GhosttyInputController({
+      model: { ...inputModel(), encodeKey: () => new Uint8Array([97]) },
+      input: input as unknown as HTMLTextAreaElement,
+      pointerTarget: new FakeElement() as unknown as HTMLElement,
+      cellSize: () => ({ width: 10, height: 20 }),
+      isMac: true,
+      onCopy: () => false,
+      onData: vi.fn(),
+      onInput,
+    });
+    for (const [key, code] of [["Shift", "ShiftLeft"], ["Control", "ControlLeft"],
+      ["Alt", "AltLeft"], ["Meta", "MetaLeft"], ["CapsLock", "CapsLock"]]) {
+      input.dispatchEvent(keyboardEvent({ key, code }));
+    }
+    expect(onInput).not.toHaveBeenCalled();
+    input.dispatchEvent(keyboardEvent({ key: "a", code: "KeyA" }));
+    input.dispatchEvent(keyboardEvent({ key: "ArrowLeft", code: "ArrowLeft", repeat: true }));
+    expect(onInput).toHaveBeenCalledTimes(2);
+    controller.dispose();
+  });
+
   it("delivers Ctrl+C to the terminal and leaves unencoded shortcuts unconsumed", () => {
     const input = new FakeTextArea();
     const onData = vi.fn();

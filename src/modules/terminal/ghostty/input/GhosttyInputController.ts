@@ -13,7 +13,11 @@ import {
   type KeyEvent,
 } from "@oarlock/ghostty-core/protocol";
 import type { GhosttyTerminalModelApi } from "../GhosttyTerminalModel";
-import { encodeTerminalPaste, isUnsafePaste } from "./terminalInputEncoding";
+import {
+  encodeTerminalPaste,
+  isModifierOnlyKey,
+  isUnsafePaste,
+} from "./terminalInputEncoding";
 
 import { TerminalInputProxy } from "@/modules/terminal/ghostty/input/TerminalInputProxy";
 import { TerminalNativeSelection } from "@/modules/terminal/ghostty/input/TerminalNativeSelection";
@@ -359,7 +363,7 @@ export class GhosttyInputController {
   }
 
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
-    if (!event.defaultPrevented) this.options.onInput?.();
+    if (!event.defaultPrevented && !isModifierOnlyKey(event)) this.options.onInput?.();
     this.nativeSelection?.reset();
     // A new keystroke: its text is never a copy of the previous one's.
     this.lastData = "";
