@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import type { DropShell } from "../../lib/quoteShellPath";
+import type { DropShell } from "@/modules/terminal/lib/quoteShellPath";
 import { encodeCompletion } from "./safePathCompletion";
 
 const names = ["space name", "$(printf injected)", "`printf injected`", "a;b&c", "a'b", "λ-file", "-leading"];

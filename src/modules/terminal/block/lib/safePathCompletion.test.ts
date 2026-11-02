@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { encodeCompletion, pathInsertionContext } from "./safePathCompletion";
-import type { DropShell } from "../../lib/quoteShellPath";
+import type { DropShell } from "@/modules/terminal/lib/quoteShellPath";
 
 describe("literal shell path completions", () => {
   it.each(["space name", "$(printf injected)", "`printf injected`", "a;b&c", "a'b", "a\\b", "λ-file", "-leading"])("passes %s as one literal POSIX argument", (name) => {
