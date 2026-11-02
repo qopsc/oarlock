@@ -79,6 +79,7 @@ pub fn parse_porcelain_v2_bytes(stdout: &[u8]) -> PorcelainV2 {
                 || file.original_path.as_deref().is_some_and(|p| p.contains('\u{fffd}'));
             if bad {
                 file.status_label = "Unreadable name".into();
+                file.unreadable = true;
             }
         }
     }
@@ -140,6 +141,7 @@ fn make_file(
         unstaged: is_unstaged(index_status, worktree_status),
         untracked: index_status == '?' && worktree_status == '?',
         status_label: status_label(index_status, worktree_status),
+        unreadable: false,
     }
 }
 
@@ -224,6 +226,8 @@ mod tests {
         assert_eq!(parsed.files[0].path, "before.txt");
         assert_eq!(parsed.files[0].status_label, "Modified");
         assert_eq!(parsed.files[1].status_label, "Unreadable name");
+        assert!(parsed.files[1].unreadable);
+        assert!(!parsed.files[0].unreadable && !parsed.files[2].unreadable);
         assert!(parsed.files[1].path.contains('\u{fffd}'));
         assert_eq!(parsed.files[2].path, "after.txt");
         assert_eq!(parsed.files[2].status_label, "Untracked");

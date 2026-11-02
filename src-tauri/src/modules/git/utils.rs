@@ -177,6 +177,11 @@ pub fn resolve_within_repo(repo_root: &Path, rel: &str) -> Result<PathBuf> {
 /// Git names directory entries, not the filesystem objects their symlinks target.
 /// Historical entries need only lexical validation; they need not exist today.
 pub fn git_entry_name(rel: &str) -> Result<String> {
+    // Status shows a name that is not UTF-8 with U+FFFD in it; that text names no
+    // real file, so no command may act on it (a file really named so is a terminal job).
+    if rel.contains('\u{fffd}') {
+        return Err(GitError::InvalidPath(rel.into()));
+    }
     if !is_safe_pathspec(rel)
         || rel.starts_with('/')
         || (cfg!(windows) && rel.starts_with('\\'))
@@ -295,6 +300,14 @@ pub(crate) fn store_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_shown_with_replacement_characters_names_no_entry() {
+        assert!(git_entry_name("bad-\u{fffd}-name.txt").is_err());
+        assert!(git_entry_name("dir/\u{fffd}").is_err());
+        assert!(git_worktree_entry(Path::new("/repo"), "bad-\u{fffd}.txt").is_err());
+        assert_eq!(git_entry_name("caf\u{e9}.txt").unwrap(), "caf\u{e9}.txt");
+    }
 
     #[test]
     fn split_upstream_separates_remote_and_branch() {

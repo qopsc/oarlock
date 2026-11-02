@@ -44,6 +44,7 @@ fn file_entry(template: &GitChangedFile, path: String) -> GitChangedFile {
         unstaged: template.unstaged,
         untracked: true,
         status_label: template.status_label.clone(),
+        unreadable: template.unreadable,
     }
 }
 
@@ -96,6 +97,7 @@ mod tests {
             unstaged: true,
             untracked: true,
             status_label: "Untracked".into(),
+            unreadable: false,
         }
     }
 
