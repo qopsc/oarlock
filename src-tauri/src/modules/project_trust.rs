@@ -1860,6 +1860,30 @@ mod tests {
         }
     }
 
+    /// The commands cannot run without an app handle here, so this reads their source: every
+    /// `keeping_trust` call in a file command passes the caller's own origin, and only
+    /// `fs_create_file`, which takes none and serves the app alone, names `Origin::App`.
+    #[test]
+    fn the_file_commands_pass_their_callers_origin_to_keeping_trust() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |file: &str| {
+            std::fs::read_to_string(manifest.join("src/modules/fs").join(file)).unwrap()
+        };
+        let calls = |source: &str| -> Vec<String> {
+            source
+                .split("keeping_trust(")
+                .skip(1)
+                .map(|rest| rest.split(',').nth(1).unwrap_or("").trim().to_owned())
+                .collect()
+        };
+        assert_eq!(calls(&read("file.rs")), ["origin", "origin"]);
+        let mutate = read("mutate.rs");
+        assert_eq!(calls(&mutate), ["Origin::App", "origin"]);
+        let create_file = mutate.split("pub async fn fs_create_file(").nth(1).unwrap();
+        let signature = create_file.split(") -> ").next().unwrap();
+        assert!(!signature.contains("origin"), "fs_create_file serves the app alone");
+    }
+
     const SKILL: &str = "---\nname: review\ndescription: Reviews a change.\n---\nCheck it.\n";
 
     #[test]
