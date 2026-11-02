@@ -1270,6 +1270,23 @@ it.each([false, true])(
     t.session.close();
   },
 );
+it("a rename during a coordinated discard still reads the discarded baseline", async () => {
+  const t = setup({ "/a": "base" });
+  t.session.open("/a");
+  await flush();
+  t.session.change("draft");
+  const discard = t.session.prepareDiscard();
+  t.rename("/a", "/b");
+  expect(t.session.retarget("/a", "/b")).toBe(true);
+  expect(t.session.hasUnsavedChanges()).toBe(true);
+  t.touch("/b", "HEAD");
+  discard.complete();
+  await flush();
+  expect(t.session.text()).toBe("HEAD");
+  expect(t.session.hasUnsavedChanges()).toBe(false);
+  t.session.close();
+});
+
 it("discard reloads an unchanged buffer but preserves typing during its read", async () => {
   const t = setup({ "/a": "base" });
   t.session.open("/a");

@@ -124,7 +124,9 @@ export class DocumentSession {
     if (!this.active || this.detached) return false;
     if (this.path === to && this.loadedPath === to) return true;
     if (this.path !== from || this.loadedPath !== from) return false;
-    this.release(from);
+    // A coordinated discard follows the file to its new name: its completion still has
+    // to read the baseline there, and the draft stays unsaved until it has.
+    this.release(from, true);
     this.path = to;
     this.loadedPath = to;
     this.epoch += 1;
@@ -398,7 +400,6 @@ export class DocumentSession {
     const empty = { complete: () => {}, dispose: () => {} };
     if (!this.active || this.detached || this.path === null)
       return { select: () => empty };
-    let epoch = this.epoch;
     const revision = this.revision;
     const token = {};
     const pending = this.pendingDiscards ?? new Map();
@@ -418,14 +419,11 @@ export class DocumentSession {
       select: (matched) => {
         if (selected) return empty;
         selected = true;
-        if (!matched || !this.active || this.detached || epoch !== this.epoch) {
+        const owned = () => this.pendingDiscards === pending && pending.has(token);
+        if (!matched || !this.active || this.detached || !owned()) {
           remove();
           // A watcher read may have been suppressed during the identity lookup.
-          if (
-            this.active &&
-            epoch === this.epoch &&
-            this.discardReadSuppressed
-          ) {
+          if (this.active && this.discardReadSuppressed) {
             this.discardReadSuppressed = false;
             this.reload();
           }
@@ -434,7 +432,7 @@ export class DocumentSession {
         this.cancelFormatter();
         this.clearTimer();
         if (this.loadedPath === this.path) {
-          epoch = ++this.epoch;
+          this.epoch += 1;
           this.readGeneration += 1;
           documentRevisionChanged();
         }
@@ -448,7 +446,7 @@ export class DocumentSession {
               if (
                 !this.active ||
                 this.detached ||
-                epoch !== this.epoch ||
+                !owned() ||
                 this.path === null
               )
                 return;
@@ -738,10 +736,12 @@ export class DocumentSession {
     this.timer = null;
   }
 
-  private release(path: string): void {
+  private release(path: string, keepDiscards = false): void {
     this.cancelFormatter();
-    this.pendingDiscards = undefined;
-    this.discardReadSuppressed = false;
+    if (!keepDiscards) {
+      this.pendingDiscards = undefined;
+      this.discardReadSuppressed = false;
+    }
     this.recoveryTarget?.dispose();
     this.recoveryTarget = undefined;
     this.clearTimer();
