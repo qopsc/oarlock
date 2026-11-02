@@ -4,6 +4,9 @@ import {
   changeFolderKey,
   changeTreeRows,
   changeTreeNavRow,
+  gitPathAbsolute,
+  gitPathBasename,
+  gitPathDirname,
   toggleCollapsedFolder,
 } from "./changeTree";
 import { parseChangeViewMode } from "./changeViewMode";
@@ -17,7 +20,7 @@ function outline(rows: ChangeTreeRow<Entry>[]): string[] {
   return rows.map((row) =>
     row.kind === "folder"
       ? `${"  ".repeat(row.depth)}${row.label}/ (${row.fileCount})${row.collapsed ? " +" : ""}`
-      : `${"  ".repeat(row.depth)}${row.entry.path.split(/[\\/]/).pop()}`,
+      : `${"  ".repeat(row.depth)}${row.entry.path.split("/").pop()}`,
   );
 }
 
@@ -132,11 +135,16 @@ describe("changeTreeRows", () => {
     ]);
   });
 
-  it("reads backslash separators and keeps the entry itself", () => {
-    const windows = { key: "k", path: "dir\\file.ts" };
-    const rows = changeTreeRows([windows], new Set());
-    expect(outline(rows)).toEqual(["dir/ (1)", "  file.ts"]);
-    expect(rows[1].kind === "file" && rows[1].entry).toBe(windows);
+  it("keeps a backslash in a Git filename instead of creating a folder", () => {
+    const file = { key: "k", path: "dir\\file.ts" };
+    const rows = changeTreeRows([file], new Set());
+    expect(outline(rows)).toEqual(["dir\\file.ts"]);
+    expect(rows[0].kind === "file" && rows[0].entry).toBe(file);
+    expect(gitPathBasename("folder/dir\\file.ts")).toBe("dir\\file.ts");
+    expect(gitPathDirname("folder/dir\\file.ts")).toBe("folder");
+    expect(gitPathAbsolute("/repo\\name", file.path)).toBe(
+      "/repo\\name/dir\\file.ts",
+    );
   });
 
   it("is empty without changes", () => {

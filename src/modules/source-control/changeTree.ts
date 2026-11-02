@@ -2,6 +2,21 @@ import type { TreeNavRow } from "@/lib/treeKeyMove";
 
 type ChangedPath = { readonly key: string; readonly path: string };
 
+// Git reports repository-relative paths with forward-slash separators on all
+// platforms. A backslash in one of those paths is part of the filename.
+export function gitPathBasename(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
+export function gitPathDirname(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index < 0 ? "" : path.slice(0, index);
+}
+
+export function gitPathAbsolute(root: string, path: string): string {
+  return `${root}${root.endsWith("/") ? "" : "/"}${path}`;
+}
+
 export type ChangeTreeRow<Entry extends ChangedPath> =
   | {
       readonly kind: "folder";
@@ -60,7 +75,7 @@ function buildFolders<Entry extends ChangedPath>(
 ): Folder<Entry> {
   const root = newFolder<Entry>("", "");
   for (const entry of entries) {
-    const parts = entry.path.replace(/\\/g, "/").split("/").filter(Boolean);
+    const parts = entry.path.split("/").filter(Boolean);
     const name = parts.pop();
     if (name === undefined) continue;
     let folder = root;

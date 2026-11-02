@@ -33,6 +33,10 @@ describe("commandTouchesRepository", () => {
 });
 
 describe("repositoryContainsContext", () => {
+  it("does not confuse a Unix backslash with a directory separator", () => {
+    expect(repositoryContainsContext("/repo\\name", "/repo\\name/src")).toBe(true);
+    expect(repositoryContainsContext("/repo\\name", "/repo/name/src")).toBe(false);
+  });
   it("matches a repository root and its descendants", () => {
     expect(repositoryContainsContext("/repo", "/repo")).toBe(true);
     expect(repositoryContainsContext("/repo", "/repo/packages/app")).toBe(

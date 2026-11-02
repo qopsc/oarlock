@@ -4614,7 +4614,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R055 | Closed | Status reports invalid UTF-8 instead of showing an empty repository. A Linux real-Git regression uses a non-UTF-8 filename; macOS refused creation of that filename. |
 | R056 | Open, Tier 2 | The shared path guard still refuses Unix filenames containing colons or control characters, although Git status can name them. |
 | R057 | Closed | A staged diff and history now report truncated Git output as an error. Real-Git regressions first reproduced both incomplete results and then passed with the fix. |
-| R063 | Open, Tier 2 | Source Control still changes backslashes into separators for grouping and opening. A direct tree helper probe placed Unix `a\\b.txt` under folder `a`. |
+| R063 | Closed | Source Control preserves Git filenames containing backslashes in grouping, labels, copy and file-open paths. A tree regression reproduced the incorrect folder before the fix. |
 | R072 | Open, Tier 2 | The shell locale check accepts any UTF-8 variable even if a higher-priority non-UTF-8 variable wins, and changes only `LANG`. |
 | R082 | Closed | Terminal link resolution preserves literal backslashes in Unix directories and filenames; a regression reproduced the wrong target, and Windows drive and UNC cases still pass. |
 | R086 | Closed; platform checks remain | AP002 binds completion to its terminal and workspace; existing ownership tests and real POSIX-shell checks are recorded in the depth checkpoint. Mounted GUI and Windows/WSL checks remain manual/port work. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **5 closed; 20 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **6 closed; 19 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4653,3 +4653,13 @@ Validation: 105 focused language-server tests and the full frontend suite passed
 Terminal link joining now treats backslashes as filename characters in Unix paths, while retaining Windows drive and UNC separator handling. A direct link regression covering directory names, filenames and parent traversal failed before the change and passes afterward. This is automated link-resolution coverage; a packaged-app click on such a file remains a useful manual check.
 
 Validation: the focused terminal-link tests and full frontend suite passed (6,086 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, and strict Clippy passed.
+
+### R243 — Source Control repository context for Unix backslashes
+
+**MAJOR, fixed:** Source Control also converted backslashes in editor and repository context paths into separators. Consequently, an editor in `/repo\\name` could follow `/repo/name`, and containment could match the wrong repository. Regressions reproduced both before the fix. Context normalization now preserves Unix backslashes and retains the existing drive and UNC behavior. This is a separate finding from R063 and is not counted among the original 31 compatibility entries.
+
+### R063 and R243 checkpoint — Source Control paths
+
+Git's repository-relative names use `/` as the separator; a backslash is kept as part of a Unix filename. Source Control now preserves that identity in the change tree, labels, relative and absolute copy actions, and file-open target. Editor-context and repository-containment comparisons also preserve Unix backslashes. Existing Windows drive and UNC comparison tests continue to pass. The tree and context tests each failed before their corresponding fix.
+
+Validation: 48 focused Source Control tests and the full frontend suite passed (6,088 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,578 library tests (four ignored) and all integration suites, and strict Clippy passed. The tests exercise the path helpers and component inputs; packaged Finder/open and clipboard actions were not manually exercised.

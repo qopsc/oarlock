@@ -59,7 +59,6 @@ import {
   COMPACT_CONTENT,
   COMPACT_ITEM,
 } from "@/modules/explorer/lib/menuItemClass";
-import { joinPath } from "@/modules/explorer/lib/useFileTree";
 import {
   OpenPrivacySettingsButton,
   showFileError,
@@ -105,6 +104,9 @@ import {
 import {
   changeTreeNavRow,
   changeTreeRows,
+  gitPathAbsolute,
+  gitPathBasename,
+  gitPathDirname,
   toggleCollapsedFolder,
 } from "./changeTree";
 import { type ChangeViewMode, parseChangeViewMode } from "./changeViewMode";
@@ -185,21 +187,9 @@ type RowDescriptor =
 
 const NO_COLLAPSED: ReadonlySet<string> = new Set();
 
-function basename(path: string): string {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : path;
-}
-
-function dirname(path: string): string {
-  const normalized = path.replace(/\\/g, "/");
-  const index = normalized.lastIndexOf("/");
-  if (index <= 0) return "";
-  return normalized.slice(0, index);
-}
-
 function entryPathLabel(entry: SourceControlFileEntry): string {
   if (entry.originalPath) return `${entry.originalPath} → ${entry.path}`;
-  return dirname(entry.path);
+  return gitPathDirname(entry.path);
 }
 
 function upstreamBadgeLabel(upstream: string | null | undefined): string {
@@ -1679,7 +1669,7 @@ const EntryRow = memo(function EntryRow({
   const entry = row.entry;
   const tree = viewMode === "tree";
   const isSelected = selectedPath === entry.path;
-  const fileName = basename(entry.path);
+  const fileName = gitPathBasename(entry.path);
   // The tree already shows the folder; a rename still says where it came from.
   const pathLabel = tree && !entry.originalPath ? "" : entryPathLabel(entry);
   const showDiscard = entry.unstaged;
@@ -1689,9 +1679,7 @@ const EntryRow = memo(function EntryRow({
   const isDiscardBusy = actionBusy === `discard:${entry.path}`;
   const disabled = actionBusy !== null;
 
-  const absolutePath = repoRoot
-    ? joinPath(repoRoot.replace(/\\/g, "/"), entry.path.replace(/\\/g, "/"))
-    : null;
+  const absolutePath = repoRoot ? gitPathAbsolute(repoRoot, entry.path) : null;
   const isDeleted = entry.statusCode === "D";
   const revealLabel = IS_MAC ? "Reveal in Finder" : "Reveal in File Manager";
 
@@ -1855,7 +1843,7 @@ const EntryRow = memo(function EntryRow({
         {/* Copy paths */}
         <ContextMenuItem
           className={COMPACT_ITEM}
-          onSelect={() => void copyToClipboard(entry.path.replace(/\\/g, "/"))}
+          onSelect={() => void copyToClipboard(entry.path)}
         >
           Copy Relative Path
         </ContextMenuItem>

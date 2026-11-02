@@ -18,6 +18,7 @@ import {
   createRefreshCoalescer,
   finishedCommandLeaves,
 } from "./refreshSignals";
+import { normalizeSourceControlPath } from "./repositoryTarget";
 
 const AUTO_FETCH_THROTTLE_MS = 5 * 60_000;
 const AUTO_FETCH_LRU_LIMIT = 16;
@@ -114,7 +115,7 @@ function sourceControlContextKey(
 }
 
 function normalizedContextPath(path: string): string {
-  const normalized = path.replace(/\\/g, "/");
+  const normalized = normalizeSourceControlPath(path);
   if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) {
     return normalized;
   }

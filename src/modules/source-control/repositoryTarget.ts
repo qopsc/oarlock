@@ -17,9 +17,15 @@ function targetScopeKey(spaceId: string, workspaceKey: string): string {
   return `${spaceId}\0${workspaceKey}`;
 }
 
+export function normalizeSourceControlPath(path: string): string {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\")
+    ? path.replace(/\\/g, "/")
+    : path;
+}
+
 function dirname(path: string | null): string | null {
   if (!path) return null;
-  const normalized = path.replace(/\\/g, "/");
+  const normalized = normalizeSourceControlPath(path);
   const index = normalized.lastIndexOf("/");
   if (index < 0) return normalized;
   if (index === 0) return "/";
