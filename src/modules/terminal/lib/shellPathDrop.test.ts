@@ -194,6 +194,24 @@ describe("runShellDrop", () => {
     confirmed.writer.dispose();
   });
 
+  it("refuses a WSL drop when the prompt is lost before delivery", async () => {
+    let confirmed = true;
+    const h = harness({
+      target: ubuntu,
+      source: ubuntu,
+      promptConfirmed: () => confirmed,
+      atPrompt: async () => {
+        confirmed = false;
+        return true;
+      },
+    });
+    await runShellDrop(h.run);
+    expect(h.paste).not.toHaveBeenCalled();
+    expect(h.refuse).toHaveBeenCalledOnce();
+    await typeAfter(h, "k");
+    h.writer.dispose();
+  });
+
   it("inserts at the command bar without asking about the foreground", async () => {
     const atPrompt = vi.fn(async () => true);
     const insert = vi.fn(() => true);

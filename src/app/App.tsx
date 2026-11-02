@@ -18,9 +18,8 @@ import {
   getLaunchDir,
 } from "@/lib/launchDir";
 import { toast } from "sonner";
-import { IS_MAC } from "@/lib/platform";
+import { IS_MAC, IS_WINDOWS } from "@/lib/platform";
 import { quoteShellPath } from "@/modules/terminal/lib/quoteShellPath";
-import { IS_WINDOWS } from "@/lib/platform";
 import { usePresence } from "@/lib/usePresence";
 import { useZoom } from "@/lib/useZoom";
 import { cn, isMarkdownPath } from "@/lib/utils";

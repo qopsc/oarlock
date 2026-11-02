@@ -66,6 +66,7 @@ import { IS_WINDOWS } from "@/lib/platform";
 import type { DropShell } from "../lib/quoteShellPath";
 import { captureDropOwner } from "../lib/dropOwnership";
 import { cachedShellDialect } from "../lib/shellDialectCache";
+import { shellPromptConfirmed } from "../lib/shellPromptConfirmed";
 import { launchShellDrop } from "../lib/shellDropLauncher";
 import { GhosttySemanticEventRouter } from "./core/GhosttySemanticEventRouter";
 import { getGhosttyCoreRuntime } from "./GhosttyCoreRuntime";
@@ -617,7 +618,7 @@ export function dropPathsIntoGhosttySession(
           return job === null ? null : !job;
         },
     dialect: () => shellDialect(session, pty),
-    promptConfirmed: () => commandBar || session.promptSeen,
+    promptConfirmed: () => commandBar || promptConfirmed(session),
     active,
     running,
     paste: (text) => {
@@ -795,11 +796,19 @@ export async function ghosttyLeafHasForegroundProcess(
  * as a child (Windows; a GUI app it started does not count); null when that
  * cannot be told.
  */
+function promptConfirmed(session: GhosttySession): boolean {
+  return shellPromptConfirmed(session.workspace, {
+    promptSeen: session.promptSeen,
+    alternateScreen: session.model?.modes().alternateScreen,
+  });
+}
+
 export async function ghosttyLeafHasForegroundJob(
   leafId: number,
 ): Promise<boolean | null> {
   const session = sessions.get(leafId);
   if (!session?.pty || session.shellExited) return null;
+  if (!promptConfirmed(session)) return true;
   return invoke<boolean>("pty_has_foreground_job", {
     id: session.pty.id,
   }).catch(() => null);
@@ -1189,10 +1198,10 @@ async function initializeSessionGeneration(
       );
     },
     onCommandState: (running) => {
-      if (!running) {
-        session.promptSeen = true;
-        mark("firstPromptMs");
-      }
+      if (!running) mark("firstPromptMs");
+    },
+    onPromptEnd: () => {
+      if (alive()) session.promptSeen = true;
     },
   });
   const model = await coreRuntime.createModel({

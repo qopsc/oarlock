@@ -52,7 +52,7 @@ export function planShellDrop(
     paths.length > MAX_PATHS ||
     paths.reduce((sum, path) => sum + path.length, 0) > MAX_BYTES
   )
-    throw new DropRefusal("A drop holds 1 to 256 paths of at most 64 KiB in all.");
+    throw new DropRefusal("A drop holds 1 to 256 paths of at most 65,536 characters in all.");
   try {
     return formatDroppedPaths(
       paths.map((path) => convertShellPath(path, source, target, dialect, windows)),
@@ -103,7 +103,11 @@ export async function runShellDrop(run: ShellDropRun): Promise<void> {
       return finish(() => run.refuse("This shell does not support dropped paths."));
     const text = planShellDrop(run.paths, run.source, run.target, dialect, run.windows);
     finish(() => {
-      if (!run.active() || run.running())
+      if (
+        !run.active() ||
+        run.running() ||
+        (run.target.kind === "wsl" && !run.promptConfirmed())
+      )
         run.refuse("The terminal changed before the dropped paths could be inserted.");
       else run.paste(text);
     }, text.length * 2);

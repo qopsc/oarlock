@@ -15,6 +15,8 @@ export type GhosttySemanticEventCallbacks = {
   readonly onBell?: () => void;
   readonly onClipboard?: (text: string) => void;
   readonly onCommandState?: (running: boolean) => void;
+  /** The prompt ended and input is expected (OSC 133 B), the signal the command bar trusts. */
+  readonly onPromptEnd?: () => void;
   readonly onCwd?: (cwd: string) => void;
   readonly onNotification?: (title: string, body: string) => void;
   readonly onOverflow?: (dropped: number) => void;
@@ -106,6 +108,7 @@ export class GhosttySemanticEventRouter {
         break;
       case "prompt-end":
         this.inCommand = true;
+        this.callbacks.onPromptEnd?.();
         break;
       case "end-of-input":
         this.inCommand = true;
