@@ -10,19 +10,10 @@ import {
 } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { arch } from "@tauri-apps/plugin-os";
 import { useState } from "react";
+import { linuxInstallCommand, type DistroKey } from "./linuxInstallCommand";
 import { UPDATES_ENABLED, useUpdater } from "./useUpdater";
-
-type DistroKey = "debian" | "fedora";
-
-function distroCommand(key: DistroKey, version: string): string {
-  switch (key) {
-    case "debian":
-      return `sudo apt install ./Oarlock_${version}_amd64.deb`;
-    case "fedora":
-      return `sudo dnf install ./Oarlock-${version}-1.x86_64.rpm`;
-  }
-}
 
 const DISTROS: { key: DistroKey; label: string }[] = [
   { key: "debian", label: "Debian / Ubuntu" },
@@ -46,7 +37,17 @@ function UpdatePrompt() {
   const [distro, setDistro] = useState<DistroKey>("debian");
   const manualVersion =
     status.kind === "manual-available" ? status.info.version : "";
-  const activeCommand = distroCommand(distro, manualVersion);
+  let architecture: string | null = null;
+  try {
+    architecture = arch();
+  } catch {
+    // Offer the release download instead of guessing an architecture.
+  }
+  const activeCommand = linuxInstallCommand(
+    distro,
+    manualVersion,
+    architecture,
+  );
 
   const open =
     status.kind === "available" ||
@@ -62,6 +63,7 @@ function UpdatePrompt() {
   const ready = status.kind === "ready";
 
   const copyCommand = async () => {
+    if (!activeCommand) return;
     try {
       await writeClipboardText(activeCommand);
       setCopied(true);
@@ -105,7 +107,9 @@ function UpdatePrompt() {
                   ? `${progress.toFixed(0)}% — ${formatBytes(status.downloaded)}`
                   : formatBytes(status.downloaded)
                 : manual
-                  ? `You're on v${manual.currentVersion}. Pick your distro and run the command, or grab the package from GitHub.`
+                  ? activeCommand
+                    ? `You're on v${manual.currentVersion}. Pick your distro and run the command, or grab the package from GitHub.`
+                    : `You're on v${manual.currentVersion}. Download the package for your system from GitHub.`
                   : update?.body || "A new version is ready to install."}
           </DialogDescription>
         </DialogHeader>
@@ -117,7 +121,7 @@ function UpdatePrompt() {
           <Progress value={undefined} className="mt-2 animate-pulse" />
         )}
 
-        {manual && (
+        {manual && activeCommand && (
           <div className="mt-2 flex flex-col gap-2">
             <div className="flex gap-1 rounded-md bg-muted/40 p-1">
               {DISTROS.map((d) => (
@@ -165,10 +169,7 @@ function UpdatePrompt() {
               <Button variant="ghost" size="sm" onClick={dismiss}>
                 Later
               </Button>
-              <Button
-                size="sm"
-                onClick={() => void openUrl(manual.releaseUrl)}
-              >
+              <Button size="sm" onClick={() => void openUrl(manual.releaseUrl)}>
                 Download package
               </Button>
             </>

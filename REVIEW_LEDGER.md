@@ -3795,6 +3795,7 @@ At this checkpoint the release-blocker count remains **5**: R005, R026-U, R111, 
 | ID | Task | Expected result |
 | --- | --- | --- |
 | R111 | After building the final release assets, generate SHA-256 hashes for the Linux `.deb` and both signed macOS `.app.tar.gz` assets and update `nix/sources.json`. | The Nix package installs successfully using those exact published assets. This is a release checklist item, not a code blocker. |
+| R001 | When the currently disabled updater is enabled, open its update dialog on x86-64 and ARM64 Linux, select each distro, and compare the displayed commands with the actual published assets. Check an unsupported architecture falls back to the download link. | Commands name the matching `.deb` or `.rpm`; no guessed command appears for an unknown architecture. |
 
 ## Release-blocker validation checkpoint (2026-10-29)
 
@@ -4602,7 +4603,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 
 | ID | Disposition | Evidence |
 | --- | --- | --- |
-| R001 | Open, Tier 2, dormant | The updater is disabled, but its Linux commands still name only x86-64 packages. Revalidate when enabling updates. |
+| R001 | Closed, Tier 2, dormant | Linux update commands now use the running architecture for the x86-64 and ARM64 packages built by the release workflow; unknown architectures and unsafe version strings show only the download action. Unit tests cover both distributions and architectures. The updater remains disabled; validate the mounted dialog and real release assets when it is enabled. Package-name mappings were checked against Tauri's pinned [Debian](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.3/crates/tauri-bundler/src/bundle/linux/debian.rs) and [RPM](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.3/crates/tauri-bundler/src/bundle/linux/rpm.rs) bundlers. |
 | R007 | Closed; packaged check manual | The native New Window and Close Tab menu accelerators now follow effective user bindings and collision handling. |
 | R023 | Windows/WSL port | The mount translation is WSL-specific and outside this release. |
 | R032 | Windows/WSL port | The affected polling path is WSL-specific and outside this release. |
@@ -4634,7 +4635,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Partially closed, split | R215-B: parser preloading now shares the document-language readiness gate, so binary and oversized documents do not trigger it; ready documents can still preload while the editor is created. Hook regressions cover both states. Credential subscriptions remain AI-related and on hold as R215-A. |
 | R217 | Closed, Tier 2 | Rustfmt uses the owning Cargo package's edition, including workspace inheritance, without executing Cargo. Manifest reads stay inside authorized folders and fail visibly on malformed, oversized, inaccessible or unsupported manifests. Loose files retain the prior 2021 default. A real rustfmt regression distinguishes 2021 from 2024 syntax; additional tests cover defaults, inherited editions and unauthorized workspaces. |
 
-Counts: **25 closed or partially held; 1 Tier 2 open (dormant); 0 Tier 3 open; 3 AI/MCP held; 2 Windows/WSL port**. The AI portion of R215 is included in the partially held row. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **26 closed or partially held; 0 Tier 2 or Tier 3 open; 3 AI/MCP held; 2 Windows/WSL port**. The AI portion of R215 is included in the partially held row. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 R093 checkpoint: the three new mocked allocation/completeness regressions failed against the previous implementation and pass with cleanup and retry. The full frontend suite passed 6,106 tests (two skipped); the native suite passed 1,586 library tests (four ignored) and all integration tests. Strict Clippy and types passed; lint remained at 80 warnings. Sandboxed test runs could not access local servers, PTYs and file watches; the full suites passed when rerun with those facilities available.
 
@@ -4643,6 +4644,8 @@ R217 checkpoint: focused manifest and real-rustfmt tests passed. The full fronte
 R215-B checkpoint: the readiness and preload regressions pass. The full frontend suite passed 6,108 tests (two skipped); the native suite passed 1,588 library tests (four ignored) and all integration tests. Strict Clippy and types passed; lint remained at 80 warnings.
 
 R095 checkpoint: rebuilt both pinned Zig 0.16.0 WASM variants; the real-core regressions failed before the fix and pass afterward. The adversarial stack workload now drains replies every 32 KiB, matching the production parser, rather than accumulating them across an entire input; its full workload and stack assertions still pass. The full frontend suite passed 6,112 tests (two skipped); the native suite passed 1,588 library tests (four ignored), all integrations and artifact validation. Strict Clippy, types and Zig formatting passed; lint remained at 80 warnings. The first frontend run exposed the old stress-harness accumulation and generated Zig package sources in the source scan; those sources were moved outside the workspace before the successful run.
+
+R001 checkpoint: package-command tests pass for both release architectures and distributions, unknown architectures and unsafe versions. The full frontend suite passed 6,117 tests (two skipped); the native suite passed 1,588 library tests (four ignored) and all integration tests. Strict Clippy and types passed; lint remained at 80 warnings. The mounted updater is disabled and remains a conditional manual check. Unrelated automatic formatting introduced in the previous terminal protocol test edit was also reversed without changing the tests.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
