@@ -68,6 +68,9 @@ pub(crate) const NATIVE_FILES: &[&str] = &[
     "project-trust.json", "oarlock-windows.json", "oarlock-spaces.json", "skills-state.json",
     "oarlock-ai-sessions.json", "oarlock-ai-snippets.json", "oarlock-ai-todos.json",
     "oarlock-ai-agents.json", "oarlock-subagents.json",
+    "oarlock-ai-sessions.before-message-files.json",
+    // The keychain fallback file; Linux keeps it in the folder the store plugin resolves.
+    "secrets.json",
 ];
 
 /// The members of `NATIVE_FILES` the page still opens through the store plugin (`STORE_PATH` in

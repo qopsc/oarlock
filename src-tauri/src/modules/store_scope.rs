@@ -217,6 +217,13 @@ mod tests {
         for opened in PAGE_OPENED_FILES {
             assert!(NATIVE_FILES.contains(opened), "{opened}");
         }
+        for owned in [
+            "oarlock-ai-sessions.before-message-files.json",
+            "secrets.json",
+            "SECRETS.JSON",
+        ] {
+            assert!(load(json!(owned), "main").is_some(), "{owned}");
+        }
     }
 
     #[test]
