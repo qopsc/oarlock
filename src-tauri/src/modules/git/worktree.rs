@@ -538,6 +538,9 @@ pub fn remove_with_guard(
     );
     if !folder_gone {
         guard(&folder).map_err(|error| GitError::command("remove worktree", error))?;
+        // The target's own configuration and hooks run during removal, so it is
+        // inspected whether or not it is forced.
+        drop(owned_repo_root(registry, &worktree.path, &repo.workspace)?);
         if !force {
             let changes = count_changes(registry, &repo.workspace, &worktree.path)?;
             if changes > 0 {
@@ -1296,6 +1299,18 @@ mod tests {
         assert!(result.removed);
         assert!(!dir.exists());
         assert_eq!(fx.worktree_paths(), vec![fx.root()]);
+    }
+
+    #[test]
+    fn forced_removal_refuses_a_target_worktree_with_executable_configuration() {
+        let Some(fx) = Fixture::new() else { return };
+        let wt = fx.add(new_branch("hostile", None), None).unwrap();
+        let dir = PathBuf::from(&wt.path);
+        git_ok(&fx.main, &["config", "extensions.worktreeConfig", "true"]);
+        git_ok(&dir, &["config", "--worktree", "core.fsmonitor", "/usr/bin/true"]);
+        let error = fx.remove(&wt.path, true).unwrap_err();
+        assert!(error.to_string().contains("fsmonitor"), "{error}");
+        assert!(dir.exists(), "the hostile worktree was removed");
     }
 
     #[cfg(unix)]

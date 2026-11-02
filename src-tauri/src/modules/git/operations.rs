@@ -613,6 +613,9 @@ pub(crate) fn discard_owned(
         return Err(GitError::PathOutsideWorkspace(owner.path().into()));
     }
     ensure_git_available(&repo_root.workspace)?;
+    // The plan was preflighted when Discard began; execution follows a
+    // cross-window wait, so the configuration is read again here.
+    super::commit_guard::preflight(repo_root)?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -684,7 +687,7 @@ pub fn push(
 ) -> Result<GitPushResult> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(
+    let remote_pins = super::remote_guard::inspect(
         registry,
         &repo_root,
         super::remote_guard::RemoteAction::Push,
@@ -695,8 +698,9 @@ pub fn push(
         return Err(GitError::NoUpstream);
     }
 
-    let output = repo_root.run(["push"], NETWORK_TIMEOUT_SECS)?;
-    ensure_success(&output, "git push failed")?;
+    let output = run_network(&repo_root, ["push"]);
+    validate_remote_pins(&remote_pins)?;
+    ensure_success(&output?, "git push failed")?;
 
     let upstream = upstream.unwrap();
     let (remote, branch) = split_upstream(&upstream);
@@ -1023,13 +1027,14 @@ pub fn fetch(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(
+    let remote_pins = super::remote_guard::inspect(
         registry,
         &repo_root,
         super::remote_guard::RemoteAction::Fetch,
     )?;
-    let output = repo_root.run(["fetch", "--prune"], NETWORK_TIMEOUT_SECS)?;
-    ensure_success(&output, "git fetch failed")
+    let output = run_network(&repo_root, ["fetch", "--prune"]);
+    validate_remote_pins(&remote_pins)?;
+    ensure_success(&output?, "git fetch failed")
 }
 
 pub fn pull_ff_only(
@@ -1039,13 +1044,31 @@ pub fn pull_ff_only(
 ) -> Result<()> {
     let repo_root = owned_repo_root(registry, repo_root, workspace)?;
     ensure_git_available(&repo_root.workspace)?;
-    super::remote_guard::inspect(
+    let remote_pins = super::remote_guard::inspect(
         registry,
         &repo_root,
         super::remote_guard::RemoteAction::Fetch,
     )?;
-    let output = repo_root.run(["pull", "--ff-only"], NETWORK_TIMEOUT_SECS)?;
-    ensure_success(&output, "git pull --ff-only failed")
+    let output = run_network(&repo_root, ["pull", "--ff-only"]);
+    validate_remote_pins(&remote_pins)?;
+    ensure_success(&output?, "git pull --ff-only failed")
+}
+
+/// Network launches keep the user's credential helpers, so repository-scoped
+/// ones are checked again right before the launch rather than at acquisition.
+fn run_network<const N: usize>(repo: &ResolvedGitDirectory, args: [&str; N]) -> Result<GitOutput> {
+    super::commit_guard::preflight(repo)?;
+    repo.run(args, NETWORK_TIMEOUT_SECS)
+}
+
+/// A local remote replaced while the transfer ran may have been read instead.
+fn validate_remote_pins(pins: &[ResolvedGitDirectory]) -> Result<()> {
+    for pin in pins {
+        if let Some(owner) = &pin.ownership {
+            owner.validate()?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_commit_success(output: &GitOutput) -> Result<()> {
@@ -1126,6 +1149,57 @@ mod tests {
             git_show_text(&repo, "HEAD:file.txt").is_err(),
             "git show ran against a replaced Git directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_and_network_launches_recheck_the_configuration_at_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        if !git(&root, &["init", "-q"]) {
+            return;
+        }
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        assert!(git(&root, &["add", "."]) && git(&root, &["commit", "-q", "-m", "i"]));
+        std::fs::write(root.join("f.txt"), "two\n").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let repo = owned_repo_root(&registry, root.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        let marker = root.join("ran");
+        let helper = format!("!touch {}", marker.display());
+        assert!(git(&root, &["config", "credential.helper", &helper]));
+        assert!(git(&root, &["config", "core.fsmonitor", "/usr/bin/true"]));
+        let entries = [DiscardEntry { path: "f.txt".into(), untracked: false }];
+        let error = discard_owned(&registry, &repo, &entries).unwrap_err();
+        assert!(error.to_string().contains("fsmonitor"), "{error}");
+        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "two\n");
+        assert!(git(&root, &["config", "--unset", "core.fsmonitor"]));
+        let error = run_network(&repo, ["ls-remote", "."]).err().unwrap();
+        assert!(error.to_string().contains("credential.helper"), "{error}");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_remote_stays_pinned_for_the_whole_transfer() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        if !git(&a, &["init", "-q"]) || !git(&b, &["init", "-q"]) {
+            return;
+        }
+        assert!(git(&a, &["remote", "add", "origin", b.to_str().unwrap()]));
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&a).unwrap();
+        registry.authorize(&b).unwrap();
+        let repo = owned_repo_root(&registry, a.to_str().unwrap(), &WorkspaceEnv::Local).unwrap();
+        let pins =
+            super::super::remote_guard::inspect(&registry, &repo, super::super::remote_guard::RemoteAction::Fetch)
+                .unwrap();
+        assert_eq!(pins.len(), 1, "the local remote's pin was dropped");
+        std::fs::rename(b.join(".git"), b.join(".git.moved")).unwrap();
+        assert!(git(&b, &["init", "-q"]));
+        assert!(pins[0].ownership.as_ref().unwrap().validate().is_err());
     }
 
     #[test]
