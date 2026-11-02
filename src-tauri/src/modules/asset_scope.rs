@@ -2,19 +2,22 @@
 //! (`tauri.conf.json`), so a script in a webview cannot read an arbitrary file that way; the
 //! backend grants, at runtime:
 //!
-//! - every authorized workspace root, recursively, as the registry authorizes it: the editor's
-//!   image, video, audio and PDF previews and the Markdown preview's images load from there.
-//!   A WSL root is registered by its host path (the share or the drive), which is also what
-//!   `fs_host_path` turns a WSL file into for its asset URL.
-//! - each installed font face `system_font_faces` hands the terminal, as a single file.
+//! - each installed font face `system_font_faces` hands the terminal, as a single file, to
+//!   Tauri's `asset:` protocol. Nothing else is ever in that scope: Tauri types a file by its
+//!   extension (HTML for an unknown one) and adds neither a sandbox nor a page token, so
+//!   previews do not go through it.
 //!
-//! The configured scope sets `requireLiteralLeadingDot`, so on every platform `**` never enters
-//! a name starting with a dot and a granted home folder does not expose `~/.ssh`. Tauri's
-//! default skips dot names only on Unix, which on Windows would serve `C:\Users\me\.ssh`.
+//! Previews load through `oarlock-asset` (`asset_all_folders.rs`), which serves every
+//! authorized workspace root, recursively, as the registry authorizes it (`Access`): the
+//! editor's image, video, audio and PDF previews and the Markdown preview's images. A WSL root
+//! is registered by its host path (the share or the drive), which is also what `fs_host_path`
+//! turns a WSL file into for its asset URL. The configured scope's `requireLiteralLeadingDot`
+//! still decides dot names, so on every platform a granted home folder does not expose
+//! `~/.ssh`; Tauri's default skips dot names only on Unix, which on Windows would serve
+//! `C:\Users\me\.ssh`.
 //!
-//! A grant here can never be taken back, so "Allow the app to access all folders" grants
-//! nothing: previews outside these roots load through `asset_all_folders`' own scheme, which
-//! asks the setting on every request.
+//! "Allow the app to access all folders" adds no root: `oarlock-asset` asks the setting on
+//! every request.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -24,8 +27,18 @@ use tauri::Manager;
 
 use super::workspace::WorkspaceRegistry;
 
+/// Tauri's asset protocol: only the font faces the backend chose are granted to it. A workspace
+/// file is never in its scope, because it types files by extension (HTML for an unknown one),
+/// sends no sandbox and needs no page token; previews go through `oarlock-asset`, which judges
+/// requests with `Access`.
 pub struct AssetScope {
     scope: tauri::scope::fs::Scope,
+    access: Access,
+}
+
+/// What `oarlock-asset` may serve besides everything while "access all folders" is on: the
+/// authorized workspace roots, recursively, and never the app's own state.
+pub struct Access {
     /// The app's own data, config and local data folders, resolved. Nothing there is ever a
     /// preview: it holds the stores, the trust decisions and the secrets file.
     app_state: Vec<PathBuf>,
@@ -67,29 +80,123 @@ fn needs_grant(root: &Path, granted: &[PathBuf], literal_leading_dot: bool) -> b
         .any(|granted| covers(granted, root, literal_leading_dot))
 }
 
-/// Whether `path` lies in one of `dirs`.
+/// Whether `path` lies in one of `dirs`. Windows paths compare without regard to case, as the
+/// filesystem does.
 fn under_any(path: &Path, dirs: &[PathBuf]) -> bool {
-    dirs.iter().any(|dir| path.starts_with(dir))
+    dirs.iter().any(|dir| within(dir, path))
 }
 
-impl AssetScope {
+fn within(dir: &Path, path: &Path) -> bool {
+    if cfg!(windows) {
+        let fold = |p: &Path| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let (dir, path) = (fold(dir), fold(path));
+        path.starts_with(&dir)
+    } else {
+        path.starts_with(dir)
+    }
+}
+
+/// Whether a granted root lets a request for `path` through the scope's wildcard rule: it lies
+/// in the root and no folder below the root starts with a dot.
+fn rooted(path: &Path, roots: &[PathBuf], literal_leading_dot: bool) -> bool {
+    roots.iter().any(|root| {
+        if cfg!(windows) {
+            within(root, path) && covers_ignoring_case(root, path, literal_leading_dot)
+        } else {
+            covers(root, path, literal_leading_dot)
+        }
+    })
+}
+
+fn covers_ignoring_case(root: &Path, path: &Path, literal_leading_dot: bool) -> bool {
+    let depth = root.components().count();
+    !literal_leading_dot
+        || path.components().skip(depth).all(|component| match component {
+            Component::Normal(name) => !name.to_string_lossy().starts_with('.'),
+            _ => true,
+        })
+}
+
+impl Access {
+    pub(crate) fn new(app_state: Vec<PathBuf>, literal_leading_dot: bool) -> Self {
+        Self {
+            app_state,
+            literal_leading_dot,
+            granted_roots: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Whether `real`, a resolved path, is in the app's own state folders.
     pub fn is_app_state(&self, real: &Path) -> bool {
         under_any(real, &self.app_state)
     }
 
-    fn grant_root(&self, root: &Path) {
+    /// Whether the resolved `real` lies in an authorized root without crossing a dot name.
+    pub fn in_workspace(&self, real: &Path) -> bool {
+        let roots = self
+            .granted_roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        rooted(real, &roots, self.literal_leading_dot)
+    }
+
+    /// Whether a request for the name `path`, as the page wrote it, may be opened. The name may
+    /// run through a link (`~/code` to a volume, macOS `/tmp`), so it is judged by where its
+    /// folder leads; the opened file is judged again by `served`. With every folder allowed only
+    /// dot names and `..` are turned away here.
+    pub fn may_open(&self, path: &Path, all_folders: bool) -> bool {
+        self.may_open_with(path, all_folders, |dir| std::fs::canonicalize(dir).ok())
+    }
+
+    fn may_open_with(
+        &self,
+        path: &Path,
+        all_folders: bool,
+        resolve: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> bool {
+        if path.components().any(|part| part == Component::ParentDir) {
+            return false;
+        }
+        if self.in_workspace(path) {
+            return true;
+        }
+        if all_folders {
+            return !has_dot_name(path);
+        }
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Some(file) = path.file_name() else {
+            return false;
+        };
+        resolve(parent).is_some_and(|dir| self.in_workspace(&dir.join(file)))
+    }
+
+    pub(crate) fn grant_root(&self, root: &Path) {
         let mut granted = self
             .granted_roots
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !needs_grant(root, &granted, self.literal_leading_dot) {
-            return;
+        if needs_grant(root, &granted, self.literal_leading_dot) {
+            granted.push(root.to_path_buf());
         }
-        match self.scope.allow_directory(root, true) {
-            Ok(()) => granted.push(root.to_path_buf()),
-            Err(e) => log::warn!("asset scope: cannot grant {}: {e}", root.display()),
-        }
+    }
+}
+
+fn has_dot_name(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
+impl AssetScope {
+    pub fn access(&self) -> &Access {
+        &self.access
     }
 
     /// Lets the webview load one file, such as a font face the backend chose.
@@ -100,7 +207,7 @@ impl AssetScope {
     }
 }
 
-/// Grants every workspace root the registry has authorized and will authorize.
+/// Records every workspace root the registry has authorized and will authorize.
 pub fn install(app: &tauri::AppHandle) {
     let scope = app.asset_protocol_scope();
     let paths = app.path();
@@ -120,13 +227,14 @@ pub fn install(app: &tauri::AppHandle) {
     }
     app.manage(AssetScope {
         scope,
-        app_state,
-        literal_leading_dot: literal_leading_dot(&app.config().app.security.asset_protocol.scope),
-        granted_roots: Mutex::new(Vec::new()),
+        access: Access::new(
+            app_state,
+            literal_leading_dot(&app.config().app.security.asset_protocol.scope),
+        ),
     });
     let handle = app.clone();
     app.state::<WorkspaceRegistry>()
-        .watch_roots(move |root| handle.state::<AssetScope>().grant_root(root));
+        .watch_roots(move |root| handle.state::<AssetScope>().access.grant_root(root));
 }
 
 #[cfg(test)]
@@ -145,6 +253,36 @@ mod tests {
         assert!(!under_any(Path::new("/home/me/.config/application/x.png"), &state));
         assert!(!under_any(Path::new("/home/me/pictures/x.png"), &state));
         assert!(!under_any(Path::new("/home/me/pictures/x.png"), &[]));
+    }
+
+    #[test]
+    fn a_workspace_file_is_served_below_a_root_and_not_through_a_dot_folder() {
+        let access = Access::new(paths(&["/home/me/.config/app"]), true);
+        access.grant_root(Path::new("/work/proj"));
+        assert!(access.in_workspace(Path::new("/work/proj/docs/a.png")));
+        assert!(!access.in_workspace(Path::new("/work/proj/.git/a.png")));
+        assert!(!access.in_workspace(Path::new("/work/other/a.png")));
+        assert!(!access.in_workspace(Path::new("/work/project/a.png")));
+        assert!(access.is_app_state(Path::new("/home/me/.config/app/x.json")));
+    }
+
+    #[test]
+    fn a_name_through_a_link_is_judged_by_where_its_folder_leads() {
+        let access = Access::new(vec![], true);
+        access.grant_root(Path::new("/vol/code/proj"));
+        let resolve = |dir: &Path| {
+            dir.strip_prefix("/home/me/code")
+                .ok()
+                .map(|rest| Path::new("/vol/code").join(rest))
+        };
+        let open = |p: &str, all| access.may_open_with(Path::new(p), all, resolve);
+        assert!(open("/home/me/code/proj/docs/a.png", false), "link-spelled root");
+        assert!(open("/vol/code/proj/a.png", false), "the root as granted");
+        assert!(!open("/home/me/code/other/a.png", false));
+        assert!(!open("/etc/hosts", false), "nothing resolves it into a root");
+        assert!(!open("/home/me/code/proj/../x.png", true), "`..` never");
+        assert!(open("/srv/photos/a.png", true), "any folder while all are allowed");
+        assert!(!open("/home/me/.ssh/id.png", true), "but not a dot name");
     }
 
     #[test]

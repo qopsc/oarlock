@@ -15,18 +15,20 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
-use std::sync::Arc;
 
 use tauri::http::{self, header, HeaderValue, Method, StatusCode};
 use tauri::utils::mime_type::MimeType;
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
-use super::asset_scope::AssetScope;
+use super::asset_scope::{Access, AssetScope};
 use super::net::page::NetworkPages;
 use super::pty::AllowedOrigins;
 use super::workspace::{Origin, WorkspaceRegistry};
+
+const SANDBOX_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 /// The scheme's name, as the page passes it to `convertFileSrc`.
 pub const SCHEME: &str = "oarlock-asset";
@@ -74,8 +76,8 @@ async fn admit(
         .ok()
 }
 
-fn busy() -> http::Response<Vec<u8>> {
-    let mut response = status_only(StatusCode::SERVICE_UNAVAILABLE, None);
+fn busy(origin: &str) -> http::Response<Vec<u8>> {
+    let mut response = status_only(StatusCode::SERVICE_UNAVAILABLE, Some(origin));
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -110,56 +112,49 @@ pub fn protocol<R: Runtime>(
         return;
     }
     let Ok(waiting) = preview_waiting().clone().try_acquire_owned() else {
-        responder.respond(busy());
+        responder.respond(busy(&origin));
         return;
     };
     tauri::async_runtime::spawn(async move {
-      let admitted = admit(preview_admission(), ADMISSION_WAIT).await;
-      drop(waiting);
-      let Some(admitted) = admitted else {
-          responder.respond(busy());
-          return;
-      };
-      let Ok(worker) = preview_budget().clone().acquire_owned().await else {
-          responder.respond(busy());
-          return;
-      };
-      // Opening and reading the file blocks; keep both permits until it finishes.
-      tauri::async_runtime::spawn_blocking(move || {
-        let _admitted = admitted;
-        let _worker = worker;
-        let scope = app.asset_protocol_scope();
-        let served = |real: &Path| {
-            serves_file(
-                real,
-                app.try_state::<AssetScope>()
-                    .is_some_and(|state| state.is_app_state(real)),
-                scope_allows_opened(&scope, real),
-                app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref()),
-            )
+        let admitted = admit(preview_admission(), ADMISSION_WAIT).await;
+        drop(waiting);
+        let Some(admitted) = admitted else {
+            responder.respond(busy(&origin));
+            return;
         };
-        responder.respond(respond_with(&request, &origin, served, served));
-      });
+        let Ok(worker) = preview_budget().clone().acquire_owned().await else {
+            responder.respond(busy(&origin));
+            return;
+        };
+        // Opening and reading the file blocks; keep both permits until it finishes.
+        tauri::async_runtime::spawn_blocking(move || {
+            let _admitted = admitted;
+            let _worker = worker;
+            let all = || app_reaches_all(app.try_state::<WorkspaceRegistry>().as_deref());
+            let state = app.try_state::<AssetScope>();
+            let access = state.as_ref().map(|state| state.access());
+            let named = |path: &Path| may_open(access, path, all());
+            let served = |real: &Path| serves_opened(access, real, all());
+            responder.respond(respond_with(&request, &origin, named, served));
+        });
     });
 }
 
-// Tauri's is_allowed canonicalizes the supplied path again, which would allow
-// a changed entry to authorize a different open handle. Match the already
-// verified handle path directly, using the asset scope's configured options.
-fn scope_allows_opened(scope: &tauri::scope::fs::Scope, path: &Path) -> bool {
-    let options = glob::MatchOptions {
-        require_literal_separator: true,
-        require_literal_leading_dot: true,
-        ..Default::default()
-    };
-    !scope
-        .forbidden_patterns()
-        .iter()
-        .any(|pattern| pattern.matches_path_with(path, options))
-        && scope
-            .allowed_patterns()
-            .iter()
-            .any(|pattern| pattern.matches_path_with(path, options))
+/// The name a page asked for may be opened: the production judgement before the open.
+fn may_open(access: Option<&Access>, path: &Path, all_folders: bool) -> bool {
+    access.is_some_and(|access| !access.is_app_state(path) && access.may_open(path, all_folders))
+}
+
+/// The opened file's real path may be served: the production judgement after the open.
+fn serves_opened(access: Option<&Access>, real: &Path, all_folders: bool) -> bool {
+    access.is_some_and(|access| {
+        serves_file(
+            real,
+            access.is_app_state(real),
+            access.in_workspace(real),
+            all_folders,
+        )
+    })
 }
 
 /// The `t` of a query: the page generation the app's own page put in the URL.
@@ -346,9 +341,7 @@ fn respond_with(
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
     match read(file, &real, &path, range, head, pdf_preview) {
-        Ok(file) => {
-            file.response(origin)
-        }
+        Ok(file) => file.response(origin),
         Err(error) => {
             log::debug!("{SCHEME}: cannot read {}: {error}", real.display());
             status_only(StatusCode::NOT_FOUND, Some(origin))
@@ -417,12 +410,18 @@ fn read(
     }
     let size = meta.len();
     let requested_range = parse_range(range, size);
-    let image_or_pdf = |path: &Path| path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-        ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"]
-            .iter().any(|candidate| ext.eq_ignore_ascii_case(candidate))
-    });
+    let image_or_pdf = |path: &Path| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"]
+                    .iter()
+                    .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+            })
+    };
     let large_image_or_pdf = image_or_pdf(real) || image_or_pdf(requested);
-    if !head && size > MAX_WHOLE_PREVIEW
+    if !head
+        && size > MAX_WHOLE_PREVIEW
         && (large_image_or_pdf || matches!(requested_range, Range::Whole))
     {
         return Ok(too_large());
@@ -439,7 +438,8 @@ fn read(
         MimeType::parse(&magic, &real.to_string_lossy())
     };
     let mime = inert_unless_media(mime);
-    if !head && size > MAX_WHOLE_PREVIEW
+    if !head
+        && size > MAX_WHOLE_PREVIEW
         && (mime.starts_with("image/") || mime == "application/pdf")
     {
         return Ok(too_large());
@@ -505,10 +505,7 @@ impl Served {
         // A PDF viewer cannot run inside a sandboxed document; every other answer, an SVG
         // opened as a page included, may not run script or reach another origin.
         if self.mime != "application/pdf" {
-            builder = builder.header(
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'unsafe-inline'; sandbox",
-            );
+            builder = builder.header(header::CONTENT_SECURITY_POLICY, SANDBOX_CSP);
         }
         if let Some(range) = self.content_range {
             builder = builder.header(header::CONTENT_RANGE, range);
@@ -533,6 +530,8 @@ fn with_origin(builder: http::response::Builder, origin: Option<&str>) -> http::
 fn status_only(status: StatusCode, origin: Option<&str>) -> http::Response<Vec<u8>> {
     with_origin(http::Response::builder(), origin)
         .status(status)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, SANDBOX_CSP)
         .body(Vec::new())
         .expect("static response headers are valid")
 }

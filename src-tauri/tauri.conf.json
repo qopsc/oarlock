@@ -28,7 +28,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost https://asset.localhost oarlock-asset: http://oarlock-asset.localhost https://oarlock-asset.localhost blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost oarlock-asset: http://oarlock-asset.localhost https://oarlock-asset.localhost blob:; font-src 'self' data: asset: http://asset.localhost https://asset.localhost; connect-src 'self' ipc: http://ipc.localhost oarlock-pty: http://oarlock-pty.localhost https: http://localhost:* http://127.0.0.1:*; frame-src 'self' http: https: asset: https://asset.localhost oarlock-asset: https://oarlock-asset.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'",
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost https://asset.localhost oarlock-asset: http://oarlock-asset.localhost https://oarlock-asset.localhost blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost oarlock-asset: http://oarlock-asset.localhost https://oarlock-asset.localhost blob:; font-src 'self' data: asset: http://asset.localhost https://asset.localhost; connect-src 'self' ipc: http://ipc.localhost oarlock-pty: http://oarlock-pty.localhost https: http://localhost:* http://127.0.0.1:*; frame-src 'self' http: https: oarlock-asset: https://oarlock-asset.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'",
       "assetProtocol": {
         "enable": true,
         "scope": {
