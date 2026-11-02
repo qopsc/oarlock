@@ -35,6 +35,8 @@ it("verifies the macOS bundle before anything is uploaded to the release", () =>
   expect(steps[verify]).toContain("jq -r .identifier src-tauri/tauri.conf.json");
   expect(steps[verify]).toContain("-R=\"anchor apple generic and certificate leaf[subject.OU] = ");
   expect(steps[verify]).toContain("$APPLE_TEAM_ID");
+  expect(steps[verify]).toContain("certificate leaf[field.1.2.840.113635.100.6.1.13]");
+  expect(steps[verify]).toContain("certificate 1[field.1.2.840.113635.100.6.2.6]");
   expect(steps[verify]).toContain("identifier \\\"$id\\\"");
   expect(steps[build]).not.toMatch(/tagName|releaseDraft|releaseId/);
   expect(steps[upload]).toContain("steps.tauri-mac.outputs.artifactPaths");
@@ -93,7 +95,8 @@ it("the signature check needs a team id and exactly one app, and hands codesign 
   const args = readFileSync(path.join(ok, "codesign-args"), "utf8").split("\n");
   expect(args.slice(0, 3)).toEqual(["--verify", "--deep", "--strict"]);
   expect(args[3]).toBe(
-    '-R=anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345" and identifier "test.example.app"',
+    '-R=anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345" and identifier "test.example.app"' +
+      " and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate 1[field.1.2.840.113635.100.6.2.6]",
   );
   expect(args[4]).toMatch(/Oarlock\.app$/);
 

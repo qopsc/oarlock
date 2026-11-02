@@ -134,7 +134,7 @@ jobs:
           [ "${#apps[@]}" -eq 1 ] || { echo "Expected exactly one packaged app in $dir, found ${#apps[@]}" >&2; exit 1; }
           id="$(jq -r .identifier src-tauri/tauri.conf.json)"
           [ -n "$id" ] && [ "$id" != "null" ] || { echo "bundle identifier missing" >&2; exit 1; }
-          codesign --verify --deep --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\" and identifier \"$id\"" "${apps[0]}"
+          codesign --verify --deep --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\" and identifier \"$id\" and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate 1[field.1.2.840.113635.100.6.2.6]" "${apps[0]}"
 
       - name: Upload the verified macOS bundle to the draft release
         if: startsWith(matrix.platform, 'macos')

@@ -51,6 +51,15 @@ text).
   (`--verify --deep --strict`, the `-R=` requirement, the app path); an unset, empty, lowercase, short and long team
   id, zero apps and two apps all exit non-zero (two apps with "exactly one packaged app" on stderr).
 
+## 3a. Final review follow-up
+
+The requirement also pins distribution: `and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate
+1[field.1.2.840.113635.100.6.2.6]` (Developer ID Application leaf, Developer ID intermediate), so an Apple Development
+or Mac App Store certificate of the same team no longer passes. The test asserts both OIDs in the step text and in the
+exact `-R=` argument the stub receives. `spctl --assess --type execute` was left out: whether Gatekeeper accepts the app
+on the runner depends on the notarization ticket being stapled and reachable at that point, which cannot be checked
+here, and a wrong guess would fail every release.
+
 ## 4. Notes
 
 - `build.rs` no longer links Foundation and Security explicitly. The Darwin build (`cargo build`, clippy, tests)
