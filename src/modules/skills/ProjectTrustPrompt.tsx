@@ -241,17 +241,34 @@ function MemoryPreview({ item }: { item: TrustItem }) {
   );
 }
 
+/** A server's detail is its environment, one line each, then the command line or URL. Nothing
+ *  is clipped: the approving user must see a long quoted argument to its end, and the list
+ *  scrolls. */
+function EntryDetail({ detail }: { detail: string }) {
+  if (!detail) return null;
+  const lines = detail.split("\n");
+  const command = lines.pop() ?? "";
+  return (
+    <>
+      {lines.length > 0 ? (
+        <span className="whitespace-pre-line break-all font-mono text-[10.5px] text-foreground">
+          {lines.join("\n")}
+        </span>
+      ) : null}
+      <span className="whitespace-pre-wrap break-all text-[10.5px] text-muted-foreground">
+        {command}
+      </span>
+    </>
+  );
+}
+
 function ItemEntries({ item }: { item: TrustItem }) {
   return (
     <ul className="flex flex-col gap-1">
       {item.entries.map((entry) => (
         <li key={entry.title} className="flex flex-col">
           <span className="font-mono text-[11px]">{entry.title}</span>
-          {entry.detail ? (
-            <span className="line-clamp-2 text-[10.5px] text-muted-foreground">
-              {entry.detail}
-            </span>
-          ) : null}
+          <EntryDetail detail={entry.detail} />
         </li>
       ))}
       {item.entries.length === 0 ? (

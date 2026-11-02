@@ -369,7 +369,7 @@ export const useChatStore = create<StoreState>((set, get) => ({
 
     // Reuse the most recent untitled "New chat" session if one exists from
     // the previous run — no point stacking empty placeholder sessions every
-    // launch — unless another window has it open. Otherwise prepend a fresh one.
+    // launch, unless another window has it open. Otherwise prepend a fresh one.
     let reusable =
       sessions[0]?.title === "New chat" && !activeElsewhere?.has(sessions[0].id)
         ? sessions[0]

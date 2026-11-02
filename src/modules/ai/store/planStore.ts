@@ -4,7 +4,9 @@ import {
 } from "@/modules/workspace/env";
 import { create } from "zustand";
 import { native, createNative } from "../lib/native";
+import { StaleFileError } from "../lib/staleFile";
 import { checkWritableCanonical } from "../lib/security";
+import { applyEditOps, type EditOp } from "../tools/editOps";
 
 export type QueuedEdit = {
   workspace?: WorkspaceEnv;
@@ -18,6 +20,12 @@ export type QueuedEdit = {
   proposedContent: string;
   /** True if the file did not exist when the edit was queued. */
   isNewFile: boolean;
+  /** The file's version on disk when the edit was queued (`null`: it did not
+   *  exist). Apply writes only over a file still at that version. */
+  baseVersion: string | null;
+  /** The replacements `edit` and `multi_edit` asked for. Apply runs them onto
+   *  the running buffer, so several edits to one file all land. */
+  edits?: EditOp[];
   /** Human-readable description, used for create_directory. */
   description?: string;
   /** Why the last Apply could not write it; it stays queued until it is
@@ -65,10 +73,12 @@ export const usePlanStore = create<PlanState>((set, get) => ({
   async applyAll() {
     const results: { id: string; ok: boolean; error?: string }[] = [];
     const processed = new Set<string>();
+    const files = new Map<string, FileState>();
     for (const q of get().queue) {
       // Rejected or discarded while earlier writes were running.
       if (!get().queue.some((x) => x.id === q.id)) continue;
       processed.add(q.id);
+      let state: FileState | undefined;
       try {
         const workspace = q.workspace;
         const client = workspace ? createNative(() => workspace) : native;
@@ -87,11 +97,21 @@ export const usePlanStore = create<PlanState>((set, get) => ({
         if (q.kind === "create_directory") {
           await client.createDir(safety.canonical);
         } else {
-          await client.writeFile(safety.canonical, q.proposedContent);
+          const key = JSON.stringify([workspace ?? null, safety.canonical]);
+          state = files.get(key);
+          if (!state) {
+            state = await loadFileState(client, safety.canonical);
+            files.set(key, state);
+          }
+          await applyToFile(client, safety.canonical, q, state);
         }
         results.push({ id: q.id, ok: true });
       } catch (e) {
-        results.push({ id: q.id, ok: false, error: String(e) });
+        results.push({
+          id: q.id,
+          ok: false,
+          error: failureText(e) + redoNote(e, state),
+        });
       }
     }
     // Edits the agent queued during the writes were not reviewed: keep them.
@@ -99,6 +119,81 @@ export const usePlanStore = create<PlanState>((set, get) => ({
     return results;
   },
 }));
+
+/** A file as one Apply sees it: the buffer the next queued edit applies onto
+ *  and the version a save must replace. `startVersion` is what the file was
+ *  when Apply began, which every edit queued against it must match. */
+type FileState = {
+  content: string | null;
+  version: string | null;
+  startVersion: string | null;
+  refused?: string;
+};
+
+type FileClient = Pick<typeof native, "readFile" | "writeFile">;
+
+async function loadFileState(
+  client: FileClient,
+  path: string,
+): Promise<FileState> {
+  let read: Awaited<ReturnType<FileClient["readFile"]>>;
+  try {
+    read = await client.readFile(path, { versioned: true });
+  } catch {
+    return { content: null, version: null, startVersion: null };
+  }
+  if (read.kind !== "text" || typeof read.version !== "string") {
+    return {
+      content: null,
+      version: null,
+      startVersion: null,
+      refused: "binary, oversized or unversioned file refused",
+    };
+  }
+  return {
+    content: read.content,
+    version: read.version,
+    startVersion: read.version,
+  };
+}
+
+async function applyToFile(
+  client: FileClient,
+  path: string,
+  q: QueuedEdit,
+  state: FileState,
+): Promise<void> {
+  if (state.refused) throw new Error(state.refused);
+  if (q.baseVersion !== state.startVersion) throw new StaleFileError(path);
+  let candidate = q.proposedContent;
+  if (q.edits) {
+    if (state.content === null) throw new Error("file no longer exists");
+    const applied = applyEditOps(state.content, q.edits);
+    if (!applied.ok) throw new Error(applied.error);
+    candidate = applied.content;
+  }
+  try {
+    const saved = await client.writeFile(path, candidate, state.version);
+    state.content = candidate;
+    state.version = saved.version;
+  } catch (e) {
+    if (e instanceof StaleFileError) state.refused = e.message;
+    throw e;
+  }
+}
+
+/** An edit that failed for its own reason after another edit to the same file landed was
+ *  derived from the file as it was: it stays queued, but only to be rejected and asked again. */
+function redoNote(e: unknown, state: FileState | undefined): string {
+  if (e instanceof StaleFileError || !state) return "";
+  return state.version === state.startVersion
+    ? ""
+    : " Another edit to this file landed first and changed it, so this one has to be rejected and asked for again.";
+}
+
+function failureText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
 /** The queue after an Apply: written edits leave it, failed ones stay with
  *  their error (a later Apply clears it), the rest are untouched. */

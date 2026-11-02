@@ -1,9 +1,8 @@
 import { formatAiError } from "./errors";
-import { createProxyFetch } from "./proxyFetch";
+import { proxyFetch } from "./proxyFetch";
 
 // Local servers and custom endpoints are reached through the native proxy, as
 // their chat requests are (no webview CORS, private networks allowed).
-const endpointFetch = createProxyFetch({ allowPrivateNetwork: true });
 export const MODEL_LIST_MAX_BYTES = 4 * 1024 * 1024;
 export const MODEL_LIST_MAX_ENTRIES = 2_000;
 export const MODEL_ID_MAX_LENGTH = 1_024;
@@ -59,7 +58,7 @@ async function readModelList(
 export async function listEndpointModels(
   baseURL: string,
   apiKey?: string | null,
-  fetchImpl: typeof fetch = endpointFetch,
+  fetchImpl: typeof fetch = proxyFetch,
   signal?: AbortSignal,
 ): Promise<string[]> {
   signal?.throwIfAborted();

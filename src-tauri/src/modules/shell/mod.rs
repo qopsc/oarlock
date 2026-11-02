@@ -9,7 +9,7 @@ mod session_registry;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -369,10 +369,9 @@ pub async fn shell_session_open(
     // wsl_home spawns wsl.exe on Windows and authorization hits the disk.
     let registry_app = app.clone();
     let (initial, workspace) = tauri::async_runtime::spawn_blocking(move || {
-        registry_app
-            .state::<WorkspaceRegistry>()
-            .gates(origin.unwrap_or_default())
-            .spawn_cwd(cwd.as_deref(), &workspace)?;
+        let registry = registry_app.state::<WorkspaceRegistry>();
+        let gates = registry.gates(origin.unwrap_or_default());
+        gates.spawn_cwd(cwd.as_deref(), &workspace)?;
         let initial = match cwd.as_deref().filter(|s| !s.is_empty()) {
             Some(c) => c.to_string(),
             None => {
@@ -385,6 +384,10 @@ pub async fn shell_session_open(
                 }
             }
         };
+        // The default home is a place the shell starts in like any other: it passes the gates.
+        if cwd.as_deref().is_none_or(str::is_empty) {
+            gates.spawn_cwd(Some(&initial), &workspace)?;
+        }
         Ok::<_, String>((initial, workspace))
     })
     .await
@@ -429,7 +432,7 @@ pub async fn shell_session_run(
         .state::<ShellState>()
         .sessions
         .read()
-        .unwrap()
+        .unwrap_or_else(PoisonError::into_inner)
         .get_owned(window.label(), id)
         .cloned()
         .ok_or_else(|| "no shell session".to_string())?;
@@ -456,7 +459,7 @@ pub async fn shell_session_close(
         .state::<ShellState>()
         .sessions
         .write()
-        .unwrap()
+        .unwrap_or_else(PoisonError::into_inner)
         .retire_owned(window.label(), id);
     if let Some(session) = session {
         session.cancellation.request();
@@ -469,6 +472,8 @@ pub async fn shell_session_close(
     }
     Ok(())
 }
+
+const FOREIGN_JOB: &str = "That background job belongs to another chat.";
 
 #[tauri::command]
 pub async fn shell_bg_spawn(
@@ -503,6 +508,7 @@ pub fn shell_bg_logs(
     state: tauri::State<ShellState>,
     handle: u32,
     since_offset: Option<u64>,
+    chat_id: Option<String>,
 ) -> Result<BackgroundLogResponse, String> {
     let proc = state
         .bg
@@ -511,11 +517,18 @@ pub fn shell_bg_logs(
         .get(handle)
         .cloned()
         .ok_or_else(|| "Background job unavailable: unknown handle or finished history expired (the latest 32 finished jobs are retained).".to_string())?;
+    if !proc.reachable_by(chat_id.as_deref()) {
+        return Err(FOREIGN_JOB.into());
+    }
     Ok(proc.read_logs(since_offset.unwrap_or(0)))
 }
 
 #[tauri::command]
-pub fn shell_bg_kill(state: tauri::State<ShellState>, handle: u32) -> Result<(), String> {
+pub fn shell_bg_kill(
+    state: tauri::State<ShellState>,
+    handle: u32,
+    chat_id: Option<String>,
+) -> Result<(), String> {
     let proc = state
         .bg
         .lock()
@@ -523,6 +536,9 @@ pub fn shell_bg_kill(state: tauri::State<ShellState>, handle: u32) -> Result<(),
         .get(handle)
         .cloned();
     if let Some(proc) = proc {
+        if !proc.reachable_by(chat_id.as_deref()) {
+            return Err(FOREIGN_JOB.into());
+        }
         proc.kill();
     }
     Ok(())

@@ -136,6 +136,56 @@ pub(crate) async fn host_is_private(host: &str) -> Result<bool, String> {
     }
 }
 
+/// What each host name was the first time this process looked at it, private or public. A name
+/// that answered with a public address stays public: a DNS answer that later moves it onto the
+/// user's network is refused instead of receiving the request and its credentials.
+#[derive(Default)]
+struct HostClasses {
+    seen: Vec<(String, bool)>,
+}
+
+const HOST_CLASS_LIMIT: usize = 64;
+
+impl HostClasses {
+    fn get(&self, host: &str) -> Option<bool> {
+        self.seen.iter().find(|(h, _)| h == host).map(|(_, p)| *p)
+    }
+
+    /// Remembers `private` for `host` unless it has been classified already; returns the class
+    /// that stands.
+    fn remember(&mut self, host: String, private: bool) -> bool {
+        if let Some(known) = self.get(&host) {
+            return known;
+        }
+        if self.seen.len() >= HOST_CLASS_LIMIT {
+            self.seen.remove(0);
+        }
+        self.seen.push((host, private));
+        private
+    }
+}
+
+fn host_classes() -> std::sync::MutexGuard<'static, HostClasses> {
+    static CLASSES: std::sync::Mutex<HostClasses> =
+        std::sync::Mutex::new(HostClasses { seen: Vec::new() });
+    CLASSES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a request to a user-configured AI endpoint may reach private and loopback addresses:
+/// decided here from the host, never on the page's word. An endpoint on the user's own network
+/// (`localhost`, a LAN address or name) may; a public name may not, and keeps that class.
+pub(crate) async fn endpoint_allows_private(host: &str) -> Result<bool, String> {
+    let key = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if let Some(known) = host_classes().get(&key) {
+        return Ok(known);
+    }
+    let private = host_is_private(host).await?;
+    Ok(host_classes().remember(key, private))
+}
+
 pub(crate) fn sanitize_headers(
     headers: Option<HashMap<String, String>>,
 ) -> Result<HeaderMap, String> {
@@ -179,14 +229,15 @@ async fn probe_endpoint(base_url: String) -> Result<u16, String> {
         return Err("empty base url".into());
     }
     let probe = format!("{trimmed}/models");
-    let parsed = validate_url(&probe, true)?;
+    let parsed = validate_url(&probe, false)?;
     let host = parsed
         .host_str()
         .ok_or_else(|| "missing host".to_string())?
         .to_string();
-    let safe_ips = classify_and_collect_safe_ips(&host, true).await?;
+    let allow_private = endpoint_allows_private(&host).await?;
+    let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
 
-    let client = client_for(Profile::Ping, &host, &safe_ips, true)?;
+    let client = client_for(Profile::Ping, &host, &safe_ips, allow_private)?;
     client
         .get(parsed)
         .send()
@@ -279,7 +330,6 @@ struct StreamRequest {
     url: String,
     method: String,
     headers: Option<HashMap<String, String>>,
-    allow_private_network: Option<bool>,
     on_event: JavaScriptChannelId,
 }
 
@@ -302,7 +352,6 @@ pub async fn ai_http_stream(
         url,
         method,
         headers,
-        allow_private_network,
         on_event,
     } = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
     let on_event = on_event.channel_on::<_, Response>(window.as_ref().clone());
@@ -313,9 +362,9 @@ pub async fn ai_http_stream(
     })?;
     tauri::async_runtime::spawn(async move {
         let run = async {
-            let allow_private = allow_private_network.unwrap_or(false);
-            let parsed = validate_url(&url, allow_private)?;
+            let parsed = validate_url(&url, false)?;
             let host = parsed.host_str().ok_or("missing host")?.to_string();
+            let allow_private = endpoint_allows_private(&host).await?;
             let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
             let client = client_for(Profile::Stream, &host, &safe_ips, allow_private)?;
             let request = build_request(&client, &method, parsed, headers, body)?;
@@ -465,6 +514,33 @@ pub async fn ai_http_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_keeps_the_class_it_first_had() {
+        let mut classes = HostClasses::default();
+        assert!(!classes.remember("api.example.com".into(), false));
+        assert!(
+            !classes.remember("api.example.com".into(), true),
+            "a name that answered public and later private stays public"
+        );
+        assert!(classes.remember("nas.lan".into(), true));
+        assert!(classes.remember("nas.lan".into(), false));
+        for n in 0..HOST_CLASS_LIMIT {
+            classes.remember(format!("h{n}"), false);
+        }
+        assert_eq!(classes.seen.len(), HOST_CLASS_LIMIT);
+        assert_eq!(classes.get("api.example.com"), None, "oldest dropped");
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_host_decides_private_access_not_the_page() {
+        assert!(endpoint_allows_private("127.0.0.1").await.unwrap());
+        assert!(endpoint_allows_private("[::1]").await.unwrap());
+        assert!(endpoint_allows_private("192.168.1.20").await.unwrap());
+        assert!(!endpoint_allows_private("93.184.216.34").await.unwrap());
+        assert!(endpoint_allows_private("169.254.169.254").await.is_err());
+        assert!(endpoint_allows_private("metadata.google.internal").await.is_err());
+    }
     use std::net::Ipv4Addr;
 
     #[derive(Debug)]

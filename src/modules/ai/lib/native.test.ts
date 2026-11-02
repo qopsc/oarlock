@@ -131,7 +131,13 @@ describe("the AI tools' file and shell calls", () => {
   const dir = "/home/me/project";
   const cases: [string, () => Promise<unknown>][] = [
     ["fs_read_file", () => native.readFile(`${dir}/a.txt`)],
-    ["fs_write_file", () => native.writeFile(`${dir}/a.txt`, "x")],
+    [
+      "fs_save_document",
+      () => {
+        invoke.mockResolvedValue({ kind: "saved", version: "v2" });
+        return native.writeFile(`${dir}/a.txt`, "x", "v1");
+      },
+    ],
     ["fs_canonicalize", () => native.canonicalize(`${dir}/a.txt`)],
     ["fs_create_dir", () => native.createDir(`${dir}/new`)],
     ["fs_read_dir", () => native.readDir(dir)],
@@ -154,6 +160,22 @@ describe("the AI tools' file and shell calls", () => {
       command,
       expect.objectContaining({ origin: "ai" }),
     );
+  });
+
+  it("refuses a save the file moved out from under, as stale", async () => {
+    const { StaleFileError } = await import("./staleFile");
+    invoke.mockResolvedValue({ kind: "conflict", version: "v9" });
+    await expect(native.writeFile(`${dir}/a.txt`, "x", "v1")).rejects.toThrow(
+      StaleFileError,
+    );
+    expect(invoke).toHaveBeenCalledWith("fs_save_document", {
+      path: `${dir}/a.txt`,
+      content: "x",
+      expectedVersion: "v1",
+      source: "ai",
+      workspace: expect.anything(),
+      origin: "ai",
+    });
   });
 
   it("leaves no file or folder command untagged", async () => {
@@ -231,7 +253,8 @@ it("binds file and shell IPC to the captured environment", async () => {
   const client = createNative(() => ubuntu);
   const { useWorkspaceEnvStore } = await import("@/modules/workspace/env");
   useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Debian" } });
-  await client.writeFile("/home/me/file", "Ubuntu buffer");
+  invoke.mockResolvedValue({ kind: "saved", version: "v2" });
+  await client.writeFile("/home/me/file", "Ubuntu buffer", null);
   await client.readFile("/home/me/file");
   await client.shellSessionOpen("/home/me");
   for (const [, args] of invoke.mock.calls)

@@ -1,4 +1,4 @@
-import { createProxyFetch, proxyFetch } from "@/modules/ai/lib/proxyFetch";
+import { proxyFetch } from "@/modules/ai/lib/proxyFetch";
 
 vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "test-page" }));
 
@@ -155,7 +155,7 @@ describe("native AI fetch transport", () => {
       headers: { "x-test": "yes" },
       body: "hello 日本語",
     });
-    const pending = createProxyFetch({ allowPrivateNetwork: true })(request);
+    const pending = proxyFetch(request);
     await started();
     const [, body, options] = calls("ai_http_stream")[0];
     expect(body).toBeInstanceOf(Uint8Array);
@@ -164,9 +164,11 @@ describe("native AI fetch transport", () => {
       method: "POST",
       pageGeneration: "test-page",
       headers: { "x-test": "yes" },
-      allowPrivateNetwork: true,
       onEvent: "__CHANNEL__:1",
     });
+    expect(
+      JSON.parse(options.headers["x-oarlock-ai-request"]),
+    ).not.toHaveProperty("allowPrivateNetwork");
     expect(options.headers["x-oarlock-ai-request"]).not.toMatch(/[^\x20-\x7e]/);
     headers();
     const response = await pending;

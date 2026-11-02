@@ -91,7 +91,7 @@ export function buildShellTools(ctx: ToolContext) {
   return {
     bash_run: tool({
       description:
-        "Run a foreground shell command in this session's persistent agent shell. cwd persists across calls (so `cd foo` then `bash_run pwd` works). Use for short-lived commands (lint, test, search, build). For long-running programs (dev servers, watch tasks), use `bash_background` in foreground mode. Never daemonize, call setsid, or self-detach; use the opt-in `bash_detach` tool instead. NEVER invoke interactive tools (vim, less, top) — they will hang. Asks for user approval.",
+        "Run a foreground shell command in this session's persistent agent shell. cwd persists across calls (so `cd foo` then `bash_run pwd` works). Use for short-lived commands (lint, test, search, build). For long-running programs (dev servers, watch tasks), use `bash_background` in foreground mode. Never daemonize, call setsid, or self-detach; use the opt-in `bash_detach` tool instead. NEVER invoke interactive tools (vim, less, top), they will hang. Asks for user approval.",
       inputSchema: z.object({
         command: z.string(),
         timeout_secs: z.number().int().min(1).max(300).optional(),
@@ -177,7 +177,7 @@ export function buildShellTools(ctx: ToolContext) {
             abortSignal?.aborted &&
             usePreferencesStore.getState().aiStopBackgroundJobs
           ) {
-            await native.shellBgKill(handle);
+            await native.shellBgKill(handle, ctx.getSessionId());
             abortSignal.throwIfAborted();
           }
           return { handle, command, cwd: effectiveCwd, ok: true };
@@ -226,14 +226,18 @@ export function buildShellTools(ctx: ToolContext) {
 
     bash_logs: tool({
       description:
-        "Read accumulated logs from a `bash_background` process. Pass `since_offset` from the previous response's `next_offset` to tail incrementally. `dropped` reports bytes evicted by the ring buffer. Only the latest 32 finished jobs retain logs; an expired handle returns an error.",
+        "Read accumulated logs from a `bash_background` process of this chat. Pass `since_offset` from the previous response's `next_offset` to tail incrementally. `dropped` reports bytes evicted by the ring buffer. Only the latest 32 finished jobs retain logs; an expired handle returns an error.",
       inputSchema: z.object({
         handle: z.number().int(),
         since_offset: z.number().int().optional(),
       }),
       execute: async ({ handle, since_offset }) => {
         try {
-          const r = await native.shellBgLogs(handle, since_offset);
+          const r = await native.shellBgLogs(
+            handle,
+            since_offset,
+            ctx.getSessionId(),
+          );
           return r;
         } catch (e) {
           return { error: String(e) };
@@ -243,7 +247,7 @@ export function buildShellTools(ctx: ToolContext) {
 
     bash_list: tool({
       description:
-        "List all background processes spawned by `bash_background` in this app — running and the latest 32 finished jobs. **Always call this BEFORE spawning a new long-running process** (especially dev servers like `pnpm dev`, `next dev`, `vite`) to avoid duplicates. If a matching process is already running, reuse it (call `open_preview` again instead of respawning). Auto-executes.",
+        "List all background processes spawned by `bash_background` in this app, running and the latest 32 finished jobs. **Always call this BEFORE spawning a new long-running process** (especially dev servers like `pnpm dev`, `next dev`, `vite`) to avoid duplicates. If a matching process is already running, reuse it (call `open_preview` again instead of respawning). Auto-executes.",
       inputSchema: z.object({}),
       execute: async () => {
         try {
@@ -257,11 +261,11 @@ export function buildShellTools(ctx: ToolContext) {
 
     bash_kill: tool({
       description:
-        "Terminate a `bash_background` process by handle. Idempotent — kills nothing if the handle is unknown or already exited.",
+        "Terminate a `bash_background` process of this chat by handle. Idempotent: kills nothing if the handle is unknown or already exited; another chat's job is refused.",
       inputSchema: z.object({ handle: z.number().int() }),
       execute: async ({ handle }) => {
         try {
-          await native.shellBgKill(handle);
+          await native.shellBgKill(handle, ctx.getSessionId());
           return { handle, ok: true };
         } catch (e) {
           return { error: String(e) };

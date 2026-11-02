@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const native = vi.hoisted(() => ({
+  readFile: vi.fn(async (_path: string): Promise<never> => {
+    throw new Error("No such file");
+  }),
   canonicalize: vi.fn(async (p: string) => p),
-  writeFile: vi.fn(async (_path: string, _content: string) => {}),
+  writeFile: vi.fn(
+    async (_path: string, _content: string, _version: string | null) => ({
+      version: "v1",
+    }),
+  ),
   createDir: vi.fn(async (_path: string) => {}),
 }));
 vi.mock("../lib/native", () => ({ native, createNative: () => native }));
@@ -17,17 +24,19 @@ const edit = (id: string, path: string): QueuedEdit => ({
   originalContent: "",
   proposedContent: "new",
   isNewFile: true,
+  baseVersion: null,
 });
 
 describe("plan Apply failures", () => {
   beforeEach(() => {
     usePlanStore.setState({ queue: [] });
-    native.writeFile.mockReset().mockResolvedValue(undefined);
+    native.writeFile.mockReset().mockResolvedValue({ version: "v1" });
   });
 
   it("keeps edits that were not written, with the reason, and drops the rest", async () => {
     native.writeFile.mockImplementation(async (path: string) => {
       if (path === "/repo/locked.ts") throw "permission denied";
+      return { version: "v1" };
     });
     const { enqueue, applyAll } = usePlanStore.getState();
     enqueue(edit("q-1", "/repo/ok.ts"));

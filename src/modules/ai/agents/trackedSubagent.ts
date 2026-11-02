@@ -10,6 +10,26 @@ import {
 } from "../store/subagentTasks";
 import { runSubagent } from "./runSubagent";
 
+/** A final status that does not reach the backend leaves the record running, which makes every
+ *  later Stop wait out its deadline; so it is retried before the user is told. */
+const FINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const FINAL_RETRY_MS = [250, 1000];
+
+async function sendRequest(request: Record<string, unknown>): Promise<void> {
+  const delays = FINAL_STATUSES.has(String(request.status))
+    ? FINAL_RETRY_MS
+    : [];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await taskCommand(request);
+      return;
+    } catch (error) {
+      if (attempt >= delays.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+    }
+  }
+}
+
 type Args = Parameters<typeof runSubagent>[0] & {
   sessionId: string;
   title: string;
@@ -62,7 +82,7 @@ async function runTracked(args: Args, ready: () => void) {
     lastRequest = request;
     queue = queue.then(async () => {
       try {
-        await taskCommand(request);
+        await sendRequest(request);
         lastError = undefined;
       } catch (e) {
         lastError = e;

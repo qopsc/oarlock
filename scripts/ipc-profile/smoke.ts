@@ -1,4 +1,4 @@
-import { createProxyFetch } from "@/modules/ai/lib/proxyFetch";
+import { proxyFetch } from "@/modules/ai/lib/proxyFetch";
 import {
   saveMessages,
   loadMessages,
@@ -10,7 +10,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { profileGrepCancellation, withProfileWatch } from "./fsLifecycle";
 const original = fetch;
-const nativeFetch = createProxyFetch({ allowPrivateNetwork: true });
+const nativeFetch = proxyFetch;
 declare const __OARLOCK_IPC_BASE_URL__: string;
 declare const __OARLOCK_IPC_TREE__: string;
 const base = __OARLOCK_IPC_BASE_URL__;

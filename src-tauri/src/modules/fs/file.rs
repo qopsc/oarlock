@@ -317,7 +317,8 @@ pub async fn fs_write_file(
         let workspace = WorkspaceEnv::from_option(workspace);
         let requested = resolve_path(&path, &workspace)?;
         let registry = watcher.state::<WorkspaceRegistry>();
-        let gates = registry.gates(origin.unwrap_or_default());
+        let origin = origin.unwrap_or_default();
+        let gates = registry.gates(origin);
         let target = gates.authorized_write_target(&requested)?;
         super::native_store::refuse_write(&watcher, &target)?;
         let mtime = document_save::with_lock(&target, || -> Result<u64, String> {
@@ -326,7 +327,7 @@ pub async fn fs_write_file(
                 target: &target,
                 content: content.as_bytes(),
             };
-            let (real, existed) = project_trust::keeping_trust(&watcher, change, || {
+            let (real, existed) = project_trust::keeping_trust(&watcher, origin, change, || {
                 write_file_checked(&target, content.as_bytes(), |opened| {
                     let current = gates.authorized_write_target(&requested)?;
                     super::native_store::refuse_write(&watcher, &current)?;
@@ -371,6 +372,7 @@ pub async fn fs_save_document(
     expected_version: Option<String>,
     workspace: Option<WorkspaceEnv>,
     source: Option<String>,
+    origin: Option<Origin>,
 ) -> Result<DocumentSaveResult, String> {
     let emitter = app.clone();
     let event_path = path.clone();
@@ -378,7 +380,8 @@ pub async fn fs_save_document(
         let workspace = WorkspaceEnv::from_option(workspace);
         let requested = resolve_path(&path, &workspace)?;
         let registry = app.state::<WorkspaceRegistry>();
-        let gates = registry.gates(Origin::App);
+        let origin = origin.unwrap_or_default();
+        let gates = registry.gates(origin);
         let target = gates.authorized_write_target(&requested)?;
         super::native_store::refuse_write(&app, &target)?;
         document_save::with_lock(&target, || {
@@ -386,7 +389,7 @@ pub async fn fs_save_document(
                 target: &target,
                 content: content.as_bytes(),
             };
-            let result = project_trust::keeping_trust(&app, change, || {
+            let result = project_trust::keeping_trust(&app, origin, change, || {
                 document_save::write_checked(
                     &target,
                     content.as_bytes(),

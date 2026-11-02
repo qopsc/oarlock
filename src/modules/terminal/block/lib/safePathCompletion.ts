@@ -1,5 +1,5 @@
 import type { WorkspaceEnv } from "@/modules/workspace/env";
-import { quoteShellPath, type DropShell } from "../../lib/quoteShellPath";
+import { quoteShellPath, type DropShell } from "@/modules/terminal/lib/quoteShellPath";
 
 export type CompletionOwner = {
   cwd: string;

@@ -1,9 +1,11 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { native as defaultNative } from "../lib/native";
+import { StaleFileError } from "../lib/staleFile";
 import { checkWritableCanonical } from "../lib/security";
 import { newQueuedEditId, usePlanStore } from "../store/planStore";
 import { resolvePath, type ToolContext } from "./context";
+import { applyEditOps } from "./editOps";
 import { contentHash, writtenEntry } from "./readCache";
 
 type EditResult =
@@ -24,74 +26,24 @@ async function applyEdits(
 ): Promise<EditResult> {
   const native = ctx.native ?? defaultNative;
   const readCache = ctx.readCache;
-  const r = await native.readFile(abs);
+  const r = await native.readFile(abs, { versioned: true });
   if (r.kind === "binary") return { error: "binary file refused", path: abs };
   if (r.kind === "toolarge")
     return { error: `file too large (${r.size} bytes)`, path: abs };
 
   const original = r.content;
+  if (typeof r.version !== "string") {
+    return { error: "could not version the file; try again", path: abs };
+  }
   const prior = readCache.get(abs);
   const fullContent =
     prior?.fullContent === true &&
     prior.size === r.size &&
     prior.hash === contentHash(original);
-  let content = original;
-  let totalReplacements = 0;
-
-  for (const e of edits) {
-    if (e.old_string === e.new_string) {
-      return {
-        error: "old_string and new_string are identical",
-        path: abs,
-      };
-    }
-    if (e.old_string.length === 0) {
-      return { error: "old_string cannot be empty", path: abs };
-    }
-    if (e.replace_all) {
-      const before = content;
-      content = content.split(e.old_string).join(e.new_string);
-      const occurrences =
-        (before.length - content.length) /
-          (e.old_string.length - e.new_string.length || 1) || 0;
-      // Recover count via direct search to avoid divide-by-zero edge cases.
-      let n = 0;
-      let i = 0;
-      while ((i = before.indexOf(e.old_string, i)) !== -1) {
-        n++;
-        i += e.old_string.length;
-      }
-      if (n === 0) {
-        return {
-          error: `old_string not found: ${JSON.stringify(e.old_string.slice(0, 80))}`,
-          path: abs,
-        };
-      }
-      totalReplacements += n;
-      void occurrences;
-    } else {
-      const first = content.indexOf(e.old_string);
-      if (first === -1) {
-        return {
-          error: `old_string not found: ${JSON.stringify(e.old_string.slice(0, 80))}`,
-          path: abs,
-        };
-      }
-      const second = content.indexOf(e.old_string, first + 1);
-      if (second !== -1) {
-        return {
-          error:
-            "old_string is not unique. Provide more surrounding context, or set replace_all=true.",
-          path: abs,
-        };
-      }
-      content =
-        content.slice(0, first) +
-        e.new_string +
-        content.slice(first + e.old_string.length);
-      totalReplacements += 1;
-    }
-  }
+  const applied = applyEditOps(original, edits);
+  if (!applied.ok) return { error: applied.error, path: abs };
+  const content = applied.content;
+  const totalReplacements = applied.replacements;
 
   if (usePlanStore.getState().active) {
     usePlanStore.getState().enqueue({
@@ -102,6 +54,8 @@ async function applyEdits(
       originalContent: original,
       proposedContent: content,
       isNewFile: false,
+      baseVersion: r.version,
+      edits,
     });
     return {
       ok: true,
@@ -112,8 +66,8 @@ async function applyEdits(
   }
 
   try {
-    await native.writeFile(abs, content);
-    const entry = { ...writtenEntry(content), fullContent };
+    const saved = await native.writeFile(abs, content, r.version);
+    const entry = { ...writtenEntry(content, saved.version), fullContent };
     readCache.set(abs, entry);
     return {
       ok: true,
@@ -122,7 +76,10 @@ async function applyEdits(
       path: abs,
     };
   } catch (err) {
-    return { error: String(err), path: abs };
+    return {
+      error: err instanceof StaleFileError ? err.message : String(err),
+      path: abs,
+    };
   }
 }
 

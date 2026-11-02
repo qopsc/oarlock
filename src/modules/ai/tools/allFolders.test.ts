@@ -8,8 +8,13 @@ import type { ToolContext } from "./context";
 const links = vi.hoisted(() => new Map<string, string>());
 const nativeMock = vi.hoisted(() => ({
   canonicalize: vi.fn(async (path: string) => links.get(path) ?? path),
-  readFile: vi.fn(async () => ({ kind: "text", content: "x\n", size: 2 })),
-  writeFile: vi.fn(async () => undefined),
+  readFile: vi.fn(async () => ({
+    kind: "text",
+    content: "x\n",
+    size: 2,
+    version: "v1",
+  })),
+  writeFile: vi.fn(async () => ({ version: "v2" })),
   readDir: vi.fn(async () => []),
   createDir: vi.fn(async () => undefined),
   grep: vi.fn(async () => ({ hits: [], truncated: false, files_scanned: 0 })),
@@ -122,13 +127,19 @@ describe("with access to all folders, the AI tools still refuse secrets", () => 
   it("reads and writes ordinary files anywhere", async () => {
     const read = await run(fs.read_file, { path: "/srv/data/notes.txt" });
     expect(read.error).toBeUndefined();
-    expect(nativeMock.readFile).toHaveBeenCalledWith("/srv/data/notes.txt");
+    expect(nativeMock.readFile).toHaveBeenCalledWith("/srv/data/notes.txt", {
+      versioned: true,
+    });
 
     const written = await run(fs.write_file, {
       path: "/srv/data/out.txt",
       content: "y",
     });
     expect(written.error).toBeUndefined();
-    expect(nativeMock.writeFile).toHaveBeenCalledWith("/srv/data/out.txt", "y");
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(
+      "/srv/data/out.txt",
+      "y",
+      "v1",
+    );
   });
 });

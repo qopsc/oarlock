@@ -5,7 +5,7 @@ import type { ToolContext } from "./context";
 const nativeMock = vi.hoisted(() => ({
   canonicalize: vi.fn(async (path: string) => path),
   readFile: vi.fn(),
-  writeFile: vi.fn(async () => undefined),
+  writeFile: vi.fn(async () => ({ version: "v2" })),
   readDir: vi.fn(),
   createDir: vi.fn(async () => undefined),
 }));
@@ -48,7 +48,10 @@ const toolOptions: ToolExecutionOptions<Record<string, unknown>> = {
 const FILE = "/workspace/a.txt";
 
 function makeContext(
-  readCache = new Map<string, { size: number; hash: number }>(),
+  readCache = new Map<
+    string,
+    { size: number; hash: number; version?: string | null }
+  >(),
 ): ToolContext {
   return {
     getCwd: () => "/workspace",
@@ -83,6 +86,7 @@ function textFile(content: string) {
     kind: "text",
     content,
     size: new TextEncoder().encode(content).length,
+    version: "v1",
   });
 }
 
@@ -98,6 +102,8 @@ beforeEach(() => {
     ok: true as const,
     canonical: p,
   }));
+  nativeMock.readFile.mockReset().mockRejectedValue(new Error("No such file"));
+  nativeMock.writeFile.mockReset().mockResolvedValue({ version: "v2" });
 });
 
 describe("read_file", () => {
@@ -224,15 +230,67 @@ describe("list_directory", () => {
   });
 });
 
+describe("read_file versions", () => {
+  it("reads versioned and keeps the version for a later write", async () => {
+    textFile("one");
+    const ctx = makeContext();
+    await run("read_file", ctx, { path: FILE });
+    expect(nativeMock.readFile).toHaveBeenCalledWith(FILE, { versioned: true });
+    expect(ctx.readCache.get(FILE)?.version).toBe("v1");
+  });
+});
+
 describe("write_file", () => {
-  it("writes content and reports the UTF-8 byte count", async () => {
+  it("creates a new file only if it still does not exist", async () => {
     const r = await run("write_file", makeContext(), {
       path: FILE,
       content: "café",
     });
     expect(r.ok).toBe(true);
     expect(r.bytesWritten).toBe(5);
-    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "café");
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "café", null);
+  });
+
+  it("overwrites over the version the model read, without another read", async () => {
+    const ctx = makeContext(
+      new Map([[FILE, { size: 1, hash: 1, version: "v5" }]]),
+    );
+    const r = await run("write_file", ctx, { path: FILE, content: "new" });
+    expect(r.ok).toBe(true);
+    expect(nativeMock.readFile).not.toHaveBeenCalled();
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "new", "v5");
+    expect(ctx.readCache.get(FILE)?.version).toBe("v2");
+  });
+
+  it("overwrites an unread file over the version it has now", async () => {
+    textFile("existing");
+    await run("write_file", makeContext(), { path: FILE, content: "new" });
+    expect(nativeMock.readFile).toHaveBeenCalledWith(FILE, {
+      versioned: true,
+    });
+    expect(nativeMock.writeFile).toHaveBeenCalledWith(FILE, "new", "v1");
+  });
+
+  it("reports a file changed since the model read it and writes nothing", async () => {
+    const { StaleFileError } = await import("../lib/staleFile");
+    nativeMock.writeFile.mockRejectedValue(new StaleFileError(FILE));
+    const r = await run(
+      "write_file",
+      makeContext(new Map([[FILE, { size: 1, hash: 1, version: "v5" }]])),
+      { path: FILE, content: "new" },
+    );
+    expect(r.error).toContain("changed on disk");
+    expect(r.ok).toBeUndefined();
+  });
+
+  it("refuses to overwrite a binary or oversized file", async () => {
+    nativeMock.readFile.mockResolvedValue({ kind: "binary", size: 5 });
+    const r = await run("write_file", makeContext(), {
+      path: FILE,
+      content: "x",
+    });
+    expect(r.error).toContain("binary");
+    expect(nativeMock.writeFile).not.toHaveBeenCalled();
   });
 
   it("lets the next read of non-ASCII content it wrote dedup", async () => {
@@ -251,6 +309,7 @@ describe("write_file", () => {
       kind: "text",
       content: "",
       size: 0,
+      version: "v1",
     });
     const r = await run("write_file", makeContext(), {
       path: FILE,
@@ -264,6 +323,31 @@ describe("write_file", () => {
         path: FILE,
         originalContent: "",
         proposedContent: "hello",
+        baseVersion: "v1",
+        isNewFile: false,
+      }),
+    );
+  });
+
+  it("shows the plan review the file as it is, keeping the version the model read", async () => {
+    planMock.active = true;
+    nativeMock.readFile.mockResolvedValue({
+      kind: "text",
+      content: "line one\nline two",
+      size: 17,
+      version: "v7",
+    });
+    await run(
+      "write_file",
+      makeContext(new Map([[FILE, { size: 1, hash: 1, version: "v5" }]])),
+      { path: FILE, content: "line one" },
+    );
+    expect(planMock.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        originalContent: "line one\nline two",
+        proposedContent: "line one",
+        baseVersion: "v5",
+        isNewFile: false,
       }),
     );
   });

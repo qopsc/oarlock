@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::SystemTime;
 
@@ -28,7 +28,7 @@ fn pump(mut pipe: impl Read, proc: &BackgroundProc) {
     loop {
         match pipe.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => proc.buffer.lock().unwrap().push(&buf[..n]),
+            Ok(n) => proc.buffer.lock().unwrap_or_else(PoisonError::into_inner).push(&buf[..n]),
         }
     }
 }
@@ -75,7 +75,7 @@ pub struct BackgroundProcInfo {
 
 impl BackgroundProc {
     pub fn read_logs(&self, since: u64) -> BackgroundLogResponse {
-        let (bytes, next_offset, dropped) = self.buffer.lock().unwrap().read_from(since);
+        let (bytes, next_offset, dropped) = self.buffer.lock().unwrap_or_else(PoisonError::into_inner).read_from(since);
         let exited = self.exited.load(Ordering::Acquire);
         let exit_code = if exited && !self.exit_unknown.load(Ordering::Acquire) {
             Some(self.exit_code.load(Ordering::Acquire))
@@ -95,6 +95,15 @@ impl BackgroundProc {
     /// alone would leave the server running and holding its port. On Unix the
     /// process leads its own group, which gets SIGTERM and, after
     /// `TERM_GRACE`, SIGKILL; on Windows its job is closed.
+    /// Whether a caller acting for `chat_id` may read this job's logs or stop it: a job a chat
+    /// started belongs to that chat alone; one that names no chat is open to every caller.
+    pub fn reachable_by(&self, chat_id: Option<&str>) -> bool {
+        match self.chat_id.as_deref() {
+            None => true,
+            Some(owner) => chat_id == Some(owner),
+        }
+    }
+
     pub fn kill(&self) {
         if self.exited.load(Ordering::Acquire) || self.killing.swap(true, Ordering::AcqRel) {
             return;
@@ -116,7 +125,7 @@ impl BackgroundProc {
             }
         }
         #[cfg(windows)]
-        drop(self.job.lock().unwrap().take());
+        drop(self.job.lock().unwrap_or_else(PoisonError::into_inner).take());
         #[cfg(windows)]
         let _ = self.child.kill();
     }
@@ -301,7 +310,7 @@ pub(super) fn spawn_notifying(
                     let active = proc_ref
                         .job
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .as_ref()
                         .map(|job| job.active_processes())
                         .transpose()?

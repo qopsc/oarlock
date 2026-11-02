@@ -159,6 +159,25 @@ describe("bash_logs / bash_list / bash_kill", () => {
     });
     const r = await run("bash_logs", makeContext(), { handle: 7 });
     expect(r.next_offset).toBe(3);
+    expect(nativeMock.shellBgLogs).toHaveBeenCalledWith(
+      7,
+      undefined,
+      "session",
+    );
+  });
+
+  it("names the chat on logs and kill, so another chat's job is refused natively", async () => {
+    nativeMock.shellBgLogs.mockRejectedValue("belongs to another chat");
+    nativeMock.shellBgKill.mockRejectedValueOnce("belongs to another chat");
+    const ctx = makeContext("chat-b");
+    expect((await run("bash_logs", ctx, { handle: 1 })).error).toContain(
+      "another chat",
+    );
+    expect((await run("bash_kill", ctx, { handle: 1 })).error).toContain(
+      "another chat",
+    );
+    expect(nativeMock.shellBgLogs).toHaveBeenCalledWith(1, undefined, "chat-b");
+    expect(nativeMock.shellBgKill).toHaveBeenCalledWith(1, "chat-b");
   });
 
   it("wraps the process list", async () => {
@@ -172,7 +191,7 @@ describe("bash_logs / bash_list / bash_kill", () => {
   it("kills idempotently by handle", async () => {
     const r = await run("bash_kill", makeContext(), { handle: 7 });
     expect(r).toEqual({ handle: 7, ok: true });
-    expect(nativeMock.shellBgKill).toHaveBeenCalledWith(7);
+    expect(nativeMock.shellBgKill).toHaveBeenCalledWith(7, "session");
   });
 });
 

@@ -384,7 +384,7 @@ function ModelDropdown() {
                 key={p.id}
                 icon={PROVIDER_ICON[p.id]}
                 title={
-                  hasKeyFor(p.id) ? p.label : `${p.label} — not configured`
+                  hasKeyFor(p.id) ? p.label : `${p.label} (not configured)`
                 }
                 active={activeProvider === p.id}
                 muted={!hasKeyFor(p.id)}

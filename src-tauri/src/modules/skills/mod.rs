@@ -26,7 +26,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::modules::fs::{blocking, to_canon};
 use crate::modules::project_trust::{
-    self, item_path, open_projects, resolve_project, Inspected, ItemEntry, ItemKind, OpenProject,
+    self, item_path, open_projects, resolve_authorized_project, Inspected, ItemEntry, ItemKind, OpenProject,
     ProjectStatus,
 };
 use crate::modules::workspace::{is_plain_name, Opened, WorkspaceEnv, WorkspaceRegistry};
@@ -56,8 +56,18 @@ struct SkillsSettings {
 }
 
 struct Staged {
+    /// The window that started the install; only it may commit or cancel.
+    window: String,
     dir: PathBuf,
     candidates: Vec<Candidate>,
+}
+
+/// Takes the install `token` names out of the map, if `window` started it.
+fn take_owned(installs: &mut HashMap<String, Staged>, token: &str, window: &str) -> Option<Staged> {
+    if installs.get(token)?.window != window {
+        return None;
+    }
+    installs.remove(token)
 }
 
 #[derive(Default)]
@@ -611,16 +621,19 @@ fn parse_id(id: &str) -> Result<(SourceKind, String), String> {
     Ok((kind, dir_name.to_owned()))
 }
 
-fn project_of(input: Option<ProjectInput>) -> Result<Option<OpenProject>, String> {
+fn project_of(
+    app: &AppHandle,
+    input: Option<ProjectInput>,
+) -> Result<Option<OpenProject>, String> {
     input
-        .map(|project| resolve_project(&project.root, project.workspace))
+        .map(|project| resolve_authorized_project(app, &project.root, project.workspace))
         .transpose()
 }
 
 /// A skill the model may use in a conversation working in `project`: valid, on, trusted and
 /// not overridden.
 fn usable(app: &AppHandle, skill: SkillRef) -> Result<SkillView, String> {
-    let project = project_of(skill.project)?;
+    let project = project_of(app, skill.project)?;
     let snapshot = collect(app, Scope::Agent(project.as_ref()));
     let view = snapshot
         .skills
@@ -651,7 +664,7 @@ fn skill_file_of(app: &AppHandle, skill: &SkillRef) -> Result<PathBuf, String> {
             source.dir
         }
         Some(item) => {
-            let project = project_of(skill.project.clone())?.ok_or("unknown skill")?;
+            let project = project_of(app, skill.project.clone())?.ok_or("unknown skill")?;
             project_item_dir(&project.real, item).ok_or("unknown skill")??
         }
     };
@@ -677,8 +690,9 @@ pub async fn skills_list(
         if all == Some(true) {
             return Ok(collect(&app, Scope::All));
         }
-        let project =
-            project.and_then(|project| resolve_project(&project.root, project.workspace).ok());
+        let project = project.and_then(|project| {
+            resolve_authorized_project(&app, &project.root, project.workspace).ok()
+        });
         Ok(collect(&app, Scope::Agent(project.as_ref())))
     })
     .await
@@ -899,6 +913,7 @@ fn sweep_staging(app: &AppHandle, skills_dir: &Path) {
 /// the skills are; each skill found there is reviewed.
 fn stage(
     app: &AppHandle,
+    window: &str,
     source: String,
     fallback: &str,
     fill: impl FnOnce(&Path) -> Result<PathBuf, String>,
@@ -951,6 +966,7 @@ fn stage(
         .insert(
             token.clone(),
             Staged {
+                window: window.to_owned(),
                 dir: staging,
                 candidates: candidates.clone(),
             },
@@ -978,11 +994,15 @@ fn repository_name(url: &str, subpath: Option<&str>) -> String {
 
 /// Clones a Git repository (shallow) into a staging folder and reviews the skills in it.
 #[tauri::command]
-pub async fn skills_install_git(app: AppHandle, url: String) -> Result<InstallPreview, String> {
+pub async fn skills_install_git(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    url: String,
+) -> Result<InstallPreview, String> {
     blocking(move || {
         let source = install::parse_git_source(&url)?;
         let fallback = repository_name(&source.url, source.subpath.as_deref());
-        stage(&app, url.trim().to_owned(), &fallback, |staging| {
+        stage(&app, window.label(), url.trim().to_owned(), &fallback, |staging| {
             install::clone(staging, &source)
         })
     })
@@ -1013,7 +1033,7 @@ pub async fn skills_install_zip(
             stem.to_string_lossy().to_ascii_lowercase()
         });
         let source = to_canon(&path);
-        stage(&app, source, &fallback, |staging| {
+        stage(&app, window.label(), source, &fallback, |staging| {
             let dest = staging.join("zip");
             std::fs::create_dir(&dest).map_err(|e| e.to_string())?;
             install::extract_zip(&path, &dest)?;
@@ -1037,18 +1057,22 @@ pub struct Installed {
 #[tauri::command]
 pub async fn skills_install_commit(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     token: String,
     names: Vec<String>,
     replace: Vec<String>,
 ) -> Result<Installed, String> {
     blocking(move || {
-        let staged = app
-            .state::<SkillsState>()
-            .installs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&token)
-            .ok_or("this install has expired; start it again")?;
+        let staged = take_owned(
+            &mut app
+                .state::<SkillsState>()
+                .installs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            &token,
+            window.label(),
+        )
+        .ok_or("this install has expired; start it again")?;
         let skills_dir = oarlock_dir(&app)?;
         let mut installed = Vec::new();
         let mut failures = Vec::new();
@@ -1080,14 +1104,21 @@ pub async fn skills_install_commit(
 }
 
 #[tauri::command]
-pub async fn skills_install_cancel(app: AppHandle, token: String) -> Result<(), String> {
+pub async fn skills_install_cancel(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    token: String,
+) -> Result<(), String> {
     blocking(move || {
-        let staged = app
-            .state::<SkillsState>()
-            .installs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&token);
+        let staged = take_owned(
+            &mut app
+                .state::<SkillsState>()
+                .installs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            &token,
+            window.label(),
+        );
         if let Some(staged) = staged {
             let _ = std::fs::remove_dir_all(staged.dir);
         }
@@ -1098,6 +1129,24 @@ pub async fn skills_install_cancel(app: AppHandle, token: String) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_install_can_be_committed_or_cancelled_only_by_the_window_that_started_it() {
+        let mut installs = HashMap::new();
+        installs.insert(
+            "t".to_owned(),
+            Staged {
+                window: "main".into(),
+                dir: PathBuf::from("/staging"),
+                candidates: Vec::new(),
+            },
+        );
+        assert!(take_owned(&mut installs, "t", "w-2").is_none());
+        assert!(installs.contains_key("t"), "a foreign window leaves it staged");
+        assert!(take_owned(&mut installs, "missing", "main").is_none());
+        assert!(take_owned(&mut installs, "t", "main").is_some());
+        assert!(installs.is_empty());
+    }
+
     use super::*;
     use discover::Found;
     use frontmatter::SkillMeta;

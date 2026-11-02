@@ -8,11 +8,57 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 use tauri::Manager;
 
 const MAX_TEXT: usize = 200_000;
 const MAX_IMAGE: usize = 15 * 1024 * 1024;
+
+/// How long and how many picks the backend remembers: a pick is meant to be imported at once.
+const PICK_TTL: Duration = Duration::from_secs(300);
+const PICK_LIMIT: usize = 256;
+
+/// The files the user chose in the OS picker, per window, each good for one import. The page
+/// says `picked`, but only a path listed here (a one-shot token the picker command issued) lets
+/// the import authorize the file's folder for the AI's later reads.
+#[derive(Default)]
+struct PickedFiles {
+    picks: Vec<(String, PathBuf, Instant)>,
+}
+
+impl PickedFiles {
+    fn grant(&mut self, window: &str, paths: &[PathBuf], now: Instant) {
+        self.picks.retain(|(_, _, at)| now.duration_since(*at) < PICK_TTL);
+        for path in paths {
+            if self.picks.len() >= PICK_LIMIT {
+                self.picks.remove(0);
+            }
+            self.picks.push((window.to_owned(), path.clone(), now));
+        }
+    }
+
+    fn take(&mut self, window: &str, path: &Path, now: Instant) -> bool {
+        self.picks.retain(|(_, _, at)| now.duration_since(*at) < PICK_TTL);
+        match self
+            .picks
+            .iter()
+            .position(|(label, picked, _)| label == window && picked == path)
+        {
+            Some(index) => {
+                self.picks.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn picked_files() -> std::sync::MutexGuard<'static, PickedFiles> {
+    static PICKS: Mutex<PickedFiles> = Mutex::new(PickedFiles { picks: Vec::new() });
+    PICKS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -169,12 +215,14 @@ fn import(
 #[tauri::command]
 pub async fn ai_import_attachment(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     path: String,
     workspace: Option<WorkspaceEnv>,
     picked: bool,
 ) -> Result<Attachment, String> {
     super::blocking(move || {
         allowed(Path::new(&path))?;
+        let picked = picked && picked_files().take(window.label(), Path::new(&path), Instant::now());
         let path = resolve_path(&path, &WorkspaceEnv::from_option(workspace))?;
         let registry = app.state::<WorkspaceRegistry>();
         let granted = std::cell::Cell::new(false);
@@ -200,19 +248,21 @@ pub async fn ai_pick_attachment_files(
 ) -> Result<Vec<String>, String> {
     super::blocking(move || {
         use tauri_plugin_dialog::DialogExt;
-        app.dialog()
+        let paths = app
+            .dialog()
             .file()
             .set_parent(&window)
             .set_title("Attach files to chat")
             .blocking_pick_files()
             .unwrap_or_default()
             .into_iter()
-            .map(|file| {
-                file.into_path()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .map_err(|e| e.to_string())
-            })
-            .collect()
+            .map(|file| file.into_path().map_err(|e| e.to_string()))
+            .collect::<Result<Vec<PathBuf>, String>>()?;
+        picked_files().grant(window.label(), &paths, Instant::now());
+        Ok(paths
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect())
     })
     .await
 }
@@ -220,6 +270,33 @@ pub async fn ai_pick_attachment_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_path_the_picker_issued_can_authorize_and_only_once() {
+        let now = Instant::now();
+        let mut picks = PickedFiles::default();
+        picks.grant("main", &[PathBuf::from("/work/a.txt")], now);
+        assert!(!picks.take("main", Path::new("/etc/hosts"), now), "never picked");
+        assert!(!picks.take("w-2", Path::new("/work/a.txt"), now), "another window");
+        assert!(picks.take("main", Path::new("/work/a.txt"), now));
+        assert!(!picks.take("main", Path::new("/work/a.txt"), now), "one shot");
+    }
+
+    #[test]
+    fn a_pick_expires_and_the_list_is_bounded() {
+        let start = Instant::now();
+        let mut picks = PickedFiles::default();
+        picks.grant("main", &[PathBuf::from("/work/old.txt")], start);
+        let later = start + PICK_TTL + Duration::from_secs(1);
+        assert!(!picks.take("main", Path::new("/work/old.txt"), later));
+        let many: Vec<PathBuf> = (0..PICK_LIMIT + 10)
+            .map(|n| PathBuf::from(format!("/work/{n}")))
+            .collect();
+        picks.grant("main", &many, later);
+        assert_eq!(picks.picks.len(), PICK_LIMIT);
+        assert!(!picks.take("main", Path::new("/work/0"), later), "oldest dropped");
+        assert!(picks.take("main", Path::new("/work/265"), later));
+    }
     #[test]
     fn ordinary_text_is_not_an_image_because_of_its_first_letters() {
         let dir = tempfile::tempdir().unwrap();

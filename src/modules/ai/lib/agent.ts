@@ -56,10 +56,8 @@ import {
 import { opencodeSessionHeaders } from "./opencodeSession";
 import { prepareAgentPrompt } from "./prompt";
 import { type ReasoningEffort, reasoningCallOptions } from "./reasoningEffort";
-import { createProxyFetch } from "./proxyFetch";
+import { proxyFetch } from "./proxyFetch";
 import { type TokenUsage, tokenUsage } from "./usage";
-
-const localProxyFetch = createProxyFetch({ allowPrivateNetwork: true });
 
 const TOOL_LABELS: Record<string, (input: Record<string, unknown>) => string> =
   {
@@ -246,7 +244,7 @@ export async function buildLanguageModel(
           apiKey: epKey || undefined,
           // OpenCode Go/Zen refuses requests without a session header.
           headers: opencodeSessionHeaders(compatURL),
-          fetch: localProxyFetch,
+          fetch: proxyFetch,
         })(resolvedModelId),
       );
       break;
@@ -259,7 +257,7 @@ export async function buildLanguageModel(
         createOpenAICompatible({
           name: "lmstudio",
           baseURL: lmstudioURL,
-          fetch: localProxyFetch,
+          fetch: proxyFetch,
         })(resolvedModelId),
       );
       break;
@@ -272,7 +270,7 @@ export async function buildLanguageModel(
         createOpenAICompatible({
           name: "mlx",
           baseURL: mlxURL,
-          fetch: localProxyFetch,
+          fetch: proxyFetch,
         })(resolvedModelId),
       );
       break;
@@ -285,7 +283,7 @@ export async function buildLanguageModel(
         createOpenAICompatible({
           name: "ollama",
           baseURL: ollamaURL,
-          fetch: localProxyFetch,
+          fetch: proxyFetch,
         })(resolvedModelId),
       );
       break;

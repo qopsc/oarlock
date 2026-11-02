@@ -48,7 +48,10 @@ describe("authorizing what the user opened", () => {
   });
 
   it("rechecks a later open of the same spelling and retries refusals", async () => {
-    invoke.mockResolvedValueOnce("/a").mockResolvedValueOnce("/other").mockRejectedValueOnce("gone");
+    invoke
+      .mockResolvedValueOnce("/a")
+      .mockResolvedValueOnce("/other")
+      .mockRejectedValueOnce("gone");
     expect(await authorize.authorizeFileFolder("/a/x.txt", local)).toBe(true);
     expect(await authorize.authorizeFileFolder("/a/x.txt", local)).toBe(true);
     expect(invoke).toHaveBeenCalledTimes(2);
@@ -106,5 +109,25 @@ describe("authorizationSettled", () => {
     await expect(
       authorize.authorizationSettled("/home/me", local),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("onAuthorized", () => {
+  it("runs for a successful authorization of exactly that path and environment", async () => {
+    const run = vi.fn();
+    const stop = authorize.onAuthorized("/work/proj", local, run);
+    invoke.mockResolvedValue("/work/proj");
+    await authorize.authorizeRoot("/work/proj", ubuntu);
+    await authorize.authorizeRoot("/work/other", local);
+    expect(run).not.toHaveBeenCalled();
+    await authorize.authorizeRoot("/work/proj", local);
+    expect(run).toHaveBeenCalledTimes(1);
+    invoke.mockRejectedValue("refused");
+    await authorize.authorizeRoot("/work/proj", local);
+    expect(run).toHaveBeenCalledTimes(1);
+    stop();
+    invoke.mockResolvedValue("/work/proj");
+    await authorize.authorizeRoot("/work/proj", local);
+    expect(run).toHaveBeenCalledTimes(1);
   });
 });

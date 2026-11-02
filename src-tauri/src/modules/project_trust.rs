@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::modules::fs::{blocking, to_canon};
-use crate::modules::workspace::{resolve_path, WorkspaceEnv};
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 
 /// Sent to every window when a decision is made or revoked, or a window opens or leaves a
 /// project.
@@ -213,6 +213,27 @@ pub fn resolve_project(root: &str, workspace: Option<WorkspaceEnv>) -> Result<Op
         root: root.to_owned(),
         workspace,
     })
+}
+
+/// `resolve_project` for a root the workspace registry authorizes: a page cannot make any
+/// readable folder the window's open project and have its `AGENTS.md` head, `.mcp.json` command
+/// lines and skill descriptions read back.
+pub fn resolve_authorized_project(
+    app: &AppHandle,
+    root: &str,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<OpenProject, String> {
+    authorized_project(&app.state::<WorkspaceRegistry>(), root, workspace)
+}
+
+fn authorized_project(
+    registry: &WorkspaceRegistry,
+    root: &str,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<OpenProject, String> {
+    let project = resolve_project(root, workspace)?;
+    registry.authorized_existing(&project.real)?;
+    Ok(project)
 }
 
 #[derive(Default)]
@@ -774,8 +795,11 @@ fn own_change_lock() -> MutexGuard<'static, ()> {
 /// again. Decided here from the disk and the bytes written, never on the page's word: no command
 /// marks content allowed, and a change made any other way (git, another editor, a shell command,
 /// an MCP server, a coding agent, the explorer's rename, move, copy, paste or delete) asks again.
+/// So does a change the AI made (`Origin::Ai`): model output must never author what the trust
+/// prompt exists to confirm, such as an MCP server's command line.
 pub fn keeping_trust<T, E>(
     app: &AppHandle,
+    origin: Origin,
     change: OwnChange<'_>,
     apply: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
@@ -783,6 +807,7 @@ pub fn keeping_trust<T, E>(
         return apply();
     }
     keep_through(
+        origin,
         &open_projects(app),
         change,
         apply,
@@ -802,11 +827,15 @@ pub fn keeping_trust<T, E>(
 /// new hash of each item `change` landed in, with the hash the user must have allowed before
 /// (None: the item held nothing).
 fn keep_through<T, E>(
+    origin: Origin,
     open: &[OpenProject],
     change: OwnChange<'_>,
     apply: impl FnOnce() -> Result<T, E>,
     mut allow: impl FnMut(&OpenProject, ItemKind, Option<&str>, &str),
 ) -> Result<T, E> {
+    if origin == Origin::Ai {
+        return apply();
+    }
     let landed: Vec<(&OpenProject, ItemKind, PathBuf, Vec<String>)> = open
         .iter()
         .filter(|project| change.target().starts_with(&project.real))
@@ -1261,7 +1290,7 @@ pub async fn project_trust_status(
 ) -> Result<Option<ProjectStatus>, String> {
     let label = webview.label().to_owned();
     blocking(move || {
-        let Ok(project) = resolve_project(&root, workspace) else {
+        let Ok(project) = resolve_authorized_project(&app, &root, workspace) else {
             if app.state::<ProjectTrustState>().release_window(&label) {
                 crate::modules::skills::open_projects_changed(&app);
                 let _ = app.emit(CHANGED_EVENT, ());
@@ -1293,7 +1322,7 @@ pub async fn project_trust_decide(
     decisions: Vec<DecisionInput>,
 ) -> Result<ProjectStatus, String> {
     blocking(move || {
-        let project = resolve_project(&root, workspace)?;
+        let project = resolve_authorized_project(&app, &root, workspace)?;
         let current: HashMap<ItemKind, Result<String, String>> = decisions
             .iter()
             .filter_map(|decision| inspect(&project.real, decision.kind))
@@ -1597,6 +1626,7 @@ mod tests {
         project: OpenProject,
         file: TrustFile,
         at: u64,
+        origin: Origin,
     }
 
     impl Own {
@@ -1615,6 +1645,7 @@ mod tests {
                 root,
                 file: TrustFile::default(),
                 at: 0,
+                origin: Origin::App,
             }
         }
 
@@ -1633,6 +1664,7 @@ mod tests {
             self.at += 1;
             let (file, at) = (&mut self.file, self.at);
             keep_through(
+                self.origin,
                 std::slice::from_ref(&self.project),
                 change,
                 apply,
@@ -1697,6 +1729,23 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn a_root_the_registry_does_not_authorize_is_not_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let registry = WorkspaceRegistry::default();
+        let text = root.to_string_lossy().into_owned();
+        assert!(authorized_project(&registry, &text, None).is_err());
+        registry.authorize(&root).unwrap();
+        assert_eq!(
+            authorized_project(&registry, &text, None).unwrap().real,
+            root
+        );
+        let inside = root.join("sub");
+        std::fs::create_dir(&inside).unwrap();
+        assert!(authorized_project(&registry, &inside.to_string_lossy(), None).is_ok());
     }
 
     #[test]
@@ -1783,6 +1832,56 @@ mod tests {
         std::fs::write(empty.path(".mcp.json"), r#"{"mcpServers": {}}"#).unwrap();
         empty.write(".mcp.json", r#"{"mcpServers": {"db": {"command": "npx"}}}"#);
         assert!(empty.allowed(mcp));
+    }
+
+    #[test]
+    fn the_ais_own_writes_ask_again_where_the_editors_keep_the_answer() {
+        let servers = r#"{"mcpServers": {"x": {"command": "curl"}}}"#;
+        for (name, path, content, kind) in [
+            ("mcp", ".mcp.json", servers, ItemKind::McpJson),
+            ("memory", "AGENTS.md", "# Rules", ItemKind::AgentsMd),
+            (
+                "skill",
+                ".claude/skills/review/SKILL.md",
+                SKILL,
+                ItemKind::ClaudeSkills,
+            ),
+        ] {
+            let mut own = Own::new();
+            std::fs::create_dir_all(own.path(".claude/skills/review")).unwrap();
+            own.origin = Origin::Ai;
+            own.write(path, content);
+            assert!(!own.allowed(kind), "{name}: model output is not consent");
+            assert!(own.current(kind).is_some(), "{name}: it is written");
+            let mut editor = Own::new();
+            std::fs::create_dir_all(editor.path(".claude/skills/review")).unwrap();
+            editor.write(path, content);
+            assert!(editor.allowed(kind), "{name}: the editor's save is kept");
+        }
+    }
+
+    /// The commands cannot run without an app handle here, so this reads their source: every
+    /// `keeping_trust` call in a file command passes the caller's own origin, and only
+    /// `fs_create_file`, which takes none and serves the app alone, names `Origin::App`.
+    #[test]
+    fn the_file_commands_pass_their_callers_origin_to_keeping_trust() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |file: &str| {
+            std::fs::read_to_string(manifest.join("src/modules/fs").join(file)).unwrap()
+        };
+        let calls = |source: &str| -> Vec<String> {
+            source
+                .split("keeping_trust(")
+                .skip(1)
+                .map(|rest| rest.split(',').nth(1).unwrap_or("").trim().to_owned())
+                .collect()
+        };
+        assert_eq!(calls(&read("file.rs")), ["origin", "origin"]);
+        let mutate = read("mutate.rs");
+        assert_eq!(calls(&mutate), ["Origin::App", "origin"]);
+        let create_file = mutate.split("pub async fn fs_create_file(").nth(1).unwrap();
+        let signature = create_file.split(") -> ").next().unwrap();
+        assert!(!signature.contains("origin"), "fs_create_file serves the app alone");
     }
 
     const SKILL: &str = "---\nname: review\ndescription: Reviews a change.\n---\nCheck it.\n";
@@ -1891,6 +1990,7 @@ mod tests {
         assert_eq!(failed.file, TrustFile::default());
         let mut asked = 0;
         keep_through(
+            Origin::App,
             &[],
             change,
             || std::fs::write(&target, "# Rules"),

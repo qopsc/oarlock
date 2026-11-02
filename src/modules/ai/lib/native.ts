@@ -1,3 +1,4 @@
+import { StaleFileError } from "./staleFile";
 import { discardAcrossWindows } from "@/modules/editor/lib/discardBridge";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -11,9 +12,19 @@ import {
 export type ProjectMemory = { size: number; text: string | null };
 
 export type ReadResult =
-  | { kind: "text"; content: string; size: number }
+  | {
+      kind: "text";
+      content: string;
+      size: number;
+      /** Identity and content of the file as read; set when asked for. */
+      version?: string | null;
+    }
   | { kind: "binary"; size: number }
   | { kind: "toolarge"; size: number; limit: number };
+
+type SaveOutcome =
+  | { kind: "saved"; version: string }
+  | { kind: "conflict"; version: string | null };
 
 export type DirEntry = {
   name: string;
@@ -214,10 +225,11 @@ export function createNative(
 
   return {
     workspaceCurrentDir: () => invoke<string>("workspace_current_dir"),
-    readFile: (path: string) =>
+    readFile: (path: string, options?: { versioned?: boolean }) =>
       invoke<ReadResult>("fs_read_file", {
         path,
         workspace: environment(),
+        ...(options?.versioned ? { versioned: true } : {}),
         ...AI_ORIGIN,
       }),
     /** The window's project AGENTS.md for a run in `root`, only while the user
@@ -229,13 +241,26 @@ export function createNative(
         workspace: environment(),
         limit: Math.floor(limit),
       }),
-    writeFile: (path: string, content: string) =>
-      invoke<void>("fs_write_file", {
+    /** Saves only over the version that was read (`null`: only a file that
+     *  does not exist), so a change made meanwhile is never overwritten. */
+    writeFile: async (
+      path: string,
+      content: string,
+      expectedVersion: string | null,
+    ): Promise<{ version: string }> => {
+      const outcome = await invoke<SaveOutcome>("fs_save_document", {
         path,
         content,
+        expectedVersion,
+        // Not "editor": open editors reload this write at once, and a theme file the AI
+        // wrote is not taken in as the user's save.
+        source: "ai",
         workspace: environment(),
         ...AI_ORIGIN,
-      }),
+      });
+      if (outcome.kind === "conflict") throw new StaleFileError(path);
+      return { version: outcome.version };
+    },
     canonicalize: (path: string) =>
       invoke<string>("fs_canonicalize", {
         path,
@@ -249,7 +274,7 @@ export function createNative(
         ...AI_ORIGIN,
       }),
     // AI tooling never sees dot-prefixed entries regardless of the user's
-    // explorer preference — keeps .git / .env / .ssh out of agent context.
+    // explorer preference: keeps .git / .env / .ssh out of agent context.
     readDir: (path: string) =>
       invoke<DirEntry[]>("fs_read_dir", {
         path,
@@ -342,15 +367,24 @@ export function createNative(
         workspace: environment(),
         ...AI_ORIGIN,
       }),
-    shellBgLogs: (handle: number, sinceOffset?: number) =>
+    shellBgLogs: (
+      handle: number,
+      sinceOffset?: number,
+      chatId?: string | null,
+    ) =>
       invoke<{
         bytes: string;
         next_offset: number;
         dropped: number;
         exited: boolean;
         exit_code: number | null;
-      }>("shell_bg_logs", { handle, sinceOffset: sinceOffset ?? null }),
-    shellBgKill: (handle: number) => invoke<void>("shell_bg_kill", { handle }),
+      }>("shell_bg_logs", {
+        handle,
+        sinceOffset: sinceOffset ?? null,
+        chatId: chatId ?? null,
+      }),
+    shellBgKill: (handle: number, chatId?: string | null) =>
+      invoke<void>("shell_bg_kill", { handle, chatId: chatId ?? null }),
     shellBgList: () =>
       invoke<
         {

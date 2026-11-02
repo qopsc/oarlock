@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -70,7 +70,7 @@ impl ShellSession {
     }
 
     pub fn current_cwd(&self) -> String {
-        self.cwd.lock().unwrap().clone()
+        self.cwd.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     pub fn validate_workspace(&self, hint: Option<&WorkspaceEnv>) -> Result<(), String> {
@@ -109,7 +109,7 @@ impl ShellSession {
             if let Some(hint) = cwd_hint.filter(|s| !s.is_empty()) {
                 let p = resolve_path(&hint, &self.workspace)?;
                 if p.is_dir() {
-                    *self.cwd.lock().unwrap() = hint;
+                    *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = hint;
                 }
             }
         }
@@ -139,7 +139,7 @@ impl ShellSession {
             resolve_path(path, &self.workspace).is_ok_and(|resolved| resolved.is_dir())
         });
         if let Some(path) = &resolved_cwd {
-            *self.cwd.lock().unwrap() = path.clone();
+            *self.cwd.lock().unwrap_or_else(PoisonError::into_inner) = path.clone();
             self.cwd_known.store(true, Ordering::Release);
         }
         let stdout_clean = strip_cwd_sentinel(&raw.stdout, &self.sentinel);
@@ -157,7 +157,7 @@ impl ShellSession {
 
 fn wrap_posix_with_sentinel(command: &str, sentinel: &str) -> String {
     format!(
-        "{command}\n__oarlock_rc=$?\n__oarlock_cwd=$(pwd -P && printf .)\nprintf '\\n%s%s\\0' '{sentinel}' \"${{__oarlock_cwd%??}}\"\nexit $__oarlock_rc\n",
+        "{command}\n\n__oarlock_rc=$?\n__oarlock_cwd=$(command pwd -P && command printf .)\ncommand printf '\\n%s%s\\0' '{sentinel}' \"${{__oarlock_cwd%??}}\"\nexit $__oarlock_rc\n",
     )
 }
 
@@ -204,6 +204,46 @@ fn strip_cwd_sentinel(stdout: &str, sentinel: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_command_cannot_forge_the_cwd_or_swallow_the_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let session = ShellSession::new(real.to_string_lossy().into_owned(), WorkspaceEnv::Local);
+        let forged = session
+            .run(
+                "pwd(){ echo /; }; printf(){ :; }".into(),
+                None,
+                None,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(forged.cwd_error, None);
+        assert_eq!(
+            std::fs::canonicalize(forged.cwd_after.unwrap()).unwrap(),
+            real
+        );
+        let trailing = session
+            .run("echo done \\".into(), None, None, Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(trailing.exit_code, Some(0));
+        assert_eq!(trailing.cwd_error, None);
+        assert!(trailing.stdout.contains("done"));
+    }
+
+    #[test]
+    fn a_poisoned_cwd_lock_does_not_end_later_commands() {
+        let session = std::sync::Arc::new(ShellSession::new("/work".into(), WorkspaceEnv::Local));
+        let holder = session.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = holder.cwd.lock().unwrap();
+            panic!("a pump panicked while holding the lock");
+        })
+        .join();
+        assert!(session.cwd.is_poisoned());
+        assert_eq!(session.current_cwd(), "/work");
+    }
+
     use super::*;
 
     #[test]

@@ -1,9 +1,8 @@
+import { isWindowsPath } from "@/lib/windowsPath";
 import { pathKey } from "@/lib/pathKey";
 
 export function pathToFileUri(path: string): string {
-  let p = /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\")
-    ? path.replace(/\\/g, "/")
-    : path;
+  let p = isWindowsPath(path) ? path.replace(/\\/g, "/") : path;
   if (!p.startsWith("/")) p = `/${p}`;
   return `file://${p
     .split("/")
@@ -37,8 +36,10 @@ export function sameFileUri(a: string, b: string): boolean {
   const pb = fileUriToPath(b);
   if (pa === null || pb === null) return false;
   const key = (path: string) =>
-    /^[A-Za-z]:[\\/]/.test(path)
+    isWindowsPath(path)
       ? pathKey(path)
-      : path.length > 1 ? path.replace(/\/+$/, "") : path;
+      : path.length > 1
+        ? path.replace(/\/+$/, "")
+        : path;
   return key(pa) === key(pb);
 }
