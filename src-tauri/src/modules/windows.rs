@@ -631,7 +631,6 @@ fn finish_quit(app: &AppHandle) {
 #[derive(Clone, Serialize)]
 struct QuitResume {
     round: u64,
-    ticket: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
@@ -641,7 +640,6 @@ fn quit_unavailable(app: &AppHandle, message: &str) {
         "oarlock:quit-resume",
         QuitResume {
             round: 0,
-            ticket: None,
             message: Some(message.to_owned()),
         },
     );
@@ -684,12 +682,11 @@ fn dispatch_quit_locked(app: &AppHandle, inner: &mut Inner, actions: Vec<QuitAct
                     }
                 });
             }
-            QuitAction::Resume(round, ticket) => {
+            QuitAction::Resume(round) => {
                 let _ = app.emit(
                     "oarlock:quit-resume",
                     QuitResume {
                         round,
-                        ticket,
                         message: None,
                     },
                 );
@@ -730,19 +727,7 @@ pub fn quit_answer(app: &AppHandle, label: &str, round: u64, ticket: u64, ok: bo
     }
 }
 
-#[tauri::command]
-pub fn app_quit_changed(app: AppHandle, window: tauri::Window, round: u64, ticket: u64) {
-    let state = app.state::<WindowsState>();
-    let mut inner = state.lock();
-    let actions = match inner.quit.as_mut() {
-        Some(active) if active.id == round => active.changed(window.label(), ticket),
-        _ => return,
-    };
-    dispatch_quit_locked(&app, &mut inner, actions);
-}
-
-/// The watchdog only releases the local seal after native confirms that it
-/// cannot commit this round. Once exit is committed the seal must remain.
+/// Cancels a round the page could not finish; refused once the exit is committed.
 #[tauri::command]
 pub fn app_quit_cancel(app: AppHandle, window: tauri::Window, round: u64) -> bool {
     if !is_app_window(window.label()) {

@@ -2,7 +2,11 @@ import {
   recoveryMutationCoverage,
   recoveryTargetsChanged,
 } from "./recoveryTarget";
-import { beginDocumentMutation } from "./quitBarrier";
+import {
+  mutationFenceAdvance,
+  mutationFenceDown,
+  mutationFenceLive,
+} from "./mutationFence";
 import type { Tab } from "@/modules/tabs";
 import {
   LOCAL_WORKSPACE,
@@ -12,10 +16,36 @@ import {
 } from "@/modules/workspace/env";
 import { renamedPath, pathAtOrUnder } from "@/app/hooks/tabCloseGuards";
 
-export type DocumentMutation = { sequence: number; workspace: WorkspaceEnv } & (
+export type DiscardBegin = {
+  sequence: number;
+  workspace: WorkspaceEnv;
+  kind: "discard-begin";
+  id: number;
+  origin: string;
+  repoRoot: string;
+  /** Canonical entry names native resolved; a spelling through a link is not one. */
+  roots: string[];
+};
+export type DiscardEnd = {
+  sequence: number;
+  workspace: WorkspaceEnv;
+  kind: "discard-end";
+  id: number;
+  ok: boolean;
+};
+export type PathMutation = { sequence: number; workspace: WorkspaceEnv } & (
   | { kind: "renamed"; from: string; to: string }
   | { kind: "deleted"; paths: string[] }
 );
+export type DocumentMutation = PathMutation | DiscardBegin | DiscardEnd;
+/** Source Control Discard announcements; native sends them on the same stream. */
+export type DiscardChannel = {
+  begin: (event: DiscardBegin) => void;
+  end: (event: DiscardEnd) => void;
+  reset: () => void;
+  /** The stream's current sequence, for a listener that has just gone live. */
+  currentSequence: () => Promise<number>;
+};
 type Space = { id: string; env?: WorkspaceEnv };
 
 /** Missing spaces have no known owner; never reinterpret them as host files. */
@@ -53,6 +83,8 @@ export function planDocumentMutation(
   }[] = [];
   const deleted: number[] = [];
   const refresh: number[] = [];
+  if (event.kind === "discard-begin" || event.kind === "discard-end")
+    return { renamed, deleted, refresh };
   for (const tab of owned) {
     if (tab.kind !== "editor" && tab.kind !== "markdown") continue;
     if (tab.kind === "editor" && tab.detached) continue;
@@ -82,30 +114,26 @@ export function planDocumentMutation(
 /** One listener lifetime. Reconciliation precedes events after a gap or failure. */
 export function subscribeDocumentMutations(
   listen: (receive: (event: DocumentMutation) => void) => Promise<() => void>,
-  apply: (event: DocumentMutation) => void,
+  apply: (event: PathMutation) => void,
   failed: (error: unknown, retry?: () => void) => void,
   ready: () => void = () => {},
-  reconcile?: (workspace: WorkspaceEnv | undefined, isLive: () => boolean, failedEvent?: DocumentMutation) => Promise<void>,
+  reconcile?: (workspace: WorkspaceEnv | undefined, isLive: () => boolean, failedEvent?: PathMutation) => Promise<void>,
+  discard?: DiscardChannel,
 ): () => void {
-  type Work = { event: DocumentMutation } | { reconcile: WorkspaceEnv | undefined; failedEvent?: DocumentMutation };
+  type Work = { event: PathMutation } | { reconcile: WorkspaceEnv | undefined; failedEvent?: PathMutation };
   let live = true;
   let last = 0;
   let unlisten: (() => void) | undefined;
   let busy = false;
   let stalled = false;
-  let releasePending: (() => void) | undefined;
   const pending: Work[] = [];
   recoveryMutationCoverage(false);
 
   const drain = () => {
     if (!live || busy || stalled || pending.length === 0) return;
     busy = true;
-    const mutation = beginDocumentMutation();
-    releasePending = mutation.release;
     const finish = () => {
       busy = false;
-      releasePending = undefined;
-      mutation.release();
       if (live && unlisten && !stalled && pending.length === 0) {
         recoveryMutationCoverage(true);
         ready();
@@ -154,22 +182,33 @@ export function subscribeDocumentMutations(
       }
       finish();
     };
-    if (mutation.ready) void mutation.ready.then(run);
-    else run();
+    run();
   };
 
   void listen((event) => {
     if (!live || event.sequence <= last) return;
+    // A missed event may have been a discard-end or the begin of a rewrite.
+    if (last !== 0 && event.sequence !== last + 1) discard?.reset();
     if (last !== 0 && event.sequence !== last + 1 && reconcile) {
       recoveryMutationCoverage(false);
       pending.push({ reconcile: undefined });
     }
     last = event.sequence;
-    recoveryTargetsChanged(
-      workspaceScopeKey(event.workspace),
-      event.kind === "deleted" ? event.paths : [event.from, event.to],
-    );
-    pending.push({ event });
+    const scope = workspaceScopeKey(event.workspace);
+    if (event.kind === "discard-begin") {
+      recoveryTargetsChanged(scope, event.roots);
+      discard?.begin(event);
+    } else if (event.kind === "discard-end") {
+      discard?.end(event);
+    } else {
+      recoveryTargetsChanged(
+        scope,
+        event.kind === "deleted" ? event.paths : [event.from, event.to],
+      );
+      pending.push({ event });
+    }
+    // Staged by the handlers above, so a read held for this event is judged after.
+    mutationFenceAdvance(event.sequence);
     drain();
   }).then(
     (stop) => {
@@ -178,6 +217,13 @@ export function subscribeDocumentMutations(
         return;
       }
       unlisten = stop;
+      if (discard)
+        void discard.currentSequence().then(
+          (sequence) => {
+            if (live) mutationFenceLive(sequence);
+          },
+          () => mutationFenceDown(),
+        );
       if (reconcile) {
         pending.unshift({ reconcile: undefined });
         drain();
@@ -189,6 +235,8 @@ export function subscribeDocumentMutations(
     (error) => {
       if (live) {
         recoveryMutationCoverage(false);
+        discard?.reset();
+        mutationFenceDown();
         if (reconcile)
           void Promise.resolve().then(() => reconcile(undefined, () => live)).catch((reconcileError) => console.error(reconcileError));
         failed(error);
@@ -199,8 +247,9 @@ export function subscribeDocumentMutations(
     if (!live) return;
     live = false;
     recoveryMutationCoverage(false);
+    discard?.reset();
+    mutationFenceDown();
     pending.length = 0;
-    releasePending?.();
     unlisten?.();
   };
 }

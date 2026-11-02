@@ -34,6 +34,10 @@ pub enum ReadResult {
         ai_context_allowed: bool,
         #[serde(skip)]
         opened_path: Option<PathBuf>,
+        /// The mutation stream's sequence once the bytes were read; a window holds
+        /// the result until its listener has seen that event (versioned reads only).
+        #[serde(rename = "mutationSequence", skip_serializing_if = "Option::is_none")]
+        mutation_sequence: Option<u64>,
     },
     Binary {
         size: u64,
@@ -98,9 +102,13 @@ pub async fn fs_read_file(
         if let ReadResult::Text {
             ai_context_allowed,
             opened_path,
+            mutation_sequence,
             ..
         } = &mut result
         {
+            if versioned.unwrap_or(false) {
+                *mutation_sequence = Some(super::mutation_events::sequence());
+            }
             *ai_context_allowed &= crate::modules::secret_paths::readable(&requested)
                 && opened_path.as_ref().is_some_and(|path| {
                     app.state::<WorkspaceRegistry>()
@@ -180,6 +188,7 @@ fn read_file_checked(
             version,
             ai_context_allowed,
             opened_path,
+            mutation_sequence: None,
         }),
         Err(_) => Ok(ReadResult::Binary { size }),
     }

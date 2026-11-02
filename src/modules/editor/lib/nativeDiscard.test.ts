@@ -1,7 +1,27 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { DocumentSession, type DocumentIo } from "./documentSession";
-import { prepareNativeDiscard, registerDiscardDocument } from "./gitSignals";
-import { DiscardCoordinator } from "./discardCoordinator";
+import {
+  prepareNativeDiscard,
+  registerDiscardDocument,
+  type DiscardMatch,
+} from "./gitSignals";
+
+const core = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: core.invoke }));
+
+/** Preparation with its identity lookup bound, as the bridge binds it. */
+function prepare(
+  workspace: { kind: "local" },
+  preserve: boolean,
+  match: DiscardMatch,
+) {
+  const round = prepareNativeDiscard(workspace, preserve);
+  return {
+    ready: () => round.ready(match),
+    complete: round.complete,
+    dispose: round.dispose,
+  };
+}
 const cleanups: (() => void)[] = [];
 const flush = async () => {
   for (let i = 0; i < 30; i++) await Promise.resolve();
@@ -27,7 +47,6 @@ function document(path: string, io: DocumentIo) {
     registerDiscardDocument({
       path,
       workspace,
-      prepare: session.prepareDiscard,
       stage: session.stageDiscard,
     }),
   );
@@ -92,16 +111,13 @@ it("the real-filesystem directory-alias reproduction retains newer autosaved tex
   await flush();
   // This models the native response; real Rust tests cover resolution, gates,
   // leaf symlinks and missing entries through match_documents itself.
-  const preparation = prepareNativeDiscard(
-    workspace,
-    true,
-    async (_id, _token, paths) =>
-      paths.map((file) => fs.realpathSync(file) === target),
+  const preparation = prepare(workspace, true, async (paths) =>
+    paths.map((file) => fs.realpathSync(file) === target),
   );
   cleanups.push(preparation.dispose);
   session.change("new work in another window");
   await session.save();
-  await preparation.ready("1", "page");
+  await preparation.ready();
   fs.writeFileSync(target, "HEAD");
   preparation.complete();
   session.reload();
@@ -114,11 +130,11 @@ it("unrelated identities do not become dirty or trigger disk reads", async () =>
   const read = vi.fn(disk.io.read);
   const session = document("/unrelated", { ...disk.io, read });
   await flush();
-  const preparation = prepareNativeDiscard(workspace, true, async () => [
+  const preparation = prepare(workspace, true, async () => [
     false,
   ]);
   cleanups.push(preparation.dispose);
-  await preparation.ready("1", "page");
+  await preparation.ready();
   preparation.complete();
   await flush();
   expect(session.isSaved()).toBe(true);
@@ -132,10 +148,10 @@ it("documents mounted during identity resolution join the readiness barrier", as
   const matcher = vi.fn(
     () => new Promise<boolean[]>((resolve) => answers.push(resolve)),
   );
-  const preparation = prepareNativeDiscard(workspace, true, matcher);
+  const preparation = prepare(workspace, true, matcher);
   cleanups.push(preparation.dispose);
   let ready = false;
-  const waiting = preparation.ready("1", "page").then(() => {
+  const waiting = preparation.ready().then(() => {
     ready = true;
   });
   const late = document("/late-alias", disk.io);
@@ -157,13 +173,13 @@ it("identity failure refuses preparation and preserves unknown buffers", async (
   const disk = memory();
   const session = document("/alias", disk.io);
   await flush();
-  const preparation = prepareNativeDiscard(workspace, false, async () => {
+  const preparation = prepare(workspace, false, async () => {
     throw new Error("lookup unavailable");
   });
   cleanups.push(preparation.dispose);
   session.change("new work");
   await session.save();
-  await expect(preparation.ready("1", "page")).rejects.toThrow(
+  await expect(preparation.ready()).rejects.toThrow(
     "lookup unavailable",
   );
   disk.set("HEAD");
@@ -177,7 +193,7 @@ it("disposal during lookup cannot reattach protection or alter later navigation"
   const session = document("/alias", disk.io);
   await flush();
   let answer!: (matches: boolean[]) => void;
-  const preparation = prepareNativeDiscard(
+  const preparation = prepare(
     workspace,
     true,
     () =>
@@ -185,7 +201,7 @@ it("disposal during lookup cannot reattach protection or alter later navigation"
         answer = resolve;
       }),
   );
-  const waiting = preparation.ready("1", "page");
+  const waiting = preparation.ready();
   await flush();
   preparation.dispose();
   await flush();
@@ -196,93 +212,108 @@ it("disposal during lookup cannot reattach protection or alter later navigation"
   await waiting;
   expect(session.text()).toBe("replacement draft");
 });
-it("Git waits for native identity resolution before dispatch", async () => {
-  const disk = memory();
-  document("/alias", disk.io);
-  await flush();
-  let answer!: (matches: boolean[]) => void;
-  const invoke = vi.fn(async (command: string) =>
-    command === "git_discard_begin" ? "1" : undefined,
-  );
-  const coordinator = new DiscardCoordinator({
-    invoke: invoke as never,
-    problem: vi.fn(),
-    prepare: () =>
-      prepareNativeDiscard(
-        workspace,
-        false,
-        () =>
-          new Promise((resolve) => {
-            answer = resolve;
-          }),
-      ),
+const entries = [{ path: "file", untracked: false }];
+function native(overrides: Record<string, (args: never) => unknown> = {}) {
+  core.invoke.mockReset();
+  core.invoke.mockImplementation(async (command: string, args: never) => {
+    const handler = overrides[command];
+    if (handler) return handler(args);
+    if (command === "git_discard_scope") return ["/real/repo/file"];
+    if (command === "git_discard_match")
+      return (args as { paths: string[] }).paths.map(() => true);
+    return undefined;
   });
-  cleanups.push(() => coordinator.dispose());
-  coordinator.ready("page");
-  const running = coordinator.execute({
-    repoRoot: "/repo",
-    entries: [{ path: "file", untracked: false }],
+}
+it("the bridge sends raw document paths with the native roots and compares no spelling", async () => {
+  const { discardAcrossWindows } = await import("./discardBridge");
+  const disk = memory();
+  document("/alias/repo/./file", disk.io);
+  await flush();
+  native();
+  await discardAcrossWindows("/alias/repo", entries, workspace);
+  expect(core.invoke).toHaveBeenCalledWith("git_discard_match", {
+    roots: ["/real/repo/file"],
+    paths: ["/alias/repo/./file"],
     workspace,
   });
+  expect(core.invoke).toHaveBeenCalledWith("git_discard", {
+    repoRoot: "/alias/repo",
+    entries,
+    roots: ["/real/repo/file"],
+    workspace,
+  });
+});
+it("Git waits for native identity resolution before dispatch", async () => {
+  const { discardAcrossWindows } = await import("./discardBridge");
+  document("/alias", memory().io);
   await flush();
-  expect(invoke.mock.calls.some(([cmd]) => cmd === "git_discard")).toBe(false);
+  let answer!: (matches: boolean[]) => void;
+  native({
+    git_discard_match: () =>
+      new Promise<boolean[]>((resolve) => {
+        answer = resolve;
+      }),
+  });
+  const running = discardAcrossWindows("/repo", entries, workspace);
+  await flush();
+  expect(core.invoke.mock.calls.some(([c]) => c === "git_discard")).toBe(false);
   answer([true]);
   await running;
-  await flush();
-  expect(invoke.mock.calls.some(([cmd]) => cmd === "git_discard")).toBe(true);
+  expect(core.invoke.mock.calls.some(([c]) => c === "git_discard")).toBe(true);
 });
-it("completion cannot acknowledge native settlement before a late identity lookup", async () => {
-  const disk = memory();
-  const session = document("/alias", disk.io);
+it("the originating window replaces only unchanged buffers", async () => {
+  const { discardAcrossWindows } = await import("./discardBridge");
+  const a = memory(),
+    b = memory(),
+    c = memory();
+  const unchanged = document("/repo/a", a.io);
+  const typed = document("/repo/b", b.io);
+  const unmatched = document("/elsewhere/c", c.io);
   await flush();
-  let answer!: (matches: boolean[]) => void;
-  const invoke = vi.fn(async () => undefined);
-  const coordinator = new DiscardCoordinator({
-    invoke: invoke as never,
-    problem: vi.fn(),
-    prepare: () =>
-      prepareNativeDiscard(
-        workspace,
-        true,
-        () =>
-          new Promise((resolve) => {
-            answer = resolve;
-          }),
+  native({
+    git_discard_match: (args) =>
+      (args as unknown as { paths: string[] }).paths.map((p) =>
+        p.startsWith("/repo/"),
       ),
+    git_discard: () => {
+      a.set("HEAD");
+      b.set("HEAD");
+      c.set("HEAD");
+    },
   });
-  cleanups.push(() => coordinator.dispose());
-  coordinator.ready("page");
-  const event = {
-    id: "1",
-    token: "page",
-    nonce: "n",
-    owner: false,
-    paths: ["/repo/file"],
-    workspace,
-    phase: "complete" as const,
-  };
-  coordinator.receive(event);
+  const running = discardAcrossWindows("/repo", entries, workspace);
+  typed.change("typed after confirmation");
+  await running;
   await flush();
-  expect(invoke).not.toHaveBeenCalled();
-  session.change("late work");
-  await session.save();
-  disk.set("HEAD");
-  answer([true]);
-  await flush();
-  expect(session.text()).toBe("late work");
-  expect(invoke).toHaveBeenCalledWith("git_discard_settled", {
-    token: "page",
-    id: "1",
-  });
+  expect(unchanged.text()).toBe("HEAD");
+  expect(typed.text()).toBe("typed after confirmation");
+  expect(typed.hasUnsavedChanges()).toBe(true);
+  expect(unmatched.text()).toBe("working tree");
 });
-
+it("a failed Discard keeps every buffer", async () => {
+  const { discardAcrossWindows } = await import("./discardBridge");
+  const disk = memory();
+  const session = document("/repo/a", disk.io);
+  await flush();
+  native({
+    git_discard: () => {
+      disk.set("HEAD");
+      throw new Error("git failed");
+    },
+  });
+  await expect(
+    discardAcrossWindows("/repo", entries, workspace),
+  ).rejects.toThrow("git failed");
+  await flush();
+  expect(session.text()).toBe("working tree");
+});
 it("cancellation before lookup dispatch avoids native work", async () => {
   const disk = memory();
   document("/alias", disk.io);
   await flush();
   const match = vi.fn(async () => [true]);
-  const preparation = prepareNativeDiscard(workspace, true, match);
-  const waiting = preparation.ready("1", "page");
+  const preparation = prepare(workspace, true, match);
+  const waiting = preparation.ready();
   preparation.dispose();
   await waiting;
   expect(match).not.toHaveBeenCalled();
@@ -292,13 +323,13 @@ it("malformed matches and undefined failures cannot acknowledge readiness", asyn
     const disk = memory();
     const session = document("/alias", disk.io);
     await flush();
-    const preparation = prepareNativeDiscard(workspace, true, async () => {
+    const preparation = prepare(workspace, true, async () => {
       if (answer === null) throw undefined;
       return answer as unknown as boolean[];
     });
     session.change("kept");
     await session.save();
-    await expect(preparation.ready("1", "page")).rejects.toBeDefined();
+    await expect(preparation.ready()).rejects.toBeDefined();
     disk.set("HEAD");
     preparation.dispose();
     await flush();

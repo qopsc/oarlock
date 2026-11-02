@@ -399,19 +399,8 @@ impl Store {
         };
         Ok(Self { path, snapshot })
     }
-    fn verify_disk(&self) -> Result<(), String> {
-        let disk =
-            read_json(&self.path)?.ok_or("Theme storage was removed; restore it and Retry")?;
-        let disk: Snapshot = serde_json::from_value(disk).map_err(|e| e.to_string())?;
-        validate(&disk)?;
-        if disk != self.snapshot {
-            return Err("Theme storage changed outside Oarlock; restart after recovery".into());
-        }
-        Ok(())
-    }
     fn mutate(&mut self, change: Change) -> Result<Snapshot, String> {
         let next = apply(&self.snapshot, change)?;
-        self.verify_disk()?;
         if next != self.snapshot {
             persist(&self.path, &next, Some(&self.snapshot))?;
             self.snapshot = next;
@@ -424,7 +413,6 @@ impl Store {
         expected_revision: Option<u64>,
     ) -> Result<Snapshot, String> {
         if let Some(revision) = expected_revision {
-            self.verify_disk()?;
             if revision != self.snapshot.revision {
                 return Err("THEME_REVISION_CHANGED".into());
             }
@@ -442,15 +430,27 @@ fn with_store<T>(
         let directory = app.path().app_data_dir().map_err(|e| e.to_string())?;
         *saved=Some(Store::open(&directory).map_err(|e|format!("Custom themes could not be loaded. Files were preserved; repair them and Retry. {e}"))?);
     }
-    work(saved.as_mut().expect("opened themes"))
+    let result = work(saved.as_mut().expect("opened themes"));
+    settle(&mut saved, result)
+}
+
+const CONFLICTS: [&str; 2] = [
+    "Theme storage changed before commit",
+    "Theme storage changed during commit",
+];
+/// A refused publish means the cache no longer describes the file; dropping it lets Retry reload.
+fn settle<T>(saved: &mut Option<Store>, result: Result<T, String>) -> Result<T, String> {
+    if let Err(message) = &result {
+        if CONFLICTS.iter().any(|conflict| message.contains(conflict)) {
+            *saved = None;
+        }
+    }
+    result
 }
 #[tauri::command]
 pub async fn themes_snapshot(app: tauri::AppHandle) -> Result<Snapshot, String> {
     super::fs::blocking(move || {
-        with_store(&app, |store| {
-            store.verify_disk()?;
-            Ok(store.snapshot.clone())
-        })
+        with_store(&app, |store| Ok(store.snapshot.clone()))
     })
     .await
 }
@@ -504,6 +504,32 @@ mod tests {
         let result = with_current_theme_file(&canonical, &version, || store.mutate(upsert("theme-stale")));
         assert!(result.unwrap_err().contains("THEME_FILE_CHANGED"));
         assert!(store.snapshot.themes.iter().all(|entry| entry["id"] != "theme-stale"));
+    }
+    #[test]
+    fn publish_against_a_file_changed_on_disk_still_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.mutate(upsert("theme-a")).unwrap();
+        let before = store.snapshot.clone();
+        let mut outside = before.clone();
+        outside.themes[0]["name"] = json!("external edit");
+        let external = serde_json::to_vec(&outside).unwrap();
+        std::fs::write(&store.path, &external).unwrap();
+        let error = store.mutate(upsert("theme-b")).unwrap_err();
+        assert!(error.contains("changed before commit"), "{error}");
+        assert_eq!(store.snapshot, before);
+        assert_eq!(std::fs::read(&store.path).unwrap(), external);
+    }
+    #[test]
+    fn a_refused_publish_drops_the_cached_store_so_retry_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saved = Some(Store::open(dir.path()).unwrap());
+        let other: Result<(), String> = Err("disk full".into());
+        assert!(settle(&mut saved, other).is_err());
+        assert!(saved.is_some());
+        let conflict: Result<(), String> = Err("Theme storage changed before commit; files preserved".into());
+        assert!(settle(&mut saved, conflict).is_err());
+        assert!(saved.is_none());
     }
     fn theme(id: &str) -> Value {
         json!({"id":id,"name":id,"variants":{"dark":{"colors":{"background":"#000"}}}})
@@ -703,18 +729,18 @@ mod tests {
     }
 
     #[test]
-    fn no_op_changes_refuse_damaged_or_missing_storage() {
+    fn no_op_changes_touch_no_storage_but_real_changes_refuse_damaged_or_missing_storage() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         store.mutate(upsert("theme-a")).unwrap();
         let before = store.snapshot.clone();
         std::fs::write(&store.path, b"damaged").unwrap();
-        assert!(store.mutate(upsert("theme-a")).is_err());
-        assert!(store.mutate(Change::Delete { id: "missing".into() }).is_err());
+        assert_eq!(store.mutate(upsert("theme-a")).unwrap(), before);
+        assert!(store.mutate(upsert("theme-z")).is_err());
         assert_eq!(store.snapshot, before);
         assert_eq!(std::fs::read(&store.path).unwrap(), b"damaged");
         std::fs::remove_file(&store.path).unwrap();
-        assert!(store.mutate(upsert("theme-a")).is_err());
+        assert!(store.mutate(upsert("theme-z")).is_err());
         assert!(!store.path.exists());
     }
     #[test]

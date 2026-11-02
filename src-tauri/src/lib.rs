@@ -365,8 +365,6 @@ pub fn run() {
                 if let Some(state) = webview.try_state::<fs::watch::FsWatchState>() {
                     state.release_window(webview.app_handle(), webview.label());
                 }
-                git::discard::page_loading(webview.app_handle(), webview.label());
-                fs::mutation_events::release_window(webview.label());
                 modules::project_trust::release_window(webview.app_handle(), webview.label());
                 windows::on_page_load(webview.app_handle(), webview.label());
             }
@@ -458,15 +456,13 @@ pub fn run() {
             fs::tree::list_subdirs,
             fs::tree::fs_read_dir,
             fs::file::fs_read_file,
+            fs::mutation_events::fs_mutation_sequence,
             fs::reconcile::fs_reconcile_documents,
             fs::file::ai_validate_document,
             fs::attachment::ai_import_attachment,
             fs::attachment::ai_pick_attachment_files,
             fs::file::fs_write_file,
             fs::file::fs_save_document,
-            fs::mutation_events::fs_recovery_begin,
-            fs::mutation_events::fs_recovery_changed,
-            fs::mutation_events::fs_recovery_end,
             fs::formatter::fs_format_document,
             fs::formatter::fs_format_cancel,
             modules::background_image::background_image_inspect,
@@ -548,14 +544,8 @@ pub fn run() {
             git::commands::git_stage,
             git::commands::git_unstage,
             git::commands::git_discard,
-            git::discard::git_discard_register,
-            git::discard::git_discard_unregister,
-            git::discard::git_discard_begin,
-            git::discard::git_discard_prepared,
-            git::discard::git_discard_match_documents,
-            git::discard::git_discard_status,
-            git::discard::git_discard_settled,
-            git::discard::git_discard_cancel,
+            git::discard::git_discard_scope,
+            git::discard::git_discard_match,
             git::commands::git_commit,
             git::commands::git_undo_commit,
             git::commands::git_commit_on_remote,
@@ -648,7 +638,6 @@ pub fn run() {
             windows::app_window_ready,
             windows::app_quit,
             windows::app_quit_ready,
-            windows::app_quit_changed,
             windows::app_quit_cancel,
             #[cfg(target_os = "macos")]
             app_menu::app_menu_set_shortcuts,
@@ -697,8 +686,6 @@ pub fn run() {
                     if let Some(state) = app.try_state::<LaunchFiles>() {
                         state.take(&label);
                     }
-                    git::discard::release_window(app, &label);
-                    fs::mutation_events::release_window(&label);
                     modules::project_trust::release_window(app, &label);
                     windows::on_destroyed(app, &label);
                 }

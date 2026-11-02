@@ -13,7 +13,6 @@ import type { Tab } from "@/modules/tabs";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { type RefObject, useEffect, useRef } from "react";
 import type { EditorPaneHandle } from "./EditorPane";
-import { installDiscardCoordinator } from "./lib/discardBridge";
 import { fileWatchTargets } from "./lib/fileWatchTargets";
 
 type Params = {
@@ -68,8 +67,6 @@ export function useEditorFileSync({ tabs, tabsRef, editorRefs }: Params) {
       void unlistenPromise.then((un) => un());
     };
   }, [tabsRef, editorRefs]);
-
-  useEffect(installDiscardCoordinator, []);
 
   const spaces = useSpaces((s) => s.spaces);
   const watches = useRef(

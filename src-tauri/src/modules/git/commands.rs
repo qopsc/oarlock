@@ -1,7 +1,7 @@
 use tauri::{AppHandle, Manager};
 
 use crate::modules::git::types::{
-    GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
+    DiscardEntry, GitBranchListResult, GitCommitFileChange, GitCommitResult, GitDiffContentResult, GitDiffResult,
     GitLogEntry, GitPanelSnapshot, GitPushResult, GitRepoInfo, GitStatusSnapshot,
     GitWorktreeAddResult, GitWorktreeBranch, GitWorktreeRemoveResult,
 };
@@ -170,10 +170,13 @@ pub async fn git_unstage(
 pub async fn git_discard(
     app: AppHandle,
     window: tauri::WebviewWindow,
-    token: String,
-    id: String,
+    repo_root: String,
+    entries: Vec<DiscardEntry>,
+    roots: Vec<String>,
+    workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
-    super::discard::execute(app, window.label().into(), token, id).await
+    let workspace = WorkspaceEnv::from_option(workspace);
+    super::discard::execute(app, window.label().into(), repo_root, entries, workspace, roots).await
 }
 
 #[tauri::command]
@@ -436,9 +439,13 @@ mod tests {
             (commands, "worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,\n            &super::utils::store_guard(&dirs))"),
             (commands, "worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,\n            &super::utils::store_guard(&dirs))"),
             (commands, "crate::modules::fs::native_store::refuse_write(&owner, &root)?;\n        operations::checkout_branch("),
-            (discard, "let guard = super::utils::store_guard(&dirs);\n            work.execute(&app.state::<WorkspaceRegistry>(), &guard)"),
+            (discard, "let guard = super::utils::store_guard(&dirs);\n                work.execute(&app.state::<WorkspaceRegistry>(), &guard)"),
         ] {
-            assert!(source.contains(call), "missing the native-store guard: {call}");
+            let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                squash(source).contains(&squash(call)),
+                "missing the native-store guard: {call}"
+            );
         }
     }
 }

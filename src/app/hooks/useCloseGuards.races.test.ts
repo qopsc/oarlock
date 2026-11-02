@@ -113,9 +113,6 @@ beforeEach(() => {
   fake.invoke.mockResolvedValue(true);
 });
 afterEach(async () => {
-  const { releaseEditors } = await import("@/modules/editor/lib/quitBarrier");
-  for (let generation = 0; generation < 10; generation++)
-    releaseEditors(`window-close:${generation}`);
   for (const cleanup of fake.cleanups.splice(0)) cleanup();
   await settle();
 });
@@ -169,20 +166,6 @@ it("window close retains the stored dirty guard when no live editor exists", asy
   await settle();
   expect(fake.close).not.toHaveBeenCalled();
   expect(fake.states[0]).toMatchObject({ dirtyEditors: 1 });
-});
-it("a close refused by another window's quit seal says so", async () => {
-  const { sealEditors, releaseEditors } = await import("@/modules/editor/lib/quitBarrier");
-  useAppCloseGuard({ current: [editor(1)] }, () => false);
-  for (const effect of fake.effects) effect();
-  expect(sealEditors("other-window-verification")).toBe(true);
-  try {
-    await fake.onClose?.({ preventDefault: vi.fn() });
-    await settle();
-    expect(fake.close).not.toHaveBeenCalled();
-    expect(fake.toast).toHaveBeenCalledWith("Can't close yet", expect.anything());
-  } finally {
-    releaseEditors("other-window-verification");
-  }
 });
 it("window close accepts a completed save before the dirty badge clears", async () => {
   useAppCloseGuard({ current: [editor(1, true)] }, () => false);
@@ -345,7 +328,7 @@ it("a delayed preference save cannot confirm a replacement prompt", async () => 
   expect(fake.close).toHaveBeenCalledOnce();
 });
 
-it("editing after approval invalidates the native ticket and final verification refuses it", async () => {
+it("editing after approval makes the final verification answer no", async () => {
   let revision = "first";
   const api = useAppCloseGuard(
     { current: [editor(1)] },
@@ -362,15 +345,8 @@ it("editing after approval invalidates the native ticket and final verification 
     ok: true,
   });
   revision = "second";
-  const { documentRevisionChanged } = await import(
-    "@/modules/editor/lib/quitBarrier"
-  );
-  documentRevisionChanged();
-  expect(fake.invoke).toHaveBeenCalledWith("app_quit_changed", {
-    round: 10,
-    ticket: 1,
-  });
   await fake.onQuit?.({ payload: { round: 10, ticket: 3, verify: true } });
+  await settle();
   expect(fake.invoke).toHaveBeenCalledWith("app_quit_ready", {
     round: 10,
     ticket: 3,
@@ -382,7 +358,7 @@ it("a new quit round waits for an aborted flush and then makes progress", async 
   for (const effect of fake.effects) effect();
   const release = deferredFlush();
   await fake.onQuit?.({ payload: { round: 10, ticket: 1, verify: false } });
-  fake.onResume?.({ payload: { round: 10, ticket: null } });
+  fake.onResume?.({ payload: { round: 10 } });
   await fake.onQuit?.({ payload: { round: 11, ticket: 1, verify: false } });
   release();
   await settle();
@@ -398,40 +374,34 @@ it("a new quit round waits for an aborted flush and then makes progress", async 
   });
 });
 
-it("a native close failure releases the final input barrier", async () => {
-  const { editorQuitSealed } = await import("@/modules/editor/lib/quitBarrier");
+it("a native close failure is reported and leaves the window open to try again", async () => {
   fake.close.mockRejectedValueOnce(new Error("native refused"));
   useAppCloseGuard({ current: [editor(1)] }, () => false);
   for (const effect of fake.effects) effect();
   await fake.onClose?.({ preventDefault: vi.fn() });
   await settle();
-  expect(editorQuitSealed()).toBe(false);
   expect(fake.toast).toHaveBeenCalledWith(
     "Could not close the window",
     expect.anything(),
   );
 });
 
-it("a local close finishing its flush cannot replace a final quit seal", async () => {
-  useAppCloseGuard({ current: [editor(1)] }, () => false);
+it("closing the window rechecks revisions in the same task as the close", async () => {
+  let revision = "confirmed";
+  const api = useAppCloseGuard(
+    { current: [editor(1)] },
+    () => true,
+    () => revision,
+  );
   for (const effect of fake.effects) effect();
-  await fake.onQuit?.({ payload: { round: 50, ticket: 1, verify: false } });
-  await settle();
-  const finishCloseFlush = deferredFlush();
   await fake.onClose?.({ preventDefault: vi.fn() });
-  const finishQuitFlush = deferredFlush();
-  await fake.onQuit?.({ payload: { round: 50, ticket: 3, verify: true } });
-  fake.close.mockRejectedValueOnce(new Error("close refused"));
-  finishCloseFlush();
+  const release = deferredFlush();
+  api.confirmAppClose();
+  revision = "typed while the state was saving";
+  release();
   await settle();
-  const { editorQuitSealed } = await import("@/modules/editor/lib/quitBarrier");
-  try {
-    expect(fake.close).not.toHaveBeenCalled();
-    expect(editorQuitSealed()).toBe(true);
-  } finally {
-    finishQuitFlush();
-    await settle();
-  }
+  expect(fake.close).not.toHaveBeenCalled();
+  expect(fake.states[0]).toMatchObject({ dirtyEditors: 1 });
 });
 it("a disposed close listener cannot prevent a later native close", async () => {
   useAppCloseGuard({ current: [editor(1)] });

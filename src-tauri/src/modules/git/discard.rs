@@ -1,17 +1,13 @@
-//! Cross-window editor preparation for Discard. The state lock never covers
-//! filesystem work, event delivery or waiting on a webview.
+//! Source Control Discard. Native resolves the repository once, names the entries
+//! it will rewrite to every window (`discard-begin` / `discard-end` on the
+//! mutation stream) and runs Git between the two events.
 use super::{operations, types::DiscardEntry, utils};
 use crate::modules::{
-    windows::is_app_window,
+    fs::mutation_events,
     workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry},
 };
-use serde::Serialize;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{LazyLock, Mutex},
-    time::Duration,
-};
-use tauri::{AppHandle, Emitter, Manager};
+use std::path::PathBuf;
+use tauri::{AppHandle, Manager};
 
 #[derive(Clone)]
 struct Work {
@@ -63,315 +59,18 @@ fn guard_tree(path: &std::path::Path, guard: &impl Fn(&std::path::Path) -> Resul
 fn guard_tree(_: &std::path::Path, _: &impl Fn(&std::path::Path) -> Result<(), String>) -> Result<(), String> {
     Err("Safe Git discard checks are unavailable on this platform".into())
 }
-#[derive(Clone, Serialize)]
 struct Scope {
     paths: Vec<String>,
     workspace: WorkspaceEnv,
 }
-#[derive(Clone, Serialize)]
-struct Event {
-    id: String,
-    token: String,
-    nonce: String,
-    owner: bool,
-    phase: &'static str,
-    #[serde(flatten)]
-    scope: Scope,
-}
-#[derive(Clone, Serialize)]
-pub struct Status {
-    phase: &'static str,
-    ok: bool,
-}
-struct Round {
-    id: String,
-    owner: String,
-    owner_token: String,
-    nonce: String,
-    scope: Scope,
-    work: Option<Work>,
-    phase: &'static str,
-    ok: bool,
-    members: HashMap<String, String>,
-    waiting: HashSet<String>,
-}
-impl Round {
-    fn event(&self, label: &str, token: &str, phase: &'static str) -> Event {
-        Event {
-            id: self.id.clone(),
-            token: token.into(),
-            nonce: self.nonce.clone(),
-            owner: label == self.owner && token == self.owner_token,
-            phase,
-            scope: self.scope.clone(),
-        }
-    }
-    fn events(&self, phase: &'static str) -> Vec<(String, Event)> {
-        self.members
-            .iter()
-            .filter(|(_, token)| !token.is_empty())
-            .map(|(label, token)| (label.clone(), self.event(label, token, phase)))
-            .collect()
-    }
-}
-#[derive(Default)]
-struct State {
-    next: u64,
-    clients: HashMap<String, String>,
-    active: Option<Round>,
-}
-impl State {
-    fn register(&mut self, label: &str) -> (String, Vec<(String, Event)>) {
-        let mut events = if self.active.as_ref().is_some_and(|r| r.phase == "preparing") {
-            self.release(label)
+impl Scope {
+    fn confirm(&self, roots: &[String]) -> Result<(), String> {
+        if self.paths == roots {
+            Ok(())
         } else {
-            vec![]
-        };
-        self.next += 1;
-        let token = self.next.to_string();
-        self.clients.insert(label.into(), token.clone());
-        if let Some(round) = &mut self.active {
-            round.members.insert(label.into(), token.clone());
-            events.push((label.into(), round.event(label, &token, "prepare")));
-            if round.phase == "finished" {
-                events.push((
-                    label.into(),
-                    round.event(label, &token, if round.ok { "complete" } else { "cancel" }),
-                ));
-            }
-        }
-        (token, events)
-    }
-    fn finish(&mut self, id: &str, ok: bool) -> Vec<(String, Event)> {
-        let Some(round) = self
-            .active
-            .as_mut()
-            .filter(|r| r.id == id && r.phase != "finished")
-        else {
-            return vec![];
-        };
-        round.phase = "finished";
-        round.ok = ok;
-        round.work = None;
-        round.waiting.clear();
-        let events = round.events(if ok { "complete" } else { "cancel" });
-        if round.members.is_empty() {
-            self.active = None;
-        }
-        events
-    }
-    fn release(&mut self, label: &str) -> Vec<(String, Event)> {
-        self.clients.remove(label);
-        let Some(round) = &mut self.active else {
-            return vec![];
-        };
-        round.members.remove(label);
-        round.waiting.remove(label);
-        if round.phase == "preparing" {
-            let id = round.id.clone();
-            return self.finish(&id, false);
-        }
-        if round.phase == "finished" && round.members.is_empty() {
-            self.active = None;
-        }
-        vec![]
-    }
-    fn loading(&mut self, label: &str) -> Vec<(String, Event)> {
-        self.clients.remove(label);
-        let Some(round) = &mut self.active else {
-            return vec![];
-        };
-        // Retain the result for a page still booting, even if the worker and
-        // every old participant finish before its registration arrives.
-        round.members.insert(label.into(), String::new());
-        round.waiting.remove(label);
-        if round.phase == "preparing" {
-            let id = round.id.clone();
-            self.finish(&id, false)
-        } else {
-            vec![]
+            Err("The repository changed since Discard was confirmed; try again".into())
         }
     }
-    fn begin(
-        &mut self,
-        owner: &str,
-        token: &str,
-        nonce: String,
-        windows: Vec<String>,
-        scope: Scope,
-        work: Work,
-    ) -> Result<(String, Vec<(String, Event)>), String> {
-        if self.clients.get(owner).map(String::as_str) != Some(token) {
-            return Err("Document coordination is not ready. Retry synchronization.".into());
-        }
-        if self.active.is_some() {
-            return Err(
-                "Another Discard is still being synchronized. Try again when it finishes.".into(),
-            );
-        }
-        if windows.is_empty()
-            || !windows.iter().any(|label| label == owner)
-            || windows
-                .iter()
-                .any(|label| !self.clients.contains_key(label))
-        {
-            return Err(
-                "An editor window is still loading or unavailable. Discard was not started.".into(),
-            );
-        }
-        self.next += 1;
-        let id = self.next.to_string();
-        let members = windows
-            .iter()
-            .map(|label| (label.clone(), self.clients[label].clone()))
-            .collect();
-        let round = Round {
-            id: id.clone(),
-            owner: owner.into(),
-            owner_token: token.into(),
-            nonce,
-            scope,
-            work: Some(work),
-            phase: "preparing",
-            ok: false,
-            members,
-            waiting: windows.into_iter().collect(),
-        };
-        let events = round.events("prepare");
-        self.active = Some(round);
-        Ok((id, events))
-    }
-    fn prepared(&mut self, label: &str, token: &str, id: &str, ok: bool) -> Vec<(String, Event)> {
-        let Some(round) = self
-            .active
-            .as_mut()
-            .filter(|r| r.id == id && r.members.get(label).map(String::as_str) == Some(token))
-        else {
-            return vec![];
-        };
-        if round.phase == "preparing" {
-            if !ok {
-                return self.finish(id, false);
-            }
-            round.waiting.remove(label);
-        }
-        vec![]
-    }
-    fn take_work(&mut self, owner: &str, token: &str, id: &str) -> Result<Option<Work>, String> {
-        let round = self
-            .active
-            .as_mut()
-            .filter(|r| r.id == id && r.owner == owner && r.owner_token == token)
-            .ok_or("Discard request expired")?;
-        if round.phase != "preparing" {
-            return Err("Discard was cancelled or has already started".into());
-        }
-        if !round.waiting.is_empty() {
-            return Ok(None);
-        }
-        round.phase = "running";
-        Ok(round.work.take())
-    }
-    fn status(&self, label: &str, token: &str, id: &str) -> Result<Status, String> {
-        if self.clients.get(label).map(String::as_str) != Some(token) {
-            return Err("Document coordinator was replaced".into());
-        }
-        let Some(round) = self
-            .active
-            .as_ref()
-            .filter(|r| r.id == id && r.members.get(label).map(String::as_str) == Some(token))
-        else {
-            return Ok(Status {
-                phase: "gone",
-                ok: false,
-            });
-        };
-        Ok(Status {
-            phase: round.phase,
-            ok: round.ok,
-        })
-    }
-    fn settled(&mut self, label: &str, token: &str, id: &str) {
-        if let Some(round) = self.active.as_mut().filter(|r| {
-            r.id == id
-                && r.phase == "finished"
-                && r.members.get(label).map(String::as_str) == Some(token)
-        }) {
-            round.members.remove(label);
-            if round.members.is_empty() {
-                self.active = None;
-            }
-        }
-    }
-}
-static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
-static CHANGED: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
-fn publish(app: &AppHandle, events: Vec<(String, Event)>) {
-    for (label, event) in events {
-        if let Err(error) = app.emit_to(&label, "git:discard", &event) {
-            log::warn!("Could not deliver discard state to {label}: {error}");
-        }
-    }
-    CHANGED.notify_waiters();
-}
-pub fn release_window(app: &AppHandle, label: &str) {
-    if !is_app_window(label) {
-        return;
-    }
-    let events = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .release(label);
-    publish(app, events);
-}
-pub fn page_loading(app: &AppHandle, label: &str) {
-    if !is_app_window(label) {
-        return;
-    }
-    let events = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .loading(label);
-    publish(app, events);
-}
-#[derive(Serialize)]
-pub struct Registration {
-    token: String,
-    events: Vec<Event>,
-}
-#[tauri::command]
-pub fn git_discard_register(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-) -> Result<Registration, String> {
-    if !is_app_window(window.label()) {
-        return Err("Only editor windows coordinate Discard".into());
-    }
-    let (token, events) = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .register(window.label());
-    let snapshot = events
-        .iter()
-        .filter(|(label, event)| label == window.label() && event.token == token)
-        .map(|(_, event)| event.clone())
-        .collect();
-    publish(&app, events);
-    Ok(Registration {
-        token,
-        events: snapshot,
-    })
-}
-#[tauri::command]
-pub fn git_discard_unregister(app: AppHandle, window: tauri::WebviewWindow, token: String) {
-    let events = {
-        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        if state.clients.get(window.label()) != Some(&token) {
-            return;
-        }
-        state.release(window.label())
-    };
-    publish(&app, events);
 }
 fn plan(
     registry: &WorkspaceRegistry,
@@ -396,63 +95,6 @@ fn plan(
             entries,
         },
     ))
-}
-#[tauri::command]
-pub async fn git_discard_begin(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-    token: String,
-    nonce: String,
-    repo_root: String,
-    entries: Vec<DiscardEntry>,
-    workspace: Option<WorkspaceEnv>,
-) -> Result<String, String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let checked_app = app.clone();
-    let root = repo_root.clone();
-    let (scope, work) = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
-        plan(
-            &checked_app.state::<WorkspaceRegistry>(),
-            root,
-            entries,
-            workspace,
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    let windows = app
-        .webview_windows()
-        .into_keys()
-        .filter(|label| is_app_window(label))
-        .collect();
-    let (id, events) = STATE.lock().unwrap_or_else(|e| e.into_inner()).begin(
-        window.label(),
-        &token,
-        nonce,
-        windows,
-        scope,
-        work,
-    )?;
-    publish(&app, events);
-    let timeout_id = id.clone();
-    let timeout_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let events = {
-            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            if state
-                .active
-                .as_ref()
-                .is_some_and(|r| r.id == timeout_id && r.phase == "preparing")
-            {
-                state.finish(&timeout_id, false)
-            } else {
-                vec![]
-            }
-        };
-        publish(&timeout_app, events);
-    });
-    Ok(id)
 }
 /// Resolve both the document's entry and its read target. Git operates on an
 /// entry (including a symlink), whereas an editor may have opened its target.
@@ -498,275 +140,84 @@ fn match_documents(
         .collect()
 }
 #[tauri::command]
-pub async fn git_discard_match_documents(
+pub async fn git_discard_scope(
     app: AppHandle,
-    window: tauri::WebviewWindow,
-    token: String,
-    id: String,
+    repo_root: String,
+    entries: Vec<DiscardEntry>,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<Vec<String>, String> {
+    let workspace = WorkspaceEnv::from_option(workspace);
+    crate::modules::fs::blocking(move || {
+        plan(&app.state::<WorkspaceRegistry>(), repo_root, entries, workspace)
+            .map(|(scope, _)| scope.paths)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn git_discard_match(
+    app: AppHandle,
+    roots: Vec<String>,
     paths: Vec<String>,
+    workspace: Option<WorkspaceEnv>,
 ) -> Result<Vec<bool>, String> {
-    let scope = {
-        let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .active
-            .as_ref()
-            .filter(|r| r.id == id && r.members.get(window.label()) == Some(&token))
-            .map(|r| r.scope.clone())
-            .ok_or("Discard identity lookup expired")?
+    let scope = Scope {
+        paths: roots,
+        workspace: WorkspaceEnv::from_option(workspace),
     };
     crate::modules::fs::blocking(move || {
         match_documents(&app.state::<WorkspaceRegistry>(), &scope, &paths)
     })
     .await
 }
-#[tauri::command]
-pub fn git_discard_prepared(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-    token: String,
-    id: String,
-    ok: bool,
-) {
-    let events =
-        STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .prepared(window.label(), &token, &id, ok);
-    publish(&app, events);
+/// The only way `execute` gets its work: the repository must still resolve to the
+/// roots the user confirmed, so a retargeted alias cannot move Git elsewhere.
+fn prepare(
+    registry: &WorkspaceRegistry,
+    root: String,
+    entries: Vec<DiscardEntry>,
+    workspace: WorkspaceEnv,
+    roots: &[String],
+) -> Result<(Scope, Work), String> {
+    let (scope, work) = plan(registry, root, entries, workspace)?;
+    scope.confirm(roots)?;
+    Ok((scope, work))
 }
-#[tauri::command]
-pub fn git_discard_status(
-    window: tauri::WebviewWindow,
-    token: String,
-    id: String,
-) -> Result<Status, String> {
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .status(window.label(), &token, &id)
-}
-#[tauri::command]
-pub fn git_discard_settled(window: tauri::WebviewWindow, token: String, id: String) {
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .settled(window.label(), &token, &id);
-}
-#[tauri::command]
-pub fn git_discard_cancel(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-    token: String,
-    id: String,
-) -> Result<Status, String> {
-    let (events, status) = {
-        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        let owned = state.active.as_ref().is_some_and(|r| {
-            r.id == id
-                && r.owner == window.label()
-                && r.owner_token == token
-                && r.phase == "preparing"
-        });
-        let events = if owned {
-            state.finish(&id, false)
-        } else {
-            vec![]
-        };
-        (events, state.status(window.label(), &token, &id)?)
-    };
-    publish(&app, events);
-    Ok(status)
-}
+/// Runs Git for entries confirmed against `roots`; a repository that no longer
+/// resolves to those roots is refused before anything is announced or run.
 pub async fn execute(
     app: AppHandle,
-    owner: String,
-    token: String,
-    id: String,
+    origin: String,
+    repo_root: String,
+    entries: Vec<DiscardEntry>,
+    workspace: WorkspaceEnv,
+    roots: Vec<String>,
 ) -> Result<(), String> {
-    let work = loop {
-        let notified = CHANGED.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let work = STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take_work(&owner, &token, &id)?;
-        if let Some(work) = work {
-            break work;
-        }
-        notified.await;
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
-            let guard = super::utils::store_guard(&dirs);
-            work.execute(&app.state::<WorkspaceRegistry>(), &guard)
-        }))
-        .unwrap_or_else(|_| {
-            Err("Git Discard failed unexpectedly; editor drafts were retained".into())
-        });
-        let events = STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .finish(&id, result.is_ok());
-        publish(&app, events);
-        result
+    crate::modules::fs::blocking(move || {
+        let (scope, work) = prepare(
+            &app.state::<WorkspaceRegistry>(),
+            repo_root.clone(),
+            entries,
+            workspace.clone(),
+            &roots,
+        )?;
+        let claims: Vec<PathBuf> = scope.paths.iter().map(PathBuf::from).collect();
+        let discarding = mutation_events::Discarding {
+            origin,
+            repo_root,
+            roots: scope.paths,
+        };
+        mutation_events::discard_bracket(&app, workspace, &claims, discarding, || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
+                let guard = super::utils::store_guard(&dirs);
+                work.execute(&app.state::<WorkspaceRegistry>(), &guard)
+            }))
+            .unwrap_or_else(|_| {
+                Err("Git Discard failed unexpectedly; editor drafts were retained".into())
+            })
+        })
     })
     .await
-    .map_err(|e| e.to_string())?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn start(state: &mut State) -> (String, String, String) {
-        let (a, _) = state.register("main");
-        let (b, _) = state.register("w-b");
-        let (id, events) = state
-            .begin(
-                "main",
-                &a,
-                "nonce".into(),
-                vec!["main".into(), "w-b".into()],
-                Scope {
-                    paths: vec!["/repo/file".into()],
-                    workspace: WorkspaceEnv::Local,
-                },
-                Work {
-                    repo: None,
-                    entries: vec![],
-                },
-            )
-            .unwrap();
-        assert_eq!(events.len(), 2);
-        (a, b, id)
-    }
-    #[test]
-    fn every_window_must_prepare_and_only_the_owner_can_start() {
-        let mut state = State::default();
-        let (a, b, id) = start(&mut state);
-        assert!(state.take_work("main", &a, &id).unwrap().is_none());
-        state.prepared("main", &a, &id, true);
-        state.prepared("w-b", &a, &id, true);
-        assert!(state.take_work("main", &a, &id).unwrap().is_none());
-        assert!(state.take_work("w-b", &b, &id).is_err());
-        state.prepared("w-b", &b, &id, true);
-        assert!(state.take_work("main", &a, &id).unwrap().is_some());
-        assert!(state.take_work("main", &a, &id).is_err());
-    }
-    #[test]
-    fn reload_or_new_page_cancels_preparation_and_old_acks_cannot_restart_it() {
-        for label in ["w-b", "w-new"] {
-            let mut state = State::default();
-            let (a, b, id) = start(&mut state);
-            let (_, events) = state.register(label);
-            assert!(events.iter().any(|(_, e)| e.phase == "cancel"));
-            state.prepared("w-b", &b, &id, true);
-            state.prepared("main", &a, &id, true);
-            assert!(state.take_work("main", &a, &id).is_err());
-        }
-    }
-    #[test]
-    fn running_worker_survives_owner_close_and_new_page_joins() {
-        let mut state = State::default();
-        let (a, b, id) = start(&mut state);
-        state.prepared("main", &a, &id, true);
-        state.prepared("w-b", &b, &id, true);
-        state.take_work("main", &a, &id).unwrap().unwrap();
-        state.release("main");
-        let (replacement, events) = state.register("main");
-        assert_eq!(events.len(), 1);
-        assert!(!events[0].1.owner);
-        assert_eq!(events[0].1.phase, "prepare");
-        assert_eq!(state.finish(&id, true).len(), 2);
-        assert!(state.status("main", &replacement, &id).unwrap().ok);
-        assert!(state.status("main", &a, &id).is_err());
-    }
-    #[test]
-    fn outcome_is_retained_until_every_participant_settles() {
-        let mut state = State::default();
-        let (a, b, id) = start(&mut state);
-        state.finish(&id, false);
-        state.settled("main", &b, &id);
-        state.settled("main", &a, "stale");
-        assert!(state.active.is_some());
-        state.settled("main", &a, &id);
-        assert_eq!(state.status("w-b", &b, &id).unwrap().phase, "finished");
-        state.settled("w-b", &b, &id);
-        assert!(state.active.is_none());
-        assert_eq!(state.status("main", &a, &id).unwrap().phase, "gone");
-    }
-    #[test]
-    fn unavailable_windows_and_overlapping_discards_are_refused() {
-        let mut state = State::default();
-        let (a, _) = state.register("main");
-        let scope = Scope {
-            paths: vec![],
-            workspace: WorkspaceEnv::Local,
-        };
-        let work = Work {
-            repo: None,
-            entries: vec![],
-        };
-        assert!(state
-            .begin(
-                "main",
-                &a,
-                "n".into(),
-                vec!["main".into(), "w-loading".into()],
-                scope.clone(),
-                work.clone()
-            )
-            .is_err());
-        let (_a, _, _) = start(&mut state);
-        assert!(state
-            .begin("main", &a, "n".into(), vec!["main".into()], scope, work)
-            .is_err());
-    }
-    #[test]
-    fn timeout_or_failed_preparation_never_dispatches_git() {
-        for timeout in [false, true] {
-            let mut state = State::default();
-            let (a, b, id) = start(&mut state);
-            if timeout {
-                state.finish(&id, false);
-            } else {
-                state.prepared("w-b", &b, &id, false);
-            }
-            assert!(state.take_work("main", &a, &id).is_err());
-            assert!(!state.status("main", &a, &id).unwrap().ok);
-        }
-    }
-    #[test]
-    fn booting_page_keeps_completion_until_it_can_register() {
-        let mut state = State::default();
-        let (a, b, id) = start(&mut state);
-        state.prepared("main", &a, &id, true);
-        state.prepared("w-b", &b, &id, true);
-        state.take_work("main", &a, &id).unwrap().unwrap();
-        state.loading("w-new");
-        state.finish(&id, true);
-        state.settled("main", &a, &id);
-        state.settled("w-b", &b, &id);
-        assert!(state.active.is_some());
-        let (token, events) = state.register("w-new");
-        assert_eq!(events.len(), 2);
-        assert!(!events[0].1.owner);
-        assert_eq!(events[1].1.phase, "complete");
-        state.settled("w-new", &token, &id);
-        assert!(state.active.is_none());
-    }
-    #[test]
-    fn closing_an_unregistered_page_releases_its_finished_membership() {
-        let mut state = State::default();
-        let (a, b, id) = start(&mut state);
-        state.loading("w-new");
-        assert!(state.take_work("main", &a, &id).is_err());
-        state.settled("main", &a, &id);
-        state.settled("w-b", &b, &id);
-        state.release("w-new");
-        assert!(state.active.is_none());
-    }
 }
 
 #[cfg(test)]
@@ -913,6 +364,50 @@ mod identity_tests {
         std::os::unix::fs::symlink(&b, &alias).unwrap();
         assert_eq!(std::path::Path::new(&work.repo.unwrap().git_path), a);
         assert_eq!(scope.paths, paths(&a.join("file")));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn discard_refuses_roots_confirmed_against_another_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        git(&a, vec!["init", "-q"]);
+        git(&b, vec!["init", "-q"]);
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let entries = || {
+            vec![DiscardEntry {
+                path: "file".into(),
+                untracked: false,
+            }]
+        };
+        let confirmed = plan(
+            &registry,
+            alias.to_string_lossy().into_owned(),
+            entries(),
+            WorkspaceEnv::Local,
+        )
+        .unwrap()
+        .0
+        .paths;
+        let prepared = || {
+            prepare(
+                &registry,
+                alias.to_string_lossy().into_owned(),
+                entries(),
+                WorkspaceEnv::Local,
+                &confirmed,
+            )
+        };
+        assert!(prepared().is_ok());
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&b, &alias).unwrap();
+        assert!(prepared().is_err());
     }
     #[cfg(unix)]
     #[test]
