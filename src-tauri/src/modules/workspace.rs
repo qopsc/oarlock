@@ -1901,6 +1901,7 @@ mod auth_tests {
         "fs_grep",
         "fs_read_dir",
         "fs_read_file",
+        "fs_save_document",
         "fs_write_file",
         "shell_bg_spawn",
         "shell_detached_spawn",
@@ -1908,6 +1909,10 @@ mod auth_tests {
         "shell_session_open",
         "shell_session_run",
     ];
+
+    /// Commands that take an origin though the AI tools no longer call them (they save through
+    /// `fs_save_document`, which checks the version they read).
+    const UNTAGGED_COMMANDS: &[&str] = &["fs_write_file"];
 
     #[test]
     fn every_command_the_ai_tools_tag_takes_their_origin() {
@@ -1922,7 +1927,12 @@ mod auth_tests {
             .filter_map(|call| call.split('"').nth(1))
             .collect();
         tagged.sort_unstable();
-        assert_eq!(tagged, ORIGIN_COMMANDS);
+        let expected: Vec<&str> = ORIGIN_COMMANDS
+            .iter()
+            .copied()
+            .filter(|name| !UNTAGGED_COMMANDS.contains(name))
+            .collect();
+        assert_eq!(tagged, expected);
 
         let mut taking = Vec::new();
         let mut dirs = vec![manifest.join("src")];
