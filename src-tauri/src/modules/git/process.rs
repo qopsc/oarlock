@@ -144,6 +144,9 @@ pub fn git_show_text(workspace: &WorkspaceEnv, repo_root: &str, spec: &str) -> R
     if output.timed_out {
         return Err(GitError::TimedOut("git show"));
     }
+    if output.truncated {
+        return Err(GitError::command("git show", "file content was truncated; view it in the terminal"));
+    }
     if output.exit_code != Some(0) {
         // A missing blob object and an absent path both make `git show` fail.
         // Ask the tree or index whether the entry exists before treating the

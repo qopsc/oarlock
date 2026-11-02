@@ -222,7 +222,9 @@ fn status_inner(repo_root: &ResolvedGitDirectory) -> Result<GitStatusSnapshot> {
     )?;
     ensure_success(&output, "git status failed")?;
 
-    let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+        GitError::command("git status", "output contains invalid UTF-8 or was cut mid-character")
+    })?;
     let parsed = parse_porcelain_v2(stdout);
     let mut listing_error = None;
     let files = untracked::expand_untracked_dirs(parsed.files, |dir, budget| {
@@ -747,6 +749,9 @@ pub fn log(
     let output = repo_root.run(args, DEFAULT_TIMEOUT_SECS)?;
     if output.timed_out {
         return Err(GitError::TimedOut("git log"));
+    }
+    if output.truncated {
+        return Err(GitError::command("git log", "output was truncated; view history in the terminal"));
     }
     if output.exit_code != Some(0) {
         if anchor.is_none() && super::branches::is_unborn_head(&repo_root)? {
