@@ -72,6 +72,8 @@ export type GitChangedFile = {
   unstaged: boolean;
   untracked: boolean;
   statusLabel: string;
+  /** The name was not valid UTF-8; `path` is lossy and native commands refuse it. */
+  unreadable?: boolean;
 };
 
 export type GitStatusSnapshot = {
