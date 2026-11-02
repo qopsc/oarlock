@@ -252,6 +252,9 @@ export function createNative(
         path,
         content,
         expectedVersion,
+        // Not "editor": open editors reload this write at once, and a theme file the AI
+        // wrote is not taken in as the user's save.
+        source: "ai",
         workspace: environment(),
         ...AI_ORIGIN,
       });

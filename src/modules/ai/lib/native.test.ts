@@ -172,6 +172,7 @@ describe("the AI tools' file and shell calls", () => {
       path: `${dir}/a.txt`,
       content: "x",
       expectedVersion: "v1",
+      source: "ai",
       workspace: expect.anything(),
       origin: "ai",
     });
