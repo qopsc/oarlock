@@ -5381,7 +5381,14 @@ is not installed) in its worktree; the merged head was re-run by the merger, wit
 in the fix status of the review document. Windows and Linux were not run, and the Windows leg of
 the S-01 scope forbid list and the Windows-only lock change in `shell/background.rs` are untested.
 
-Deferred by decision, with no fix in these batches: O-01, O-06, O-08, O-09, O-10 and O-15
+O-01 is resolved by deletion (batch F). The isolated executor pieces with no production caller
+(`candidate_index`, `index_publication`, `candidate_object`, `worker` and its `git_execution_capability`
+command, the sandboxed XPC helper under `src-tauri/git-worker` with its build, signing, verification and CI
+steps, and the `sha1` dependency) were removed; `candidate_policy::parse_config` stays for the commit guard,
+and the macOS release now verifies the app signature with an inline `codesign` step. Reviews 67 to 80
+above describe the removed design and are history.
+
+Deferred by decision, with no fix in these batches: O-06, O-08, O-09, O-10 and O-15
 (each proposes deleting a mechanism built on an earlier approved decision, which the owner deferred
 to a separate decision), O-07 (D-11 only adds a toast when a seal refuses a close; the quit barrier is
 unchanged), D-12 (its module is `cfg(target_os = "linux")` and only the Darwin target is installed

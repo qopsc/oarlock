@@ -705,8 +705,9 @@ a deadline on reserved slots.
 
 **O-01** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `over-engineering` · `src-tauri/src/modules/git/candidate_index.rs`,
 `index_publication.rs`, `candidate_object.rs`, `worker.rs`, `src-tauri/git-worker/*`, `scripts/git-worker/build.mjs`, `.github/workflows/release.yml`
-Status: deferred (no fix batch): left by decision; no change in batches A to E, and the notes record
-no further reason
+Status: fixed in 191f903 (batch F, by deletion: the owner decided to delete the unused executor); no test for
+removed code; the release check is `releaseWorkflow.test.ts` (inline codesign step run against a temporary
+directory), see `docs/reviews/pr-2-fixes/batch-F.md`
 
 1,362 lines of Rust (`candidate_index`, `index_publication`, `candidate_object`) have no
 production caller; `candidate_policy` is used only for its NUL-config parser. The Objective-C XPC

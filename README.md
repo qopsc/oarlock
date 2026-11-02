@@ -159,12 +159,9 @@ bun run tauri dev       # development
 bun run tauri build     # local release bundle
 ```
 
-On macOS, local builds without an Apple signing identity include an ad-hoc-signed
-Git helper that refuses execution. Distribution builds must set
-`OARLOCK_DISTRIBUTION_BUILD=1`, provide `APPLE_SIGNING_IDENTITY` and `APPLE_TEAM_ID`,
-and verify the signed app with `scripts/git-worker/verify-app.mjs`. The release
-workflow enforces this policy. Local ad-hoc signing does not enable isolated Git
-execution.
+The isolated Git executor and its sandboxed XPC helper were removed (review O-01).
+macOS release signing is Tauri's, and the release workflow verifies the signed app
+before anything is uploaded.
 
 **Checks**
 ```bash

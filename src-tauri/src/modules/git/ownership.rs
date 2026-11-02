@@ -76,13 +76,6 @@ impl RepositoryPin {
     pub fn path(&self) -> &Path {
         self.worktree.path()
     }
-    pub(super) fn index_directory(&self) -> Result<cap_std::fs::Dir> {
-        self.validate()?;
-        Ok(cap_std::fs::Dir::from_std_file(
-            self.git.directory.try_clone()?,
-        ))
-    }
-
     fn common_path(&self) -> &Path {
         self.common.as_ref().unwrap_or(&self.git).path()
     }

@@ -90,7 +90,6 @@ sha2 = "0.10"
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
 # Operation-scoped directory handles for authorized creates, save staging and publication.
 cap-std = { version = "4.0.3", default-features = false }
-sha1 = "0.10.6"
 
 [dev-dependencies]
 proptest = "1"

@@ -572,7 +572,6 @@ pub fn run() {
             git::commands::git_checkout_branch,
             git::commands::git_worktree_add,
             git::commands::git_worktree_remove,
-            git::worker::git_execution_capability,
             modules::skills::skills_list,
             modules::skills::skills_load,
             modules::skills::skills_read_file,
