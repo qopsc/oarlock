@@ -4,7 +4,7 @@ import { dismissFileError, showFileError } from "@/modules/mac-privacy";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { useOwnedWorkspace } from "@/modules/workspace/owner";
 import { workspaceScopeKey, type WorkspaceEnv } from "@/modules/workspace/env";
-import { observeNativeRecoveryTarget } from "./recoveryTarget";
+import { observeRecoveryTarget } from "./recoveryTarget";
 import { workspaceEnvForPath } from "@/modules/workspace";
 import { authorizationSettled } from "@/modules/workspace/authorize";
 import { invoke } from "@tauri-apps/api/core";
@@ -33,14 +33,11 @@ type Options = {
 // file (a custom theme in the app's config folder) opens in a WSL window too.
 export function createDocumentIo(owner: WorkspaceEnv): DocumentIo {
   return {
-    observeRecovery: (path) => {
-      const workspace = workspaceEnvForPath(path, owner);
-      return observeNativeRecoveryTarget(path, workspaceScopeKey(workspace), {
-        begin: () => invoke<string>("fs_recovery_begin", { path, workspace }),
-        changed: (id) => invoke<boolean>("fs_recovery_changed", { id }),
-        end: (id) => invoke("fs_recovery_end", { id }),
-      });
-    },
+    observeRecovery: (path) =>
+      observeRecoveryTarget(
+        path,
+        workspaceScopeKey(workspaceEnvForPath(path, owner)),
+      ),
     read: (path, force) => {
       const workspace = workspaceEnvForPath(path, owner);
       return authorizationSettled(path, workspace).then(() =>

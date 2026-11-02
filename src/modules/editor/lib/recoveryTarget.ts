@@ -8,8 +8,6 @@ type Pending = {
   path: string;
   scope: string;
   changed: boolean;
-  /** Native keeps the mutation history, so losing this listener loses nothing. */
-  nativeHistory: boolean;
 };
 const pending = new Set<Pending>();
 let covered = false;
@@ -17,7 +15,7 @@ let covered = false;
 /** Fed by the window's existing ordered mutation listener, before quit deferral. */
 export function recoveryMutationCoverage(ready: boolean): void {
   covered = ready;
-  if (!ready) for (const target of pending) if (!target.nativeHistory) target.changed = true;
+  if (!ready) for (const target of pending) target.changed = true;
 }
 export function recoveryTargetsChanged(
   scope: string,
@@ -36,53 +34,17 @@ export function recoveryTargetsChanged(
 export function observeRecoveryTarget(
   path: string,
   scope: string,
-  nativeHistory = false,
 ): RecoveryTarget {
   if (!covered)
     throw new Error(
       "Document updates are unavailable. Retry document synchronization before restoring this draft.",
     );
-  const target: Pending = { path, scope, changed: false, nativeHistory };
+  const target: Pending = { path, scope, changed: false };
   pending.add(target);
   return {
     changed: () => target.changed,
     dispose: () => {
       pending.delete(target);
-    },
-  };
-}
-
-/** Pair immediate local notifications with authoritative native alias tracking. */
-export async function observeNativeRecoveryTarget(
-  path: string,
-  scope: string,
-  native: {
-    begin: () => Promise<string>;
-    changed: (id: string) => Promise<boolean>;
-    end: (id: string) => Promise<unknown>;
-  },
-): Promise<RecoveryTarget> {
-  const local = observeRecoveryTarget(path, scope, true);
-  let id: string;
-  try {
-    id = await native.begin();
-  } catch (error) {
-    local.dispose();
-    throw error;
-  }
-  let live = true;
-  return {
-    changed: async () =>
-      !live || !!(await local.changed()) || native.changed(id),
-    dispose: () => {
-      if (!live) return;
-      live = false;
-      local.dispose();
-      void native
-        .end(id)
-        .catch((error) =>
-          console.warn("Could not release recovery handle", error),
-        );
     },
   };
 }

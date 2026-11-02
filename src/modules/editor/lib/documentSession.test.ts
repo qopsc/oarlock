@@ -1070,7 +1070,7 @@ it("a final quit barrier cannot be crossed by a late recovery reply", async () =
     t.session.close();
   }
 });
-it.each(["rename", "lost listener", "deferred delete"])(
+it.each(["rename", "parent rename", "lost listener", "deferred delete"])(
   "recovery observes %s before binding, even when the returned disk version is unchanged",
   async (kind) => {
     const { subscribeDocumentMutations } = await import("./documentMutations");
@@ -1095,9 +1095,18 @@ it.each(["rename", "lost listener", "deferred delete"])(
     t.io.observeRecovery = (path) =>
       observeRecoveryTarget(path, workspaceScopeKey(env));
     t.hold("write");
-    const recovery = t.session.recover("/a");
+    const target = kind === "parent rename" ? "/work/dir/a" : "/a";
+    const recovery = t.session.recover(target);
     await flush();
     if (kind === "lost listener") stop();
+    else if (kind === "parent rename")
+      receive({
+        sequence: 1,
+        workspace: env,
+        kind: "renamed",
+        from: "/work/dir",
+        to: "/work/dir2",
+      });
     else if (kind === "rename") {
       receive({
         sequence: 1,
@@ -1124,7 +1133,7 @@ it.each(["rename", "lost listener", "deferred delete"])(
     expect(await recovery).toBe(false);
     expect(t.session.isDetached()).toBe(true);
     expect(t.session.text()).toBe("draft");
-    expect(t.host.saveFailed).toHaveBeenCalledWith("/a", expect.any(Error));
+    expect(t.host.saveFailed).toHaveBeenCalledWith(target, expect.any(Error));
     stop();
     t.session.close();
   },
@@ -1400,25 +1409,6 @@ it("a discard snapshot cannot strand a loading or replacement document", async (
   expect(t.session.text()).toBe("b");
   expect(t.session.isSaved()).toBe(true);
   t.session.close();
-});
-it("recovery closing during native handle acquisition cleans up without writing", async () => {
-  const t = await detachedRecovery();
-  const dispose = vi.fn();
-  let acquired!: (value: {
-    changed: () => boolean;
-    dispose: () => void;
-  }) => void;
-  t.io.observeRecovery = () =>
-    new Promise((resolve) => {
-      acquired = resolve;
-    });
-  const recovery = t.session.recover("/a");
-  await flush();
-  t.session.close();
-  acquired({ changed: () => false, dispose });
-  expect(await recovery).toBe(false);
-  expect(dispose).toHaveBeenCalledOnce();
-  expect(t.disk.has("/a")).toBe(false);
 });
 it("closing during the final native recovery check cannot rebind the document", async () => {
   const t = await detachedRecovery();

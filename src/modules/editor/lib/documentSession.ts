@@ -30,7 +30,7 @@ export type SaveResult =
   | { kind: "saved"; version: string }
   | { kind: "conflict"; version: string | null };
 export type DocumentIo = {
-  observeRecovery?: (path: string) => RecoveryTarget | Promise<RecoveryTarget>;
+  observeRecovery?: (path: string) => RecoveryTarget;
   read: (path: string, force: boolean) => Promise<ReadResult>;
   /** Native compares the exact disk baseline under its per-file transaction lock. */
   write: (

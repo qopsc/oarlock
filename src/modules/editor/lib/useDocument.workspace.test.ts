@@ -61,9 +61,6 @@ it("pending recovery keeps its owning environment after the current space change
   const { workspaceScopeKey } = await import("@/modules/workspace/env");
   const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
   const debian = { kind: "wsl", distro: "Debian" } as const;
-  calls.invoke.mockImplementation(async (command: string) =>
-    command === "fs_recovery_begin" ? "test-handle" : false,
-  );
   recoveryMutationCoverage(true);
   const target =
     await createDocumentIo(ubuntu).observeRecovery?.("/home/me/file");
@@ -85,9 +82,6 @@ it("a host Save As destination in a WSL-owned editor observes host mutations", a
   );
   const { workspaceScopeKey } = await import("@/modules/workspace/env");
   const ubuntu = { kind: "wsl", distro: "Ubuntu" } as const;
-  calls.invoke.mockImplementation(async (command: string) =>
-    command === "fs_recovery_begin" ? "test-handle" : false,
-  );
   recoveryMutationCoverage(true);
   const target =
     await createDocumentIo(ubuntu).observeRecovery?.("C:\\work\\file.txt");

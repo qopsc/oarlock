@@ -366,7 +366,6 @@ pub fn run() {
                     state.release_window(webview.app_handle(), webview.label());
                 }
                 git::discard::page_loading(webview.app_handle(), webview.label());
-                fs::mutation_events::release_window(webview.label());
                 modules::project_trust::release_window(webview.app_handle(), webview.label());
                 windows::on_page_load(webview.app_handle(), webview.label());
             }
@@ -464,9 +463,6 @@ pub fn run() {
             fs::attachment::ai_pick_attachment_files,
             fs::file::fs_write_file,
             fs::file::fs_save_document,
-            fs::mutation_events::fs_recovery_begin,
-            fs::mutation_events::fs_recovery_changed,
-            fs::mutation_events::fs_recovery_end,
             fs::formatter::fs_format_document,
             fs::formatter::fs_format_cancel,
             modules::background_image::background_image_inspect,
@@ -699,7 +695,6 @@ pub fn run() {
                         state.take(&label);
                     }
                     git::discard::release_window(app, &label);
-                    fs::mutation_events::release_window(&label);
                     modules::project_trust::release_window(app, &label);
                     windows::on_destroyed(app, &label);
                 }
