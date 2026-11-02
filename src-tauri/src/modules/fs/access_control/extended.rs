@@ -12,9 +12,20 @@ use std::{
 const MAX_NAMES: usize = 64 * 1024;
 const MAX_VALUE: usize = 1024 * 1024;
 const MAX_TOTAL: usize = 8 * 1024 * 1024;
+/// LSM labels travel with a file but are never part of equality: the kernel
+/// owns them, so verification must not fail because a label differs.
+#[derive(Debug, Default)]
+struct Labels(BTreeMap<CString, Vec<u8>>);
+impl PartialEq for Labels {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Labels {}
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Extended {
     values: BTreeMap<CString, Vec<u8>>,
+    labels: Labels,
     #[cfg(target_os = "macos")]
     flags: u32,
 }
@@ -88,7 +99,18 @@ fn names(file: &File) -> io::Result<Vec<CString>> {
     }))
 }
 fn managed_by_acl(name: &CStr) -> bool {
-    cfg!(target_os = "linux") && name.to_bytes() == b"system.posix_acl_access"
+    cfg!(target_os = "linux")
+        && matches!(
+            name.to_bytes(),
+            b"system.posix_acl_access" | b"system.posix_acl_default"
+        )
+}
+/// SELinux and SMACK labels are assigned by policy; `capability`, `ima`, `evm`
+/// and every other `security.*` name still fail closed.
+fn lsm_managed(name: &CStr) -> bool {
+    let bytes = name.to_bytes();
+    cfg!(target_os = "linux")
+        && (bytes == b"security.selinux" || bytes.starts_with(b"security.SMACK64"))
 }
 fn supported(name: &CStr) -> bool {
     let bytes = name.to_bytes();
@@ -171,9 +193,16 @@ impl Extended {
             flags
         };
         let mut values = BTreeMap::new();
+        let mut labels = BTreeMap::new();
         let mut remaining = MAX_TOTAL;
         for name in names(file)? {
             if managed_by_acl(&name) {
+                continue;
+            }
+            if lsm_managed(&name) {
+                let bytes = value(file, &name, remaining.min(MAX_VALUE))?;
+                remaining -= bytes.len();
+                labels.insert(name, bytes);
                 continue;
             }
             if !supported(&name) {
@@ -187,13 +216,38 @@ impl Extended {
         }
         Ok(Self {
             values,
+            labels: Labels(labels),
             #[cfg(target_os = "macos")]
             flags,
         })
     }
+    /// A save keeps the original's label on the staged file.
     pub fn apply(&self, file: &File) -> io::Result<()> {
+        self.apply_with(file, true)
+    }
+    /// A copy lets the kernel label the new file by policy.
+    #[cfg(target_os = "linux")]
+    pub fn apply_for_copy(&self, file: &File) -> io::Result<()> {
+        self.apply_with(file, false)
+    }
+    fn apply_with(&self, file: &File, labels: bool) -> io::Result<()> {
         // Inspect before changing anything, including unsupported inherited state.
         let current = Self::capture(file)?;
+        if labels {
+            for (name, bytes) in &self.labels.0 {
+                if current.labels.0.get(name) != Some(bytes) {
+                    set(file, name, Some(bytes)).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "Cannot preserve the security label {:?}: {error}",
+                                name.to_string_lossy()
+                            ),
+                        )
+                    })?;
+                }
+            }
+        }
         for name in current.values.keys() {
             if !self.values.contains_key(name) {
                 set(file, name, None)?;
@@ -241,6 +295,26 @@ mod tests {
         let error = metadata.apply(&candidate).unwrap_err();
         assert!(error.to_string().contains("Cannot preserve extended attribute"));
         assert_eq!(value(&source, c"user.oarlock-test", MAX_VALUE).unwrap(), b"must survive");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lsm_labels_are_classified_and_other_security_names_stay_refused() {
+        for name in [c"security.selinux", c"security.SMACK64", c"security.SMACK64EXEC"] {
+            assert!(lsm_managed(name), "{name:?}");
+            assert!(!supported(name));
+        }
+        for name in [
+            c"security.capability",
+            c"security.ima",
+            c"security.evm",
+            c"trusted.x",
+            c"security.selinuxx",
+        ] {
+            assert!(!lsm_managed(name), "{name:?}");
+            assert!(!supported(name), "{name:?}");
+        }
+        assert!(!lsm_managed(c"user.security.selinux"));
+        assert!(managed_by_acl(c"system.posix_acl_default"));
     }
     #[test]
     fn attributes_are_exact_and_unknown_metadata_is_refused() {

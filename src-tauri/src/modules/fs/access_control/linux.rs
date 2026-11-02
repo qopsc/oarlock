@@ -60,8 +60,14 @@ pub fn apply(acl: &Acl, file: &File) -> io::Result<()> {
     Ok(())
 }
 
+const DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";
+
 pub fn privatize(file: &File) -> io::Result<()> {
     apply(&Acl(None), file)?;
+    // A private folder must not pass an inherited default ACL on to its children.
+    if file.metadata()?.is_dir() {
+        apply_default(&None, file)?;
+    }
     if read(file)? != Acl(None) {
         return Err(io::Error::other(
             "Staging ACL removal could not be verified",
@@ -70,10 +76,43 @@ pub fn privatize(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// The default ACL of a folder, `None` when it has none. Failing to read is not absence.
+pub fn read_default(dir: &File) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = vec![0; 65536];
+    let count = unsafe {
+        libc::fgetxattr(dir.as_raw_fd(), DEFAULT.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len())
+    };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return if matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    bytes.truncate(count as usize);
+    Ok(Some(bytes))
+}
+/// Sets the default ACL, or removes an inherited one when the source has none.
+pub fn apply_default(acl: &Option<Vec<u8>>, dir: &File) -> io::Result<()> {
+    let result = match acl {
+        Some(bytes) => unsafe {
+            libc::fsetxattr(dir.as_raw_fd(), DEFAULT.as_ptr(), bytes.as_ptr().cast(), bytes.len(), 0)
+        },
+        None => unsafe { libc::fremovexattr(dir.as_raw_fd(), DEFAULT.as_ptr()) },
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if acl.is_some() || !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn inherit_directory(source: &File, target: &File) -> io::Result<()> {
     read(source)?;
-    const DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";
     let mut bytes = vec![0; 65536];
     let count = unsafe {
         libc::fgetxattr(

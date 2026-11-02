@@ -203,7 +203,7 @@ impl Staged<'_> {
 }
 
 /// Makes the rename itself durable. On Apple `File::sync_all` is `F_FULLFSYNC`.
-fn sync_directory(dir: &Dir) -> io::Result<()> {
+pub(super) fn sync_directory(dir: &Dir) -> io::Result<()> {
     dir.try_clone()?.into_std_file().sync_all()
 }
 
@@ -360,13 +360,19 @@ mod tests {
             }
             let dest = Destination::pin(&target, false, &|_| Ok(())).unwrap();
             let staged = dest.stage(b"PRIVATE_DRAFT").unwrap();
-            assert_eq!(
-                fs::read_dir(root.path()).unwrap().count(),
-                usize::from(replace)
-            );
+            // Linux may stage in a private 0700 child of this folder when no
+            // private location exists on its mount: never readable, never content.
+            let visible = || {
+                fs::read_dir(root.path())
+                    .unwrap()
+                    .filter(|e| e.as_ref().unwrap().file_name() != ".oarlock-staging")
+                    .count()
+            };
+            assert_eq!(visible(), usize::from(replace));
             staged.persist(replace).unwrap();
             assert_eq!(fs::read(&target).unwrap(), b"PRIVATE_DRAFT");
-            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+            assert_eq!(visible(), 1);
+            assert!(!root.path().join(".oarlock-staging").exists());
         }
     }
 

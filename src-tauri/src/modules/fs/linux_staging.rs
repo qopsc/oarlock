@@ -1,4 +1,5 @@
-//! Linux unnamed save candidates and bounded, opportunistic cleanup.
+//! Linux unnamed save candidates, private copy areas and bounded, opportunistic
+//! cleanup. Every staged byte lives under a 0700 directory owned by the user.
 use super::{access_control::AccessControl, attachment::handle_path, file_identity::entry_matches};
 use cap_std::fs::{Dir, DirBuilder, MetadataExt as _};
 use std::{
@@ -6,7 +7,7 @@ use std::{
     fs::{self, File},
     io,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, PermissionsExt},
@@ -17,7 +18,10 @@ use std::{
 };
 
 const STAGING: &str = "oarlock-staging";
+const DEST_STAGING: &str = ".oarlock-staging";
 const MIN_AGE: Duration = Duration::from_secs(60);
+pub(super) const MAX_CLEANUP_ENTRIES: usize = 4096;
+const MAX_TREE_DEPTH: usize = 256;
 
 fn c_name(name: &OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes())
@@ -75,31 +79,16 @@ fn link_file(file: &File, directory: &Dir, name: &OsStr) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
-fn name(hidden: bool) -> io::Result<OsString> {
+fn random_hex() -> io::Result<u128> {
     let mut random = [0; 16];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
-    Ok(format!(
-        "{}{}-{:032x}.tmp",
-        if hidden { "." } else { "" },
-        std::process::id(),
-        u128::from_le_bytes(random)
-    )
-    .into())
+    Ok(u128::from_le_bytes(random))
 }
-fn is_ours(name: &OsStr, hidden: bool) -> bool {
-    let Some(mut name) = name.to_str() else {
-        return false;
-    };
-    if hidden {
-        let Some(stripped) = name.strip_prefix('.') else {
-            return false;
-        };
-        name = stripped;
-    }
-    let Some(name) = name.strip_suffix(".tmp") else {
-        return false;
-    };
-    let Some((pid, random)) = name.split_once('-') else {
+fn name() -> io::Result<OsString> {
+    Ok(format!("{}-{:032x}.tmp", std::process::id(), random_hex()?).into())
+}
+fn is_pid_and_random(text: &str) -> bool {
+    let Some((pid, random)) = text.split_once('-') else {
         return false;
     };
     !pid.is_empty()
@@ -110,17 +99,99 @@ fn is_ours(name: &OsStr, hidden: bool) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn cleanup(directory: &Dir, hidden: bool) -> io::Result<()> {
-    for entry in directory.entries()? {
+fn is_ours(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .is_some_and(is_pid_and_random)
+}
+fn is_copy_area(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix("copy-"))
+        .and_then(|name| name.strip_suffix(".d"))
+        .is_some_and(is_pid_and_random)
+}
+
+fn open_path(parent: RawFd, name: &OsStr) -> io::Result<File> {
+    let cname = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            cname.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn proc_path(file: &File) -> io::Result<CString> {
+    CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(io::Error::other)
+}
+/// Removes a staged tree we own. A staged folder may be read-only (its source
+/// was), so each directory is made 0700 first; the private area protects it.
+pub(super) fn remove_tree(parent: &Dir, name: &OsStr) -> io::Result<()> {
+    remove_tree_at(parent.as_raw_fd(), name, 0)
+}
+fn remove_tree_at(parent: RawFd, name: &OsStr, depth: usize) -> io::Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(io::Error::other("Staged tree is too deep to remove"));
+    }
+    let cname = c_name(name)?;
+    let held = open_path(parent, name)?;
+    let metadata = held.metadata()?;
+    if !metadata.is_dir() {
+        if unsafe { libc::unlinkat(parent, cname.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::other("Staged folder has a different owner"));
+    }
+    let procfs = proc_path(&held)?;
+    if unsafe { libc::chmod(procfs.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe {
+        libc::open(
+            procfs.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = unsafe { File::from_raw_fd(fd) };
+    let entries = Dir::from_std_file(dir.try_clone()?);
+    for entry in entries.entries()? {
+        remove_tree_at(dir.as_raw_fd(), &entry?.file_name(), depth + 1)?;
+    }
+    if unsafe { libc::unlinkat(parent, cname.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn cleanup(directory: &Dir) -> io::Result<()> {
+    cleanup_with_cap(directory, MAX_CLEANUP_ENTRIES)
+}
+fn cleanup_with_cap(directory: &Dir, cap: usize) -> io::Result<()> {
+    for (seen, entry) in directory.entries()?.enumerate() {
+        if seen >= cap {
+            log::debug!("Staging cleanup stopped at {cap} entries");
+            break;
+        }
         let entry = entry?;
         let name = entry.file_name();
-        if !is_ours(&name, hidden) {
+        let copy_area = is_copy_area(&name);
+        if !copy_area && !is_ours(&name) {
             continue;
         }
-        if !directory
-            .symlink_metadata(&name)
-            .is_ok_and(|metadata| metadata.is_file())
-        {
+        let Ok(kind) = directory.symlink_metadata(&name) else {
+            continue;
+        };
+        if copy_area != kind.is_dir() || (!copy_area && !kind.is_file()) {
             continue;
         }
         let cname = c_name(&name)?;
@@ -145,7 +216,11 @@ fn cleanup(directory: &Dir, hidden: bool) -> io::Result<()> {
         }
         let file = unsafe { File::from_raw_fd(fd) };
         let metadata = match file.metadata() {
-            Ok(value) if value.is_file() && value.uid() == unsafe { libc::geteuid() } => value,
+            Ok(value)
+                if (value.is_file() || value.is_dir()) && value.uid() == unsafe { libc::geteuid() } =>
+            {
+                value
+            }
             _ => continue,
         };
         let old = metadata
@@ -157,7 +232,12 @@ fn cleanup(directory: &Dir, hidden: bool) -> io::Result<()> {
             continue;
         }
         if entry_matches(directory, Path::new(&name), &file).unwrap_or(false) {
-            if let Err(error) = directory.remove_file(&name) {
+            let removed = if copy_area {
+                remove_tree(directory, &name)
+            } else {
+                directory.remove_file(&name)
+            };
+            if let Err(error) = removed {
                 log::warn!("Could not remove stale staging entry: {error}");
             }
         }
@@ -192,27 +272,56 @@ fn common_dir(directory: &Path) -> io::Result<Option<Option<PathBuf>>> {
     }
     Ok(None)
 }
-fn same_filesystem(destination: &Dir, candidate: &Dir) -> io::Result<bool> {
-    Ok(destination.dir_metadata()?.dev() == candidate.dir_metadata()?.dev())
+
+// `st_dev` matches across bind mounts, where link and rename still fail with
+// EXDEV, so the mount id decides when the kernel reports one.
+fn mount_key(fd: RawFd) -> io::Result<(u64, Option<u64>)> {
+    const STATX_MNT_ID: u32 = 0x1000;
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_BASIC_STATS | STATX_MNT_ID,
+            &mut stat,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dev = libc::makedev(stat.stx_dev_major, stat.stx_dev_minor);
+    Ok((
+        dev,
+        (stat.stx_mask & STATX_MNT_ID != 0).then_some(stat.stx_mnt_id),
+    ))
 }
-fn private_child(parent: &Dir) -> io::Result<Dir> {
+fn same_mount(destination: &Dir, candidate: &Dir) -> io::Result<bool> {
+    let (a, b) = (
+        mount_key(destination.as_raw_fd())?,
+        mount_key(candidate.as_raw_fd())?,
+    );
+    Ok(a.0 == b.0 && (a.1.is_none() || b.1.is_none() || a.1 == b.1))
+}
+fn private_child(parent: &Dir, child: &str) -> io::Result<Dir> {
     let mut builder = DirBuilder::new();
     use cap_std::fs::DirBuilderExt;
     builder.mode(0o700);
-    let created = match parent.create_dir_with(STAGING, &builder) {
+    let created = match parent.create_dir_with(child, &builder) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error),
     };
-    if !parent.symlink_metadata(STAGING)?.is_dir() {
+    if !parent.symlink_metadata(child)?.is_dir() {
         return Err(io::Error::other("Staging path is not a directory"));
     }
     // cap-std directory handles may be O_PATH; ACL xattrs require a readable
     // directory descriptor, opened without following a substituted symlink.
+    let cchild = CString::new(child).map_err(io::Error::other)?;
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
-            c"oarlock-staging".as_ptr(),
+            cchild.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
@@ -221,7 +330,7 @@ fn private_child(parent: &Dir) -> io::Result<Dir> {
     }
     let identity = unsafe { File::from_raw_fd(fd) };
     let dir = Dir::from_std_file(identity.try_clone()?);
-    if !entry_matches(parent, Path::new(STAGING), &identity)? {
+    if !entry_matches(parent, Path::new(child), &identity)? {
         return Err(io::Error::other("Staging directory changed"));
     }
     let metadata = identity.metadata()?;
@@ -236,64 +345,110 @@ fn private_child(parent: &Dir) -> io::Result<Dir> {
     Ok(dir)
 }
 fn cache_location(destination: &Dir, cache: Option<&Path>) -> io::Result<Dir> {
-    if let Some(cache) = cache {
-        if let Ok(parent) = Dir::open_ambient_dir(cache, cap_std::ambient_authority()) {
-            let metadata = parent.dir_metadata()?;
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Cache directory is not privately controlled",
-                ));
-            }
-            if same_filesystem(destination, &parent)?
-                && super::private_staging::outside_worktrees(&parent.try_clone()?.into_std_file())
-                    .is_ok()
-            {
-                if let Ok(dir) = private_child(&parent) {
-                    return Ok(dir);
-                }
-            }
+    let unavailable = || {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "No private same-filesystem staging directory is available outside the Git worktree",
+        )
+    };
+    let cache = cache.ok_or_else(unavailable)?;
+    let parent = match Dir::open_ambient_dir(cache, cap_std::ambient_authority()) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(cache)?;
+            Dir::open_ambient_dir(cache, cap_std::ambient_authority())?
         }
+        Err(error) => return Err(error),
+    };
+    let metadata = parent.dir_metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Cache directory is not privately controlled",
+        ));
     }
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "No private same-filesystem staging directory is available outside the Git worktree",
-    ))
+    if !same_mount(destination, &parent)?
+        || super::private_staging::outside_worktrees(&parent.try_clone()?.into_std_file())
+            .is_err()
+    {
+        return Err(unavailable());
+    }
+    private_child(&parent, STAGING)
 }
-fn location_with_cache(destination: &Dir, cache: Option<&Path>) -> io::Result<(Dir, bool)> {
+
+#[derive(Clone, Debug)]
+enum Location {
+    Common(PathBuf),
+    Cache(Option<PathBuf>),
+    DestinationChild,
+}
+fn locations(destination: &Dir, cache: Option<&Path>) -> io::Result<Vec<Location>> {
     let actual =
         handle_path(&destination.try_clone()?.into_std_file()).map_err(io::Error::other)?;
-    match common_dir(&actual)? {
-        None => Ok((destination.try_clone()?, true)),
-        Some(common) => {
-            if let Some(common) = common {
-                if let Ok(parent) = Dir::open_ambient_dir(&common, cap_std::ambient_authority()) {
-                    if same_filesystem(destination, &parent)? {
-                        if let Ok(dir) = private_child(&parent) {
-                            return Ok((dir, false));
-                        }
-                    }
-                }
+    let cache = Location::Cache(cache.map(Path::to_path_buf));
+    Ok(match common_dir(&actual)? {
+        // No repository: the user's cache, then a private child of the folder.
+        None => vec![cache, Location::DestinationChild],
+        // A foreign or escaping `.git`: never inside the worktree (Review 76).
+        Some(None) => vec![cache],
+        Some(Some(common)) => vec![Location::Common(common), cache],
+    })
+}
+fn open_location(destination: &Dir, location: &Location) -> io::Result<Dir> {
+    match location {
+        Location::Common(common) => {
+            let parent = Dir::open_ambient_dir(common, cap_std::ambient_authority())?;
+            if !same_mount(destination, &parent)? {
+                return Err(io::Error::from(io::ErrorKind::Unsupported));
             }
-            Ok((cache_location(destination, cache)?, false))
+            private_child(&parent, STAGING)
+        }
+        Location::Cache(path) => cache_location(destination, path.as_deref()),
+        Location::DestinationChild => private_child(destination, DEST_STAGING),
+    }
+}
+/// First usable location at or after `from`; the error is the last refusal.
+fn select(
+    destination: &Dir,
+    locations: &[Location],
+    from: usize,
+) -> io::Result<(usize, Dir)> {
+    let mut last = io::Error::new(
+        io::ErrorKind::Unsupported,
+        "No private same-filesystem staging directory is available outside the Git worktree",
+    );
+    for (index, location) in locations.iter().enumerate().skip(from) {
+        match open_location(destination, location) {
+            Ok(dir) => return Ok((index, dir)),
+            Err(error) => last = error,
         }
     }
+    Err(last)
+}
+fn remove_destination_child(destination: &Dir) {
+    let _ = destination.remove_dir(DEST_STAGING);
 }
 
 pub(super) struct Candidate {
     file: File,
     staging: Dir,
-    hidden: bool,
+    destination: Dir,
+    locations: Vec<Location>,
+    index: usize,
     linked: Option<OsString>,
-    cache: Option<PathBuf>,
 }
 impl Candidate {
     pub fn create(destination: &Dir) -> io::Result<Self> {
         Self::create_with_cache(destination, dirs::cache_dir())
     }
     fn create_with_cache(destination: &Dir, cache: Option<PathBuf>) -> io::Result<Self> {
-        let (staging, hidden) = location_with_cache(destination, cache.as_deref())?;
-        cleanup(&staging, hidden)?;
+        let locations = locations(destination, cache.as_deref())?;
+        let (index, staging) = select(destination, &locations, 0)?;
+        cleanup(&staging)?;
         let file = unnamed(destination, 0o600)?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
@@ -302,9 +457,10 @@ impl Candidate {
         Ok(Self {
             file,
             staging,
-            hidden,
+            destination: destination.try_clone()?,
+            locations,
+            index,
             linked: None,
-            cache,
         })
     }
     pub fn file(&self) -> &File {
@@ -331,47 +487,197 @@ impl Candidate {
         if !replace {
             return link_file(&self.file, destination, target);
         }
-        let mut fallback_attempted = false;
-        for _ in 0..8 {
-            let candidate = name(self.hidden)?;
-            match link_file(&self.file, &self.staging, &candidate) {
-                Ok(()) => {
-                    self.linked = Some(candidate);
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.link_and_rename(destination, target) {
+                // A bind mount shares `st_dev` but not the mount: stage elsewhere.
                 Err(error)
                     if error.raw_os_error() == Some(libc::EXDEV)
-                        && !self.hidden
-                        && !fallback_attempted =>
+                        && attempts <= self.locations.len() =>
                 {
-                    self.staging = cache_location(destination, self.cache.as_deref())?;
-                    cleanup(&self.staging, false)?;
-                    fallback_attempted = true;
+                    let (index, staging) =
+                        select(&self.destination, &self.locations, self.index + 1)?;
+                    cleanup(&staging)?;
+                    self.index = index;
+                    self.staging = staging;
+                }
+                other => return other,
+            }
+        }
+    }
+    fn link_and_rename(&mut self, destination: &Dir, target: &OsStr) -> io::Result<()> {
+        let mut reopened = false;
+        let mut collisions = 0;
+        while self.linked.is_none() {
+            let candidate = name()?;
+            match link_file(&self.file, &self.staging, &candidate) {
+                Ok(()) => self.linked = Some(candidate),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && collisions < 8 => {
+                    collisions += 1;
+                }
+                // A concurrent save removed the empty folder after its own publish.
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && !reopened
+                        && matches!(self.locations[self.index], Location::DestinationChild) =>
+                {
+                    reopened = true;
+                    self.staging = private_child(&self.destination, DEST_STAGING)?;
                 }
                 Err(error) => return Err(error),
             }
         }
         let name = self
             .linked
-            .as_ref()
+            .clone()
             .ok_or_else(|| io::Error::other("Cannot allocate staging name"))?;
         self.verify()?;
-        self.staging.rename(name, destination, target)?;
-        self.linked = None;
-        Ok(())
+        match self.staging.rename(&name, destination, target) {
+            Ok(()) => {
+                self.linked = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.remove_linked();
+                Err(error)
+            }
+        }
     }
-}
-impl Drop for Candidate {
-    fn drop(&mut self) {
-        if let Some(name) = &self.linked {
-            if entry_matches(&self.staging, Path::new(name), &self.file).unwrap_or(false) {
-                if let Err(error) = self.staging.remove_file(name) {
+    fn remove_linked(&mut self) {
+        if let Some(name) = self.linked.take() {
+            if entry_matches(&self.staging, Path::new(&name), &self.file).unwrap_or(false) {
+                if let Err(error) = self.staging.remove_file(&name) {
                     log::warn!("Could not remove staging file: {error}");
                 }
             }
         }
     }
+}
+impl Drop for Candidate {
+    fn drop(&mut self) {
+        self.remove_linked();
+        if matches!(self.locations[self.index], Location::DestinationChild) {
+            remove_destination_child(&self.destination);
+        }
+    }
+}
+
+/// A per-operation 0700 folder in a private staging location, locked for the
+/// operation's lifetime so the stale sweep never removes a live copy.
+pub(super) struct CopyArea {
+    parent: Dir,
+    name: OsString,
+    area: File,
+    destination: Dir,
+    locations: Vec<Location>,
+    index: usize,
+}
+impl CopyArea {
+    pub fn create(destination: &Dir, from: usize) -> io::Result<Self> {
+        Self::create_with_cache(destination, dirs::cache_dir(), from)
+    }
+    pub fn create_with_cache(
+        destination: &Dir,
+        cache: Option<PathBuf>,
+        from: usize,
+    ) -> io::Result<Self> {
+        let locations = locations(destination, cache.as_deref())?;
+        let (index, parent) = select(destination, &locations, from)?;
+        cleanup(&parent)?;
+        let name = OsString::from(format!(
+            "copy-{}-{:032x}.d",
+            std::process::id(),
+            random_hex()?
+        ));
+        let mut builder = DirBuilder::new();
+        use cap_std::fs::DirBuilderExt;
+        builder.mode(0o700);
+        parent.create_dir_with(&name, &builder)?;
+        let cname = c_name(&name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let area = unsafe { File::from_raw_fd(fd) };
+        let this = Self {
+            parent,
+            name,
+            area,
+            destination: destination.try_clone()?,
+            locations,
+            index,
+        };
+        if unsafe { libc::flock(this.area.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        AccessControl::privatize_directory(&this.area)?;
+        this.verify()?;
+        Ok(this)
+    }
+    /// The location a retry after `EXDEV` must start from.
+    pub fn next_location(&self) -> usize {
+        self.index + 1
+    }
+    pub fn fd(&self) -> RawFd {
+        self.area.as_raw_fd()
+    }
+    pub fn dir(&self) -> io::Result<Dir> {
+        Ok(Dir::from_std_file(self.area.try_clone()?))
+    }
+    pub fn verify(&self) -> io::Result<()> {
+        if !entry_matches(&self.parent, Path::new(&self.name), &self.area)? {
+            return Err(io::Error::other("Copy staging folder changed"));
+        }
+        Ok(())
+    }
+}
+impl Drop for CopyArea {
+    fn drop(&mut self) {
+        if let Err(error) = remove_tree(&self.parent, &self.name) {
+            log::warn!("Could not remove copy staging folder: {error}");
+        }
+        if matches!(self.locations[self.index], Location::DestinationChild) {
+            remove_destination_child(&self.destination);
+        }
+    }
+}
+
+/// `RENAME_NOREPLACE` through directory descriptors; a filesystem that does
+/// not implement it (EINVAL) is a refusal, never a replacing rename.
+pub(super) fn rename_noreplace_at(
+    from_dir: RawFd,
+    from: &OsStr,
+    to_dir: RawFd,
+    to: &OsStr,
+) -> io::Result<()> {
+    let (from, to) = (c_name(from)?, c_name(to)?);
+    if unsafe {
+        libc::renameat2(
+            from_dir,
+            from.as_ptr(),
+            to_dir,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINVAL) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "This filesystem cannot publish without replacing (RENAME_NOREPLACE); nothing was copied",
+        ));
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -379,7 +685,7 @@ mod tests {
     use super::*;
     use std::{io::Write, process::Command};
 
-    fn test_dir() -> tempfile::TempDir {
+    pub(super) fn test_dir() -> tempfile::TempDir {
         match std::env::var_os("OARLOCK_TEST_PRIMARY_VOLUME") {
             Some(path) => tempfile::tempdir_in(path).unwrap(),
             None => tempfile::tempdir().unwrap(),
@@ -413,6 +719,24 @@ mod tests {
             0
         );
     }
+    fn lock(path: &Path) -> File {
+        let held = File::open(path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        held
+    }
+    fn staging_path(candidate: &Candidate) -> PathBuf {
+        handle_path(&candidate.staging.try_clone().unwrap().into_std_file()).unwrap()
+    }
+    fn private_cache(root: &Path) -> PathBuf {
+        let cache = root.join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+        cache
+    }
+
     #[test]
     fn cleanup_removes_only_old_unlocked_regular_matching_entries() {
         let root = test_dir();
@@ -429,12 +753,8 @@ mod tests {
         old(&root.path().join("unrelated.tmp"));
         std::os::unix::fs::symlink(root.path().join("unrelated.tmp"), root.path().join(link))
             .unwrap();
-        let held = File::open(root.path().join(live)).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        cleanup(&dir, false).unwrap();
+        let _held = lock(&root.path().join(live));
+        cleanup(&dir).unwrap();
         assert!(!root.path().join(stale).exists());
         for name in [live, recent, "unrelated.tmp", link] {
             assert!(
@@ -442,6 +762,57 @@ mod tests {
                 "{name}"
             );
         }
+    }
+    #[test]
+    fn cleanup_stops_at_the_entry_cap_without_error() {
+        let root = test_dir();
+        let dir = open_dir(root.path());
+        for n in 0..12 {
+            let path = root.path().join(format!("123-{n:032x}.tmp"));
+            fs::write(&path, "old").unwrap();
+            old(&path);
+        }
+        cleanup_with_cap(&dir, 5).unwrap();
+        let left = fs::read_dir(root.path()).unwrap().count();
+        assert_eq!(left, 7);
+        // The cap bounds the entries examined, not the cleanup itself.
+        cleanup_with_cap(&dir, usize::MAX).unwrap();
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn remove_tree_empties_read_only_nested_folders() {
+        let root = test_dir();
+        let dir = open_dir(root.path());
+        let nested = root.path().join("tree/a/b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink("file", nested.join("link")).unwrap();
+        for folder in ["tree/a/b", "tree/a", "tree"] {
+            fs::set_permissions(root.path().join(folder), fs::Permissions::from_mode(0o555))
+                .unwrap();
+        }
+        remove_tree(&dir, OsStr::new("tree")).unwrap();
+        assert!(!root.path().join("tree").exists());
+    }
+    #[test]
+    fn stale_copy_areas_are_swept_and_live_ones_are_kept() {
+        let root = test_dir();
+        let dir = open_dir(root.path());
+        let stale = root.path().join("copy-1-00000000000000000000000000000001.d");
+        let live = root.path().join("copy-1-00000000000000000000000000000002.d");
+        for area in [&stale, &live] {
+            fs::create_dir_all(area.join("nested")).unwrap();
+            fs::write(area.join("nested/file"), "x").unwrap();
+            fs::set_permissions(area.join("nested"), fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        // The age check reads the area's own time; nested changes would not move it.
+        old(&stale);
+        old(&live);
+        let _held = lock(&live);
+        cleanup(&dir).unwrap();
+        assert!(!stale.exists());
+        assert!(live.exists());
+        fs::set_permissions(live.join("nested"), fs::Permissions::from_mode(0o700)).unwrap();
     }
     #[test]
     fn repository_staging_is_private_to_git_and_invisible_to_status() {
@@ -457,14 +828,9 @@ mod tests {
         fs::write(root.path().join(".env"), "original").unwrap();
         let dir = open_dir(root.path());
         let mut candidate = Candidate::create(&dir).unwrap();
-        assert!(!candidate.hidden);
-        assert!(
-            handle_path(&candidate.staging.try_clone().unwrap().into_std_file())
-                .unwrap()
-                .starts_with(root.path().join(".git"))
-        );
+        assert!(staging_path(&candidate).starts_with(root.path().join(".git")));
         candidate.file().write_all(b"secret draft").unwrap();
-        let pending = name(false).unwrap();
+        let pending = name().unwrap();
         link_file(candidate.file(), &candidate.staging, &pending).unwrap();
         candidate.linked = Some(pending);
         let status = git(
@@ -487,32 +853,113 @@ mod tests {
         assert_eq!(fs::read(root.path().join(".env")).unwrap(), b"updated");
     }
     #[test]
-    fn non_repository_uses_hidden_sibling_and_cleans_stale_entries() {
+    fn non_repository_stages_privately_and_never_in_the_users_directory() {
         let root = test_dir();
-        let dir = open_dir(root.path());
-        let stale = ".123-00000000000000000000000000000001.tmp";
-        fs::write(root.path().join(stale), "old").unwrap();
-        old(&root.path().join(stale));
-        let live = ".123-00000000000000000000000000000002.tmp";
-        fs::write(root.path().join(live), "live").unwrap();
-        old(&root.path().join(live));
-        let held = File::open(root.path().join(live)).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        fs::write(root.path().join(".unrelated.tmp"), "keep").unwrap();
-        fs::write(root.path().join("document"), "old").unwrap();
-        let mut candidate = Candidate::create(&dir).unwrap();
-        assert!(candidate.hidden);
-        assert!(!root.path().join(stale).exists());
-        assert!(root.path().join(live).exists());
-        assert!(root.path().join(".unrelated.tmp").exists());
+        let cache = private_cache(root.path());
+        let work = root.path().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("document"), "old").unwrap();
+        let dir = open_dir(&work);
+        let mut candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
+        assert!(staging_path(&candidate).starts_with(&cache));
         candidate.file().write_all(b"new").unwrap();
         candidate
             .publish(&dir, OsStr::new("document"), true)
             .unwrap();
-        assert_eq!(fs::read(root.path().join("document")).unwrap(), b"new");
+        assert_eq!(fs::read(work.join("document")).unwrap(), b"new");
+        let names: Vec<_> = fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![OsString::from("document")]);
+    }
+    #[test]
+    fn crash_between_link_and_rename_leaves_nothing_in_the_users_directory() {
+        let root = test_dir();
+        let cache = private_cache(root.path());
+        let work = root.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let dir = open_dir(&work);
+        let mut candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
+        candidate.file().write_all(b"secret draft").unwrap();
+        candidate
+            .file()
+            .set_permissions(fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let pending = name().unwrap();
+        link_file(candidate.file(), &candidate.staging, &pending).unwrap();
+        let staging = staging_path(&candidate);
+        std::mem::forget(candidate);
+        assert_eq!(fs::read_dir(&work).unwrap().count(), 0);
+        let mode = fs::metadata(&staging).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+        assert!(staging.join(&pending).exists());
+        assert!(staging.starts_with(&cache));
+    }
+    #[test]
+    fn a_missing_cache_directory_is_created_private() {
+        let root = test_dir();
+        let cache = root.path().join("fresh/cache");
+        let work = root.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let dir = open_dir(&work);
+        let candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
+        assert!(staging_path(&candidate).starts_with(&cache));
+        let mode = fs::metadata(&cache).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+    }
+    #[test]
+    fn unusable_cache_falls_back_to_a_private_destination_child_removed_after_publish() {
+        let root = test_dir();
+        let work = root.path().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("document"), "old").unwrap();
+        let not_a_directory = root.path().join("cache-file");
+        fs::write(&not_a_directory, "").unwrap();
+        let dir = open_dir(&work);
+        let mut candidate =
+            Candidate::create_with_cache(&dir, Some(not_a_directory.clone())).unwrap();
+        let staging = staging_path(&candidate);
+        assert_eq!(staging, work.join(".oarlock-staging"));
+        let mode = fs::metadata(&staging).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+        candidate.file().write_all(b"new").unwrap();
+        candidate
+            .publish(&dir, OsStr::new("document"), true)
+            .unwrap();
+        drop(candidate);
+        assert!(!work.join(".oarlock-staging").exists());
+        assert_eq!(fs::read(work.join("document")).unwrap(), b"new");
+    }
+    #[test]
+    fn a_non_empty_destination_child_is_left_in_place() {
+        let root = test_dir();
+        let work = root.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let not_a_directory = root.path().join("cache-file");
+        fs::write(&not_a_directory, "").unwrap();
+        let dir = open_dir(&work);
+        let candidate = Candidate::create_with_cache(&dir, Some(not_a_directory)).unwrap();
+        fs::write(work.join(".oarlock-staging/other"), "keep").unwrap();
+        drop(candidate);
+        assert!(work.join(".oarlock-staging/other").exists());
+    }
+    #[test]
+    fn a_foreign_git_marker_never_gets_a_destination_child_and_refuses_without_a_cache() {
+        let root = test_dir();
+        std::os::unix::fs::symlink("elsewhere", root.path().join(".git")).unwrap();
+        let dir = open_dir(root.path());
+        let error = Candidate::create_with_cache(&dir, None).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(!root.path().join(".oarlock-staging").exists());
+        assert!(!root.path().join("oarlock-staging").exists());
+    }
+    #[test]
+    fn same_mount_is_reflexive_and_distinguishes_volumes() {
+        let root = test_dir();
+        let dir = open_dir(root.path());
+        assert!(same_mount(&dir, &dir).unwrap());
+        if let Some(second) = std::env::var_os("OARLOCK_TEST_SECOND_VOLUME") {
+            let other = tempfile::tempdir_in(second).unwrap();
+            assert!(!same_mount(&dir, &open_dir(other.path())).unwrap());
+        }
     }
     #[test]
     fn linked_worktree_with_cross_volume_common_dir_uses_cache_or_refuses() {
@@ -554,14 +1001,11 @@ mod tests {
                 worktree.to_str().unwrap(),
             ],
         );
-        let cache = other.path().join("cache");
-        fs::create_dir(&cache).unwrap();
+        let cache = private_cache(other.path());
         let dir = open_dir(&worktree);
         assert!(Candidate::create_with_cache(&dir, None).is_err());
         let mut candidate = Candidate::create_with_cache(&dir, Some(cache.clone())).unwrap();
-        assert!(!candidate.hidden);
-        let actual = handle_path(&candidate.staging.try_clone().unwrap().into_std_file()).unwrap();
-        assert!(actual.starts_with(&cache), "{}", actual.display());
+        assert!(staging_path(&candidate).starts_with(&cache));
         candidate.file().write_all(b"updated").unwrap();
         candidate
             .publish(&dir, OsStr::new("file.txt"), true)
@@ -596,7 +1040,7 @@ mod tests {
         let dir = open_dir(root.path());
         let mut candidate = Candidate::create(&dir).unwrap();
         candidate.file().write_all(b"private draft").unwrap();
-        let pending = name(false).unwrap();
+        let pending = name().unwrap();
         link_file(candidate.file(), &candidate.staging, &pending).unwrap();
         candidate.linked = Some(pending.clone());
         candidate.staging.remove_file(&pending).unwrap();
@@ -619,7 +1063,7 @@ mod tests {
         let root = test_dir();
         let dir = open_dir(root.path());
         for fifo in [false, true] {
-            let name = format!(".123-{:032x}.tmp", usize::from(fifo));
+            let name = format!("123-{:032x}.tmp", usize::from(fifo));
             let path = root.path().join(&name);
             if fifo {
                 let name = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -627,7 +1071,7 @@ mod tests {
             } else {
                 std::os::unix::fs::symlink("missing", &path).unwrap();
             }
-            cleanup(&dir, true).unwrap();
+            cleanup(&dir).unwrap();
             assert!(fs::symlink_metadata(&path).is_ok());
             fs::remove_file(path).unwrap();
         }
@@ -638,5 +1082,19 @@ mod tests {
         let error = unnamed(&proc, 0o600).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("O_TMPFILE"), "{error}");
+    }
+    #[test]
+    fn noreplace_publication_keeps_an_existing_entry() {
+        let root = test_dir();
+        fs::create_dir(root.path().join("from")).unwrap();
+        fs::create_dir(root.path().join("to")).unwrap();
+        fs::write(root.path().join("from/item"), "new").unwrap();
+        fs::write(root.path().join("to/item"), "old").unwrap();
+        let (from, to) = (open_dir(&root.path().join("from")), open_dir(&root.path().join("to")));
+        let error =
+            rename_noreplace_at(from.as_raw_fd(), OsStr::new("item"), to.as_raw_fd(), OsStr::new("item"))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(root.path().join("to/item")).unwrap(), b"old");
     }
 }
