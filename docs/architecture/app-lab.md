@@ -17,13 +17,19 @@ builds the normal frontend and fails if any `bench` chunk or marker string is em
 # one scenario against this checkout (builds the bench app first; release, private target dir)
 bun scripts/app-lab/run.ts --scenario tabs --target-dir /tmp/app-lab-target --report tabs.json
 
-# measure a pristine revision instead of the working tree (HEAD or any rev, plus the overlay)
+# measure an instrumented committed revision instead of the working tree
 scripts/app-lab/export-tree.sh /tmp/app-lab-src HEAD
+(cd /tmp/app-lab-src && bun install --frozen-lockfile && bun run build:cli)
 bun scripts/app-lab/run.ts --scenario tabs --source /tmp/app-lab-src --target-dir /tmp/app-lab-target
 
 bun scripts/app-lab/run.ts --compare base.json [base2.json ...] --candidate cand.json
 bun scripts/app-lab/app_report.ts report1.json report2.json    # one comparable line per report
 ```
+
+The export contains only the selected revision; it never overlays current edits
+or shares the working tree's dependencies. A revision predating app-lab's
+instrumentation is refused. Install that revision's locked dependencies and
+build its CLI as shown before running the benchmark.
 
 Build time on an M4 (10 cores): cold release build including every dependency 2 min 14 s;
 after a frontend or app change 88 to 90 s (the frontend itself 6 s). `--reuse-build` skips
