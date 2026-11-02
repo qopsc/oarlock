@@ -2,7 +2,7 @@
   "extends": "../tsconfig.json",
   "compilerOptions": {
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    "types": ["node"]
+    "types": ["node", "@webgpu/types"]
   },
   "include": [
     "../src/vite-env.d.ts",
@@ -16,6 +16,9 @@
     "editor-search",
     "vim-review",
     "ipc-profile/run.ts",
+    "ipc-profile/smoke.ts",
+    "ipc-profile/fsLifecycle.ts",
+    "ipc-profile/fsLifecycle.test.ts",
     "renderer-profile/lab_report.ts",
     "renderer-profile/lab_report.test.ts",
     "renderer-profile/libproc.ts",

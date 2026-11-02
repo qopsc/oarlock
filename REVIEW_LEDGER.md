@@ -4623,7 +4623,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R112 | Closed; final-asset check manual | The Linux Nix install now copies the bundled CLI alongside the application. A fixture runs the actual install phase. |
 | R113 | Closed | The release workflow validates a version-tag ref before any publishing job; branch and non-version-tag dispatches fail the validation job. |
 | R116 | Closed | Benchmark export archives only the selected commit and does not copy current edits, dependencies or sidecar binaries. A real temporary-repository regression reproduced dirty-file contamination. |
-| R118 | Open, Tier 2 | The IPC profiling harness still invokes obsolete watch removal and search request contracts. Its AI-specific profiling remains on hold. |
+| R118 | Filesystem portion closed; AI held | The IPC profiling harness uses acquired watch handles and page-owned cancellable search. Its AI-specific profiling remains on hold. |
 | R122 | Closed | The shell-integration guide describes profile-specific launch-only fish integration, consistent with `apply_fish_init`. |
 | R123 | Closed | The WebGL guide now describes one WASM instance per terminal from a shared compiled module, consistent with the resource guide. |
 | R171 | AI/MCP on hold | The affected text-window tool belongs to the held AI backend. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **20 closed; 5 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **21 closed or partially held; 4 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4743,3 +4743,9 @@ Validation: both focused fixtures and the full frontend suite passed (6,100 pass
 The app-lab export now archives only the selected commit. It does not overlay dirty files, share the working tree's dependencies, or copy its sidecar binary. The export verifies the revision before creating the destination and rejects a revision lacking app-lab instrumentation; the instructions now require installing that snapshot's locked dependencies and building its own CLI. This deliberately stops supporting implicit instrumentation overlays for older revisions, because those overlays could contain unrelated edits.
 
 Validation: a disposable real-Git regression reproduced a dirty application file entering the old export; it now confirms committed contents, no shared dependencies or copied sidecar, rejection of invalid refs before destination creation, and refusal of an uninstrumented revision. A real archive of current HEAD also passed those file checks. The full macOS native suite and strict Clippy passed; the full frontend suite passed 6,101 tests (two skipped), types passed and lint remained at 80 warnings. A full benchmark build from an exported snapshot was not run; installing the snapshot's dependencies and building its CLI are manual prerequisites.
+
+### R118 checkpoint — IPC profiling filesystem ownership
+
+The filesystem portion of the profiling harness now retains the handles returned by native watch registration and releases those exact handles in a `finally` block. Interactive grep uses the existing page-owned search helper and explicitly cancels the superseded request; file searches use request keys. The harness's filesystem helper and smoke file are now included in script type checking. AI-related profiling remains on hold and was not changed or run.
+
+Validation: focused tests exercise release on failure and cancellation before a replacement search, alongside the existing page-ownership tests. The profiling frontend bundle built successfully; the live macOS smoke harness was not run because it also executes held AI checks. The full macOS native suite and strict Clippy passed; the full frontend suite passed 6,103 tests (two skipped), types passed and lint remained at 80 warnings. Manual follow-up after the AI backend decision: run the full IPC profile and confirm watch events, exact cleanup and search cancellation against the packaged app.
