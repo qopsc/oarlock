@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn the_branch_rule_agrees_with_git() {
         let git_accepts = |name: &str| {
-            std::process::Command::new("git")
+            crate::modules::git::process::test_git()
                 .args(["check-ref-format", "--branch", name])
                 .output()
                 .map(|o| o.status.success())

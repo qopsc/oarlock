@@ -627,6 +627,25 @@ const ISOLATED_GIT_ENV: &[&str] = &[
     "GIT_CONFIG_NOSYSTEM",
 ];
 
+/// Unit tests run production Git launches too; none may read the developer's
+/// `$HOME` Git configuration (LFS filters, signing programs, a monitor).
+#[cfg(test)]
+fn isolate_test_home(cmd: &mut Command) {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let home = HOME.get_or_init(|| tempfile::tempdir().expect("isolated home"));
+    cmd.env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"));
+}
+
+/// A plain `git` for test setup, isolated the same way.
+#[cfg(test)]
+pub(crate) fn test_git() -> Command {
+    let mut cmd = Command::new("git");
+    isolate_test_home(&mut cmd);
+    cmd
+}
+
 static GIT_PROGRAM: OnceLock<OsString> = OnceLock::new();
 
 /// The `git` found on `PATH` the first time Git is needed, as an absolute path,
@@ -691,6 +710,8 @@ fn build_git_command(
     }
 
     let mut cmd = Command::new(git_program());
+    #[cfg(test)]
+    isolate_test_home(&mut cmd);
     // Every path this API receives names an entry selected by the caller.
     // `--` only stops option parsing; it does not stop Git's glob expansion.
     cmd.arg("--literal-pathspecs");
@@ -775,11 +796,10 @@ mod tests {
         use super::git_show_text;
         use crate::modules::git::utils::owned_repo_root;
         use crate::modules::workspace::WorkspaceRegistry;
-        use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let repo = std::fs::canonicalize(dir.path()).unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = super::test_git()
                 .args(args)
                 .current_dir(&repo)
                 .output()
@@ -823,12 +843,11 @@ mod tests {
     fn a_timed_out_commit_removes_its_index_lock_and_stops_its_hooks() {
         use super::run_git;
         use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
 
         let dir = tempfile::tempdir().unwrap();
         let repo = std::fs::canonicalize(dir.path()).unwrap();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
+            let out = super::test_git()
                 .args(args)
                 .current_dir(&repo)
                 .output()
@@ -1161,6 +1180,23 @@ mod tests {
         if first != "git" {
             assert!(std::path::Path::new(first).is_absolute());
         }
+    }
+
+    #[test]
+    fn unit_tests_never_read_the_developers_global_git_configuration() {
+        let production = super::run_git(
+            &WorkspaceEnv::Local,
+            None,
+            ["config", "--global", "--list"],
+            10,
+        )
+        .unwrap();
+        assert!(production.stdout.is_empty(), "production launch saw a global config");
+        let setup = super::test_git()
+            .args(["config", "--global", "--list"])
+            .output()
+            .unwrap();
+        assert!(setup.stdout.is_empty(), "test setup saw a global config");
     }
 
     #[test]

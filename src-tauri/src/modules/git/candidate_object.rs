@@ -103,14 +103,14 @@ mod tests {
     use super::*;
     use std::{
         io::Write,
-        process::{Command, Stdio},
+        process::Stdio,
     };
 
     #[test]
     fn blob_identity_matches_real_git() {
         let content = b"hello\0world\n";
         let identity = ObjectIdentity::capture(ObjectKind::Blob, content, content.len()).unwrap();
-        let mut git = Command::new("git")
+        let mut git = crate::modules::git::process::test_git()
             .args(["hash-object", "--stdin"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

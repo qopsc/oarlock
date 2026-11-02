@@ -258,7 +258,7 @@ mod tests {
     use std::path::Path;
 
     fn git(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        crate::modules::git::process::test_git()
             .args([
                 "-c",
                 "user.name=t",
@@ -299,7 +299,7 @@ mod tests {
         std::fs::write(root.join("file"), "two\n").unwrap();
         assert!(git(&root, &["commit", "-q", "-a", "-m", "two"]));
         assert!(git(&root, &["branch", "other"]));
-        let head = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&root).output().unwrap();
+        let head = crate::modules::git::process::test_git().args(["rev-parse", "HEAD"]).current_dir(&root).output().unwrap();
         assert!(head.status.success());
         let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
         let registry = WorkspaceRegistry::default();

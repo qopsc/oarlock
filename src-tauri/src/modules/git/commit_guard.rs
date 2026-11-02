@@ -374,14 +374,14 @@ pub(super) fn preflight(repo: &ResolvedGitDirectory) -> Result<()> {
 mod tests {
     use super::*;
     use crate::modules::workspace::{WorkspaceEnv, WorkspaceRegistry};
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn guarded_invocation_neutralizes_new_hooks_and_fsmonitor_after_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::modules::git::process::test_git()
                 .current_dir(&root)
                 .args(args)
                 .output()

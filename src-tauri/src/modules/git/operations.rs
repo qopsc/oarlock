@@ -1108,7 +1108,7 @@ mod tests {
     use crate::modules::git::commit_files::status_label_for;
 
     fn git(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        crate::modules::git::process::test_git()
             .args([
                 "-c",
                 "user.name=t",

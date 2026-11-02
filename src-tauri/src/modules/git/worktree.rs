@@ -585,7 +585,6 @@ fn remove(
 mod tests {
     use super::super::utils::authorized_repo_root;
     use super::*;
-    use std::process::Command;
 
     fn entry(path: &str) -> GitWorktreeEntry {
         GitWorktreeEntry {
@@ -900,7 +899,7 @@ mod tests {
     // Integration tests against real repositories.
 
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("git")
+        crate::modules::git::process::test_git()
             .args([
                 "-c",
                 "user.name=t",
@@ -937,7 +936,7 @@ mod tests {
         /// A repository `app` with one commit on `main` and a branch `other`, the repository
         /// folder alone authorized.
         fn new() -> Option<Self> {
-            if Command::new("git").arg("--version").output().is_err() {
+            if crate::modules::git::process::test_git().arg("--version").output().is_err() {
                 return None;
             }
             let dir = tempfile::tempdir().unwrap();
