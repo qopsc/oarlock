@@ -10,11 +10,29 @@ const MAX_PENDING_BYTES = 256 * 1024;
  * answer carries up to 32 MiB as base64 (`terminalIntegration.ts`).
  */
 const MAX_REPLY_BYTES = 64 * 1024 * 1024;
+/**
+ * One input unit (a paste) may exceed the budget while nothing beyond the
+ * budget is queued; past this it is refused.
+ */
+const MAX_INPUT_UNIT_BYTES = 8 * 1024 * 1024;
+/**
+ * A reserved position nobody filled in this long is released: the longest
+ * wait behind one is a clipboard capture (15 s) plus its page wait (30 s).
+ */
+const RESERVED_SLOT_DEADLINE_MS = 60_000;
 const MAX_WRITE_BATCH_BYTES = 64 * 1024;
 const MAX_PENDING_ACTIONS = 256;
 
 type PendingBytes = { kind: "bytes"; bytes: Uint8Array; reply: boolean; valid?: () => boolean; cancelled?: () => void };
-type PendingAction = { kind: "action"; run: (() => void) | null; active: boolean; size: number };
+type PendingAction = {
+  kind: "action";
+  run: (() => void) | null;
+  active: boolean;
+  size: number;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+export type InputRefusal = "input-full" | "input-too-large" | "actions-full" | "slot-timeout";
 type Pending = PendingBytes | PendingAction;
 
 /**
@@ -34,7 +52,19 @@ export class BoundedPtyWriter {
   private actionBytes = 0;
   private insertion: number | null = null;
 
-  constructor(private readonly onError: (error: unknown) => void) {}
+  /**
+   * `onError` is for a PTY write that failed: the writer stops until
+   * detached. `onRefused` names input dropped for a bound, which leaves the
+   * writer working.
+   */
+  constructor(
+    private readonly onError: (error: unknown) => void,
+    private readonly onRefused: (reason: InputRefusal) => void = () => undefined,
+  ) {}
+
+  get hasFailed(): boolean {
+    return this.failed;
+  }
 
   attach(pty: PtySession): void {
     if (this.disposed) return;
@@ -64,12 +94,30 @@ export class BoundedPtyWriter {
   }
 
   clear(): void {
-    for (const item of this.queue) if (item.kind === "action") item.active = false;
+    for (const item of this.queue) if (item.kind === "action") this.retire(item);
     this.queue.length = 0;
     this.inputBytes = 0;
     this.replyBytes = 0;
     this.actions = 0;
     this.actionBytes = 0;
+  }
+
+  private retire(item: PendingAction): void {
+    item.active = false;
+    if (item.timer !== null) clearTimeout(item.timer);
+    item.timer = null;
+  }
+
+  private release(item: PendingAction, reason: InputRefusal): void {
+    if (!item.active) return;
+    const index = this.queue.indexOf(item);
+    if (index >= 0) this.queue.splice(index, 1);
+    if (this.insertion !== null && index >= 0 && index < this.insertion) this.insertion--;
+    this.retire(item);
+    this.actions--;
+    this.actionBytes -= item.size;
+    this.onRefused(reason);
+    void this.flush();
   }
 
   private insert(item: Pending): void {
@@ -81,19 +129,24 @@ export class BoundedPtyWriter {
   reserveInput(): ((action: () => void, size?: number) => void) | null {
     if (this.disposed || this.failed) return null;
     if (this.actions >= MAX_PENDING_ACTIONS) {
-      this.fail(new Error("Terminal input queue is full"));
+      this.onRefused("actions-full");
       return null;
     }
-    const item: PendingAction = { kind: "action", run: null, active: true, size: 0 };
+    const item: PendingAction = { kind: "action", run: null, active: true, size: 0, timer: null };
+    item.timer = setTimeout(() => this.release(item, "slot-timeout"), RESERVED_SLOT_DEADLINE_MS);
     this.actions++;
     this.insert(item);
     return (action, size = 0) => {
       if (!item.active || item.run) return;
+      const queued = this.inputBytes + this.actionBytes;
       if (!Number.isSafeInteger(size) || size < 0 ||
-          this.inputBytes + this.actionBytes + size > MAX_PENDING_BYTES) {
-        this.fail(new Error("Terminal input queue is full"));
+          (queued + size > MAX_PENDING_BYTES &&
+            (queued > MAX_PENDING_BYTES || size > MAX_INPUT_UNIT_BYTES))) {
+        this.release(item, size > MAX_INPUT_UNIT_BYTES ? "input-too-large" : "input-full");
         return;
       }
+      if (item.timer !== null) clearTimeout(item.timer);
+      item.timer = null;
       item.size = size;
       this.actionBytes += size;
       item.run = action;
@@ -120,13 +173,14 @@ export class BoundedPtyWriter {
   enqueue(bytes: Uint8Array, reply = false, valid?: () => boolean, cancelled?: () => void): boolean {
     if (this.disposed || this.failed || bytes.byteLength === 0) return false;
     const queued = reply ? this.replyBytes : this.inputBytes + this.actionBytes;
+    const limit = reply ? MAX_REPLY_BYTES : MAX_INPUT_UNIT_BYTES;
     const fits =
       queued + bytes.byteLength <= MAX_PENDING_BYTES ||
-      (reply &&
-        queued <= MAX_PENDING_BYTES &&
-        bytes.byteLength <= MAX_REPLY_BYTES);
+      (queued <= MAX_PENDING_BYTES && bytes.byteLength <= limit);
     if (!fits) {
-      this.fail(new Error("Terminal input queue is full"));
+      if (!reply) {
+        this.onRefused(bytes.byteLength > MAX_INPUT_UNIT_BYTES ? "input-too-large" : "input-full");
+      }
       return false;
     }
     this.insert({ kind: "bytes", bytes, reply, valid, cancelled });
@@ -159,7 +213,7 @@ export class BoundedPtyWriter {
         if (first.kind === "action") {
           if (!first.run) return;
           this.queue.shift();
-          first.active = false;
+          this.retire(first);
           this.actions--;
           this.actionBytes -= first.size;
           this.insertion = 0;

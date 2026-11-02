@@ -19,7 +19,11 @@ import { initializeSessionGeneration as startSessionInitialization, waitForSessi
 import { BoundedPtyWriter } from "@/modules/terminal/lib/BoundedPtyWriter";
 import { captureCompletionOwner } from "@/modules/terminal/lib/completionOwnership";
 import { captureInputOwner } from "@/modules/terminal/lib/inputOwnership";
-import { reportPendingInputCancellation, reportTerminalInputFailure } from "@/modules/terminal/lib/inputNotices";
+import {
+  reportPendingInputCancellation,
+  reportTerminalInputFailure,
+  reportTerminalInputRefused,
+} from "@/modules/terminal/lib/inputNotices";
 import { scheduleOwnedInput } from "@/modules/terminal/lib/orderedAppInput";
 import { LatestClipboardWrite } from "@/modules/terminal/lib/LatestClipboardWrite";
 import { setLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
@@ -975,7 +979,10 @@ function ensureSession(
     input: null,
     pty: null,
     ptyResize,
-    writer: new BoundedPtyWriter((error) => reportTerminalInputFailure(leafId, error)),
+    writer: new BoundedPtyWriter(
+      (error) => reportTerminalInputFailure(leafId, error),
+      (reason) => reportTerminalInputRefused(leafId, reason),
+    ),
     container: null,
     callbacks: {},
     visible: false,
