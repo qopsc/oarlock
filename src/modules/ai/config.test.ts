@@ -258,7 +258,7 @@ it("legacy model references resolve to native metadata and become unavailable wh
   expect(endpointIdFromCompatModel("openai-compatible-custom")).toBe("legacy");
   expect(resolveModel("openai-compatible-custom", endpoints)).toMatchObject({
     label: endpoint.modelId,
-    description: `${endpoint.name} — ${endpoint.baseURL}`,
+    description: `${endpoint.name}: ${endpoint.baseURL}`,
   });
   expect(isResolvableModelId("openai-compatible-custom", endpoints)).toBe(true);
   expect(isResolvableModelId("openai-compatible-custom", [])).toBe(false);

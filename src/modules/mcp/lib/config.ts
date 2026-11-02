@@ -5,6 +5,8 @@
  * kept in the keychain, which only the backend reads.
  */
 
+import { isWindowsPath } from "@/lib/windowsPath";
+
 export type McpTransportType = "stdio" | "http" | "sse";
 
 /** A variable or header. A secret one has no value here. */
@@ -387,9 +389,5 @@ export function validateServer(
 }
 
 export function isAbsolutePath(path: string): boolean {
-  return (
-    path.startsWith("/") ||
-    /^[A-Za-z]:[\\/]/.test(path) ||
-    path.startsWith("\\\\")
-  );
+  return path.startsWith("/") || isWindowsPath(path);
 }

@@ -271,7 +271,7 @@ export function createNative(
         ...AI_ORIGIN,
       }),
     // AI tooling never sees dot-prefixed entries regardless of the user's
-    // explorer preference — keeps .git / .env / .ssh out of agent context.
+    // explorer preference: keeps .git / .env / .ssh out of agent context.
     readDir: (path: string) =>
       invoke<DirEntry[]>("fs_read_dir", {
         path,

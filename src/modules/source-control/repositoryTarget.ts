@@ -1,3 +1,4 @@
+import { isWindowsPath } from "@/lib/windowsPath";
 import type { SidebarViewId } from "@/modules/sidebar";
 import type { Tab } from "@/modules/tabs";
 
@@ -5,9 +6,7 @@ export type SourceControlRepositoryTarget =
   | { mode: "follow-context" }
   | { mode: "fixed"; repoRoot: string };
 
-export type SourceControlRepositoryTargets = Readonly<
-  Record<string, string>
->;
+export type SourceControlRepositoryTargets = Readonly<Record<string, string>>;
 
 const FOLLOW_CONTEXT: SourceControlRepositoryTarget = {
   mode: "follow-context",
@@ -18,9 +17,7 @@ function targetScopeKey(spaceId: string, workspaceKey: string): string {
 }
 
 export function normalizeSourceControlPath(path: string): string {
-  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\")
-    ? path.replace(/\\/g, "/")
-    : path;
+  return isWindowsPath(path) ? path.replace(/\\/g, "/") : path;
 }
 
 function dirname(path: string | null): string | null {
@@ -41,9 +38,7 @@ export function repositoryTargetForSpace(
   workspaceKey: string,
 ): SourceControlRepositoryTarget {
   const repoRoot = targets[targetScopeKey(spaceId, workspaceKey)];
-  return repoRoot
-    ? { mode: "fixed", repoRoot }
-    : FOLLOW_CONTEXT;
+  return repoRoot ? { mode: "fixed", repoRoot } : FOLLOW_CONTEXT;
 }
 
 export function setRepositoryTargetForSpace(

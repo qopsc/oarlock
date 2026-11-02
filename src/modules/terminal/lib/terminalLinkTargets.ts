@@ -1,3 +1,4 @@
+import { isWindowsDrivePath, isWindowsPath } from "@/lib/windowsPath";
 import { openExternalUrl } from "@/lib/external-link";
 import { authorizeFileFolder } from "@/modules/workspace/authorize";
 import { getWslHome, workspaceEnvForPath } from "@/modules/workspace/env";
@@ -155,21 +156,18 @@ export async function openTerminalLinkTarget(
 }
 
 function isAbsolutePath(path: string): boolean {
-  return (
-    path.startsWith("/") ||
-    /^[A-Za-z]:[\\/]/.test(path) ||
-    path.startsWith("\\\\")
-  );
+  return path.startsWith("/") || isWindowsPath(path);
 }
 
 /** Joins and normalizes `.`/`..` segments, keeping the base's separator. */
 export function joinPath(base: string, relative: string): string {
-  const windows = /^[A-Za-z]:[\\/]/.test(base) || base.startsWith("\\\\");
-  const separator = windows && base.includes("\\") && !base.includes("/") ? "\\" : "/";
+  const windows = isWindowsPath(base);
+  const separator =
+    windows && base.includes("\\") && !base.includes("/") ? "\\" : "/";
   const uncRoot = /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.exec(base)?.[0];
   const root =
     uncRoot ??
-    (/^[A-Za-z]:[\\/]/.test(base)
+    (isWindowsDrivePath(base)
       ? base.slice(0, 3)
       : base.startsWith("/")
         ? "/"
