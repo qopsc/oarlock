@@ -364,15 +364,24 @@ export function createNative(
         workspace: environment(),
         ...AI_ORIGIN,
       }),
-    shellBgLogs: (handle: number, sinceOffset?: number) =>
+    shellBgLogs: (
+      handle: number,
+      sinceOffset?: number,
+      chatId?: string | null,
+    ) =>
       invoke<{
         bytes: string;
         next_offset: number;
         dropped: number;
         exited: boolean;
         exit_code: number | null;
-      }>("shell_bg_logs", { handle, sinceOffset: sinceOffset ?? null }),
-    shellBgKill: (handle: number) => invoke<void>("shell_bg_kill", { handle }),
+      }>("shell_bg_logs", {
+        handle,
+        sinceOffset: sinceOffset ?? null,
+        chatId: chatId ?? null,
+      }),
+    shellBgKill: (handle: number, chatId?: string | null) =>
+      invoke<void>("shell_bg_kill", { handle, chatId: chatId ?? null }),
     shellBgList: () =>
       invoke<
         {

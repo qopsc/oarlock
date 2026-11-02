@@ -106,3 +106,25 @@ fn info_reflects_command_and_exit() {
     assert!(info_done.exited);
     assert_eq!(info_done.exit_code, Some(0));
 }
+
+#[test]
+fn a_job_is_reachable_only_from_the_chat_that_started_it() {
+    let proc = background::spawn_owned(
+        "sleep 30".into(),
+        None,
+        WorkspaceEnv::Local,
+        Some("chat-a".into()),
+    )
+    .expect("spawn");
+
+    assert!(proc.reachable_by(Some("chat-a")));
+    assert!(!proc.reachable_by(Some("chat-b")), "another chat");
+    assert!(!proc.reachable_by(None), "a caller naming no chat");
+
+    let unowned = background::spawn("sleep 30".into(), None, WorkspaceEnv::Local).expect("spawn");
+    assert!(unowned.reachable_by(Some("chat-b")));
+    assert!(unowned.reachable_by(None));
+
+    proc.kill();
+    unowned.kill();
+}

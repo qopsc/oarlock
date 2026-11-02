@@ -470,6 +470,8 @@ pub async fn shell_session_close(
     Ok(())
 }
 
+const FOREIGN_JOB: &str = "That background job belongs to another chat.";
+
 #[tauri::command]
 pub async fn shell_bg_spawn(
     app: tauri::AppHandle,
@@ -503,6 +505,7 @@ pub fn shell_bg_logs(
     state: tauri::State<ShellState>,
     handle: u32,
     since_offset: Option<u64>,
+    chat_id: Option<String>,
 ) -> Result<BackgroundLogResponse, String> {
     let proc = state
         .bg
@@ -511,11 +514,18 @@ pub fn shell_bg_logs(
         .get(handle)
         .cloned()
         .ok_or_else(|| "Background job unavailable: unknown handle or finished history expired (the latest 32 finished jobs are retained).".to_string())?;
+    if !proc.reachable_by(chat_id.as_deref()) {
+        return Err(FOREIGN_JOB.into());
+    }
     Ok(proc.read_logs(since_offset.unwrap_or(0)))
 }
 
 #[tauri::command]
-pub fn shell_bg_kill(state: tauri::State<ShellState>, handle: u32) -> Result<(), String> {
+pub fn shell_bg_kill(
+    state: tauri::State<ShellState>,
+    handle: u32,
+    chat_id: Option<String>,
+) -> Result<(), String> {
     let proc = state
         .bg
         .lock()
@@ -523,6 +533,9 @@ pub fn shell_bg_kill(state: tauri::State<ShellState>, handle: u32) -> Result<(),
         .get(handle)
         .cloned();
     if let Some(proc) = proc {
+        if !proc.reachable_by(chat_id.as_deref()) {
+            return Err(FOREIGN_JOB.into());
+        }
         proc.kill();
     }
     Ok(())

@@ -95,6 +95,15 @@ impl BackgroundProc {
     /// alone would leave the server running and holding its port. On Unix the
     /// process leads its own group, which gets SIGTERM and, after
     /// `TERM_GRACE`, SIGKILL; on Windows its job is closed.
+    /// Whether a caller acting for `chat_id` may read this job's logs or stop it: a job a chat
+    /// started belongs to that chat alone; one that names no chat is open to every caller.
+    pub fn reachable_by(&self, chat_id: Option<&str>) -> bool {
+        match self.chat_id.as_deref() {
+            None => true,
+            Some(owner) => chat_id == Some(owner),
+        }
+    }
+
     pub fn kill(&self) {
         if self.exited.load(Ordering::Acquire) || self.killing.swap(true, Ordering::AcqRel) {
             return;

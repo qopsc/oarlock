@@ -177,7 +177,7 @@ export function buildShellTools(ctx: ToolContext) {
             abortSignal?.aborted &&
             usePreferencesStore.getState().aiStopBackgroundJobs
           ) {
-            await native.shellBgKill(handle);
+            await native.shellBgKill(handle, ctx.getSessionId());
             abortSignal.throwIfAborted();
           }
           return { handle, command, cwd: effectiveCwd, ok: true };
@@ -226,14 +226,18 @@ export function buildShellTools(ctx: ToolContext) {
 
     bash_logs: tool({
       description:
-        "Read accumulated logs from a `bash_background` process. Pass `since_offset` from the previous response's `next_offset` to tail incrementally. `dropped` reports bytes evicted by the ring buffer. Only the latest 32 finished jobs retain logs; an expired handle returns an error.",
+        "Read accumulated logs from a `bash_background` process of this chat. Pass `since_offset` from the previous response's `next_offset` to tail incrementally. `dropped` reports bytes evicted by the ring buffer. Only the latest 32 finished jobs retain logs; an expired handle returns an error.",
       inputSchema: z.object({
         handle: z.number().int(),
         since_offset: z.number().int().optional(),
       }),
       execute: async ({ handle, since_offset }) => {
         try {
-          const r = await native.shellBgLogs(handle, since_offset);
+          const r = await native.shellBgLogs(
+            handle,
+            since_offset,
+            ctx.getSessionId(),
+          );
           return r;
         } catch (e) {
           return { error: String(e) };
@@ -257,11 +261,11 @@ export function buildShellTools(ctx: ToolContext) {
 
     bash_kill: tool({
       description:
-        "Terminate a `bash_background` process by handle. Idempotent — kills nothing if the handle is unknown or already exited.",
+        "Terminate a `bash_background` process of this chat by handle. Idempotent — kills nothing if the handle is unknown or already exited; another chat's job is refused.",
       inputSchema: z.object({ handle: z.number().int() }),
       execute: async ({ handle }) => {
         try {
-          await native.shellBgKill(handle);
+          await native.shellBgKill(handle, ctx.getSessionId());
           return { handle, ok: true };
         } catch (e) {
           return { error: String(e) };
