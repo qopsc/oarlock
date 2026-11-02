@@ -4606,7 +4606,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R007 | Open, Tier 2 | The native macOS New Window and Close Tab items still use fixed accelerators outside the configurable accelerator map. |
 | R023 | Windows/WSL port | The mount translation is WSL-specific and outside this release. |
 | R032 | Windows/WSL port | The affected polling path is WSL-specific and outside this release. |
-| R043 | Open, Tier 2 | The safe search keymap is still higher precedence than the editor's Ctrl+G Go to Line binding on Linux; the Windows case is port work. |
+| R043 | Closed | Ctrl+G reaches Go to Line before safe search, while Vim remains first; a CodeMirror precedence regression reproduced the conflict. Windows runtime validation remains port work. |
 | R044 | Open, Tier 2 | The core package is now a tracked workspace package, but its declared types still refer to ignored `dist` files. A copy without `dist` reproduces TS2307 on both imports. The app's clean build has not been shown to fail. |
 | R048 | Closed | Language-server URIs preserve literal Unix backslashes, recognize localhost, reject other hosts, and compare Unix paths without treating backslashes as separators. Regressions reproduced the previous incorrect paths. |
 | R049 | Open, Tier 2 | Native shell-environment capture retains each shell's first result, including failure, while the UI offers redetection. |
@@ -4634,7 +4634,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **9 closed; 16 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
+Counts: **10 closed; 15 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. The two original resource findings R190 and R192, plus R103's format-compatibility policy, await user decisions and remain open.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 
@@ -4673,3 +4673,9 @@ The shell guide now describes launch-only, profile-specific fish integration; th
 Shell startup now reads the locale values from the actual child command and respects `LC_ALL`, `LC_CTYPE`, then `LANG` precedence, ignoring empty values. If the effective value is not UTF-8, it replaces that value with the existing platform fallback; an already effective UTF-8 setting stays untouched. Replacing a non-UTF-8 `LC_ALL` changes all locale categories for the child, a deliberate trade-off needed for the existing UTF-8 terminal guarantee. A regression failed before the change and uses the real `locale charmap` utility after it.
 
 Validation: both focused locale tests passed on macOS and in the offline Linux container. The first Linux attempt ran unrelated integration links concurrently and was killed by the container memory limit; restricting the retry to library tests and one build job passed. The full macOS native suite passed 1,580 library tests (four ignored) and all integration suites; strict Clippy passed. The full frontend suite passed 6,088 tests (two skipped), types passed and lint remained at 80 warnings. Linux emitted four already recorded unrelated warnings.
+
+### R043 checkpoint — Go to Line shortcut
+
+The editor's Ctrl+G binding now precedes the safe search keymap and follows Vim's keymap. A CodeMirror precedence regression failed before the fix and checks both ordinary editing and a higher-priority Vim binding. F3 remains available for the next search match. This is automated keymap coverage; an interactive Linux and packaged macOS shortcut check remains useful.
+
+Validation: focused editor tests and the full frontend suite passed (6,089 passed, two skipped); types passed and lint remained at 80 warnings. The full macOS native suite passed 1,580 library tests (four ignored) and all integration suites; strict Clippy passed.

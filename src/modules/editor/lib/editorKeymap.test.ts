@@ -1,9 +1,10 @@
 import { focusClaimsChord } from "@/modules/shortcuts/lib/shortcutScope";
 import { gotoLine, searchKeymap } from "@codemirror/search";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Prec } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 import { editorClaimedModKey, editorKeymap } from "./editorKeymap";
+import { safeSearchKeymap } from "../search/regexView";
 
 /**
  * The command the editor runs for a key off macOS (where `Mod` is Ctrl): the
@@ -28,6 +29,17 @@ describe("editorKeymap", () => {
 
   it("goes to a line on Ctrl+G ahead of the search keymap's find-next", () => {
     expect(commandFor(state, "Ctrl-g")).toBe(gotoLine);
+  });
+
+  it("goes to a line ahead of the safe search keymap, while Vim retains priority", () => {
+    const editor = editorKeymap(vi.fn());
+    const normal = EditorState.create({ extensions: [editor, safeSearchKeymap] });
+    expect(commandFor(normal, "Ctrl-g")).toBe(gotoLine);
+
+    const vimCommand = () => true;
+    const vim = Prec.highest(keymap.of([{ key: "Ctrl-g", run: vimCommand }]));
+    const withVim = EditorState.create({ extensions: [vim, editor, safeSearchKeymap] });
+    expect(commandFor(withVim, "Ctrl-g")).toBe(vimCommand);
   });
 
   it("saves on Mod+S", () => {

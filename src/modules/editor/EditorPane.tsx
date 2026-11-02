@@ -572,6 +572,8 @@ export const EditorPane = memo(
         vimCompartment.of(
           usePreferencesStore.getState().vimMode ? Prec.highest(vim()) : [],
         ),
+        // Before safe search, but after Vim, so Ctrl+G reaches Go to Line.
+        editorKeymap(() => void performSaveRef.current()),
         wrapCompartment.of(
           wordWrapExtension(
             usePreferencesStore.getState().editorWordWrap
@@ -608,7 +610,6 @@ export const EditorPane = memo(
           getDocument: () => completionDocument.current(),
           getLanguage: () => languageRef.current,
         }),
-        editorKeymap(() => void performSaveRef.current()),
       ],
       [searchCounts],
     );

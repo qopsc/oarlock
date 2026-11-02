@@ -8,7 +8,7 @@ import { keymap } from "@codemirror/view";
  * off macOS) to find-next; F3 still finds the next match.
  */
 export function editorKeymap(save: () => void): Extension {
-  return Prec.high(
+  return Prec.highest(
     keymap.of([
       {
         key: "Mod-s",
