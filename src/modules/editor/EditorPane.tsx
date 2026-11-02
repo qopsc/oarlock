@@ -2,7 +2,6 @@ import {
   safeFindNext as findNext,
   safeFindPrevious as findPrevious,
 } from "./search/regexView";
-import { editorQuitExtension } from "./lib/quitExtension";
 import { completionPreferences } from "./lib/autocomplete/preferences";
 import type { CompletionCredential } from "./lib/autocomplete/credential";
 import { useOwnedWorkspace } from "@/modules/workspace/owner";
@@ -565,7 +564,6 @@ export const EditorPane = memo(
 
     const extensions = useMemo(
       () => [
-        editorQuitExtension,
         // basicSetup is added before user extensions by @uiw/react-codemirror,
         // so we must elevate vim's precedence to win the keymap.
         vimCompartment.of(

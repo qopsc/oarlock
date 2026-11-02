@@ -276,11 +276,7 @@ it("retained deleted drafts never follow replacement-file events", () => {
   ).toEqual([]);
 });
 
-it("renames and deletion cancel final verification before applying their complete identity chain", async () => {
-  const { sealEditors, releaseEditors, editorMutationsPending } = await import(
-    "./quitBarrier"
-  );
-  const { QuitApproval } = await import("@/app/hooks/quitApproval");
+it("chained renames and a deletion apply in order and keep the unsaved draft at its last name", async () => {
   const session = new DocumentSession(
     {
       read: async () => ({
@@ -305,33 +301,6 @@ it("renames and deletion cancel final verification before applying their complet
   session.open("/a");
   await flush();
   session.change("unsaved draft");
-  let finishCancel!: (cancelled: boolean) => void;
-  let finishFlush!: (saved: boolean) => void;
-  const host = {
-    read: () => new Map([[1, session.closeRevision()]]),
-    flush: () =>
-      new Promise<boolean>((resolve) => {
-        finishFlush = resolve;
-      }),
-    answer: vi.fn().mockResolvedValue(undefined),
-    changed: vi.fn().mockResolvedValue(undefined),
-    cancel: vi.fn(
-      () =>
-        new Promise<boolean>((resolve) => {
-          finishCancel = resolve;
-        }),
-    ),
-    resumed: vi.fn(),
-    failed: vi.fn(),
-    interrupted: vi.fn(),
-  };
-  const approval = new QuitApproval(host);
-  const first = { round: 7, ticket: 1, verify: false };
-  const last = { round: 7, ticket: 3, verify: true };
-  approval.begin(first);
-  approval.approve(first, host.read());
-  approval.begin(last);
-  const verifying = approval.verify(last);
   let receive!: (event: DocumentMutation) => void;
   let path = "/a";
   const applied: number[] = [];
@@ -341,8 +310,6 @@ it("renames and deletion cancel final verification before applying their complet
       return () => {};
     },
     (event) => {
-      // The reservation prevents another final seal between two path updates.
-      expect(sealEditors("too-early")).toBe(false);
       if (event.kind === "renamed") {
         expect(event.from).toBe(path);
         session.retarget(event.from, event.to);
@@ -359,85 +326,15 @@ it("renames and deletion cancel final verification before applying their complet
     },
   );
   try {
-    receive({
-      sequence: 1,
-      workspace: local,
-      kind: "renamed",
-      from: "/a",
-      to: "/b",
-    });
-    receive({
-      sequence: 2,
-      workspace: local,
-      kind: "renamed",
-      from: "/b",
-      to: "/c",
-    });
+    receive({ sequence: 1, workspace: local, kind: "renamed", from: "/a", to: "/b" });
+    receive({ sequence: 2, workspace: local, kind: "renamed", from: "/b", to: "/c" });
     receive({ sequence: 3, workspace: local, kind: "deleted", paths: ["/c"] });
-    expect(applied).toEqual([]);
-    expect(host.cancel).toHaveBeenCalledExactlyOnceWith(7);
-    expect(editorMutationsPending()).toBe(true);
-    finishFlush(true);
-    await verifying;
-    expect(host.answer).not.toHaveBeenCalledWith(last, true);
-    finishCancel(true);
-    await flush();
     expect(applied).toEqual([1, 2, 3]);
-    expect(host.interrupted).toHaveBeenCalledOnce();
     expect(path).toBe("/c");
     expect(session.text()).toBe("unsaved draft");
     expect(session.isDetached()).toBe(true);
-    expect(editorMutationsPending()).toBe(false);
-    expect(sealEditors("after-events")).toBe(true);
-    releaseEditors("after-events");
   } finally {
     stop();
-    approval.dispose();
-    releaseEditors("7:3");
     session.close();
   }
-});
-it("disposing a mutation listener releases its reservation without replaying into a replacement page", async () => {
-  const { sealEditors, releaseEditors, editorMutationsPending } = await import(
-    "./quitBarrier"
-  );
-  sealEditors("local-closing");
-  let receive!: (event: DocumentMutation) => void;
-  const apply = vi.fn();
-  const stop = subscribeDocumentMutations(
-    async (listener) => {
-      receive = listener;
-      return () => {};
-    },
-    apply,
-    vi.fn(),
-  );
-  receive(move);
-  expect(editorMutationsPending()).toBe(true);
-  stop();
-  expect(editorMutationsPending()).toBe(false);
-  releaseEditors("local-closing");
-  await flush();
-  expect(apply).not.toHaveBeenCalled();
-});
-it("a refused local close replays all waiting renames in order", async () => {
-  const { sealEditors, releaseEditors } = await import("./quitBarrier");
-  sealEditors("local-closing");
-  let receive!: (event: DocumentMutation) => void;
-  const applied: number[] = [];
-  const stop = subscribeDocumentMutations(
-    async (listener) => {
-      receive = listener;
-      return () => {};
-    },
-    (event) => applied.push(event.sequence),
-    vi.fn(),
-  );
-  receive(move);
-  receive({ ...move, sequence: 2 });
-  expect(applied).toEqual([]);
-  releaseEditors("local-closing");
-  await flush();
-  expect(applied).toEqual([1, 2]);
-  stop();
 });

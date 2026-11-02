@@ -1,9 +1,3 @@
-import {
-  beginDocumentMutation,
-  deferEditorLifecycle,
-  documentRevisionChanged,
-  editorQuitSealed,
-} from "./quitBarrier";
 import { awaitMutationSequence } from "./mutationFence";
 import { detectEol, type Eol, normalizeToLf, restoreEol } from "./eol";
 import type { RecoveryTarget } from "./recoveryTarget";
@@ -112,7 +106,6 @@ export class DocumentSession {
   ) {}
 
   open(path: string): void {
-    if (deferEditorLifecycle(this, "binding", () => this.open(path))) return;
     const prev = this.path;
     if (prev === path && this.active) return;
     this.active = true;
@@ -133,7 +126,6 @@ export class DocumentSession {
     this.loadedPath = to;
     this.epoch += 1;
     this.readGeneration += 1;
-    documentRevisionChanged();
     this.armAutoSave();
     return true;
   };
@@ -144,38 +136,17 @@ export class DocumentSession {
       : null;
 
   close(): void {
-    if (deferEditorLifecycle(this, "binding", () => this.close())) return;
     if (!this.active) return;
     this.active = false;
     this.epoch += 1;
-    documentRevisionChanged();
     if (this.path !== null) this.release(this.path);
   }
 
   openAnyway = (): void => {
-    if (deferEditorLifecycle(this, "reload", this.openAnyway)) return;
     if (this.active && this.path !== null) this.load(true);
   };
 
   change = (text: string): void => {
-    if (editorQuitSealed()) {
-      // A programmatic view transaction may bypass CodeMirror's input filter.
-      // It cannot change the owned buffer; restore that view if quit is aborted.
-      const epoch = this.epoch;
-      deferEditorLifecycle(this, "restoreView", () => {
-        if (
-          this.active &&
-          epoch === this.epoch &&
-          this.loadedPath === this.path
-        )
-          this.host.state({
-            status: "ready",
-            content: this.buffer,
-            size: this.buffer.length,
-          });
-      });
-      return;
-    }
     this.cancelFormatter();
     this.buffer = text;
     this.revision += 1;
@@ -236,7 +207,6 @@ export class DocumentSession {
         formatter.signal,
       );
       if (
-        editorQuitSealed() ||
         formatter.signal.aborted ||
         !this.active ||
         epoch !== this.epoch ||
@@ -274,13 +244,6 @@ export class DocumentSession {
   isDetached = (): boolean => this.detached;
 
   detach = (): void => {
-    const epoch = this.epoch;
-    if (
-      deferEditorLifecycle(this, "detach", () => {
-        if (epoch === this.epoch) this.detach();
-      })
-    )
-      return;
     if (
       !this.active ||
       this.path === null ||
@@ -306,8 +269,7 @@ export class DocumentSession {
       if (
         !this.active ||
         !this.detached ||
-        epoch !== this.epoch ||
-        editorQuitSealed()
+        epoch !== this.epoch
       )
         return false;
       const content = this.buffer,
@@ -334,7 +296,7 @@ export class DocumentSession {
           );
         const changed = await observed?.changed();
         if (!current()) return false;
-        if (changed || editorQuitSealed()) throw interrupted();
+        if (changed) throw interrupted();
         // Include native file identity, not just equal bytes. Never reload a
         // replacement into a draft or mark it saved on an obsolete write reply.
         const disk = await this.io.read(target, this.force);
@@ -343,7 +305,6 @@ export class DocumentSession {
         if (!current()) return false;
         if (
           changedAfterRead ||
-          editorQuitSealed() ||
           disk.kind !== "text" ||
           disk.version !== result.version
         )
@@ -412,10 +373,8 @@ export class DocumentSession {
       if (pending.size === 0 && this.pendingDiscards === pending)
         this.pendingDiscards = undefined;
       if (this.active) this.host.dirty(this.hasUnsavedChanges());
-      documentRevisionChanged();
-    };
+      };
     this.host.dirty(this.hasUnsavedChanges());
-    documentRevisionChanged();
     let selected = false;
     return {
       select: (matched) => {
@@ -436,13 +395,11 @@ export class DocumentSession {
         if (this.loadedPath === this.path) {
           this.epoch += 1;
           this.readGeneration += 1;
-          documentRevisionChanged();
         }
         let live = true;
         const finish = (failed: boolean) => {
           if (!live) return;
           live = false;
-          const mutation = beginDocumentMutation();
           const apply = () => {
             try {
               if (
@@ -472,11 +429,9 @@ export class DocumentSession {
               });
             } finally {
               remove();
-              mutation.release();
             }
           };
-          if (mutation.ready) void mutation.ready.then(apply);
-          else apply();
+          apply();
         };
         return { complete: () => finish(false), dispose: () => finish(true) };
       },
@@ -620,19 +575,6 @@ export class DocumentSession {
   // `keepIfUnchanged` skips the re-render when disk already matches the
   // baseline (self-save, duplicate watcher event); loads always publish.
   private adopt(res: ReadResult, keepIfUnchanged = false): void {
-    const epoch = this.epoch,
-      generation = this.readGeneration;
-    if (
-      deferEditorLifecycle(this, "adopt", () => {
-        if (
-          epoch === this.epoch &&
-          generation === this.readGeneration &&
-          this.active
-        )
-          this.adopt(res, keepIfUnchanged);
-      })
-    )
-      return;
     if (res.kind !== "text") {
       this.loadedPath = null;
       this.aiAllowed = false;
@@ -764,7 +706,6 @@ export class DocumentSession {
   private setDirty(dirty: boolean): void {
     this.isDirty = dirty;
     this.host.dirty(this.hasUnsavedChanges());
-    documentRevisionChanged();
   }
 
   private cancelFormatter(): void {

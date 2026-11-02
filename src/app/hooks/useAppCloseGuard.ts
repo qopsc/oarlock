@@ -1,9 +1,4 @@
 import {
-  editorQuitSealed,
-  sealEditors,
-  releaseEditors,
-} from "@/modules/editor/lib/quitBarrier";
-import {
   hasNewEdits,
   QuitApproval,
   type QuitRequest,
@@ -57,15 +52,6 @@ export function closeAfterFlush(
   alreadyWarned: boolean,
 ): "close" | "warn" {
   return flush.ok || alreadyWarned ? "close" : "warn";
-}
-
-/** Closing refused while documents are being updated or another window verifies a quit. */
-function notifyCloseBlocked(): void {
-  toast.info("Can't close yet", {
-    id: "close-blocked",
-    description:
-      "Document updates are being applied or another window is finishing a quit. Try again in a moment.",
-  });
 }
 
 export async function boundedSpaceFlush(
@@ -165,26 +151,14 @@ export function useAppCloseGuard(
           ticket: request.ticket,
           ok,
         }),
-      changed: (request) =>
-        invoke("app_quit_changed", {
-          round: request.round,
-          ticket: request.ticket,
-        }),
       cancel: (round) => invoke<boolean>("app_quit_cancel", { round }),
-      resumed: (cancelled) => {
-        if (!cancelled) return;
+      resumed: () => {
         attempt.current += 1;
         if (pending.current?.request.quitRound !== null) {
           pending.current = null;
           setPendingAppClose(null);
         }
       },
-      interrupted: () =>
-        toast.info("Quit cancelled because files changed", {
-          id: "quit-files-changed",
-          description:
-            "Document updates are being applied. You can quit again when ready.",
-        }),
       failed: () =>
         toast.error("Could not finish quitting", {
           id: "quit-check-failed",
@@ -207,17 +181,11 @@ export function useAppCloseGuard(
   const closeIdle = useRef<Promise<void>>(Promise.resolve());
   const warned = useRef(false);
   const closeWindow = useCallback(async () => {
-    const seal = `window-close:${attempt.current}`;
-    if (!sealEditors(seal)) {
-      notifyCloseBlocked();
-      return;
-    }
     forceClose.current = true;
     try {
       await getCurrentWindow().close();
     } catch (error) {
       forceClose.current = false;
-      releaseEditors(seal);
       toast.error("Could not close the window", {
         description: String(error),
       });
@@ -339,16 +307,11 @@ export function useAppCloseGuard(
       .onCloseRequested(async (event) => {
         if (disposed || forceClose.current) return;
         event.preventDefault();
-        if (editorQuitSealed()) {
-          notifyCloseBlocked();
-          return;
-        }
         if (closing.current || pending.current) return;
         const generation = ++attempt.current;
         const current = () =>
           !disposed &&
           generation === attempt.current &&
-          !editorQuitSealed() &&
           !closing.current &&
           !pending.current;
         const found = await blocker();

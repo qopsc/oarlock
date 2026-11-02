@@ -2,7 +2,6 @@ import {
   recoveryMutationCoverage,
   recoveryTargetsChanged,
 } from "./recoveryTarget";
-import { beginDocumentMutation } from "./quitBarrier";
 import {
   mutationFenceAdvance,
   mutationFenceDown,
@@ -127,19 +126,14 @@ export function subscribeDocumentMutations(
   let unlisten: (() => void) | undefined;
   let busy = false;
   let stalled = false;
-  let releasePending: (() => void) | undefined;
   const pending: Work[] = [];
   recoveryMutationCoverage(false);
 
   const drain = () => {
     if (!live || busy || stalled || pending.length === 0) return;
     busy = true;
-    const mutation = beginDocumentMutation();
-    releasePending = mutation.release;
     const finish = () => {
       busy = false;
-      releasePending = undefined;
-      mutation.release();
       if (live && unlisten && !stalled && pending.length === 0) {
         recoveryMutationCoverage(true);
         ready();
@@ -188,8 +182,7 @@ export function subscribeDocumentMutations(
       }
       finish();
     };
-    if (mutation.ready) void mutation.ready.then(run);
-    else run();
+    run();
   };
 
   void listen((event) => {
@@ -257,7 +250,6 @@ export function subscribeDocumentMutations(
     discard?.reset();
     mutationFenceDown();
     pending.length = 0;
-    releasePending?.();
     unlisten?.();
   };
 }

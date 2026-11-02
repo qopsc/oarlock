@@ -639,7 +639,6 @@ pub fn run() {
             windows::app_window_ready,
             windows::app_quit,
             windows::app_quit_ready,
-            windows::app_quit_changed,
             windows::app_quit_cancel,
             #[cfg(target_os = "macos")]
             app_menu::app_menu_set_shortcuts,

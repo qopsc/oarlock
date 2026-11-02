@@ -1,5 +1,7 @@
-//! Pure quit protocol. Confirmation leaves windows editable; final verification
-//! requires every participant to seal its editor before answering.
+//! Pure quit protocol. Confirmation leaves windows editable. Once every window
+//! approved, one verification ticket goes to all of them; each re-reads its dirty
+//! revisions and answers at once. A "no" asks that window again; the process exits
+//! only after every window answered yes to the same ticket.
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -13,7 +15,7 @@ pub(super) struct Request {
 pub(super) enum Action {
     Ask(String, Request),
     Verify(Vec<String>, Request),
-    Resume(u64, Option<u64>),
+    Resume(u64),
     Exit,
 }
 #[derive(Debug)]
@@ -109,34 +111,13 @@ impl QuitRound {
         self.approvals.insert(label.to_owned(), ticket);
         self.next()
     }
-    pub fn changed(&mut self, label: &str, ticket: u64) -> Vec<Action> {
-        if self.ended {
-            return vec![];
-        }
-        // An edit can overtake its approval IPC. Retire that request too;
-        // its delayed acknowledgement must not approve the newer document.
-        if self
-            .asking
-            .as_ref()
-            .is_some_and(|(asked, id)| asked == label && *id == ticket)
-        {
-            self.asking = None;
-        } else if self.approvals.get(label) != Some(&ticket) {
-            return vec![];
-        }
-        self.invalidate(label)
-    }
     fn invalidate(&mut self, label: &str) -> Vec<Action> {
         self.approvals.remove(label);
-        let mut actions = Vec::new();
-        if let Some(verification) = self.verification.take() {
-            actions.push(Action::Resume(self.id, Some(verification.ticket)));
-        }
+        self.verification = None;
         if !self.queue.iter().any(|item| item == label) {
             self.queue.push_back(label.to_owned());
         }
-        actions.extend(self.next());
-        actions
+        self.next()
     }
     pub fn verifying(&self, ticket: u64) -> bool {
         !self.ended
@@ -150,7 +131,7 @@ impl QuitRound {
             return vec![];
         }
         self.ended = true;
-        vec![Action::Resume(self.id, None)]
+        vec![Action::Resume(self.id)]
     }
 }
 
@@ -161,7 +142,7 @@ mod tests {
         QuitRound::new(1, VecDeque::from(["a".into(), "b".into()]))
     }
     #[test]
-    fn every_window_must_confirm_then_seal_before_exit() {
+    fn every_window_must_confirm_then_answer_one_verification_before_exit() {
         let mut r = round();
         assert!(
             matches!(&r.next()[0], Action::Ask(label, Request { ticket: 1, .. }) if label == "a")
@@ -175,43 +156,34 @@ mod tests {
         assert_eq!(r.answer("b", 3, true), vec![Action::Exit]);
     }
     #[test]
-    fn edits_while_another_window_confirms_requeue_only_the_changed_window() {
-        let mut r = round();
-        r.next();
-        r.answer("a", 1, true);
-        assert!(r.changed("a", 1).is_empty());
-        assert!(r.changed("a", 1).is_empty());
-        assert!(
-            matches!(&r.answer("b", 2, true)[0], Action::Ask(label, Request { ticket: 3, .. }) if label == "a")
-        );
-        assert!(r.answer("a", 1, true).is_empty());
-        assert!(matches!(&r.answer("a", 3, true)[0], Action::Verify(_, _)));
-    }
-    #[test]
-    fn an_invalidation_that_overtakes_approval_retires_the_old_ticket() {
-        let mut r = round();
-        r.next();
-        assert!(matches!(&r.changed("a", 1)[0], Action::Ask(label, _) if label == "b"));
-        assert!(r.answer("a", 1, true).is_empty());
-        assert!(matches!(&r.answer("b", 2, true)[0], Action::Ask(label, _) if label == "a"));
-    }
-    #[test]
-    fn stale_verification_releases_all_seals_and_requires_confirmation_again() {
+    fn a_failed_verification_requeues_only_that_window_and_exit_needs_every_answer_for_one_ticket() {
         let mut r = round();
         r.next();
         r.answer("a", 1, true);
         r.answer("b", 2, true);
         r.answer("a", 3, true);
         let actions = r.answer("b", 3, false);
-        assert_eq!(actions[0], Action::Resume(1, Some(3)));
+        assert_eq!(actions.len(), 1);
         assert!(
-            matches!(&actions[1], Action::Ask(label, Request { ticket: 4, .. }) if label == "b")
+            matches!(&actions[0], Action::Ask(label, Request { ticket: 4, verify: false, .. }) if label == "b")
         );
         assert!(r.answer("b", 3, true).is_empty());
-        r.answer("b", 4, true);
+        let verify = r.answer("b", 4, true);
+        assert!(matches!(&verify[0], Action::Verify(labels, Request { ticket: 5, .. }) if labels == &vec!["a".to_string(), "b".to_string()]));
         assert!(r.answer("a", 3, true).is_empty());
         assert!(r.answer("a", 5, true).is_empty());
         assert_eq!(r.answer("b", 5, true), vec![Action::Exit]);
+    }
+    #[test]
+    fn a_stale_ticket_cannot_approve_exit() {
+        let mut r = round();
+        r.next();
+        r.answer("a", 1, true);
+        r.answer("b", 2, true);
+        r.answer("a", 3, false);
+        assert!(r.answer("b", 3, true).is_empty());
+        assert!(r.answer("a", 3, true).is_empty());
+        assert!(!r.verifying(3));
     }
     #[test]
     fn cancel_and_membership_changes_never_accept_late_votes() {
@@ -220,7 +192,7 @@ mod tests {
         r.answer("a", 1, true);
         r.answer("b", 2, true);
         assert!(r.verifying(3));
-        assert_eq!(r.cancel(), vec![Action::Resume(1, None)]);
+        assert_eq!(r.cancel(), vec![Action::Resume(1)]);
         assert!(!r.verifying(3));
         assert!(r.answer("a", 3, true).is_empty());
         assert!(r.answer("b", 3, true).is_empty());
@@ -231,11 +203,10 @@ mod tests {
         let mut r = round();
         r.next();
         assert!(r.answer("b", 1, true).is_empty());
-        assert!(r.changed("b", 1).is_empty());
         r.answer("a", 1, true);
         r.answer("b", 2, true);
         assert!(r.answer("outsider", 3, true).is_empty());
-        assert!(r.changed("a", 9).is_empty());
-        assert_eq!(r.changed("a", 1)[0], Action::Resume(1, Some(3)));
+        assert!(r.answer("a", 9, false).is_empty());
+        assert!(r.verifying(3));
     }
 }

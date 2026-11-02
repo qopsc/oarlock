@@ -919,26 +919,6 @@ it("close acknowledgements distinguish edits, detachments and remounted sessions
   t.session.close();
 });
 
-it("the final quit seal rejects new text and resumes a deferred deletion on cancellation", async () => {
-  const { sealEditors, releaseEditors } = await import("./quitBarrier");
-  const t = setup({ "/a": "base" });
-  t.session.open("/a");
-  await flush();
-  t.session.change("approved draft");
-  sealEditors("document-test");
-  try {
-    t.session.change("unaccepted edit");
-    t.session.detach();
-    expect(t.session.text()).toBe("approved draft");
-    expect(t.session.isDetached()).toBe(false);
-  } finally {
-    releaseEditors("document-test");
-  }
-  expect(t.session.isDetached()).toBe(true);
-  expect(t.session.text()).toBe("approved draft");
-  t.session.close();
-});
-
 it("retains a detached draft when its recovery target is deleted before the save reply", async () => {
   const { planDocumentMutation } = await import("./documentMutations");
   const t = setup({ "/a": "base" });
@@ -1052,31 +1032,12 @@ it("closing a draft releases pending destination tracking before the write repli
   expect(await recovery).toBe(false);
   expect(t.host.saved).not.toHaveBeenCalled();
 });
-it("a final quit barrier cannot be crossed by a late recovery reply", async () => {
-  const { sealEditors, releaseEditors } = await import("./quitBarrier");
-  const t = await detachedRecovery();
-  t.hold("write");
-  const recovery = t.session.recover("/a");
-  await flush();
-  sealEditors("recover-test");
-  try {
-    t.release("write");
-    expect(await recovery).toBe(false);
-    expect(t.session.isDetached()).toBe(true);
-    expect(t.session.hasUnsavedChanges()).toBe(true);
-    expect(t.session.text()).toBe("draft");
-  } finally {
-    releaseEditors("recover-test");
-    t.session.close();
-  }
-});
-it.each(["rename", "parent rename", "lost listener", "deferred delete"])(
+it.each(["rename", "parent rename", "lost listener", "delete"])(
   "recovery observes %s before binding, even when the returned disk version is unchanged",
   async (kind) => {
     const { subscribeDocumentMutations } = await import("./documentMutations");
     const { observeRecoveryTarget } = await import("./recoveryTarget");
     const { workspaceScopeKey } = await import("@/modules/workspace/env");
-    const { sealEditors, releaseEditors } = await import("./quitBarrier");
     const t = await detachedRecovery();
     const env = { kind: "local" } as const;
     let receive!: (
@@ -1123,11 +1084,7 @@ it.each(["rename", "parent rename", "lost listener", "deferred delete"])(
         to: "/a",
       });
     } else {
-      sealEditors("recover-events");
       receive({ sequence: 1, workspace: env, kind: "deleted", paths: ["/a"] });
-      expect(apply).not.toHaveBeenCalled();
-      // Release after the observation, before its deferred tab update.
-      releaseEditors("recover-events");
     }
     t.release("write");
     expect(await recovery).toBe(false);
@@ -1369,26 +1326,6 @@ it("late pre-discard save replies cannot mark the retained newer draft clean", a
   await flush();
   reply();
   expect(await save).toBe(false);
-  expect(t.session.text()).toBe("new draft");
-  expect(t.session.hasUnsavedChanges()).toBe(true);
-  t.session.close();
-});
-it("discard completion waits for quit cancellation before changing the editor", async () => {
-  const { sealEditors, releaseEditors } = await import("./quitBarrier");
-  const t = setup({ "/a": "base" });
-  t.session.open("/a");
-  await flush();
-  const discard = t.session.prepareDiscard();
-  t.session.change("new draft");
-  t.touch("/a", "HEAD");
-  const cancel = vi.fn();
-  sealEditors("discard-test", cancel);
-  discard.complete();
-  discard.dispose();
-  expect(cancel).toHaveBeenCalledOnce();
-  expect(t.session.text()).toBe("new draft");
-  releaseEditors("discard-test");
-  await flush();
   expect(t.session.text()).toBe("new draft");
   expect(t.session.hasUnsavedChanges()).toBe(true);
   t.session.close();
