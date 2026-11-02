@@ -7,7 +7,7 @@
 //! stream buffer the window bounds unconsumed data at 192 KiB per request.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::{AbortHandle, AbortRegistration};
@@ -84,7 +84,7 @@ impl AiStreamState {
             return Err("invalid AI request id".into());
         }
         let key = (window.to_owned(), id.to_owned());
-        let mut requests = self.0.lock().unwrap();
+        let mut requests = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if requests.contains_key(&key) {
             return Err("AI request id is already active".into());
         }
@@ -112,7 +112,7 @@ impl AiStreamState {
         let request = self
             .0
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&(window.to_owned(), id.to_owned()))
             .cloned();
         if let Some(request) = request {
@@ -124,7 +124,7 @@ impl AiStreamState {
         let requests: Vec<_> = self
             .0
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|((owner, _), _)| owner == window)
             .map(|(_, request)| request.clone())
@@ -138,7 +138,7 @@ impl AiStreamState {
         let request = self
             .0
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&(window.to_owned(), id.to_owned()))
             .cloned();
         match request {
@@ -149,13 +149,13 @@ impl AiStreamState {
 
     #[cfg(test)]
     fn active(&self) -> usize {
-        self.0.lock().unwrap().len()
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 }
 
 impl Drop for StreamLease {
     fn drop(&mut self) {
-        self.state.0.lock().unwrap().remove(&self.key);
+        self.state.0.lock().unwrap_or_else(PoisonError::into_inner).remove(&self.key);
     }
 }
 
@@ -165,7 +165,7 @@ impl StreamControl {
         if bytes == 0 || bytes > CHUNK_BYTES {
             return Err("invalid AI stream chunk size".into());
         }
-        let mut credit = self.credit.lock().unwrap();
+        let mut credit = self.credit.lock().unwrap_or_else(PoisonError::into_inner);
         if !credit.admits(bytes as u64) {
             return Ok(false);
         }
@@ -202,7 +202,7 @@ impl StreamControl {
     }
 
     fn acknowledge(&self, bytes: u64) -> Result<(), String> {
-        let mut credit = self.credit.lock().unwrap();
+        let mut credit = self.credit.lock().unwrap_or_else(PoisonError::into_inner);
         if bytes <= credit.acknowledged {
             return Ok(());
         }

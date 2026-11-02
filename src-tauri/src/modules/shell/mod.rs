@@ -9,7 +9,7 @@ mod session_registry;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -429,7 +429,7 @@ pub async fn shell_session_run(
         .state::<ShellState>()
         .sessions
         .read()
-        .unwrap()
+        .unwrap_or_else(PoisonError::into_inner)
         .get_owned(window.label(), id)
         .cloned()
         .ok_or_else(|| "no shell session".to_string())?;
@@ -456,7 +456,7 @@ pub async fn shell_session_close(
         .state::<ShellState>()
         .sessions
         .write()
-        .unwrap()
+        .unwrap_or_else(PoisonError::into_inner)
         .retire_owned(window.label(), id);
     if let Some(session) = session {
         session.cancellation.request();
