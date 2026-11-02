@@ -5415,12 +5415,17 @@ environment are no longer honored by Source Control, a project MCP server can no
 variable, `allow_private` for AI endpoints is decided natively, and the preview scheme serves only
 media types behind a per-page token while Tauri's asset scope matches nothing.
 
-Measured on the merged head with `bun run size` (production build, gzip): total client JS
-2,882,091 bytes (11 over the 2,882,080 allowance), primary terminal JS 96,033 bytes (243 over the
-95,790 allowance), startup 251,157 bytes, WebGL fallback 16,460 bytes, WASM variants 654,361 bytes.
-The two exceeded allowances rise to 2,882,100 and 96,040 bytes. The larger overruns the batch notes
-report were measured in their worktrees against development builds and do not describe the merged
-tree. Each batch ran its own lint, types, frontend tests, Clippy and `cargo test --locked` (nextest
+The bundle figures first recorded here (total client JS 2,882,091 bytes, terminal 96,033) were wrong:
+`bun run size` measures `dist/`, and the merged head was measured against a `dist/` built days
+earlier, so the allowances set from them (2,882,100 and 96,040 bytes) never matched a real build.
+CI only runs the size budget on pull requests to `main`, so nothing caught it on this branch. A
+fresh local build of the PR 1 merge base (`577ccc9`) reproduces CI's figures byte for byte, so local
+builds are the reference: that merge base is 2,796,701 bytes of total client JS and 92,473 of
+terminal JS, the PR 2 head before these fixes (`1bc762f9`) is 2,895,916 and 97,993 (the budget
+records PR 2 itself kept were made the same way and are not reliable), and the merged head of these
+batches (`e7db16e3`) is 2,900,924 and 98,652 (startup 258,180, WebGL 16,563, WASM 656,131), so the
+batches cost 5,008 bytes of total and 659 of terminal JS. Review 108 sets the allowances from a real
+build. Each batch ran its own lint, types, frontend tests, Clippy and `cargo test --locked` (nextest
 is not installed) in its worktree; the merged head was re-run by the merger, with the result recorded
 in the fix status of the review document. Windows and Linux were not run, and the Windows leg of
 the S-01 scope forbid list and the Windows-only lock change in `shell/background.rs` are untested.
