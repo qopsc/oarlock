@@ -13,14 +13,14 @@ pub use error::{Error, Result};
 use serde::{Deserialize, Serialize};
 pub use serde_json::Value as JsonValue;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::Duration,
 };
 pub use store::{DeserializeFn, SerializeFn, Store, StoreBuilder, resolve_store_path};
 use tauri::{
-    AppHandle, Manager, ResourceId, RunEvent, Runtime, State,
+    AppHandle, Manager, ResourceId, RunEvent, Runtime, State, Webview, WindowEvent,
     plugin::{self, TauriPlugin},
 };
 
@@ -38,9 +38,41 @@ struct ChangePayload<'a> {
     exists: bool,
 }
 
+/// The stores each webview opened through `load` or `get_store`. A store id is a small counter,
+/// so a page that guessed one could otherwise change a store only the backend opened.
+#[derive(Debug, Default)]
+struct Grants(Mutex<HashMap<String, HashSet<ResourceId>>>);
+
+impl Grants {
+    fn grant(&self, webview: &str, rid: ResourceId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(webview.to_owned())
+            .or_default()
+            .insert(rid);
+    }
+
+    fn allows(&self, webview: &str, rid: ResourceId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(webview)
+            .is_some_and(|rids| rids.contains(&rid))
+    }
+
+    fn forget(&self, webview: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(webview);
+    }
+}
+
 #[derive(Debug)]
 struct StoreState {
     stores: Arc<RwLock<HashMap<PathBuf, ResourceId>>>,
+    grants: Grants,
     serialize_fns: HashMap<String, SerializeFn>,
     deserialize_fns: HashMap<String, DeserializeFn>,
     default_serialize: SerializeFn,
@@ -122,36 +154,60 @@ fn builder<R: Runtime>(
     Ok(builder)
 }
 
+/// The store `rid` names, if this webview opened it.
+fn owned_store<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &StoreState,
+    webview: &Webview<R>,
+    rid: ResourceId,
+) -> Result<Arc<Store<R>>> {
+    if !state.grants.allows(webview.label(), rid) {
+        return Err(tauri::Error::BadResourceId(rid).into());
+    }
+    Ok(app.resources_table().get::<Store<R>>(rid)?)
+}
+
 #[tauri::command]
 async fn load<R: Runtime>(
     app: AppHandle<R>,
+    webview: Webview<R>,
     store_state: State<'_, StoreState>,
     path: PathBuf,
     options: Option<LoadStoreOptions>,
 ) -> Result<ResourceId> {
-    let builder = builder(app, store_state, path, options)?;
+    let builder = builder(app, store_state.clone(), path, options)?;
     let (_, rid) = builder.build_inner()?;
+    store_state.grants.grant(webview.label(), rid);
     Ok(rid)
 }
 
 #[tauri::command]
 async fn get_store<R: Runtime>(
     app: AppHandle<R>,
+    webview: Webview<R>,
     store_state: State<'_, StoreState>,
     path: PathBuf,
 ) -> Result<Option<ResourceId>> {
-    let stores = store_state.stores.read().unwrap();
-    Ok(stores.get(&resolve_store_path(&app, path)?).copied())
+    let rid = {
+        let stores = store_state.stores.read().unwrap();
+        stores.get(&resolve_store_path(&app, path)?).copied()
+    };
+    if let Some(rid) = rid {
+        store_state.grants.grant(webview.label(), rid);
+    }
+    Ok(rid)
 }
 
 #[tauri::command]
 async fn set<R: Runtime>(
     app: AppHandle<R>,
+    webview: Webview<R>,
+    store_state: State<'_, StoreState>,
     rid: ResourceId,
     key: String,
     value: JsonValue,
 ) -> Result<()> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     store.set(key, value);
     Ok(())
 }
@@ -159,75 +215,81 @@ async fn set<R: Runtime>(
 #[tauri::command]
 async fn get<R: Runtime>(
     app: AppHandle<R>,
+    webview: Webview<R>,
+    store_state: State<'_, StoreState>,
     rid: ResourceId,
     key: String,
 ) -> Result<(Option<JsonValue>, bool)> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     let value = store.get(key);
     let exists = value.is_some();
     Ok((value, exists))
 }
 
 #[tauri::command]
-async fn has<R: Runtime>(app: AppHandle<R>, rid: ResourceId, key: String) -> Result<bool> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn has<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId, key: String) -> Result<bool> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     Ok(store.has(key))
 }
 
 #[tauri::command]
-async fn delete<R: Runtime>(app: AppHandle<R>, rid: ResourceId, key: String) -> Result<bool> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn delete<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId, key: String) -> Result<bool> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     Ok(store.delete(key))
 }
 
 #[tauri::command]
-async fn clear<R: Runtime>(app: AppHandle<R>, rid: ResourceId) -> Result<()> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn clear<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId) -> Result<()> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     store.clear();
     Ok(())
 }
 
 #[tauri::command]
-async fn reset<R: Runtime>(app: AppHandle<R>, rid: ResourceId) -> Result<()> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn reset<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId) -> Result<()> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     store.reset();
     Ok(())
 }
 
 #[tauri::command]
-async fn keys<R: Runtime>(app: AppHandle<R>, rid: ResourceId) -> Result<Vec<String>> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn keys<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId) -> Result<Vec<String>> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     Ok(store.keys())
 }
 
 #[tauri::command]
-async fn values<R: Runtime>(app: AppHandle<R>, rid: ResourceId) -> Result<Vec<JsonValue>> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn values<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId) -> Result<Vec<JsonValue>> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     Ok(store.values())
 }
 
 #[tauri::command]
 async fn entries<R: Runtime>(
     app: AppHandle<R>,
+    webview: Webview<R>,
+    store_state: State<'_, StoreState>,
     rid: ResourceId,
 ) -> Result<Vec<(String, JsonValue)>> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     Ok(store.entries())
 }
 
 #[tauri::command]
-async fn length<R: Runtime>(app: AppHandle<R>, rid: ResourceId) -> Result<usize> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn length<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId) -> Result<usize> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     Ok(store.length())
 }
 
 #[tauri::command]
 async fn reload<R: Runtime>(
     app: AppHandle<R>,
+    webview: Webview<R>,
+    store_state: State<'_, StoreState>,
     rid: ResourceId,
     ignore_defaults: Option<bool>,
 ) -> Result<()> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     if ignore_defaults.unwrap_or_default() {
         store.reload_ignore_defaults()
     } else {
@@ -236,9 +298,28 @@ async fn reload<R: Runtime>(
 }
 
 #[tauri::command]
-async fn save<R: Runtime>(app: AppHandle<R>, rid: ResourceId) -> Result<()> {
-    let store = app.resources_table().get::<Store<R>>(rid)?;
+async fn save<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, store_state: State<'_, StoreState>, rid: ResourceId) -> Result<()> {
+    let store = owned_store(&app, &store_state, &webview, rid)?;
     store.save()
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::Grants;
+
+    #[test]
+    fn a_webview_reaches_only_the_stores_it_opened() {
+        let grants = Grants::default();
+        assert!(!grants.allows("main", 1), "a backend-only store");
+        grants.grant("main", 7);
+        assert!(grants.allows("main", 7));
+        assert!(!grants.allows("main", 8), "a guessed neighbour");
+        assert!(!grants.allows("w-1", 7), "another webview");
+        grants.grant("w-1", 7);
+        grants.forget("main");
+        assert!(!grants.allows("main", 7));
+        assert!(grants.allows("w-1", 7), "forgetting one leaves the others");
+    }
 }
 
 /// Extension trait to access the store APIs on a [`Manager`] such as `App`, `AppHandle`,
@@ -459,6 +540,7 @@ impl Builder {
             .setup(move |app_handle, _api| {
                 app_handle.manage(StoreState {
                     stores: Arc::new(RwLock::new(HashMap::new())),
+                    grants: Grants::default(),
                     serialize_fns: self.serialize_fns,
                     deserialize_fns: self.deserialize_fns,
                     default_serialize: self.default_serialize,
@@ -467,6 +549,14 @@ impl Builder {
                 Ok(())
             })
             .on_event(|app_handle, event| {
+                if let RunEvent::WindowEvent {
+                    label,
+                    event: WindowEvent::Destroyed,
+                    ..
+                } = event
+                {
+                    app_handle.state::<StoreState>().grants.forget(label);
+                }
                 if let RunEvent::Exit = event {
                     let collection = app_handle.state::<StoreState>();
                     let stores = collection.stores.read().unwrap();
