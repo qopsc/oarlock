@@ -327,23 +327,37 @@ export class CustomShaderPass {
     if (!this.framebuffer || width !== this.width || height !== this.height) {
       this.releaseTarget();
       this.texture = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, this.texture);
-      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      this.framebuffer = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
-      gl.framebufferTexture2D(
-        gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
-        gl.TEXTURE_2D,
-        this.texture,
-        0,
-      );
-      this.width = width;
-      this.height = height;
+      if (!this.texture)
+        throw new Error("Unable to allocate the custom shader texture");
+      try {
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        this.framebuffer = gl.createFramebuffer();
+        if (!this.framebuffer)
+          throw new Error("Unable to allocate the custom shader framebuffer");
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          this.texture,
+          0,
+        );
+        if (
+          gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE
+        )
+          throw new Error("Custom shader framebuffer is incomplete");
+        this.width = width;
+        this.height = height;
+      } catch (error) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        this.releaseTarget();
+        throw error;
+      }
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
   }

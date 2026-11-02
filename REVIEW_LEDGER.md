@@ -4618,7 +4618,7 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R072 | Closed | Shell locale selection reads the actual child environment in `LC_ALL`, `LC_CTYPE`, `LANG` precedence order. Regressions invoke the system locale utility on macOS and Linux. |
 | R082 | Closed | Terminal link resolution preserves literal backslashes in Unix directories and filenames; a regression reproduced the wrong target, and Windows drive and UNC cases still pass. |
 | R086 | Closed; platform checks remain | AP002 binds completion to its terminal and workspace; existing ownership tests and real POSIX-shell checks are recorded in the depth checkpoint. Mounted GUI and Windows/WSL checks remain manual/port work. |
-| R093 | Open, Tier 2 | The optional WebGL shader path still does not check failed texture/framebuffer allocation or completeness. No driver-pressure reproduction was run. |
+| R093 | Closed, Tier 2 | Shader texture/framebuffer allocation failures and incomplete targets now release partial resources and enter the existing renderer recovery path. Mocked WebGL regressions reproduce all three failures and verify retry; real GPU memory pressure was not reproduced. |
 | R095 | Open, Tier 2 | The terminal core still drops arbitrary leading reply bytes on overflow. The source confirms the behavior; no production burst reproduction is claimed. |
 | R112 | Closed; final-asset check manual | The Linux Nix install now copies the bundled CLI alongside the application. A fixture runs the actual install phase. |
 | R113 | Closed | The release workflow validates a version-tag ref before any publishing job; branch and non-version-tag dispatches fail the validation job. |
@@ -4634,7 +4634,9 @@ Tiers follow the user's impact order: data loss/corruption, wrong result, stuck 
 | R215 | Open, Tier 3, split | Binary/oversized documents still trigger unconditional parser preloading. Credential subscriptions are AI-related and remain on hold as R215-A; the parser preload is R215-B. |
 | R217 | Open, Tier 2 | External rustfmt still receives `--edition 2021` unconditionally. A Rust 2024 project reproduction remains outstanding. |
 
-Counts: **21 closed or partially held; 4 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+Counts: **22 closed or partially held; 3 Tier 2 open (one dormant); 1 Tier 3 open with an AI-held portion; 3 AI/MCP held; 2 Windows/WSL port**. No Tier 1 or Tier 4 finding was established by this revalidation. R239 and R241 are separately logged later findings, not members of this 31-row group. Resource finding R192 remains open pending a decision on its DOM-dependent rendering boundary.
+
+R093 checkpoint: the three new mocked allocation/completeness regressions failed against the previous implementation and pass with cleanup and retry. The full frontend suite passed 6,106 tests (two skipped); the native suite passed 1,586 library tests (four ignored) and all integration tests. Strict Clippy and types passed; lint remained at 80 warnings. Sandboxed test runs could not access local servers, PTYs and file watches; the full suites passed when rerun with those facilities available.
 
 ### R055 and R057 checkpoint — incomplete Git reads
 

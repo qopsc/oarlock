@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CURSOR_STYLE,
+  CustomShaderPass,
   customShaderErrors,
   customShaderFragment,
   ShaderClock,
@@ -8,6 +9,74 @@ import {
   shaderCursorRect,
   shaderDate,
 } from "./customShader";
+
+describe("custom shader render target", () => {
+  function target() {
+    const texture = {} as WebGLTexture;
+    const framebuffer = {} as WebGLFramebuffer;
+    const gl = {
+      TEXTURE_2D: 1,
+      RGBA8: 2,
+      TEXTURE_MIN_FILTER: 3,
+      TEXTURE_MAG_FILTER: 4,
+      LINEAR: 5,
+      TEXTURE_WRAP_S: 6,
+      TEXTURE_WRAP_T: 7,
+      CLAMP_TO_EDGE: 8,
+      FRAMEBUFFER: 9,
+      COLOR_ATTACHMENT0: 10,
+      FRAMEBUFFER_COMPLETE: 11,
+      createTexture: vi.fn(() => texture as WebGLTexture | null),
+      createFramebuffer: vi.fn(() => framebuffer as WebGLFramebuffer | null),
+      bindTexture: vi.fn(),
+      texStorage2D: vi.fn(),
+      texParameteri: vi.fn(),
+      bindFramebuffer: vi.fn(),
+      framebufferTexture2D: vi.fn(),
+      checkFramebufferStatus: vi.fn(() => 11),
+      deleteTexture: vi.fn(),
+      deleteFramebuffer: vi.fn(),
+      deleteProgram: vi.fn(),
+    };
+    return {
+      gl,
+      texture,
+      framebuffer,
+      pass: new CustomShaderPass(
+        gl as unknown as WebGL2RenderingContext,
+        {} as WebGLProgram,
+      ),
+    };
+  }
+
+  it("reports a failed texture allocation and can retry", () => {
+    const { gl, pass } = target();
+    gl.createTexture.mockReturnValueOnce(null);
+    expect(() => pass.begin(80, 40)).toThrow(/texture/i);
+    expect(gl.createFramebuffer).not.toHaveBeenCalled();
+    expect(() => pass.begin(80, 40)).not.toThrow();
+  });
+
+  it("releases the texture if framebuffer allocation fails", () => {
+    const { gl, texture, pass } = target();
+    gl.createFramebuffer.mockReturnValueOnce(null);
+    expect(() => pass.begin(80, 40)).toThrow(/framebuffer/i);
+    expect(gl.deleteTexture).toHaveBeenCalledWith(texture);
+    expect(() => pass.begin(80, 40)).not.toThrow();
+  });
+
+  it("rejects and releases an incomplete framebuffer before retrying", () => {
+    const { gl, texture, framebuffer, pass } = target();
+    gl.checkFramebufferStatus.mockReturnValueOnce(99);
+    expect(() => pass.begin(80, 40)).toThrow(/framebuffer/i);
+    expect(gl.deleteTexture).toHaveBeenCalledWith(texture);
+    expect(gl.deleteFramebuffer).toHaveBeenCalledWith(framebuffer);
+    expect(() => pass.begin(80, 40)).not.toThrow();
+    expect(gl.checkFramebufferStatus).toHaveBeenCalledTimes(2);
+    pass.begin(80, 40);
+    expect(gl.checkFramebufferStatus).toHaveBeenCalledTimes(2);
+  });
+});
 
 const MAIN_IMAGE = `void mainImage(out vec4 fragColor, in vec2 fragCoord) {
   fragColor = texture(iChannel0, fragCoord / iResolution.xy);

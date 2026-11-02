@@ -40,6 +40,8 @@ function recordingGl() {
                 log.push(`decorationsOnly=${args[1]}`);
             }
             if (key === "getExtension") return null;
+            if (key === "checkFramebufferStatus")
+              return (gl as Record<string, number>).FRAMEBUFFER_COMPLETE;
             if (key === "getUniformLocation") return { name: args[1] };
             if (key === "createTexture") return { texture: ++textures };
             return {};
