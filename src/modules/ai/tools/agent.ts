@@ -1,5 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
+import { useAgentStore } from "@/modules/agents/store/agentStore";
 import { useManagedAgentsStore } from "@/modules/agents/store/managedAgentsStore";
 import { captureGhosttyInputOwner } from "@/modules/terminal";
 import type { ToolContext } from "./context";
@@ -81,12 +82,24 @@ export function buildManagedAgentTools(ctx: ToolContext) {
         if (hasControlChars(oneLine)) {
           return { error: "instruction contains control characters" };
         }
+        if (!useAgentStore.getState().sessions[managed.leafId]) {
+          return {
+            error:
+              "the agent in this terminal is not running (it may have exited); spawn a new one with spawn_coding_agent",
+          };
+        }
         const owner = captureGhosttyInputOwner(managed.leafId);
         if (!owner?.write(oneLine)) {
           store.remove(managed.leafId);
           return { error: "agent terminal is no longer available (closed?)" };
         }
-        setTimeout(() => owner.write("\r"), SUBMIT_DELAY_MS);
+        await new Promise((resolve) => setTimeout(resolve, SUBMIT_DELAY_MS));
+        if (!owner.active() || !owner.write("\r")) {
+          return {
+            error:
+              "the terminal changed after the instruction was typed, so it was typed but not submitted; ask the user to press Enter in the agent terminal or resend",
+          };
+        }
         store.bumpRound(managed.leafId);
         return { ok: true, sent: oneLine, round: store.get(managed.leafId)?.rounds };
       },

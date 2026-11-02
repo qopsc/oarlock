@@ -16,7 +16,16 @@ const storeMock = vi.hoisted(() => ({
   get: vi.fn(),
 }));
 
-const terminalMock = vi.hoisted(() => ({ writeToSession: vi.fn((_leaf: number, _text: string) => true), capture: vi.fn() }));
+const terminalMock = vi.hoisted(() => ({
+  writeToSession: vi.fn((_leaf: number, _text: string) => true),
+  capture: vi.fn(),
+  active: true,
+}));
+const armed = vi.hoisted(() => ({ sessions: {} as Record<number, unknown> }));
+
+vi.mock("@/modules/agents/store/agentStore", () => ({
+  useAgentStore: { getState: () => ({ sessions: armed.sessions }) },
+}));
 
 vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
   useManagedAgentsStore: {
@@ -89,7 +98,10 @@ beforeEach(() => {
   terminalMock.writeToSession.mockReturnValue(true);
   terminalMock.capture.mockImplementation((leafId: number) => ({
     write: (text: string) => terminalMock.writeToSession(leafId, text),
+    active: () => terminalMock.active,
   }));
+  terminalMock.active = true;
+  armed.sessions = { 3: { status: "waiting" } };
 });
 
 describe("spawn_coding_agent", () => {
@@ -148,22 +160,42 @@ describe("send_to_agent", () => {
     expect(r.error).toContain("no Claude Code agent is active");
   });
 
-  it("collapses the instruction to one line and writes it", async () => {
+  it("collapses the instruction to one line, writes it and submits after the delay", async () => {
     storeMock.getBySessionId.mockReturnValue(AGENT);
     storeMock.get.mockReturnValue({ ...AGENT, rounds: 2 });
-    const r = await run("send_to_agent", makeContext(), {
+    const pending = run("send_to_agent", makeContext(), {
       instruction: "line one\n  line two",
     });
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
     expect(r.ok).toBe(true);
     expect(r.sent).toBe("line one line two");
-    expect(terminalMock.writeToSession).toHaveBeenCalledWith(
-      3,
-      "line one line two",
-    );
-    expect(storeMock.bumpRound).toHaveBeenCalledWith(3);
-    vi.runOnlyPendingTimers();
+    expect(terminalMock.writeToSession).toHaveBeenNthCalledWith(1, 3, "line one line two");
+    expect(terminalMock.writeToSession).toHaveBeenNthCalledWith(2, 3, "\r");
     expect(terminalMock.capture).toHaveBeenCalledTimes(1);
-    expect(terminalMock.writeToSession).toHaveBeenCalledWith(3, "\r");
+    expect(storeMock.bumpRound).toHaveBeenCalledWith(3);
+  });
+
+  it("reports failure instead of ok when the terminal changes before Enter", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    const pending = run("send_to_agent", makeContext(), { instruction: "fix it" });
+    await vi.advanceTimersByTimeAsync(10);
+    terminalMock.active = false;
+    await vi.advanceTimersByTimeAsync(200);
+    const r = await pending;
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain("not submitted");
+    expect(terminalMock.writeToSession).toHaveBeenCalledTimes(1);
+    expect(storeMock.bumpRound).not.toHaveBeenCalled();
+  });
+
+  it("refuses to type into a terminal whose agent is not running", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    armed.sessions = {};
+    const r = await run("send_to_agent", makeContext(), { instruction: "fix it" });
+    expect(r.error).toContain("not running");
+    expect(terminalMock.capture).not.toHaveBeenCalled();
+    expect(terminalMock.writeToSession).not.toHaveBeenCalled();
   });
 
   it("rejects an instruction with control characters", async () => {
