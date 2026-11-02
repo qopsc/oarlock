@@ -352,7 +352,7 @@ move backend-only stores off the plugin.
 
 **S-05** · Medium · ledger MAJOR · 4.5 · CONFIRMED · `security` · `src-tauri/src/modules/asset_all_folders.rs:235-244`,
 `:273-283`
-Status: fixed in 3afb85e (batch B); test a_path_outside_every_scope_is_refused_without_being_opened
+Status: fixed in 3afb85e (batch B); test a_path_outside_every_scope_is_refused_without_being_opened Follow-up 297fe1ab (batch B): links are walked by name and refused before any open.
 
 The handler opens the requested path first and authorizes the opened handle afterwards. The open
 follows symlinks and happens for any absolute path, so a request from a frame makes the process

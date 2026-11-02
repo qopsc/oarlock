@@ -5371,19 +5371,21 @@ environment are no longer honored by Source Control, a project MCP server can no
 variable, `allow_private` for AI endpoints is decided natively, and the preview scheme serves only
 media types behind a per-page token while Tauri's asset scope matches nothing.
 
-Measured size deltas as the notes report them, against fe147a5, where `bun run size` was already over
-its limits: batch C, total client JS 14.67 kB over its limit (+0.83 kB), primary terminal JS 98.66 kB
-gzip (+0.67 kB, limit 95.79 kB), startup 256.69 kB unchanged, WebGL fallback 16.56 kB, WASM variants
-656.13 kB gzip (+0.41 kB); batch D did not run `bun run size` and the reviewer measured +1,332 bytes
-gzip in the eager startup chunk and +1,466 in total client JS. No `.size-limit.json` allowance was
-edited by these notes or by this documentation pass. Each batch ran its own lint, types, frontend
-tests, Clippy and `cargo test --locked` (nextest is not installed) in its worktree; the merged head
-was not re-run by the documentation pass. Windows and Linux were not run, and the Windows leg of
+Measured on the merged head with `bun run size` (production build, gzip): total client JS
+2,882,091 bytes (11 over the 2,882,080 allowance), primary terminal JS 96,033 bytes (243 over the
+95,790 allowance), startup 251,157 bytes, WebGL fallback 16,460 bytes, WASM variants 654,361 bytes.
+The two exceeded allowances rise to 2,882,100 and 96,040 bytes. The larger overruns the batch notes
+report were measured in their worktrees against development builds and do not describe the merged
+tree. Each batch ran its own lint, types, frontend tests, Clippy and `cargo test --locked` (nextest
+is not installed) in its worktree; the merged head was re-run by the merger, with the result recorded
+in the fix status of the review document. Windows and Linux were not run, and the Windows leg of
 the S-01 scope forbid list and the Windows-only lock change in `shell/background.rs` are untested.
 
 Deferred by decision, with no fix in these batches: O-01, O-06, O-08, O-09, O-10 and O-15
-(over-engineering findings; the notes record the decision, not a reason), O-07 (D-11 only adds a toast when
-a seal refuses a close; the quit barrier is unchanged), D-12 and D-20 (Linux, secondary). Left open
+(each proposes deleting a mechanism built on an earlier approved decision, which the owner deferred
+to a separate decision), O-07 (D-11 only adds a toast when a seal refuses a close; the quit barrier is
+unchanged), D-12 (its module is `cfg(target_os = "linux")` and only the Darwin target is installed
+here) and D-20 (needs a Linux copy implementation). Left open
 inside closed or partly closed findings: S-09 (a same-user process can change configuration between
 the re-preflight and Git reading it), S-23 (every `read_skill_file` still rehashes the project skills
 tree, `resolve_inside` canonicalizes before the open, and a shell function named `command` can change
