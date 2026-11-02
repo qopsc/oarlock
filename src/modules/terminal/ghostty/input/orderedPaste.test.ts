@@ -17,10 +17,13 @@ const key = (values: Partial<KeyboardEvent>) => Object.assign(
     isComposing: false, key: "", keyCode: 0, metaKey: false, repeat: false,
     shiftKey: false, ...values },
 ) as KeyboardEvent;
-function setup(extra: Partial<ConstructorParameters<typeof GhosttyInputController>[0]> = {}) {
+function setup(
+  extra: Partial<ConstructorParameters<typeof GhosttyInputController>[0]> = {},
+  onRefused: (reason: string) => void = () => undefined,
+) {
   const input = new FakeTextArea();
   const sent: string[] = [];
-  const writer = new BoundedPtyWriter((error) => { throw error; });
+  const writer = new BoundedPtyWriter((error) => { throw error; }, onRefused);
   writer.attach({ id: 1, write: async (bytes: Uint8Array) => {
     sent.push(new TextDecoder().decode(bytes));
   }, close: async () => {}, resize: async () => {} } as PtySession);
@@ -35,8 +38,8 @@ function setup(extra: Partial<ConstructorParameters<typeof GhosttyInputControlle
     pointerTarget: new FakeElement() as unknown as HTMLElement,
     cellSize: () => ({ width: 10, height: 20 }), isMac: true,
     onCopy: () => false, onData: (bytes) => { writer.enqueue(bytes); },
-    reserveInput: () => writer.reserveInput(),
-    deferInput: (action) => writer.deferInput(action),
+    reserveInput: (options) => writer.reserveInput(options),
+    deferInput: (action, size, repeat) => writer.deferInput(action, size, repeat),
     ...extra,
   });
   return { input, writer, sent, controller };
@@ -128,4 +131,86 @@ it("drops unresolved paste and later input when the terminal closes", async () =
   finish("late");
   await Promise.resolve(); await Promise.resolve();
   expect(sent).toEqual([]);
+});
+
+it("keeps the terminal alive when keys pile up behind a stalled clipboard read", async () => {
+  delayedClipboard();
+  const refused = vi.fn();
+  const { input, sent, writer, controller } = setup({}, refused);
+  input.dispatchEvent(key({ key: "v", code: "KeyV", metaKey: true }));
+  for (let index = 0; index < 400; index++) {
+    input.dispatchEvent(key({ key: "a", code: "KeyA" }));
+  }
+  expect(refused).toHaveBeenCalledWith("actions-full");
+  expect(writer.hasFailed).toBe(false);
+  expect(sent).toEqual([]);
+  controller.dispose(); writer.dispose();
+});
+
+it("types again after a stalled clipboard read times out", async () => {
+  vi.useFakeTimers();
+  try {
+    delayedClipboard();
+    const refused = vi.fn();
+    const { input, sent, writer, controller } = setup({}, refused);
+    input.dispatchEvent(key({ key: "v", code: "KeyV", metaKey: true }));
+    input.dispatchEvent(key({ key: "Enter", code: "Enter" }));
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(refused).toHaveBeenCalledWith("slot-timeout");
+    expect(writer.hasFailed).toBe(false);
+    input.dispatchEvent(key({ key: "Enter", code: "Enter" }));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sent.length).toBeGreaterThan(0);
+    controller.dispose(); writer.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("refuses a paste over the hard cap with a notice and keeps typing", async () => {
+  const finish = delayedClipboard();
+  const refused = vi.fn();
+  const { input, sent, writer, controller } = setup({}, refused);
+  input.dispatchEvent(key({ key: "v", code: "KeyV", metaKey: true }));
+  finish("x".repeat(9 * 1024 * 1024));
+  await vi.waitFor(() => expect(refused).toHaveBeenCalledWith("input-too-large"));
+  expect(writer.hasFailed).toBe(false);
+  input.dispatchEvent(key({ key: "Enter", code: "Enter" }));
+  await vi.waitFor(() => expect(sent).toEqual(["\r"]));
+  controller.dispose(); writer.dispose();
+});
+
+it("drops held-key repeats past a small backlog behind a stalled read", () => {
+  delayedClipboard();
+  const refused = vi.fn();
+  const { input, writer, controller } = setup({}, refused);
+  input.dispatchEvent(key({ key: "v", code: "KeyV", metaKey: true }));
+  for (let index = 0; index < 100; index++) {
+    input.dispatchEvent(key({ key: "a", code: "KeyA", repeat: true }));
+  }
+  expect(refused).not.toHaveBeenCalled();
+  expect(writer.holdingInput).toBe(true);
+  expect(writer.pendingActions).toBeLessThanOrEqual(33);
+  input.dispatchEvent(key({ key: "b", code: "KeyB" }));
+  controller.dispose(); writer.dispose();
+});
+
+it("still sends a paste the user confirms after the slot deadline window", async () => {
+  vi.useFakeTimers();
+  try {
+    let answer!: (value: boolean) => void;
+    const refused = vi.fn();
+    const { sent, writer, controller } = setup({
+      confirmPaste: () => new Promise((resolve) => { answer = resolve; }),
+    }, refused);
+    controller.paste("echo one\necho two");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(refused).not.toHaveBeenCalled();
+    answer(true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sent).toEqual(["echo one\recho two"]);
+    controller.dispose(); writer.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
 });

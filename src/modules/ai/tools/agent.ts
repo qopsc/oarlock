@@ -1,7 +1,12 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { useManagedAgentsStore } from "@/modules/agents/store/managedAgentsStore";
-import { captureGhosttyInputOwner } from "@/modules/terminal";
+import { captureGhosttyInputOwner, leafShellAtPrompt } from "@/modules/terminal";
+
+/** A program owns the terminal; a background job the shell left running does not count. */
+async function agentIsRunning(leafId: number): Promise<boolean> {
+  return (await leafShellAtPrompt(leafId)) === false;
+}
 import type { ToolContext } from "./context";
 
 // Claude Code's TUI treats a trailing CR in the same write chunk as the text
@@ -81,12 +86,27 @@ export function buildManagedAgentTools(ctx: ToolContext) {
         if (hasControlChars(oneLine)) {
           return { error: "instruction contains control characters" };
         }
+        // The agent record goes stale in shells without OSC 133 integration,
+        // so what the PTY says about its foreground decides.
+        if (!(await agentIsRunning(managed.leafId))) {
+          return {
+            error:
+              "the agent in this terminal is not running (its shell is at the prompt, or only background jobs remain); spawn a new one with spawn_coding_agent",
+          };
+        }
         const owner = captureGhosttyInputOwner(managed.leafId);
         if (!owner?.write(oneLine)) {
           store.remove(managed.leafId);
           return { error: "agent terminal is no longer available (closed?)" };
         }
-        setTimeout(() => owner.write("\r"), SUBMIT_DELAY_MS);
+        await new Promise((resolve) => setTimeout(resolve, SUBMIT_DELAY_MS));
+        const stillRunning = owner.active() && (await agentIsRunning(managed.leafId));
+        if (!stillRunning || !(await owner.writeDelivered("\r"))) {
+          return {
+            error:
+              "the instruction was typed but not submitted because the terminal changed or the agent stopped; ask the user to check the agent terminal before sending anything else",
+          };
+        }
         store.bumpRound(managed.leafId);
         return { ok: true, sent: oneLine, round: store.get(managed.leafId)?.rounds };
       },

@@ -150,6 +150,13 @@ fn ensure_utf8_locale(cmd: &mut CommandBuilder) {
     if effective.as_ref().is_some_and(|(_, value)| is_utf8(value)) {
         return;
     }
+    // LC_ALL is a deliberate override of every category (often `C` for
+    // byte-order sorting), so replacing it would change collation, numbers,
+    // time and messages for the whole shell.
+    if let Some(("LC_ALL", value)) = effective.as_ref().map(|(key, value)| (*key, value)) {
+        log::warn!("LC_ALL={value} is not UTF-8; leaving it, so the shell may mishandle non-ASCII text");
+        return;
+    }
     #[cfg(target_os = "macos")]
     let fallback = "en_US.UTF-8";
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1580,7 +1587,6 @@ mod tests {
     #[test]
     fn utf8_locale_respects_effective_precedence_in_the_child_environment() {
         for (all, ctype, lang, changed) in [
-            (Some("C"), Some("en_US.UTF-8"), Some("en_US.UTF-8"), "LC_ALL"),
             (Some(""), Some("C"), Some("en_US.UTF-8"), "LC_CTYPE"),
             (None, None, Some("C"), "LANG"),
         ] {
@@ -1599,6 +1605,20 @@ mod tests {
                 .unwrap();
             assert!(output.status.success());
             assert!(String::from_utf8_lossy(&output.stdout).to_ascii_uppercase().contains("UTF-8"));
+        }
+    }
+
+    #[test]
+    fn utf8_locale_leaves_an_explicit_lc_all_alone() {
+        for value in ["C", "POSIX", "de_DE.ISO-8859-1"] {
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.env_clear();
+            cmd.env("LC_ALL", value);
+            cmd.env("LANG", "en_US.UTF-8");
+            super::ensure_utf8_locale(&mut cmd);
+            assert_eq!(cmd.get_env("LC_ALL"), Some(OsStr::new(value)));
+            assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("en_US.UTF-8")));
+            assert_eq!(cmd.get_env("LC_CTYPE"), None);
         }
     }
 

@@ -413,8 +413,14 @@ const StreamHandler = struct {
     kitty_read_answer: ?ghostty.clipboard.Read.Result = null,
     /// The reply queue's bound; raised while a held read is answered.
     output_limit: usize = max_output_bytes,
-    /// Once a reply cannot fit, no partial protocol stream may be delivered.
-    reply_overflow: bool = false,
+    /// A reply that does not fit is dropped whole, never cut, and the terminal
+    /// goes on; the first drop is logged.
+    reply_drop_logged: bool = false,
+    /// While a held Kitty read is answered: where its answer starts in the
+    /// queue, and whether one of its packets was dropped. A dropped packet
+    /// drops the whole answer, so the program never sees a truncated one.
+    answer_start: usize = 0,
+    answer_dropped: bool = false,
     /// Kitty keyboard flags a program may turn on
     /// (`restty_set_kitty_keyboard_flags`). Pushes and sets keep only these,
     /// so the flags reported to queries and used for key encoding agree.
@@ -681,9 +687,12 @@ const StreamHandler = struct {
         defer self.freeKittyRead(read);
         self.kitty_read_answer = answer;
         self.output_limit = max_kitty_answer_output;
+        self.answer_start = self.output.items.len;
+        self.answer_dropped = false;
         defer {
             self.kitty_read_answer = null;
             self.output_limit = max_output_bytes;
+            self.answer_dropped = false;
         }
         self.readonly.vt(.kitty_clipboard, .{
             .metadata = read.metadata,
@@ -990,12 +999,18 @@ const StreamHandler = struct {
     }
 
     fn appendOutput(self: *StreamHandler, bytes: []const u8) !void {
-        if (bytes.len == 0 or self.reply_overflow) return;
+        if (bytes.len == 0 or self.answer_dropped) return;
 
         const limit = self.output_limit;
         if (self.output.items.len > limit or bytes.len > limit - self.output.items.len) {
-            self.reply_overflow = true;
-            self.output.clearRetainingCapacity();
+            if (!self.reply_drop_logged) {
+                self.reply_drop_logged = true;
+                log.warn("terminal reply queue full; dropping replies", .{});
+            }
+            if (self.kitty_read_answer != null) {
+                self.answer_dropped = true;
+                self.output.shrinkRetainingCapacity(self.answer_start);
+            }
             return;
         }
         try self.output.appendSlice(self.alloc, bytes);
@@ -2434,7 +2449,6 @@ pub export fn restty_write(handle: ?*Restty, ptr: [*]const u8, len: usize) u32 {
         h.search.viewport_dirty = true;
         h.search.active_dirty = true;
     }
-    if (h.stream.handler.reply_overflow) return @intFromEnum(ErrorCode.reply_overflow);
     return @intFromEnum(ErrorCode.ok);
 }
 
@@ -2788,8 +2802,6 @@ pub export fn restty_output_ptr(handle: ?*Restty) usize {
 
 pub export fn restty_output_len(handle: ?*Restty) u32 {
     const h = handle orelse return 0;
-    // No valid reply reaches this length; the host treats it as a fatal error.
-    if (h.stream.handler.reply_overflow) return std.math.maxInt(i32);
     return @intCast(h.output.items.len);
 }
 

@@ -121,9 +121,9 @@ export default function ShellInput({
           }, size);
         },
         holding: () => holdingGhosttyInput(leafIdRef.current),
-        reserve: () => {
+        reserve: (options) => {
           const leaf = leafIdRef.current;
-          const finish = reserveGhosttyInput(leaf);
+          const finish = reserveGhosttyInput(leaf, options);
           return finish && ((action, size) => finish(() => {
             if (leafIdRef.current === leaf && handleRef.current === handle) action();
             else toast.message("Pending terminal input cancelled", {

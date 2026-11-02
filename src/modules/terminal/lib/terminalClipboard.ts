@@ -5,6 +5,7 @@ import {
 export { readTerminalClipboardSnapshot } from "./terminalClipboardSnapshot";
 import { ClipboardWrite } from "@/lib/clipboardWrite";
 import { isTauri } from "@tauri-apps/api/core";
+import { toast } from "sonner";
 
 /**
  * What a terminal program puts on the clipboard: text, or an image with the
@@ -55,6 +56,27 @@ export async function writeTerminalClipboard(text: string): Promise<void> {
   } finally {
     write.dispose();
     invalidateClipboardImage();
+  }
+}
+
+/**
+ * The user's own copy. A newer write (a program's, or the user's next copy)
+ * may take the slot first (the approved ordering); the user is told rather
+ * than left with the old clipboard.
+ */
+export async function copyTerminalSelection(text: string): Promise<boolean> {
+  try {
+    await writeTerminalClipboard(text);
+    return true;
+  } catch (error) {
+    const replaced = /superseded|cancelled/i.test(String(error));
+    toast.error(replaced ? "Copy was replaced" : "Could not copy", {
+      id: "terminal-copy-failed",
+      description: replaced
+        ? "A newer copy or a program's clipboard write replaced it. Copy again."
+        : String(error),
+    });
+    return false;
   }
 }
 

@@ -122,18 +122,30 @@ describe.each([
     }
   }
 
-  it("reports reply overflow rather than delivering a truncated escape sequence", () => {
+  it("drops the reply that does not fit, keeps whole replies and survives", () => {
     const terminal = ghostty.createTerminal(80, 24);
     try {
-      // Each primary-device-attributes query emits a 12-byte response. Two
-      // realistic-sized input slices together exceed the 256 KiB reply cap.
+      const reply = "\x1b[?62;22;52c";
       terminal.write(encoder.encode("\x1b[c".repeat(10_922)));
       expect(() =>
         terminal.write(encoder.encode("\x1b[c".repeat(10_924))),
-      ).toThrow(/reply.*(overflow|limit)/i);
-      expect(() => terminal.drainOutputBytes()).toThrow(
-        /reply.*(overflow|limit)/i,
-      );
+      ).not.toThrow();
+      const first = decoder.decode(terminal.drainOutputBytes());
+      // Whole replies only, the rest of the flood dropped.
+      expect(first.length % reply.length).toBe(0);
+      expect(first.length).toBeGreaterThan(10_922 * reply.length);
+      expect(first.length).toBeLessThanOrEqual(256 * 1024);
+      expect(first).toBe(reply.repeat(first.length / reply.length));
+      // The pane lives: the next query is answered.
+      terminal.write(encoder.encode("\x1b[c"));
+      expect(decoder.decode(terminal.drainOutputBytes())).toBe(reply);
+      // A query flood in a single slice does not end the terminal either.
+      expect(() =>
+        terminal.write(encoder.encode("\x1b[c".repeat(30_000))),
+      ).not.toThrow();
+      expect(terminal.drainOutputBytes().length).toBeLessThanOrEqual(256 * 1024);
+      terminal.write(encoder.encode("\x1b[c"));
+      expect(decoder.decode(terminal.drainOutputBytes())).toBe(reply);
     } finally {
       terminal.dispose();
     }

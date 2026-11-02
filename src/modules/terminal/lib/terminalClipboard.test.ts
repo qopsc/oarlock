@@ -5,6 +5,7 @@ import {
   readTerminalClipboard,
   runProgramClipboardWrite,
   writeClipboardImage,
+  copyTerminalSelection,
   writeTerminalClipboard,
   writeTerminalClipboardContent as writeContent,
 } from "./terminalClipboard";
@@ -13,6 +14,8 @@ const writeTerminalClipboardContent = (
   content: Parameters<typeof writeContent>[0],
   owner = new AbortController().signal,
 ) => writeContent(content, owner);
+const toasts = vi.hoisted(() => ({ error: vi.fn() }));
+vi.mock("sonner", () => ({ toast: toasts }));
 vi.mock("@/lib/networkPage", () => ({ networkPage: async () => "page" }));
 const order = vi.hoisted(() => ({ next: 0, latest: "", revision: 0 }));
 const imageHeaders = vi.hoisted(() => [] as (string | undefined)[]);
@@ -120,6 +123,19 @@ describe("terminal clipboard", () => {
     expect(web.readText).not.toHaveBeenCalled();
     native.readText.mockResolvedValue("retry");
     await expect(readTerminalClipboard()).resolves.toBe("retry");
+  });
+
+  it("tells the user when a program's write took the clipboard first", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Macintosh", clipboard: web });
+    native.writeText.mockImplementation(async () => {
+      throw new Error("Clipboard write was cancelled or superseded");
+    });
+    await expect(copyTerminalSelection("mine")).resolves.toBe(false);
+    expect(toasts.error).toHaveBeenCalledWith("Copy was replaced", expect.anything());
+    native.writeText.mockReset();
+    toasts.error.mockClear();
+    await expect(copyTerminalSelection("mine")).resolves.toBe(true);
+    expect(toasts.error).not.toHaveBeenCalled();
   });
 
   it("reports failed copies instead of signaling success", async () => {

@@ -56,3 +56,13 @@ export function supportedKittyKeyboardFlags(
     ? KITTY_KEYBOARD_ALL_FLAGS & ~(KITTY_REPORT_EVENTS | KITTY_REPORT_ALTERNATES)
     : KITTY_KEYBOARD_ALL_FLAGS;
 }
+
+const MODIFIER_KEYS: ReadonlySet<string> = new Set([
+  "Shift", "Control", "Alt", "AltGraph", "Meta", "CapsLock", "NumLock",
+  "ScrollLock", "Fn", "FnLock", "Hyper", "Super", "Symbol", "SymbolLock", "OS",
+]);
+
+/** A key that changes modifier state and types nothing by itself. */
+export function isModifierOnlyKey(event: Pick<KeyboardEvent, "key">): boolean {
+  return MODIFIER_KEYS.has(event.key);
+}

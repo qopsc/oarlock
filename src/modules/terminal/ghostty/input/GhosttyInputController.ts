@@ -13,7 +13,11 @@ import {
   type KeyEvent,
 } from "@oarlock/ghostty-core/protocol";
 import type { GhosttyTerminalModelApi } from "../GhosttyTerminalModel";
-import { encodeTerminalPaste, isUnsafePaste } from "./terminalInputEncoding";
+import {
+  encodeTerminalPaste,
+  isModifierOnlyKey,
+  isUnsafePaste,
+} from "./terminalInputEncoding";
 
 import { TerminalInputProxy } from "@/modules/terminal/ghostty/input/TerminalInputProxy";
 import { TerminalNativeSelection } from "@/modules/terminal/ghostty/input/TerminalNativeSelection";
@@ -160,8 +164,8 @@ export type GhosttyInputControllerOptions = {
   readonly gridShiftY?: () => number;
   readonly onData: (bytes: Uint8Array) => void;
   readonly onInput?: () => void;
-  readonly reserveInput?: () => ((action: () => void, size?: number) => void) | null;
-  readonly deferInput?: (action: () => void, size?: number) => boolean;
+  readonly reserveInput?: (options?: { deadline?: boolean }) => ((action: () => void, size?: number) => void) | null;
+  readonly deferInput?: (action: () => void, size?: number, repeat?: boolean) => boolean;
   /**
    * Copies the selection; false when nothing is selected, and the key goes
    * on to the program. `clearSelection` asks for the copied selection to be
@@ -313,7 +317,7 @@ export class GhosttyInputController {
   private pasteText(text: string): void {
     const bracketed = this.options.model.modes().bracketedPaste;
     if (this.options.confirmPaste && isUnsafePaste(text, bracketed)) {
-      const reserved = this.options.reserveInput?.();
+      const reserved = this.options.reserveInput?.({ deadline: false });
       if (this.options.reserveInput && !reserved) return;
       const finish = reserved ?? ((action: () => void, _size?: number) => action());
       void Promise.resolve().then(() => this.options.confirmPaste?.(text) ?? false).then(
@@ -359,7 +363,7 @@ export class GhosttyInputController {
   }
 
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
-    if (!event.defaultPrevented) this.options.onInput?.();
+    if (!event.defaultPrevented && !isModifierOnlyKey(event)) this.options.onInput?.();
     this.nativeSelection?.reset();
     // A new keystroke: its text is never a copy of the previous one's.
     this.lastData = "";
@@ -425,7 +429,7 @@ export class GhosttyInputController {
     }
 
     if (!(this.isMac && event.metaKey) &&
-        this.options.deferInput?.(() => this.finishKeyDown(event), event.key.length * 2)) {
+        this.options.deferInput?.(() => this.finishKeyDown(event), event.key.length * 2, event.repeat)) {
       consume(event);
       return;
     }

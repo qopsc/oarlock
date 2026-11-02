@@ -19,7 +19,11 @@ import { initializeSessionGeneration as startSessionInitialization, waitForSessi
 import { BoundedPtyWriter } from "@/modules/terminal/lib/BoundedPtyWriter";
 import { captureCompletionOwner } from "@/modules/terminal/lib/completionOwnership";
 import { captureInputOwner } from "@/modules/terminal/lib/inputOwnership";
-import { reportPendingInputCancellation, reportTerminalInputFailure } from "@/modules/terminal/lib/inputNotices";
+import {
+  reportPendingInputCancellation,
+  reportTerminalInputFailure,
+  reportTerminalInputRefused,
+} from "@/modules/terminal/lib/inputNotices";
 import { scheduleOwnedInput } from "@/modules/terminal/lib/orderedAppInput";
 import { LatestClipboardWrite } from "@/modules/terminal/lib/LatestClipboardWrite";
 import { setLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
@@ -46,7 +50,7 @@ import {
   ProgramClipboardWrite,
   runProgramClipboardWrite,
   writePrimarySelection,
-  writeTerminalClipboard,
+  copyTerminalSelection,
 } from "../lib/terminalClipboard";
 import { TerminalCwdReports } from "../lib/terminalCwdReports";
 import { useTerminalFontOffsets } from "../lib/terminalFontOffsets";
@@ -434,9 +438,21 @@ export function captureGhosttyInputOwner(leafId: number) {
   const write = (data: string, valid: () => boolean = () => true) =>
     session.writer.enqueue(textEncoder.encode(data), false,
       () => owner.active() && valid(), cancelled);
+  /** Resolves true once the PTY took the bytes; false if refused, cancelled or failed. */
+  const writeDelivered = (data: string, valid: () => boolean = () => true) =>
+    new Promise<boolean>((resolve) => {
+      const queued = session.writer.enqueue(
+        textEncoder.encode(data), false,
+        () => owner.active() && valid(),
+        () => { cancelled(); resolve(false); },
+        resolve,
+      );
+      if (!queued) resolve(false);
+    });
   return {
     ...owner,
     write,
+    writeDelivered,
     schedule: (prepare: () => Promise<string>, valid: () => boolean = () => true) =>
       scheduleOwnedInput(session.writer, owner, prepare, valid, write, cancelled,
         (error) => toast.error("Could not send terminal input", { description: String(error) })),
@@ -462,11 +478,11 @@ export function holdingGhosttyInput(leafId: number): boolean {
   return sessions.get(leafId)?.writer.holdingInput ?? false;
 }
 
-export function reserveGhosttyInput(leafId: number) {
+export function reserveGhosttyInput(leafId: number, options?: { deadline?: boolean }) {
   const session = sessions.get(leafId);
   if (!session || session.disposed || session.shellExited) return null;
   const generation = session.generation;
-  const finish = session.writer.reserveInput();
+  const finish = session.writer.reserveInput(options);
   if (!finish) return null;
   return (action: () => void, size = 0) => finish(() => {
     if (sessions.get(leafId) === session && !session.disposed &&
@@ -975,7 +991,10 @@ function ensureSession(
     input: null,
     pty: null,
     ptyResize,
-    writer: new BoundedPtyWriter((error) => reportTerminalInputFailure(leafId, error)),
+    writer: new BoundedPtyWriter(
+      (error) => reportTerminalInputFailure(leafId, error),
+      (reason) => reportTerminalInputRefused(leafId, reason),
+    ),
     container: null,
     callbacks: {},
     visible: false,
@@ -1344,8 +1363,8 @@ function createGhosttyInput(
     }),
     gridShiftY: () => surface.gridShiftY(),
     onInput: () => noteGhosttyUserInput(session.leafId),
-    reserveInput: () => session.writer.reserveInput(),
-    deferInput: (action, size) => session.writer.deferInput(action, size),
+    reserveInput: (options) => session.writer.reserveInput(options),
+    deferInput: (action, size, repeat) => session.writer.deferInput(action, size, repeat),
     onData: (bytes) => {
       if (
         ghosttyBlocks(session.leafId)?.getMode() === "prompt" &&
@@ -1378,7 +1397,7 @@ function createGhosttyInput(
       if (!text) return;
       void writePrimarySelection(text);
       if (mode === "clipboard")
-        void writeTerminalClipboard(text).catch(() => {});
+        void copyTerminalSelection(text);
     },
     onMiddleClick: () => {
       if (
@@ -1407,7 +1426,7 @@ function createGhosttyInput(
     onCopy: (clearSelection) => {
       const text = surface.getSelection();
       if (!text) return false;
-      void writeTerminalClipboard(text).catch(() => {});
+      void copyTerminalSelection(text);
       if (clearSelection) surface.clearSelection();
       return true;
     },

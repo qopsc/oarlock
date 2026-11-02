@@ -3,7 +3,7 @@ import { EditorView, runScopeHandlers } from "@codemirror/view";
 export type ShellInputGateOwner = {
   defer: (action: () => void, size?: number) => boolean;
   holding: () => boolean;
-  reserve: () => ((action: () => void, size?: number) => void) | null;
+  reserve: (options?: { deadline?: boolean }) => ((action: () => void, size?: number) => void) | null;
   noteInput: () => void;
 };
 
@@ -22,7 +22,8 @@ export function shellInputGate(owner: ShellInputGateOwner) {
         return owner.defer(() => { runScopeHandlers(view, event, "editor"); }, event.key.length * 2);
       },
       compositionstart() {
-        if (owner.holding()) composition = owner.reserve();
+        // The composition waits on the user, not the system: no deadline.
+        if (owner.holding()) composition = owner.reserve({ deadline: false });
         return false;
       },
       compositionend(event, view) {
