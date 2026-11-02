@@ -610,6 +610,29 @@ fn window_listings(app: &AppHandle, window: &str) -> Vec<ProjectServers> {
         })
         .collect()
 }
+/// The project a run would retain (none when it has no `.mcp.json` servers), and its key.
+pub(super) fn resolve_run_project(
+    app: &AppHandle,
+    root: Option<String>,
+    workspace: Option<crate::modules::workspace::WorkspaceEnv>,
+) -> Result<(Option<OpenProject>, Option<String>), String> {
+    let project = root
+        .map(|root| project_trust::resolve_project(&root, workspace))
+        .transpose()?;
+    let key = project.as_ref().map(|p| p.key.clone());
+    let Some(project) = project else {
+        return Ok((None, key));
+    };
+    app.state::<crate::modules::workspace::WorkspaceRegistry>()
+        .authorized_existing(&project.real)
+        .map_err(|e| e.to_string())?;
+    let retained = listing(app, &project).is_some_and(|p| !p.servers.is_empty());
+    Ok((retained.then_some(project), key))
+}
+pub(super) fn run_listings(app: &AppHandle, window: &str) -> Vec<ProjectServers> {
+    window_listings(app, window)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunProject {

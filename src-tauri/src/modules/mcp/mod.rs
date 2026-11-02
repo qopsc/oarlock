@@ -27,6 +27,7 @@ mod http;
 pub mod import;
 mod jsonc;
 mod leases;
+pub mod runs;
 mod logs;
 mod names;
 pub mod oauth;
