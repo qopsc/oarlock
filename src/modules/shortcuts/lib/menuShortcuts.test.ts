@@ -167,22 +167,25 @@ describe("menuShortcutPlan", () => {
     });
   });
 
-  it("matches the table the native menu is first built with", async () => {
+  it("matches the table the native menu is first built with, field by field", async () => {
     const { readFileSync } = await import("node:fs");
     const native = readFileSync("src-tauri/src/modules/app_menu.rs", "utf8");
+    const block = /fn macos_defaults[\s\S]*?json!\(\{([\s\S]*?)\}\)\)/.exec(native)?.[1] ?? "";
+    const fields = Object.fromEntries(
+      [...block.matchAll(/"(\w+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]),
+    );
     const table = menuShortcutPlan({}, mac).accelerators;
-    for (const key of [
-      table.newWindow,
-      table.closeTab,
-      table.newTab,
-      table.nextTab,
-      table.previousTab,
-      table.commandPalette,
-      table.toggleAi,
-    ]) {
-      expect(native).toContain(`"${key}"`);
-    }
-    expect(native).toContain("Cmd+Digit{n}");
+    expect(fields).toEqual({
+      newWindow: table.newWindow,
+      closeTab: table.closeTab,
+      newTab: table.newTab,
+      nextTab: table.nextTab,
+      previousTab: table.previousTab,
+      commandPalette: table.commandPalette,
+      toggleAi: table.toggleAi,
+    });
+    expect(block).toContain('"selectTab": (1..=9).map(|n| format!("Cmd+Digit{n}"))');
+    expect(table.selectTab).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `Cmd+Digit${n}`));
   });
 
   it("follows the user's own bindings", () => {
