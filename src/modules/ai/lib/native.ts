@@ -1,3 +1,4 @@
+import { StaleFileError } from "./staleFile";
 import { discardAcrossWindows } from "@/modules/editor/lib/discardBridge";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -11,9 +12,19 @@ import {
 export type ProjectMemory = { size: number; text: string | null };
 
 export type ReadResult =
-  | { kind: "text"; content: string; size: number }
+  | {
+      kind: "text";
+      content: string;
+      size: number;
+      /** Identity and content of the file as read; set when asked for. */
+      version?: string | null;
+    }
   | { kind: "binary"; size: number }
   | { kind: "toolarge"; size: number; limit: number };
+
+type SaveOutcome =
+  | { kind: "saved"; version: string }
+  | { kind: "conflict"; version: string | null };
 
 export type DirEntry = {
   name: string;
@@ -214,10 +225,11 @@ export function createNative(
 
   return {
     workspaceCurrentDir: () => invoke<string>("workspace_current_dir"),
-    readFile: (path: string) =>
+    readFile: (path: string, options?: { versioned?: boolean }) =>
       invoke<ReadResult>("fs_read_file", {
         path,
         workspace: environment(),
+        ...(options?.versioned ? { versioned: true } : {}),
         ...AI_ORIGIN,
       }),
     /** The window's project AGENTS.md for a run in `root`, only while the user
@@ -229,13 +241,23 @@ export function createNative(
         workspace: environment(),
         limit: Math.floor(limit),
       }),
-    writeFile: (path: string, content: string) =>
-      invoke<void>("fs_write_file", {
+    /** Saves only over the version that was read (`null`: only a file that
+     *  does not exist), so a change made meanwhile is never overwritten. */
+    writeFile: async (
+      path: string,
+      content: string,
+      expectedVersion: string | null,
+    ): Promise<{ version: string }> => {
+      const outcome = await invoke<SaveOutcome>("fs_save_document", {
         path,
         content,
+        expectedVersion,
         workspace: environment(),
         ...AI_ORIGIN,
-      }),
+      });
+      if (outcome.kind === "conflict") throw new StaleFileError(path);
+      return { version: outcome.version };
+    },
     canonicalize: (path: string) =>
       invoke<string>("fs_canonicalize", {
         path,

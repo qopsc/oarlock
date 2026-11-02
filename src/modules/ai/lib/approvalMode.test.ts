@@ -7,7 +7,7 @@ vi.mock("@ai-sdk/openai", () => ({
   createOpenAI: () => () => model.current,
 }));
 const native = vi.hoisted(() => ({
-  writeFile: vi.fn(async () => {}),
+  writeFile: vi.fn(async () => ({ version: "v2" })),
   canonicalize: vi.fn(async (path: string) => path),
 }));
 vi.mock("./native", () => ({ native }));
@@ -152,7 +152,11 @@ describe("Auto-approve in a real run", () => {
       AUTO,
     );
     expect(approvals).toEqual([]);
-    expect(native.writeFile).toHaveBeenCalledWith("/workspace/notes.txt", "hi");
+    expect(native.writeFile).toHaveBeenCalledWith(
+      "/workspace/notes.txt",
+      "hi",
+      null,
+    );
   });
 
   it("still asks before launching a coding agent", async () => {

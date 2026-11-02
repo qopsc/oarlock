@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { native as defaultNative } from "../lib/native";
+import { StaleFileError } from "../lib/staleFile";
 import {
   checkReadableCanonical,
   checkWritableCanonical,
@@ -43,7 +44,7 @@ export function buildFsTools(ctx: ToolContext) {
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
         try {
-          const r = await native.readFile(abs);
+          const r = await native.readFile(abs, { versioned: true });
           if (r.kind === "binary")
             return { error: "binary file refused", path: abs, size: r.size };
           if (r.kind === "toolarge")
@@ -71,7 +72,12 @@ export function buildFsTools(ctx: ToolContext) {
             (prior?.fullContent === true &&
               prior.size === r.size &&
               prior.hash === hash);
-          ctx.readCache.set(abs, { size: r.size, hash, fullContent });
+          ctx.readCache.set(abs, {
+            size: r.size,
+            hash,
+            fullContent,
+            version: r.version,
+          });
           if (isFullRead) {
             return {
               path: abs,
@@ -145,15 +151,29 @@ export function buildFsTools(ctx: ToolContext) {
         if (!safety.ok) return { error: safety.reason, path: reqPath };
         const abs = safety.canonical;
 
-        if (usePlanStore.getState().active) {
-          let original = "";
-          let isNewFile = false;
+        // The version the write must replace: the one the model read, else the
+        // one on disk now; null when there is no file (create only).
+        let expected: string | null | undefined =
+          ctx.readCache.get(abs)?.version;
+        let original = "";
+        if (expected === undefined) {
           try {
-            const r = await native.readFile(abs);
-            if (r.kind === "text") original = r.content;
+            const r = await native.readFile(abs, { versioned: true });
+            if (r.kind !== "text" || typeof r.version !== "string") {
+              return {
+                error:
+                  "cannot overwrite a binary, oversized or unversioned file",
+                path: abs,
+              };
+            }
+            original = r.content;
+            expected = r.version;
           } catch {
-            isNewFile = true;
+            expected = null;
           }
+        }
+
+        if (usePlanStore.getState().active) {
           usePlanStore.getState().enqueue({
             workspace: ctx.workspace,
             id: newQueuedEditId(),
@@ -161,7 +181,8 @@ export function buildFsTools(ctx: ToolContext) {
             path: abs,
             originalContent: original,
             proposedContent: content,
-            isNewFile,
+            isNewFile: expected === null,
+            baseVersion: expected,
           });
           return {
             path: abs,
@@ -171,12 +192,15 @@ export function buildFsTools(ctx: ToolContext) {
         }
 
         try {
-          await native.writeFile(abs, content);
-          const entry = writtenEntry(content);
+          const saved = await native.writeFile(abs, content, expected);
+          const entry = writtenEntry(content, saved.version);
           ctx.readCache.set(abs, entry);
           return { path: abs, bytesWritten: entry.size, ok: true };
         } catch (e) {
-          return { error: String(e), path: abs };
+          return {
+            error: e instanceof StaleFileError ? e.message : String(e),
+            path: abs,
+          };
         }
       },
     }),
@@ -204,6 +228,7 @@ export function buildFsTools(ctx: ToolContext) {
             originalContent: "",
             proposedContent: "",
             isNewFile: true,
+            baseVersion: null,
             description: "Create directory",
           });
           return { path: abs, queued_for_plan_review: true, ok: true };

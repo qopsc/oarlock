@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const native = vi.hoisted(() => ({
+  readFile: vi.fn(),
   writeFile: vi.fn(),
   createDir: vi.fn(),
   canonicalize: vi.fn(),
@@ -21,6 +22,7 @@ function edit(partial: Partial<QueuedEdit> = {}): QueuedEdit {
     originalContent: "old",
     proposedContent: "new",
     isNewFile: false,
+    baseVersion: "v1",
     ...partial,
   };
 }
@@ -40,7 +42,13 @@ const queueIds = () => usePlanStore.getState().queue.map((q) => q.id);
 describe("plan mode store", () => {
   beforeEach(() => {
     usePlanStore.setState({ active: false, queue: [] });
-    native.writeFile.mockReset().mockResolvedValue(undefined);
+    native.readFile.mockReset().mockResolvedValue({
+      kind: "text",
+      content: "old",
+      size: 3,
+      version: "v1",
+    });
+    native.writeFile.mockReset().mockResolvedValue({ version: "v2" });
     native.createDir.mockReset().mockResolvedValue(undefined);
     native.canonicalize
       .mockReset()
@@ -87,8 +95,8 @@ describe("plan mode store", () => {
     const results = await usePlanStore.getState().applyAll();
 
     expect(native.writeFile.mock.calls).toEqual([
-      ["/repo/a.ts", "new"],
-      ["/repo/b.ts", "new"],
+      ["/repo/a.ts", "new", "v1"],
+      ["/repo/b.ts", "new", "v1"],
     ]);
     expect(results).toEqual([
       { id: "q-1", ok: true },
@@ -113,7 +121,7 @@ describe("plan mode store", () => {
     native.writeFile.mockImplementation((path: string) =>
       path === "/repo/blocked"
         ? Promise.reject(new Error("denied"))
-        : Promise.resolve(),
+        : Promise.resolve({ version: "v2" }),
     );
 
     const results = await usePlanStore.getState().applyAll();
@@ -172,16 +180,21 @@ describe("plan mode store", () => {
 
     await usePlanStore.getState().applyAll();
 
-    expect(native.writeFile).toHaveBeenCalledWith("/repo/src/real.ts", "new");
+    expect(native.writeFile).toHaveBeenCalledWith(
+      "/repo/src/real.ts",
+      "new",
+      "v1",
+    );
   });
 
   it("keeps edits enqueued while applyAll is pending and applies them later", async () => {
     let releaseWrite: (() => void) | undefined;
     native.writeFile.mockImplementation(
       (path: string) =>
-        new Promise<void>((resolve) => {
-          if (path === "/repo/first") releaseWrite = resolve;
-          else resolve();
+        new Promise<{ version: string }>((resolve) => {
+          if (path === "/repo/first")
+            releaseWrite = () => resolve({ version: "v2" });
+          else resolve({ version: "v2" });
         }),
     );
     usePlanStore.getState().enqueue(edit({ id: "q-1", path: "/repo/first" }));
@@ -205,9 +218,10 @@ describe("plan mode store", () => {
     let releaseWrite: (() => void) | undefined;
     native.writeFile.mockImplementation(
       (path: string) =>
-        new Promise<void>((resolve) => {
-          if (path === "/repo/first") releaseWrite = resolve;
-          else resolve();
+        new Promise<{ version: string }>((resolve) => {
+          if (path === "/repo/first")
+            releaseWrite = () => resolve({ version: "v2" });
+          else resolve({ version: "v2" });
         }),
     );
     usePlanStore.getState().enqueue(edit({ id: "q-1", path: "/repo/first" }));
@@ -228,5 +242,122 @@ describe("plan mode store", () => {
       "/repo/third",
     ]);
     expect(usePlanStore.getState().queue).toEqual([]);
+  });
+
+  describe("same-file edits and stale versions", () => {
+    const op = (old_string: string, new_string: string) => ({
+      old_string,
+      new_string,
+    });
+    const queued = (id: string, edits: ReturnType<typeof op>[]) =>
+      edit({
+        id,
+        kind: "edit",
+        edits,
+        originalContent: "X0 Y0",
+        proposedContent: "ignored by apply",
+      });
+
+    beforeEach(() => {
+      native.readFile.mockResolvedValue({
+        kind: "text",
+        content: "X0 Y0",
+        size: 5,
+        version: "v1",
+      });
+      native.writeFile
+        .mockResolvedValueOnce({ version: "v2" })
+        .mockResolvedValueOnce({ version: "v3" });
+    });
+
+    it("lands two edits to one file by applying the second onto the first's result", async () => {
+      const { enqueue, applyAll } = usePlanStore.getState();
+      enqueue(queued("q-1", [op("X0", "X1")]));
+      enqueue(queued("q-2", [op("Y0", "Y1")]));
+
+      const results = await applyAll();
+
+      expect(results).toEqual([
+        { id: "q-1", ok: true },
+        { id: "q-2", ok: true },
+      ]);
+      expect(native.writeFile.mock.calls).toEqual([
+        ["/repo/a.ts", "X1 Y0", "v1"],
+        ["/repo/a.ts", "X1 Y1", "v2"],
+      ]);
+    });
+
+    it("reports every edit stale when the file changed after they were queued", async () => {
+      native.readFile.mockResolvedValue({
+        kind: "text",
+        content: "X0 Y0 saved in the editor",
+        size: 25,
+        version: "v9",
+      });
+      const { enqueue, applyAll } = usePlanStore.getState();
+      enqueue(queued("q-1", [op("X0", "X1")]));
+      enqueue(queued("q-2", [op("Y0", "Y1")]));
+
+      const results = await applyAll();
+
+      expect(native.writeFile).not.toHaveBeenCalled();
+      expect(results.map((r) => r.ok)).toEqual([false, false]);
+      expect(results[0].error).toMatch(/changed on disk/);
+      expect(usePlanStore.getState().queue.map((q) => q.id)).toEqual([
+        "q-1",
+        "q-2",
+      ]);
+    });
+
+    it("reports a save that loses the race as stale and stops the file's chain", async () => {
+      const { StaleFileError } = await import("@/modules/ai/lib/staleFile");
+      native.writeFile
+        .mockReset()
+        .mockRejectedValueOnce(new StaleFileError("/repo/a.ts"));
+      const { enqueue, applyAll } = usePlanStore.getState();
+      enqueue(queued("q-1", [op("X0", "X1")]));
+      enqueue(queued("q-2", [op("Y0", "Y1")]));
+
+      const results = await applyAll();
+
+      expect(native.writeFile).toHaveBeenCalledTimes(1);
+      expect(results.map((r) => r.ok)).toEqual([false, false]);
+      expect(results[0].error).toMatch(/changed on disk/);
+    });
+
+    it("reports a queued edit that no longer applies to the running buffer", async () => {
+      const { enqueue, applyAll } = usePlanStore.getState();
+      enqueue(queued("q-1", [op("X0", "X1")]));
+      enqueue(queued("q-2", [op("X0", "X2")]));
+
+      const results = await applyAll();
+
+      expect(results[0]).toEqual({ id: "q-1", ok: true });
+      expect(results[1]).toMatchObject({ id: "q-2", ok: false });
+      expect(results[1].error).toMatch(/old_string not found/);
+    });
+
+    it("creates a new file only if it still does not exist", async () => {
+      native.readFile.mockResolvedValue({
+        kind: "text",
+        content: "someone made it",
+        size: 15,
+        version: "v7",
+      });
+      const { enqueue, applyAll } = usePlanStore.getState();
+      enqueue(
+        edit({
+          kind: "write_file",
+          isNewFile: true,
+          baseVersion: null,
+          path: "/repo/new.ts",
+        }),
+      );
+
+      const results = await applyAll();
+
+      expect(results[0].ok).toBe(false);
+      expect(native.writeFile).not.toHaveBeenCalled();
+    });
   });
 });
