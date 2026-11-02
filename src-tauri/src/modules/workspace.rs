@@ -72,6 +72,7 @@ impl WorkspaceRegistry {
         Gates {
             registry: self,
             everywhere: self.all_folders(origin),
+            protect_secrets: origin == Origin::Ai,
         }
     }
 
@@ -81,6 +82,7 @@ impl WorkspaceRegistry {
         Gates {
             registry: self,
             everywhere: false,
+            protect_secrets: false,
         }
     }
 
@@ -215,6 +217,9 @@ impl WorkspaceRegistry {
 pub struct Gates<'a> {
     registry: &'a WorkspaceRegistry,
     everywhere: bool,
+    /// The AI's gates also refuse the secret paths the page's deny-list names, so a page bug
+    /// or a tool that forgets the check cannot reach `.env` or `.ssh`.
+    protect_secrets: bool,
 }
 
 impl Gates<'_> {
@@ -228,11 +233,23 @@ impl Gates<'_> {
     /// missing path out there reads as outside too, so the answer never tells whether it exists.
     pub fn authorized_existing(&self, path: &Path) -> Result<PathBuf, String> {
         require_absolute(path)?;
+        self.screen(path)?;
         match std::fs::canonicalize(path) {
-            Ok(real) if self.reaches(&real) => Ok(real),
+            Ok(real) if self.reaches(&real) => {
+                self.screen(&real)?;
+                Ok(real)
+            }
             Ok(_) => Err(outside(path)),
             Err(error) => Err(self.missing(path, error)),
         }
+    }
+
+    /// Refuses a protected path for the AI's gates; the page's own gates are not screened.
+    fn screen(&self, path: &Path) -> Result<(), String> {
+        if self.protect_secrets && !crate::modules::secret_paths::readable(path) {
+            return Err(format!("{} is a protected path", path.display()));
+        }
+        Ok(())
     }
 
     /// A directory entry itself, not what a link points to: its name in its real folder, which
@@ -245,7 +262,10 @@ impl Gates<'_> {
         if !is_plain_name(name) {
             return Err(format!("not a file or folder: {}", path.display()));
         }
-        Ok(self.authorized_existing(parent)?.join(name))
+        self.screen(path)?;
+        let entry = self.authorized_existing(parent)?.join(name);
+        self.screen(&entry)?;
+        Ok(entry)
     }
 
     /// A path that may not exist yet (a file or folder to create): its nearest existing ancestor,
@@ -253,6 +273,7 @@ impl Gates<'_> {
     /// link nor `..` leads out.
     pub fn authorized_new(&self, path: &Path) -> Result<PathBuf, String> {
         require_absolute(path)?;
+        self.screen(path)?;
         let (real, rest) = nearest_real_ancestor(path).ok_or_else(|| outside(path))?;
         if !self.reaches(&real) {
             return Err(outside(path));
@@ -263,7 +284,9 @@ impl Gates<'_> {
                 path.display()
             ));
         }
-        Ok(real.join(rest))
+        let created = real.join(rest);
+        self.screen(&created)?;
+        Ok(created)
     }
 
     /// The file a write lands in: an existing file (a link followed to its file) or a new one.
@@ -1708,6 +1731,48 @@ mod auth_tests {
             dir.display()
         );
         results[0]
+    }
+
+    #[test]
+    fn ai_gates_refuse_secret_paths_natively_and_app_gates_do_not() {
+        let (reg, root, _) = inside_and_outside("secrets");
+        fs::write(root.join(".env"), b"TOKEN=1").unwrap();
+        fs::create_dir(root.join(".ssh")).unwrap();
+        let link = root.join("notes.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join(".env"), &link).unwrap();
+        let secret = root.join(".env");
+        let ai = reg.gates(Origin::Ai);
+        let app = reg.gates(Origin::App);
+        assert!(
+            ai.authorized_existing(&secret).is_err(),
+            "read and canonicalize"
+        );
+        assert!(ai.authorized_write_target(&secret).is_err(), "write");
+        assert!(ai.authorized_entry(&secret).is_err(), "rename, delete");
+        assert!(
+            ai.authorized_new(&root.join(".env.local")).is_err(),
+            "create"
+        );
+        assert!(
+            ai.authorized_new(&root.join(".ssh").join("config"))
+                .is_err(),
+            "create in"
+        );
+        assert!(ai.authorized_existing(&root.join("a.txt")).is_ok());
+        assert!(ai.authorized_new(&root.join("new.txt")).is_ok());
+        #[cfg(unix)]
+        {
+            assert!(ai.authorized_existing(&link).is_err(), "a link to a secret");
+            assert!(
+                ai.authorized_write_target(&link).is_err(),
+                "write through a link"
+            );
+        }
+        assert!(app.authorized_existing(&secret).is_ok());
+        assert!(app.authorized_write_target(&secret).is_ok());
+        assert!(app.authorized_new(&root.join(".env.local")).is_ok());
+        assert!(reg.authorized_existing(&secret).is_ok());
     }
 
     #[test]
