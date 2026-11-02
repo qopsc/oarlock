@@ -19,6 +19,10 @@ type Entry = {
   objectUrl?: string;
   bytes: number;
 };
+/** How many images one window loads at once. The backend allows 16 per window, and a request
+ * it has not yet seen cancelled still counts there, so the page stays under it. */
+export const MAX_CONCURRENT_IMAGES = 12;
+
 export type ImageLease = { url: Promise<string>; release: () => void };
 
 /** Each consumer releases exactly its acquisition, once. Pending work belongs
@@ -27,6 +31,8 @@ export class RemoteImageCache {
   private readonly entries = new Map<string, Entry>();
   private readonly idle = new Map<string, Entry>();
   private idleBytes = 0;
+  private active = 0;
+  private readonly waiting: (() => void)[] = [];
 
   constructor(
     private readonly load: (url: string, signal: AbortSignal) => Promise<Blob>,
@@ -34,7 +40,35 @@ export class RemoteImageCache {
     private readonly revoke: (objectUrl: string) => void,
     private readonly idleLimit = 32,
     private readonly idleByteLimit = 32 * 1024 * 1024,
+    private readonly concurrency = MAX_CONCURRENT_IMAGES,
   ) {}
+
+  /** A place among the images loading now; waits in order behind them. A lease released
+   * while waiting leaves the queue without ever starting its load. */
+  private take(signal: AbortSignal): Promise<() => void> | (() => void) {
+    const release = () => {
+      this.active--;
+      this.waiting.shift()?.();
+    };
+    if (this.active < this.concurrency) {
+      this.active++;
+      return release;
+    }
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        signal.removeEventListener("abort", leave);
+        this.active++;
+        resolve(release);
+      };
+      const leave = () => {
+        const at = this.waiting.indexOf(start);
+        if (at >= 0) this.waiting.splice(at, 1);
+        reject(signal.reason);
+      };
+      this.waiting.push(start);
+      signal.addEventListener("abort", leave, { once: true });
+    });
+  }
 
   acquire(url: string): ImageLease {
     let entry = this.entries.get(url);
@@ -49,7 +83,17 @@ export class RemoteImageCache {
         promise: Promise.resolve()
           .then(() => {
             controller.signal.throwIfAborted();
-            return this.load(url, controller.signal);
+            const run = (done: () => void) => {
+              try {
+                controller.signal.throwIfAborted();
+                return this.load(url, controller.signal).finally(done);
+              } catch (error) {
+                done();
+                throw error;
+              }
+            };
+            const place = this.take(controller.signal);
+            return typeof place === "function" ? run(place) : place.then(run);
           })
           .then((blob) => {
             controller.signal.throwIfAborted();
