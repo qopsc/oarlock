@@ -254,19 +254,26 @@ fn respond(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
     match read(file, &real, &path, range, head, pdf_preview) {
         Ok(file) => {
-            let mut response = file.response(origin);
-            if pdf_preview {
-                response.headers_mut().insert(
-                    header::X_CONTENT_TYPE_OPTIONS,
-                    HeaderValue::from_static("nosniff"),
-                );
-            }
-            response
+            file.response(origin)
         }
         Err(error) => {
             log::debug!("{SCHEME}: cannot read {}: {error}", real.display());
             status_only(StatusCode::NOT_FOUND, Some(origin))
         }
+    }
+}
+
+/// The only types a document in the app's webview may be given. Anything else, HTML above
+/// all (`MimeType::parse` falls back to it for an unknown extension), is data, never a page.
+fn inert_unless_media(mime: String) -> String {
+    let media = ["image/", "video/", "audio/"]
+        .iter()
+        .any(|prefix| mime.starts_with(prefix))
+        || mime == "application/pdf";
+    if media {
+        mime
+    } else {
+        "application/octet-stream".into()
     }
 }
 
@@ -338,6 +345,7 @@ fn read(
     } else {
         MimeType::parse(&magic, &real.to_string_lossy())
     };
+    let mime = inert_unless_media(mime);
     if !head && size > MAX_WHOLE_PREVIEW
         && (mime.starts_with("image/") || mime == "application/pdf")
     {
@@ -396,14 +404,17 @@ impl Served {
     fn response(self, origin: &str) -> http::Response<Vec<u8>> {
         let mut builder = with_origin(http::Response::builder(), Some(origin))
             .status(self.status)
-            .header(header::CONTENT_TYPE, self.mime)
+            .header(header::CONTENT_TYPE, self.mime.as_str())
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, "content-range")
-            .header(header::CONTENT_LENGTH, self.len);
-        if self.status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            .header(header::CONTENT_LENGTH, self.len)
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        // A PDF viewer cannot run inside a sandboxed document; every other answer, an SVG
+        // opened as a page included, may not run script or reach another origin.
+        if self.mime != "application/pdf" {
             builder = builder.header(
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; sandbox",
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox",
             );
         }
         if let Some(range) = self.content_range {

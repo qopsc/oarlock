@@ -305,3 +305,76 @@ fn pdf_alias_cannot_open_html_through_a_symlink() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
 }
+
+const HTML: &[u8] = b"<!DOCTYPE html><html><script>fetch('x')</script></html>";
+const PNG: &[u8] =
+    b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89";
+
+fn assert_inert(response: &http::Response<Vec<u8>>) {
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(response.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+}
+
+#[test]
+fn html_bytes_are_never_served_as_a_document_whatever_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["notes.md", "logo.png", "README", "page.html", "clip.mp4", "a.js"] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, HTML).unwrap();
+        let response = respond(&request(&path, Method::GET), "tauri://localhost", |_| true);
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        assert_inert(&response);
+        let head = respond(&request(&path, Method::HEAD), "tauri://localhost", |_| true);
+        assert_inert(&head);
+    }
+}
+
+#[test]
+fn image_media_and_pdf_keep_their_types_with_nosniff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = tmp.path().join("pic.png");
+    std::fs::write(&png, PNG).unwrap();
+    let response = respond(&request(&png, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(response.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+
+    let svg = tmp.path().join("pic.svg");
+    std::fs::write(
+        &svg,
+        b"<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>",
+    )
+    .unwrap();
+    let response = respond(&request(&svg, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+    assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+
+    let pdf = tmp.path().join("doc.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+    let response = respond(&request(&pdf, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+    assert_eq!(response.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+}
+
+#[test]
+fn a_png_named_file_holding_html_is_inert_even_for_a_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("evil.png");
+    std::fs::write(&path, HTML).unwrap();
+    let mut request = request(&path, Method::GET);
+    request
+        .headers_mut()
+        .insert(header::RANGE, HeaderValue::from_static("bytes=0-9"));
+    let ranged = respond(&request, "tauri://localhost", |_| true);
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_inert(&ranged);
+}
