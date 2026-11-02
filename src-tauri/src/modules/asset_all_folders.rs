@@ -142,7 +142,10 @@ pub fn protocol<R: Runtime>(
 
 /// The name a page asked for may be opened: the production judgement before the open.
 fn may_open(access: Option<&Access>, path: &Path, all_folders: bool) -> bool {
-    access.is_some_and(|access| !access.is_app_state(path) && access.may_open(path, all_folders))
+    access.is_some_and(|access| {
+        !access.is_app_state(path)
+            && access.may_open_following(path, all_folders, |link| std::fs::read_link(link))
+    })
 }
 
 /// The opened file's real path may be served: the production judgement after the open.

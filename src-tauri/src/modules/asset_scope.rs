@@ -177,6 +177,58 @@ impl Access {
         self.permits(path) || (all_folders && !has_dot_name(path))
     }
 
+    /// `may_open`, and the same for every name a link on the way composes into. A link inside a
+    /// workspace can point anywhere (`logo.png -> /net/host/share/x`), and opening follows it
+    /// before the opened file can be judged, which is what an automount or a network share
+    /// reacts to. So each prefix of the name is read with `read_link` alone (nothing is
+    /// statted or opened), its target text is composed with the rest of the name, and the
+    /// composed name must pass `may_open` too. A link that composes outside every root, a loop
+    /// and more than 40 links are refused.
+    pub fn may_open_following(
+        &self,
+        path: &Path,
+        all_folders: bool,
+        read_link: impl Fn(&Path) -> std::io::Result<PathBuf>,
+    ) -> bool {
+        let mut path = path.to_path_buf();
+        let mut hops = 0;
+        'again: loop {
+            if !self.may_open(&path, all_folders) {
+                return false;
+            }
+            let parts: Vec<Component> = path.components().collect();
+            let mut prefix = PathBuf::new();
+            for (at, part) in parts.iter().enumerate() {
+                prefix.push(part);
+                if !matches!(part, Component::Normal(_)) {
+                    continue;
+                }
+                match read_link(&prefix) {
+                    Ok(target) => {
+                        hops += 1;
+                        if hops > 40 {
+                            return false;
+                        }
+                        let mut composed = if target.is_absolute() {
+                            target
+                        } else {
+                            prefix.parent().unwrap_or(Path::new("")).join(target)
+                        };
+                        composed.extend(&parts[at + 1..]);
+                        let Some(flat) = flatten(&composed) else {
+                            return false;
+                        };
+                        path = flat;
+                        continue 'again;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return false,
+                    Err(_) => {}
+                }
+            }
+            return true;
+        }
+    }
+
     pub(crate) fn grant_root(&self, root: &Path) {
         self.grant_root_as(root, std::fs::canonicalize(root).ok());
     }
@@ -206,6 +258,24 @@ impl Access {
             }
         }
     }
+}
+
+/// `path` with its `.` and `..` parts folded away, by name alone; `None` when a `..` would
+/// climb past the start.
+fn flatten(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() || out.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 fn has_dot_name(path: &Path) -> bool {
@@ -470,6 +540,58 @@ mod tests {
         assert!(config["app"]["security"]["assetProtocol"]["scope"]["allow"]
             .as_array()
             .is_some_and(|allow| allow.is_empty()));
+    }
+
+    #[test]
+    fn a_link_is_followed_by_name_and_must_stay_inside_a_root() {
+        use std::cell::RefCell;
+        let access = Access::new(vec![], true);
+        access.grant_root_as(Path::new("/work/proj"), None);
+        let links: Vec<(&str, &str)> = vec![
+            ("/work/proj/inside.png", "docs/pic.png"),
+            ("/work/proj/up.png", "../../etc/hosts"),
+            ("/work/proj/mount.png", "/net/attacker.example/share/x"),
+            ("/work/proj/loop-a", "loop-b"),
+            ("/work/proj/loop-b", "loop-a"),
+            ("/work/proj/dir", "/net/host/dir"),
+            ("/work/proj/back.png", "/work/proj/docs/pic.png"),
+        ];
+        let seen = RefCell::new(Vec::new());
+        let read = |p: &Path| {
+            seen.borrow_mut().push(p.to_path_buf());
+            links
+                .iter()
+                .find(|(l, _)| Path::new(l) == p)
+                .map(|(_, t)| PathBuf::from(t))
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        };
+        let open = |p: &str| access.may_open_following(Path::new(p), false, read);
+        assert!(open("/work/proj/docs/pic.png"));
+        assert!(open("/work/proj/inside.png"), "composes inside the root");
+        assert!(open("/work/proj/back.png"));
+        assert!(!open("/work/proj/up.png"), "climbs out of the root");
+        assert!(!open("/work/proj/mount.png"), "points at a network share");
+        assert!(!open("/work/proj/dir/x.png"), "a folder link leading out");
+        assert!(!open("/work/proj/loop-a"), "a loop");
+        assert!(
+            !open("/work/elsewhere/a.png"),
+            "not under a root, never read"
+        );
+        assert!(
+            seen.borrow().iter().all(|p| p.starts_with("/work")),
+            "only names under the work folder were read: {:?}",
+            seen.borrow()
+        );
+    }
+
+    #[test]
+    fn flattening_folds_dots_and_refuses_to_climb_past_the_start() {
+        assert_eq!(
+            flatten(Path::new("/a/b/../c/./d")),
+            Some(PathBuf::from("/a/c/d"))
+        );
+        assert_eq!(flatten(Path::new("/a/../..")), None);
+        assert_eq!(flatten(Path::new("/..")), None);
     }
 
     #[test]
