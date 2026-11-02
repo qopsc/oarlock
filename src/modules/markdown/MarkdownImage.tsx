@@ -1,4 +1,7 @@
 import { useWorkspaceAssetUrl } from "@/modules/workspace";
+import { openInDefaultApp } from "@/modules/explorer/lib/openDefault";
+import { useOwnedWorkspace } from "@/modules/workspace/owner";
+import { workspaceEnvForPath } from "@/modules/workspace/env";
 import {
   type ComponentProps,
   type CSSProperties,
@@ -76,18 +79,33 @@ export function imageHeightStyle(height: unknown): CSSProperties | undefined {
  */
 export function MarkdownImage({ node: _node, src, alt, ...props }: Props) {
   const localPath = props[LOCAL_IMAGE_PATH] ?? null;
+  const owner = useOwnedWorkspace();
   const remote =
     localPath === null && typeof src === "string" && /^https?:\/\//i.test(src)
       ? src
       : null;
   const localUrl = useWorkspaceAssetUrl(localPath);
+  const [failedLocalUrl, setFailedLocalUrl] = useState<string | null>(null);
   const secureRemote = remote !== null && /^https:/i.test(remote);
   const image = useRemoteImage(secureRemote ? remote : null);
   const style = imageHeightStyle(props.height);
 
   if (localPath !== null) {
+    if (localUrl !== null && failedLocalUrl === localUrl) {
+      return (
+        <span className="inline-block rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+          Image is too large to preview or could not be loaded. {" "}
+          <button type="button" className="underline" onClick={() => void openInDefaultApp(localPath, workspaceEnvForPath(localPath, owner))}>
+            Open externally
+          </button>
+        </span>
+      );
+    }
     return localUrl ? (
-      <img {...props} style={style} src={localUrl} alt={alt} />
+      <img {...props} style={style} src={localUrl} alt={alt} onError={(event) => {
+        setFailedLocalUrl(localUrl);
+        props.onError?.(event);
+      }} />
     ) : null;
   }
   if (remote === null) {

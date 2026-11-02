@@ -15,6 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::Arc;
 
 use tauri::http::{self, header, HeaderValue, Method, StatusCode};
 use tauri::utils::mime_type::MimeType;
@@ -32,8 +33,21 @@ const MAX_PART: u64 = 1000 * 1024;
 
 /// How much of a file the content type is sniffed from.
 const SNIFF_BYTES: u64 = 8192;
+const MAX_WHOLE_PREVIEW: u64 = 50 * 1024 * 1024;
+const MAX_ACTIVE_PREVIEWS: usize = 2;
+const MAX_PENDING_PREVIEWS: usize = 64;
 
 static ORIGINS: OnceLock<AllowedOrigins> = OnceLock::new();
+
+fn preview_budget() -> &'static Arc<tokio::sync::Semaphore> {
+    static BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_PREVIEWS)))
+}
+
+fn preview_admission() -> &'static Arc<tokio::sync::Semaphore> {
+    static ADMISSION: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    ADMISSION.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_PREVIEWS)))
+}
 
 pub fn protocol<R: Runtime>(
     ctx: UriSchemeContext<'_, R>,
@@ -41,8 +55,19 @@ pub fn protocol<R: Runtime>(
     responder: UriSchemeResponder,
 ) {
     let app = ctx.app_handle().clone();
-    // Opening and reading the file blocks.
-    tauri::async_runtime::spawn_blocking(move || {
+    let Ok(admitted) = preview_admission().clone().try_acquire_owned() else {
+        responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+      let Ok(worker) = preview_budget().clone().acquire_owned().await else {
+          responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
+          return;
+      };
+      // Opening and reading the file blocks; keep both permits until it finishes.
+      tauri::async_runtime::spawn_blocking(move || {
+        let _admitted = admitted;
+        let _worker = worker;
         let origins = ORIGINS.get_or_init(|| {
             AllowedOrigins::for_app(
                 app.config().build.dev_url.as_ref(),
@@ -64,6 +89,7 @@ pub fn protocol<R: Runtime>(
             )
         };
         responder.respond(respond(&request, &origin, served));
+      });
     });
 }
 
@@ -226,7 +252,7 @@ fn respond(
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
-    match read(file, &real, range, head, pdf_preview) {
+    match read(file, &real, &path, range, head, pdf_preview) {
         Ok(file) => {
             let mut response = file.response(origin);
             if pdf_preview {
@@ -266,9 +292,21 @@ struct Served {
     body: Vec<u8>,
 }
 
+fn too_large() -> Served {
+    const MESSAGE: &[u8] = b"This file is too large to preview; open it in another application.";
+    Served {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        mime: "text/plain".into(),
+        content_range: None,
+        len: MESSAGE.len() as u64,
+        body: MESSAGE.to_vec(),
+    }
+}
+
 fn read(
     mut file: File,
     real: &Path,
+    requested: &Path,
     range: Option<&str>,
     head: bool,
     pdf_preview: bool,
@@ -278,6 +316,17 @@ fn read(
         return Err(std::io::Error::other("not a file"));
     }
     let size = meta.len();
+    let requested_range = parse_range(range, size);
+    let image_or_pdf = |path: &Path| path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"]
+            .iter().any(|candidate| ext.eq_ignore_ascii_case(candidate))
+    });
+    let large_image_or_pdf = image_or_pdf(real) || image_or_pdf(requested);
+    if !head && size > MAX_WHOLE_PREVIEW
+        && (large_image_or_pdf || matches!(requested_range, Range::Whole))
+    {
+        return Ok(too_large());
+    }
     let mut magic = Vec::new();
     (&mut file)
         .take(size.min(SNIFF_BYTES))
@@ -289,6 +338,11 @@ fn read(
     } else {
         MimeType::parse(&magic, &real.to_string_lossy())
     };
+    if !head && size > MAX_WHOLE_PREVIEW
+        && (mime.starts_with("image/") || mime == "application/pdf")
+    {
+        return Ok(too_large());
+    }
     if pdf_preview && mime != "application/pdf" {
         const MESSAGE: &[u8] = b"This file is not a valid PDF and cannot be previewed.";
         return Ok(Served {
@@ -299,7 +353,7 @@ fn read(
             body: if head { Vec::new() } else { MESSAGE.to_vec() },
         });
     }
-    let (status, start, len, content_range) = match parse_range(range, size) {
+    let (status, start, len, content_range) = match requested_range {
         Range::Whole => (StatusCode::OK, 0, size, None),
         Range::Part { start, end } => (
             StatusCode::PARTIAL_CONTENT,

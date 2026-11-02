@@ -9,19 +9,14 @@ import {
 } from "./env";
 
 /**
- * The backend's guarded scheme for PDF previews and previews while the app
- * may access all folders. It checks the setting on every request, preserves
- * the asset scope's dot-folder rule, and validates PDF content.
+ * The backend's guarded scheme checks scope and read limits on every request,
+ * preserves the asset scope's dot-folder rule, and validates PDF content.
  */
 const ALL_FOLDERS_SCHEME = "oarlock-asset";
 
 /** A host path as a URL the webview loads it from. */
 function assetSrc(hostPath: string, allFolders: boolean): string {
-  // PDF previews use an iframe. The guarded scheme verifies PDF content
-  // before serving it so a renamed HTML file cannot run script in that frame.
-  return allFolders || /\.pdf$/i.test(hostPath)
-    ? convertFileSrc(hostPath, ALL_FOLDERS_SCHEME)
-    : convertFileSrc(hostPath);
+  return `${convertFileSrc(hostPath, ALL_FOLDERS_SCHEME)}?access=${allFolders ? 1 : 0}`;
 }
 
 /**
@@ -41,8 +36,8 @@ export async function workspaceAssetUrl(
 
 /**
  * `workspaceAssetUrl` for render: null until a WSL path is mapped. Follows
- * "Allow the app to access all folders", so turning it off reloads previews
- * through the asset protocol at once.
+ * "Allow the app to access all folders", so a change reloads previews and
+ * the guarded scheme checks the updated access setting.
  */
 export function useWorkspaceAssetUrl(path: string | null): string | null {
   const workspace = useOwnedWorkspace();

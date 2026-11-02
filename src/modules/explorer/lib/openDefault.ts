@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { showFileError } from "@/modules/mac-privacy";
-import { currentWorkspaceEnv } from "@/modules/workspace";
+import { currentWorkspaceEnv, type WorkspaceEnv } from "@/modules/workspace";
 
 /** `fs_open_default`: "cancelled" means the file runs as a program and the user said no. */
 type OpenOutcome = "opened" | "cancelled";
@@ -10,11 +10,11 @@ type OpenOutcome = "opened" | "cancelled";
  * document at once; for a file that would run as a program it asks first in
  * the OS's own dialog, which nothing in the page can answer.
  */
-export async function openInDefaultApp(path: string): Promise<void> {
+export async function openInDefaultApp(path: string, workspace: WorkspaceEnv = currentWorkspaceEnv()): Promise<void> {
   try {
     await invoke<OpenOutcome>("fs_open_default", {
       path,
-      workspace: currentWorkspaceEnv(),
+      workspace,
     });
   } catch (e) {
     showFileError("Could not open the file", {

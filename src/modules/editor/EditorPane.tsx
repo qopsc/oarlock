@@ -82,7 +82,7 @@ import {
 } from "./lib/documentLanguage";
 import { resolveLanguage } from "./lib/languageResolver";
 import { useDocumentLanguage } from "./lib/useDocumentLanguage";
-import { mediaPreviewKind } from "./lib/mediaPreview";
+import { isPreviewTooLarge, mediaPreviewKind } from "./lib/mediaPreview";
 import { SearchCountHub, searchCountHub } from "./lib/searchCount";
 import { FORCE_READ_LIMIT, useDocument } from "./lib/useDocument";
 import { useEditorThemeExt } from "./lib/useEditorThemeExt";
@@ -862,6 +862,17 @@ export const EditorPane = memo(
       const isPdf = kind === "pdf";
 
       if (kind) {
+        if (isPreviewTooLarge(kind, doc.size)) {
+          return (
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+              <p className="text-sm text-foreground">This file is too large to preview.</p>
+              <p className="text-xs text-muted-foreground">{formatBytes(doc.size)} · limit 50 MiB</p>
+              <button type="button" onClick={() => void openInDefaultApp(path, workspace)} className="rounded-md border border-border bg-muted/60 px-3 py-1 text-xs text-foreground hover:bg-accent">
+                Open externally
+              </button>
+            </div>
+          );
+        }
         // A WSL path is still being mapped to its host path.
         if (assetUrl === null) return null;
         return (
@@ -917,7 +928,7 @@ export const EditorPane = memo(
             )}
             <button
               type="button"
-              onClick={() => void openInDefaultApp(path)}
+              onClick={() => void openInDefaultApp(path, workspace)}
               className="rounded-md border border-border bg-muted/60 px-3 py-1 text-xs text-foreground hover:bg-accent"
             >
               Open in Default App

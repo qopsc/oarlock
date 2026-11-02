@@ -7,6 +7,8 @@ const fake = vi.hoisted(() => ({
   cells: [] as unknown[],
   index: 0,
   visible: true,
+  localUrl: null as string | null,
+  openExternal: vi.fn(),
   effects: [] as (() => void)[],
   requests: [] as {
     url: string;
@@ -15,7 +17,9 @@ const fake = vi.hoisted(() => ({
     release: ReturnType<typeof vi.fn>;
   }[],
 }));
-vi.mock("@/modules/workspace", () => ({ useWorkspaceAssetUrl: () => null }));
+vi.mock("@/modules/workspace", () => ({ useWorkspaceAssetUrl: () => fake.localUrl }));
+vi.mock("@/modules/workspace/owner", () => ({ useOwnedWorkspace: () => ({ kind: "local" }) }));
+vi.mock("@/modules/explorer/lib/openDefault", () => ({ openInDefaultApp: fake.openExternal }));
 vi.mock("./remoteImages", () => ({
   remoteImages: {
     acquire(url: string) {
@@ -89,6 +93,21 @@ beforeEach(() => {
   fake.requests = [];
   fake.index = 0;
   fake.visible = true;
+  fake.localUrl = null;
+  fake.openExternal.mockReset();
+});
+
+it("offers an external open action after a local image cannot be previewed", () => {
+  fake.localUrl = "oarlock-asset://large";
+  fake.index = 0;
+  const image = MarkdownImage({ src: "large.png", "data-local-path": "/repo/large.png" }) as ReactElement<{ onError: (event: never) => void }>;
+  image.props.onError({} as never);
+  fake.index = 0;
+  const notice = MarkdownImage({ src: "large.png", "data-local-path": "/repo/large.png" }) as ReactElement<{ children: ReactElement[] }>;
+  expect(notice.type).toBe("span");
+  const button = notice.props.children.find((child) => typeof child === "object" && child?.type === "button") as ReactElement<{ onClick: () => void }>;
+  button.props.onClick();
+  expect(fake.openExternal).toHaveBeenCalledWith("/repo/large.png", { kind: "local" });
 });
 afterEach(() => {
   unmount();

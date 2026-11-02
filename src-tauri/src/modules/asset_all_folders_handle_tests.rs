@@ -1,5 +1,53 @@
 use super::*;
 
+#[test]
+fn oversized_whole_preview_is_refused_before_buffering() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("large.pdf");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"%PDF-1.7\n").unwrap();
+    file.set_len(50 * 1024 * 1024 + 1).unwrap();
+    let response = respond(&request(&path, Method::GET), "tauri://localhost", |_| true);
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(response.body().len() < 1024);
+}
+
+#[test]
+fn oversized_image_is_refused_even_for_a_range_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("large.png");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(50 * 1024 * 1024 + 1).unwrap();
+    let mut request = request(&path, Method::GET);
+    request.headers_mut().insert(header::RANGE, HeaderValue::from_static("bytes=0-100"));
+    let response = respond(&request, "tauri://localhost", |_| true);
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[test]
+fn large_video_keeps_existing_bounded_range_playback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("large.mp4");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(50 * 1024 * 1024 + 1).unwrap();
+    let mut request = request(&path, Method::GET);
+    request.headers_mut().insert(header::RANGE, HeaderValue::from_static("bytes=0-15"));
+    let response = respond(&request, "tauri://localhost", |_| true);
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.body().len(), 16);
+}
+
+#[test]
+fn preview_admission_is_bounded_and_releases_capacity() {
+    let permits: Vec<_> = (0..MAX_PENDING_PREVIEWS)
+        .map(|_| preview_admission().clone().try_acquire_owned().unwrap())
+        .collect();
+    assert!(preview_admission().clone().try_acquire_owned().is_err());
+    drop(permits);
+    assert!(preview_admission().clone().try_acquire_owned().is_ok());
+}
+
 fn request(path: &Path, method: Method) -> http::Request<Vec<u8>> {
     let encoded: String = path
         .to_string_lossy()

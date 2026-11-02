@@ -3,8 +3,8 @@ import { Streamdown } from "streamdown";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  convertFileSrc: (path: string) =>
-    `asset://localhost/${encodeURIComponent(path)}`,
+  convertFileSrc: (path: string, protocol = "asset") =>
+    `${protocol}://localhost/${encodeURIComponent(path)}`,
   invoke: vi.fn(() => new Promise(() => {})),
 }));
 vi.mock("@/modules/settings/store", () => ({ setLastWslDistro: vi.fn() }));
@@ -14,7 +14,7 @@ const { previewRehypePlugins } = await import("./previewPipeline");
 const { MarkdownImage } = await import("./MarkdownImage");
 
 const asset = (path: string) =>
-  `src="asset://localhost/${encodeURIComponent(path)}"`;
+  `src="oarlock-asset://localhost/${encodeURIComponent(path)}?access=0"`;
 
 function render(markdown: string, file = "/repo/docs/README.md") {
   return renderToStaticMarkup(

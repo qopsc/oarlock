@@ -15,7 +15,7 @@ beforeEach(() => invoke.mockReset());
 describe("workspaceAssetUrl", () => {
   it("converts a local path directly", async () => {
     expect(await workspaceAssetUrl("C:\\pics\\a.png", { kind: "local" })).toBe(
-      `http://asset.localhost/${encodeURIComponent("C:\\pics\\a.png")}`,
+      `http://oarlock-asset.localhost/${encodeURIComponent("C:\\pics\\a.png")}?access=0`,
     );
     expect(invoke).not.toHaveBeenCalled();
   });
@@ -24,7 +24,7 @@ describe("workspaceAssetUrl", () => {
     invoke.mockResolvedValue("\\\\wsl.localhost\\Ubuntu\\home\\me\\a.png");
     const workspace = { kind: "wsl", distro: "Ubuntu" } as const;
     expect(await workspaceAssetUrl("/home/me/a.png", workspace)).toBe(
-      `http://asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\home\\me\\a.png")}`,
+      `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\home\\me\\a.png")}?access=0`,
     );
     expect(invoke).toHaveBeenCalledWith("fs_host_path", {
       path: "/home/me/a.png",
@@ -36,23 +36,23 @@ describe("workspaceAssetUrl", () => {
     expect(
       await workspaceAssetUrl("D:\\photos\\a.png", { kind: "local" }, true),
     ).toBe(
-      `http://oarlock-asset.localhost/${encodeURIComponent("D:\\photos\\a.png")}`,
+      `http://oarlock-asset.localhost/${encodeURIComponent("D:\\photos\\a.png")}?access=1`,
     );
     invoke.mockResolvedValue("\\\\wsl.localhost\\Ubuntu\\srv\\a.png");
     const workspace = { kind: "wsl", distro: "Ubuntu" } as const;
     expect(await workspaceAssetUrl("/srv/a.png", workspace, true)).toBe(
-      `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\srv\\a.png")}`,
+      `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\srv\\a.png")}?access=1`,
     );
   });
 
   it("uses the guarded scheme for PDF previews in every workspace", async () => {
     expect(await workspaceAssetUrl("/repo/unsafe.PDF", { kind: "local" })).toBe(
-      `http://oarlock-asset.localhost/${encodeURIComponent("/repo/unsafe.PDF")}`,
+      `http://oarlock-asset.localhost/${encodeURIComponent("/repo/unsafe.PDF")}?access=0`,
     );
     invoke.mockResolvedValue("\\\\wsl.localhost\\Ubuntu\\repo\\file.pdf");
     const workspace = { kind: "wsl", distro: "Ubuntu" } as const;
     expect(await workspaceAssetUrl("/repo/file.pdf", workspace)).toBe(
-      `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\repo\\file.pdf")}`,
+      `http://oarlock-asset.localhost/${encodeURIComponent("\\\\wsl.localhost\\Ubuntu\\repo\\file.pdf")}?access=0`,
     );
   });
 });

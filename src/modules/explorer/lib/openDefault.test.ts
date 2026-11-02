@@ -20,6 +20,13 @@ beforeEach(() => {
 });
 
 describe("openInDefaultApp", () => {
+  it("uses the owning workspace even if the active workspace changes", async () => {
+    const owner = { kind: "wsl", distro: "Ubuntu" } as const;
+    useWorkspaceEnvStore.setState({ env: { kind: "wsl", distro: "Debian" } });
+    invoke.mockResolvedValue("opened");
+    await openInDefaultApp("/repo/image.png", owner);
+    expect(invoke).toHaveBeenCalledWith("fs_open_default", { path: "/repo/image.png", workspace: owner });
+  });
   it("asks the backend once and never carries an approval", async () => {
     const workspace = { kind: "wsl", distro: "Ubuntu" } as const;
     useWorkspaceEnvStore.setState({ env: workspace });

@@ -32,16 +32,18 @@ it.each(["image/png", "image/gif"])(
 
 it("revalidates a saved background before handing it to the browser", async () => {
   validation.inspect.mockRejectedValue(
-    new Error("Image dimensions exceed the limit"),
+    new Error("Image format is unavailable or unsupported"),
   );
   const data = {
     result: new Blob([new Uint8Array([1, 2, 3])]),
     onsuccess: undefined as (() => void) | undefined,
   };
+  const remove = vi.fn();
+  const transaction = vi.fn(() => ({ objectStore: () => ({ get: () => data, delete: remove }) }));
   const opened = {
     result: {
       onclose: null,
-      transaction: () => ({ objectStore: () => ({ get: () => data }) }),
+      transaction,
     },
     onsuccess: undefined as (() => void) | undefined,
   };
@@ -51,8 +53,10 @@ it("revalidates a saved background before handing it to the browser", async () =
   opened.onsuccess?.();
   await vi.waitFor(() => expect(data.onsuccess).toBeTypeOf("function"));
   data.onsuccess?.();
-  await expect(result).rejects.toThrow("dimensions");
+  await expect(result).rejects.toThrow("unsupported");
   expect(validation.inspect).toHaveBeenCalledOnce();
+  expect(transaction).toHaveBeenCalledWith("images", "readonly");
+  expect(remove).not.toHaveBeenCalled();
 });
 
 it("decodes the inspected snapshot rather than reading the selected file again", async () => {

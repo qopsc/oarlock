@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { bindMediaPlayback, mediaPreviewKind } from "./mediaPreview";
+import { bindMediaPlayback, isPreviewTooLarge, mediaPreviewKind } from "./mediaPreview";
+
+it("limits image and PDF previews while retaining ranged audio and video", () => {
+  const limit = 50 * 1024 * 1024;
+  expect(isPreviewTooLarge("image", limit)).toBe(false);
+  expect(isPreviewTooLarge("image", limit + 1)).toBe(true);
+  expect(isPreviewTooLarge("pdf", limit + 1)).toBe(true);
+  expect(isPreviewTooLarge("video", limit + 1)).toBe(false);
+  expect(isPreviewTooLarge("audio", limit + 1)).toBe(false);
+});
 
 describe("mediaPreviewKind", () => {
   it("detects video types", () => {
