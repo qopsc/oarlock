@@ -47,13 +47,8 @@ Notes on judgment calls:
 
 ## 2. Findings left open with reason
 
-- T-01 is only partly closed. The review's fix is a test through the command-level function with the
-  real guard. `native_store::refuse_write` needs a `tauri::AppHandle`, and this crate has no
-  `tauri` `test` feature (so no `mock_app`), and I may not edit `Cargo.toml` or `native_store.rs`.
-  The new test pins the production call sites by source, which catches a dropped or mis-targeted
-  closure at the three commands but does not execute the real guard. Full closure needs either a
-  dev-dependency `tauri = { features = ["test"] }` (Batch B or the merger) or a guard that can be
-  built from the data directory paths alone.
+- T-01 is closed by the rework below (the first version only pinned call sites by source; that
+  limitation no longer applies).
 - S-09 residual: the preflight-to-Git-read window on network launches and Discard remains for a
   same-user process that edits config in that window (stated in the section 1 notes).
 
@@ -145,3 +140,40 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 run once showed `modules::fs::watch::macos::tests::every_stream_reports_a_usable_resume_point`
 failing; it passed on immediate rerun and in the serial full run above (the intermittent macOS
 FSEvents test the ledger already records).
+
+## 6. Rework after review (commits on top, none rewritten)
+
+| Item | Change | Test | Commit |
+| --- | --- | --- | --- |
+| D-17-R1 | `apply_tracked` snapshots the ids of the recoveries that exist when it claims its paths and judges only those at publish; recoveries registered meanwhile cannot overlap the claim (their `begin` waits) and are left alone | `mutation_events.rs::an_unrelated_mutation_does_not_invalidate_a_recovery_registered_meanwhile` | 14f71a4 |
+| TQ-R1 | The unrelated-mutation leg of the overlap test runs on a thread and waits with `recv_timeout`, so a broken claim fails instead of hanging | `unrelated_mutations_overlap_while_related_ones_wait_their_turn` | 14f71a4 |
+| T-01-R1 | `fs/native_store.rs` (additive, per the granted exception): `StoreDirs` (built by `StoreDirs::under` from the data, local data and config folders plus the extra protected paths), `store_dirs(app)` and the pure `refuse_write_in(&dirs, target)`; `refuse_write` delegates to them. `git/utils.rs::store_guard` builds the closure from the pure function and is what `git_worktree_add`, `git_worktree_remove` and the discard worker pass. The source pin is kept as defense in depth, searches only the production half of each file and matches the exact call text | `worktree.rs::add_and_remove_refuse_native_store_locations_with_the_real_check`, `discard.rs::discard_refuses_a_hard_link_to_a_native_store_with_the_real_check`, `commands.rs::every_work_tree_changing_command_passes_the_native_store_guard` | 843ce94, 8da23a3 |
+| D-13-R1 | `GitChangedFile.unreadable` (serialized as `unreadable`) is set for names that were not UTF-8; `git_entry_name` refuses any entry containing U+FFFD, so stage, unstage, discard, diff and open cannot act on a different file. A file genuinely named with U+FFFD cannot be handled in the panel (terminal only). Disabling the actions in the panel and adding the field to the TypeScript type belong to the frontend batch | `parser.rs::one_invalid_utf8_name_is_marked_and_the_rest_of_the_status_is_kept`, `utils.rs::a_name_shown_with_replacement_characters_names_no_entry` | 0776b65 |
+| O-04-R1 | Under `cfg(test)`, `build_git_command` points `HOME`, `USERPROFILE` and `XDG_CONFIG_HOME` of every production Git launch at an empty temp dir, and test setup uses `process::test_git()` (same isolation) instead of `Command::new("git")` in all git unit-test modules | `process.rs::unit_tests_never_read_the_developers_global_git_configuration` | 65dcda3 |
+| S-02-R1 | `OwnedRepository::content_roots` (worktree, its Git directory, the shared one and, for a linked worktree, the main checkout) is what makes a config origin repository scope | `git_executable_refusal.rs::include_from_the_main_checkout_is_repository_scope_in_a_linked_worktree` | 6771f39 |
+| S-11-R1 | A failed lookup is not pinned: `pinned_program` returns a name that cannot exist (the launch reports "not installed") and looks again on the next launch; a found binary is never replaced | `process.rs::a_failed_lookup_is_not_pinned_and_a_found_binary_is_never_replaced` | 9b6d35a |
+| S-09-R1 | Forced removal maps an acquisition failure of the target (not authorized, broken `.git`) to a message that points to the terminal; refusals keep their own text | `worktree.rs::removal_of_a_worktree_that_cannot_be_acquired_points_to_the_terminal` | ccc1c73 |
+| FMT-R1 | `rustfmt` on `operations.rs` and `tests/common/mod.rs` (only the two files I touched that the review named) | n/a | 90744ae |
+| S-10-R1 | Prose below | n/a | this commit |
+
+Additional wording for the merger:
+
+- AGENTS.md edit 1 (scrubbed variables), append: "`GIT_SSH_COMMAND` and `GIT_SSH` in Oarlock's own
+  environment are no longer honored by Source Control; set `core.sshCommand` or use `~/.ssh/config`."
+- AGENTS.md edit 2, append: "Forced worktree removal also requires the target to be authorized with an
+  intact `.git`; otherwise it fails with a message to remove the worktree in the terminal."
+- AGENTS.md, same bullet: "`StoreDirs`/`refuse_write_in` in `fs/native_store.rs` is the pure native-store
+  check; Source Control builds its guard from it (`git/utils.rs::store_guard`)."
+- `docs/architecture/security-model.md` edit (section 4, item 1), add: "Users who set `GIT_SSH_COMMAND` or
+  `GIT_SSH` in the environment Oarlock starts with must move that to `core.sshCommand` or `~/.ssh/config`
+  for Source Control; terminals are unaffected."
+
+Checks after the rework (in `src-tauri`; no `.ts` file changed):
+
+```
+cargo clippy --all-targets --locked -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.04s
+cargo test --locked -- --test-threads=1
+test result: ok. 1615 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 77.44s
+(all integration binaries ok: git_entrypoint_guard 32, git_executable_refusal 10, git_operations 61, git_remote_scope 15, git_store_aliases 2, git_fixture_isolation 2, git_ai_diff 8, git_optional_reads 5)
+```
