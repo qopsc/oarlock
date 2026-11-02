@@ -4534,6 +4534,8 @@ Native clipboard captures share four slots; image capture and native image writi
 
 R241 — **MAJOR, Tier 3:** non-PNG terminal clipboard writes use the webview's `createImageBitmap` before their decoded dimensions are checked; multiple windows can begin conversions independently. A compressed image may therefore allocate substantially before the size check. This is a source-level resource risk; no out-of-memory test was run. It is separate from R079's native capture and PNG-work admission, and needs its own review.
 
+R241 decision pending: the existing native clipboard image writer already has shared admission and bounded PNG decoding, but it currently accepts only PNG. Moving other formats there can bound decoding before allocating pixels, while requiring an explicit supported-format policy and an extension of the existing image-write input contract. Alternatives are to keep the current webview conversion with the documented resource risk, or refuse non-PNG images for now. The user has been asked which compatibility policy to use; no conversion behavior has changed.
+
 R079 validation: the native macOS suite passed 1,561 library tests (four ignored) and all integration tests. The frontend suite passed 6,058 tests (two skipped); type checking passed and lint remained at 80 warnings. The final Linux clipboard suite passed 21 tests with three ignored in an offline unprivileged container. An additional headless GTK test passed with the ignored timeout-ownership test enabled. The initial frontend run could not bind its local servers in the restricted environment; the full rerun with local-server access passed.
 
 
