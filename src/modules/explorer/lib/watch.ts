@@ -9,9 +9,14 @@ const FS_CHANGED_EVENT = "fs:changed";
 
 type FsChangedPayload = { paths: string[] };
 
+export type UnavailableWatch = { path: string; reason: string };
+
 export type FsWatchHandles = {
   directories: { path: string; handle: string }[];
   files: { path: string; handle: string }[];
+  /** Paths native could not watch (a deleted folder); the rest of the batch registered. */
+  unavailableDirectories?: UnavailableWatch[];
+  unavailableFiles?: UnavailableWatch[];
 };
 
 export function releaseWatchHandles(handles: string[]): void {
@@ -38,7 +43,7 @@ export function createFileWatchClient(
     failed.clear();
     clearNotice();
   };
-  type Entry = { handle?: string; removed: boolean };
+  type Entry = { handle?: string; removed: boolean; unavailable?: boolean };
   const entries = new Map<string, Entry[]>();
   const key = (kind: string, path: string) => JSON.stringify([kind, path]);
   const removeEntries = (removed: Entry[]) => {
@@ -88,7 +93,10 @@ export function createFileWatchClient(
           for (const path of new Set(values)) {
             const id = key(kind, path);
             const pending = (acquired.get(id) ?? []).filter(
-              (entry) => !entry.removed && entry.handle === undefined,
+              (entry) =>
+                !entry.removed &&
+                entry.handle === undefined &&
+                !entry.unavailable,
             );
             requested.set(id, pending);
             for (const _entry of pending) live.push(path);
@@ -117,6 +125,15 @@ export function createFileWatchClient(
                 const entry = requested.get(key(kind, path))?.shift();
                 if (!entry || entry.removed) late.push(handle);
                 else entry.handle = handle;
+              }
+            }
+            for (const [kind, gone] of [
+              ["directories", result.unavailableDirectories],
+              ["files", result.unavailableFiles],
+            ] as const) {
+              for (const { path } of gone ?? []) {
+                const entry = requested.get(key(kind, path))?.shift();
+                if (entry) entry.unavailable = true;
               }
             }
             releaseWatchHandles(late);

@@ -270,10 +270,20 @@ struct WatchPath {
     path: String,
     handle: String,
 }
+/// A requested path that could not be watched. It never fails the rest of the batch: a
+/// restored tab whose folder was deleted must not cost every other editor its watch.
+#[derive(Debug, PartialEq, serde::Serialize)]
+struct Unavailable {
+    path: String,
+    reason: String,
+}
 #[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FsWatchHandles {
     directories: Vec<WatchPath>,
     files: Vec<WatchPath>,
+    unavailable_directories: Vec<Unavailable>,
+    unavailable_files: Vec<Unavailable>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -489,28 +499,40 @@ fn resolve_changes(pending: Pending, shared: &Shared) -> Changes {
     }
 }
 
-/// Each requested directory with its canonical path. Canonical keys keep add/remove symmetric
-/// whatever the spelling, and the spelling is what changes are reported under.
+/// Each requested directory with its canonical path, and the ones that cannot be watched.
+/// Canonical keys keep add/remove symmetric whatever the spelling, and the spelling is what
+/// changes are reported under. Only an unusable environment fails the whole request.
 fn prepare_dirs(
     gates: Gates<'_>,
     workspace: &WorkspaceEnv,
     paths: Vec<String>,
-) -> Result<Vec<(String, PathBuf)>, String> {
+) -> Result<(Vec<(String, PathBuf)>, Vec<Unavailable>), String> {
     let mut dirs = Vec::with_capacity(paths.len());
+    let mut unavailable = Vec::new();
     for raw in paths {
         let resolved = resolve_path(&raw, workspace)?;
-        let canonical =
-            std::fs::canonicalize(&resolved).map_err(|e| format!("Cannot watch {raw}: {e}"))?;
+        let canonical = match std::fs::canonicalize(&resolved) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                unavailable.push(Unavailable {
+                    path: raw,
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
         if !canonical.is_dir() || !gates.reaches(&canonical) {
-            return Err(format!(
-                "Cannot watch {raw}: directory unavailable or not authorized"
-            ));
+            unavailable.push(Unavailable {
+                path: raw,
+                reason: "directory unavailable or not authorized".into(),
+            });
+            continue;
         }
         if !plan::is_skipped(&canonical) {
             dirs.push((raw, canonical));
         }
     }
-    Ok(dirs)
+    Ok((dirs, unavailable))
 }
 
 /// A file is identified by its canonical directory plus its own name, so the
@@ -522,6 +544,36 @@ fn canonical_file(workspace: &WorkspaceEnv, raw: &str) -> Option<(String, String
     let parent = std::fs::canonicalize(resolved.parent()?).ok()?;
     let file = parent.join(name);
     Some((to_canon(&parent), to_canon(&file), file))
+}
+
+/// Each requested file with its canonical directory, key and baseline stamp, and the ones
+/// whose folder is gone or out of reach. A file deleted with its folder is still reviewable,
+/// so its missing parent is a result, not an error.
+fn prepare_files(
+    gates: Gates<'_>,
+    workspace: &WorkspaceEnv,
+    raws: Vec<String>,
+) -> (Vec<(String, String, String, Option<FileStamp>)>, Vec<Unavailable>) {
+    let mut watched = Vec::with_capacity(raws.len());
+    let mut unavailable = Vec::new();
+    for raw in raws {
+        let Some((dir, key, path)) = canonical_file(workspace, &raw) else {
+            unavailable.push(Unavailable {
+                path: raw,
+                reason: "parent directory unavailable".into(),
+            });
+            continue;
+        };
+        if !path.parent().is_some_and(|parent| gates.reaches(parent)) {
+            unavailable.push(Unavailable {
+                path: raw,
+                reason: "directory not authorized".into(),
+            });
+            continue;
+        }
+        watched.push((dir, key, raw, FileStamp::of(&path)));
+    }
+    (watched, unavailable)
 }
 
 impl FsWatchState {
@@ -721,19 +773,9 @@ pub async fn fs_watch_add(
     blocking(move || {
         let workspace = WorkspaceEnv::from_option(workspace);
         let gates = app.state::<WorkspaceRegistry>().inner().gates(Origin::App);
-        let dirs = prepare_dirs(gates, &workspace, paths)?;
-        let files: Vec<_> = files
-            .unwrap_or_default()
-            .into_iter()
-            .map(|raw| {
-                let (dir, key, path) = canonical_file(&workspace, &raw)
-                    .ok_or_else(|| format!("Cannot watch {raw}: parent directory unavailable"))?;
-                if !path.parent().is_some_and(|parent| gates.reaches(parent)) {
-                    return Err(format!("Cannot watch {raw}: directory not authorized"));
-                }
-                Ok((dir, key, raw, FileStamp::of(&path)))
-            })
-            .collect::<Result<_, String>>()?;
+        let (dirs, unavailable_directories) = prepare_dirs(gates, &workspace, paths)?;
+        let (files, unavailable_files) =
+            prepare_files(gates, &workspace, files.unwrap_or_default());
         let baselines: Vec<_> = dirs
             .iter()
             .map(|(_, dir)| plan::listing_signature(dir))
@@ -745,7 +787,11 @@ pub async fn fs_watch_add(
             dirs.len() + files.len(),
             |ids| {
                 let mut ids = ids.into_iter();
-                let mut handles = FsWatchHandles::default();
+                let mut handles = FsWatchHandles {
+                    unavailable_directories,
+                    unavailable_files,
+                    ..FsWatchHandles::default()
+                };
                 let mut held = Vec::new();
                 if dirs.is_empty() && files.is_empty() {
                     return Ok((handles, held));
@@ -1323,18 +1369,44 @@ mod tests {
     }
 
     #[test]
-    fn failed_watch_preparation_does_not_silently_omit_requested_directories() {
+    fn a_file_deleted_with_its_folder_is_reported_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(root.join("kept.txt"), "x").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(&root).unwrap();
+        let (files, unavailable) = prepare_files(
+            registry.gates(Origin::App),
+            &WorkspaceEnv::Local,
+            vec![
+                to_canon(root.join("gone/old.rs")),
+                to_canon(root.join("kept.txt")),
+            ],
+        );
+        assert_eq!(files.len(), 1, "the file that exists still registers");
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].path, to_canon(root.join("gone/old.rs")));
+    }
+
+    #[test]
+    fn failed_watch_preparation_names_the_directories_it_could_not_watch() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let registry = WorkspaceRegistry::default();
         let prepare =
             |paths| prepare_dirs(registry.gates(Origin::App), &WorkspaceEnv::Local, paths);
-        assert!(prepare(vec![to_canon(&root)]).is_err());
+        let (dirs, unavailable) = prepare(vec![to_canon(&root)]).unwrap();
+        assert!(dirs.is_empty() && unavailable.len() == 1);
         registry.authorize(&root).unwrap();
-        assert!(prepare(vec![to_canon(&root), to_canon(root.join("missing"))]).is_err());
+        let (dirs, unavailable) =
+            prepare(vec![to_canon(&root), to_canon(root.join("missing"))]).unwrap();
+        assert_eq!(dirs.len(), 1, "the valid directory still registers");
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].path, to_canon(root.join("missing")));
         std::fs::write(root.join("file"), "text").unwrap();
-        assert!(prepare(vec![to_canon(root.join("file"))]).is_err());
-        assert_eq!(prepare(vec![to_canon(&root)]).unwrap().len(), 1);
+        let (dirs, unavailable) = prepare(vec![to_canon(root.join("file"))]).unwrap();
+        assert!(dirs.is_empty() && unavailable.len() == 1);
+        assert_eq!(prepare(vec![to_canon(&root)]).unwrap().0.len(), 1);
     }
 
     /// A project opened through a link (`/tmp` on macOS, `/home` on Fedora Atomic) is watched
@@ -1359,7 +1431,8 @@ mod tests {
             &WorkspaceEnv::Local,
             vec![link_src.clone()],
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(dirs, vec![(link_src.clone(), real.join("src"))]);
         let (dir_key, file_key, file_path) =
             canonical_file(&WorkspaceEnv::Local, &link_file).unwrap();
@@ -1806,7 +1879,8 @@ mod tests {
             &WorkspaceEnv::Local,
             vec![to_canon(&dir)],
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(dirs.is_empty(), "existing directory exclusion");
         let shared = Shared::new();
         shared.set.lock().unwrap().add_file(

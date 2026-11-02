@@ -87,6 +87,29 @@ describe("watch handles", () => {
     });
   });
 
+  it("registers the valid paths of a batch and does not retry or announce a missing folder", async () => {
+    const { watchHealth } = await import("./watchHealth");
+    const { toast } = await import("sonner");
+    vi.mocked(toast.error).mockClear();
+    invoke.mockResolvedValue({
+      directories: [{ path: "/repo/src", handle: "src" }],
+      files: [{ path: "/repo/src/a.ts", handle: "a" }],
+      unavailableDirectories: [{ path: "/repo/old", reason: "No such file" }],
+      unavailableFiles: [{ path: "/repo/old/x.rs", reason: "parent gone" }],
+    });
+    const watch = createFileWatchClient(() => local);
+    watch.add(["/repo/src", "/repo/old"], ["/repo/src/a.ts", "/repo/old/x.rs"]);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    await watchHealth.retry();
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(toast.error).not.toHaveBeenCalled();
+    watch.dispose();
+    expect(invoke).toHaveBeenCalledWith("watch_release", {
+      handles: ["src", "a"],
+    });
+  });
+
   it("keeps a surviving duplicate's recovered handle", async () => {
     const { watchHealth } = await import("./watchHealth");
     const { toast } = await import("sonner");
