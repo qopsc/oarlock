@@ -143,6 +143,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARTIFACT_PATHS: ${{ steps.tauri-mac.outputs.artifactPaths }}
+          ARCH_TARGET: ${{ matrix.rust-target }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -150,8 +151,23 @@ jobs:
             || gh release create "$TAG" --draft --repo "$GITHUB_REPOSITORY" \
                  --title "Oarlock ${TAG}" --notes "See the assets to download and install." \
             || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          # tauri-action lists the .app directory, which it tars only when it
+          # uploads itself. Tar it here under a per-architecture name so the two
+          # macOS legs never clobber each other; files go up as they are.
+          ARCH="${ARCH_TARGET%%-*}"
           printf '%s' "$ARTIFACT_PATHS" | jq -r '.[]' | while IFS= read -r artifact; do
-            gh release upload "$TAG" "$artifact" --clobber --repo "$GITHUB_REPOSITORY"
+            if [ -d "$artifact" ]; then
+              case "$artifact" in
+                *.app) ;;
+                *) echo "skipping directory $artifact"; continue ;;
+              esac
+              stem="$(basename "$artifact" .app)"
+              archive="${RUNNER_TEMP}/${stem}_${ARCH}.app.tar.gz"
+              tar -czf "$archive" -C "$(dirname "$artifact")" "$(basename "$artifact")"
+              gh release upload "$TAG" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
+            else
+              gh release upload "$TAG" "$artifact" --clobber --repo "$GITHUB_REPOSITORY"
+            fi
           done
 
       - id: tauri

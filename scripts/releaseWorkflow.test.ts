@@ -30,6 +30,13 @@ it("verifies the macOS bundle before anything is uploaded to the release", () =>
   expect(verify).toBeLessThan(upload);
   expect(steps[build]).not.toMatch(/tagName|releaseDraft|releaseId/);
   expect(steps[upload]).toContain("steps.tauri-mac.outputs.artifactPaths");
+  // A directory is never handed to `gh release upload`; the .app is tarred under a
+  // per-architecture name, and plain files (the .dmg) go up as they are.
+  expect(steps[upload]).toContain('if [ -d "$artifact" ]');
+  expect(steps[upload]).toContain('tar -czf "$archive"');
+  expect(steps[upload]).toContain('${stem}_${ARCH}.app.tar.gz');
+  expect(steps[upload]).toContain('ARCH="${ARCH_TARGET%%-*}"');
+  expect(steps[upload]).toContain("ARCH_TARGET: ${{ matrix.rust-target }}");
   const publishing = steps.filter((step) => /tagName:/.test(step));
   expect(publishing).toHaveLength(1);
   expect(publishing[0]).toContain("!startsWith(matrix.platform, 'macos')");
