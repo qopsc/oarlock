@@ -369,7 +369,7 @@ pub async fn fs_rename(
             let to_p = gates.authorized_entry(&resolve_path(&to, &workspace)?)?;
             super::native_store::refuse_write(&app, &from_p)?;
             super::native_store::refuse_write(&app, &to_p)?;
-            rename(&from_p, &to_p)?;
+            rename_guarded(&from_p, &to_p, |path| super::native_store::refuse_write(&app, path))?;
             note_changed(&index, &from_p);
             note_changed(&index, &to_p);
             Ok(((), Some(Change::Renamed { from, to })))
@@ -378,7 +378,21 @@ pub async fn fs_rename(
     .await
 }
 
+#[cfg(test)]
 fn rename(from_p: &Path, to_p: &Path) -> Result<(), String> {
+    rename_guarded(from_p, to_p, |_| Ok(()))
+}
+
+#[cfg(test)]
+fn delete_path(p: &Path) -> Result<(), String> {
+    delete_path_guarded(p, |_| Ok(()))
+}
+
+fn rename_guarded(
+    from_p: &Path,
+    to_p: &Path,
+    guard: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if metadata_if_exists(from_p)
         .map_err(|e| e.to_string())?
         .is_none()
@@ -391,6 +405,9 @@ fn rename(from_p: &Path, to_p: &Path) -> Result<(), String> {
     {
         return Err(format!("already exists: {}", to_p.display()));
     }
+    // The first look ran before these inspections; look again right before acting.
+    guard(from_p)?;
+    guard(to_p)?;
     rename_no_replace(from_p, to_p).map_err(|e| {
         log::debug!(
             "fs_rename({} -> {}) failed: {e}",
@@ -417,9 +434,14 @@ pub async fn fs_move(
         mutation_events::transact(&app, workspace.clone(), &[from.clone(), to.clone()], || {
             let root =
                 resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
-            super::native_store::refuse_write(&app, &resolve_path(&from, &workspace)?)?;
-            super::native_store::refuse_write(&app, &resolve_path(&to, &workspace)?)?;
-            let moved = fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)?;
+            let moved = fs_move_checked(
+                &from,
+                &to,
+                &root,
+                expected_conflict.as_deref(),
+                &workspace,
+                |path| super::native_store::refuse_write(&app, path),
+            )?;
             if moved == FsMoveResult::Moved {
                 let index = app.state::<FileIndexState>();
                 note_changed(&index, &resolve_path(&from, &workspace)?);
@@ -433,6 +455,7 @@ pub async fn fs_move(
     .await
 }
 
+#[cfg(test)]
 fn fs_move_impl(
     from: &str,
     to: &str,
@@ -440,10 +463,33 @@ fn fs_move_impl(
     expected_conflict: Option<&str>,
     workspace: &WorkspaceEnv,
 ) -> Result<FsMoveResult, String> {
-    let from_p = resolve_path(from, workspace)?;
-    let to_p = resolve_path(to, workspace)?;
-    authorize_mutation_entry(&from_p, root)?;
-    authorize_mutation_entry(&to_p, root)?;
+    fs_move_checked(from, to, root, expected_conflict, workspace, |_| Ok(()))
+}
+
+/// The entry named by `path`: its parent resolved and checked against `root`,
+/// its own name left alone (a link is the entry, never followed).
+fn authorized_entry_path(path: &Path, root: &Path) -> Result<std::path::PathBuf, String> {
+    authorize_mutation_entry(path, root)?;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("not a file or folder: {}", path.display()));
+    };
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("path parent is not accessible: {error}"))?;
+    Ok(parent.join(name))
+}
+
+fn fs_move_checked(
+    from: &str,
+    to: &str,
+    root: &Path,
+    expected_conflict: Option<&str>,
+    workspace: &WorkspaceEnv,
+    guard: impl Fn(&Path) -> Result<(), String>,
+) -> Result<FsMoveResult, String> {
+    let from_p = authorized_entry_path(&resolve_path(from, workspace)?, root)?;
+    let to_p = authorized_entry_path(&resolve_path(to, workspace)?, root)?;
+    guard(&from_p)?;
+    guard(&to_p)?;
     if from_p == to_p {
         return Ok(FsMoveResult::Moved);
     }
@@ -458,6 +504,8 @@ fn fs_move_impl(
         if !replaceable || expected_conflict != Some(token.as_str()) {
             return Ok(FsMoveResult::Conflict { replaceable, token });
         }
+        guard(&from_p)?;
+        guard(&to_p)?;
         replace_file(&from_p, &to_p).map_err(|error| {
             log::warn!(
                 "fs_move replace({} -> {}) failed: {error}",
@@ -469,6 +517,8 @@ fn fs_move_impl(
         return Ok(FsMoveResult::Moved);
     }
 
+    guard(&from_p)?;
+    guard(&to_p)?;
     match rename_no_replace(&from_p, &to_p) {
         Ok(()) => Ok(FsMoveResult::Moved),
         Err(error) if is_conflict(&error) => {
@@ -508,7 +558,7 @@ pub async fn fs_delete(
                 .gates(Origin::App)
                 .authorized_entry(&resolve_path(&path, &workspace)?)?;
             super::native_store::refuse_write(&app, &p)?;
-            delete_path(&p)?;
+            delete_path_guarded(&p, |path| super::native_store::refuse_write(&app, path))?;
             note_changed(&index, &p);
             Ok((
                 (),
@@ -521,7 +571,9 @@ pub async fn fs_delete(
     .await
 }
 
-fn delete_path(p: &Path) -> Result<(), String> {
+fn delete_path_guarded(p: &Path, guard: impl Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+    // The first look ran before the removal was dispatched; look again right before acting.
+    guard(p)?;
     remove_path(p).map_err(|e| {
         log::warn!("fs_delete({}) failed: {e}", p.display());
         e.to_string()
@@ -595,9 +647,9 @@ fn fs_delete_batch_checked(
             failed += 1;
             continue;
         };
-        let result = authorize_mutation_entry(&resolved, root)
-            .and_then(|()| guard(&resolved))
-            .and_then(|()| remove_path(&resolved).map_err(|error| error.to_string()));
+        let result = authorized_entry_path(&resolved, root)
+            .and_then(|entry| guard(&entry).map(|()| entry))
+            .and_then(|entry| remove_path(&entry).map_err(|error| error.to_string()));
         match result {
             Ok(()) => deleted.push(path),
             Err(error) => {
@@ -650,6 +702,66 @@ mod tests {
 
     fn s(p: std::path::PathBuf) -> String {
         p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn rename_and_delete_stop_when_the_guard_refuses_at_the_moment_of_acting() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a");
+        let to = dir.path().join("b");
+        std::fs::write(&from, b"keep").unwrap();
+        let refuse = |_: &Path| Err::<(), String>("protected".into());
+        assert_eq!(rename_guarded(&from, &to, refuse).unwrap_err(), "protected");
+        assert_eq!(delete_path_guarded(&from, refuse).unwrap_err(), "protected");
+        assert_eq!(std::fs::read(&from).unwrap(), b"keep");
+        assert!(!to.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_guards_the_authorized_entries_and_checks_again_before_acting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+        std::fs::write(real.join("file"), b"keep").unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let result = fs_move_checked(
+            &s(root.join("alias/file")),
+            &s(root.join("moved")),
+            &root,
+            None,
+            &WorkspaceEnv::Local,
+            |path| {
+                seen.borrow_mut().push(path.to_path_buf());
+                if path.starts_with(&real) {
+                    Err("protected".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err(), "protected");
+        assert!(seen.borrow().contains(&real.join("file")), "{:?}", seen.borrow());
+        assert_eq!(std::fs::read(real.join("file")).unwrap(), b"keep");
+        assert!(!root.join("moved").exists());
+
+        // A guard that changes its mind after the first look still stops the move.
+        let calls = std::cell::Cell::new(0);
+        let result = fs_move_checked(
+            &s(real.join("file")),
+            &s(root.join("moved")),
+            &root,
+            None,
+            &WorkspaceEnv::Local,
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() > 2 { Err("changed".into()) } else { Ok(()) }
+            },
+        );
+        assert_eq!(result.unwrap_err(), "changed");
+        assert_eq!(std::fs::read(real.join("file")).unwrap(), b"keep");
     }
 
     fn move_path(
