@@ -123,3 +123,19 @@ Checks (worktree head after the commits above plus the docs commit):
   (`status_reports_unrepresentable_filenames_instead_of_an_empty_tree`: the bind-mounted macOS tree does not keep a
   non-UTF-8 name; the test file is untouched by this batch).
 - TypeScript `bun run test src/modules/ai/lib/security.test.ts`: 68 passed. Rust `cargo test --locked secret_paths`: 2 passed.
+
+### Rework round 2 (commit `7de5abf6`)
+
+- **`..` after a name.** A relative link target in which a `..` follows a named component is refused
+  (`parent_after_name` in `copy_owned.rs`, before the depth rule and the registry fallback), because on POSIX `..`
+  after a link follows the link's target. A leading run of `..` is still judged by the depth rule and the registry.
+  Regression `a_relative_link_with_dot_dot_after_a_name_is_refused_because_it_may_follow_a_link` (macOS and Linux; the
+  reviewer's probe, renamed): fails with the new check removed, passes with it.
+- **`git_status_limits`.** The Linux-only test is now
+  `status_marks_unrepresentable_filenames_unreadable_and_keeps_the_rest`: status succeeds, exactly the non-UTF-8 entry
+  is `unreadable` with label "Unreadable name", and an ordinary entry is intact. It is `cfg(target_os = "linux")`, so
+  it is not compiled on macOS; in the container `git_status_limits` reports `3 passed`.
+- macOS: clippy `Finished` clean; `cargo test --locked -- --test-threads=1` lib `1679 passed; 0 failed; 4 ignored`,
+  all integration binaries ok. Container (fresh `git archive`, uid 1000, `--init`): clippy `Finished` clean;
+  `cargo test --locked -j1 --no-fail-fast -- --test-threads=1` lib `1698 passed; 3 failed; 4 ignored` (the same three
+  environmental failures), every integration binary ok.
