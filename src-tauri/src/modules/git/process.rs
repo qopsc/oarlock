@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -627,6 +627,44 @@ const ISOLATED_GIT_ENV: &[&str] = &[
     "GIT_CONFIG_NOSYSTEM",
 ];
 
+static GIT_PROGRAM: OnceLock<OsString> = OnceLock::new();
+
+/// The `git` found on `PATH` the first time Git is needed, as an absolute path,
+/// so a later `PATH` change or a planted earlier entry cannot swap the binary.
+fn git_program() -> &'static OsStr {
+    GIT_PROGRAM
+        .get_or_init(|| {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let name = if cfg!(windows) { "git.exe" } else { "git" };
+            find_on_path(name, &path)
+                .map(PathBuf::into_os_string)
+                .unwrap_or_else(|| OsString::from("git"))
+        })
+        .as_os_str()
+}
+
+fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
 fn build_git_command(
     _workspace: &WorkspaceEnv,
     cwd: Option<&str>,
@@ -652,7 +690,7 @@ fn build_git_command(
         return Ok(cmd);
     }
 
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_program());
     // Every path this API receives names an entry selected by the caller.
     // `--` only stops option parsing; it does not stop Git's glob expansion.
     cmd.arg("--literal-pathspecs");
@@ -1090,6 +1128,39 @@ mod tests {
             &WorkspaceEnv::Local,
         );
         args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_search_takes_the_first_absolute_executable_and_skips_relative_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (first, second) = (first.path().canonicalize().unwrap(), second.path().canonicalize().unwrap());
+        for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
+            std::fs::write(dir.join("git"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join("git"), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let path = std::env::join_paths([
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("relative/bin"),
+            first.clone(),
+            second.clone(),
+        ])
+        .unwrap();
+        assert_eq!(super::find_on_path("git", &path), Some(second.join("git")));
+        assert_eq!(super::find_on_path("absent-program", &path), None);
+    }
+
+    #[test]
+    fn every_launch_uses_the_binary_resolved_once() {
+        let first = super::git_program();
+        assert_eq!(first, super::git_program());
+        let command = super::build_git_command(&WorkspaceEnv::Local, None, &[]).unwrap();
+        assert_eq!(command.get_program(), first);
+        if first != "git" {
+            assert!(std::path::Path::new(first).is_absolute());
+        }
     }
 
     #[test]
