@@ -39,13 +39,33 @@ fn large_video_keeps_existing_bounded_range_playback() {
 }
 
 #[test]
-fn preview_admission_is_bounded_and_releases_capacity() {
-    let permits: Vec<_> = (0..MAX_PENDING_PREVIEWS)
-        .map(|_| preview_admission().clone().try_acquire_owned().unwrap())
-        .collect();
-    assert!(preview_admission().clone().try_acquire_owned().is_err());
-    drop(permits);
-    assert!(preview_admission().clone().try_acquire_owned().is_ok());
+fn a_request_beyond_the_admission_slots_waits_for_one() {
+    tauri::async_runtime::block_on(async {
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_PREVIEWS));
+        let held: Vec<_> = (0..MAX_PENDING_PREVIEWS)
+            .map(|_| slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        let sixty_fifth = tokio::spawn({
+            let slots = slots.clone();
+            async move { admit(&slots, Duration::from_secs(5)).await.is_some() }
+        });
+        tokio::task::yield_now().await;
+        assert!(!sixty_fifth.is_finished(), "the 65th request waits");
+        drop(held);
+        assert!(sixty_fifth.await.unwrap(), "and is served once a slot frees");
+    });
+}
+
+#[test]
+fn a_request_that_waits_too_long_is_told_to_retry() {
+    tauri::async_runtime::block_on(async {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = slots.clone().try_acquire_owned().unwrap();
+        assert!(admit(&slots, Duration::from_millis(20)).await.is_none());
+    });
+    let response = busy();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
 }
 
 fn request(path: &Path, method: Method) -> http::Request<Vec<u8>> {

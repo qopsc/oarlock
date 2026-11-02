@@ -16,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::sync::Arc;
 
 use tauri::http::{self, header, HeaderValue, Method, StatusCode};
@@ -38,6 +39,9 @@ const SNIFF_BYTES: u64 = 8192;
 const MAX_WHOLE_PREVIEW: u64 = 50 * 1024 * 1024;
 const MAX_ACTIVE_PREVIEWS: usize = 2;
 const MAX_PENDING_PREVIEWS: usize = 64;
+/// How many requests may wait for a slot before the rest are told to retry.
+const MAX_WAITING_PREVIEWS: usize = 2048;
+const ADMISSION_WAIT: Duration = Duration::from_secs(30);
 
 static ORIGINS: OnceLock<AllowedOrigins> = OnceLock::new();
 
@@ -46,9 +50,35 @@ fn preview_budget() -> &'static Arc<tokio::sync::Semaphore> {
     BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_PREVIEWS)))
 }
 
+fn preview_waiting() -> &'static Arc<tokio::sync::Semaphore> {
+    static WAITING: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    WAITING.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_WAITING_PREVIEWS)))
+}
+
 fn preview_admission() -> &'static Arc<tokio::sync::Semaphore> {
     static ADMISSION: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     ADMISSION.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_PREVIEWS)))
+}
+
+/// Waits for one of the admission slots, or gives up after `wait`. WebKit starts every image of
+/// a page at once, so a document with more local images than slots has to be answered in turn,
+/// not refused.
+async fn admit(
+    slots: &Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::time::timeout(wait, slots.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()
+}
+
+fn busy() -> http::Response<Vec<u8>> {
+    let mut response = status_only(StatusCode::SERVICE_UNAVAILABLE, None);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 pub fn protocol<R: Runtime>(
@@ -58,38 +88,45 @@ pub fn protocol<R: Runtime>(
 ) {
     let app = ctx.app_handle().clone();
     let label = ctx.webview_label().to_string();
-    let Ok(admitted) = preview_admission().clone().try_acquire_owned() else {
-        responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
+    // Refuse what is not the app's own page before it can take a place in the queue.
+    let origins = ORIGINS.get_or_init(|| {
+        AllowedOrigins::for_app(
+            app.config().build.dev_url.as_ref(),
+            tauri::is_dev(),
+            cfg!(windows),
+        )
+    });
+    let origin_header = request.headers().get(header::ORIGIN);
+    let Some(origin) = origins.check(origin_header.map(HeaderValue::as_bytes)) else {
+        responder.respond(status_only(StatusCode::FORBIDDEN, None));
+        return;
+    };
+    let belongs = app
+        .try_state::<NetworkPages>()
+        .is_some_and(|pages| page_admits(&pages, &label, request.uri().query()));
+    if !belongs {
+        responder.respond(status_only(StatusCode::FORBIDDEN, Some(&origin)));
+        return;
+    }
+    let Ok(waiting) = preview_waiting().clone().try_acquire_owned() else {
+        responder.respond(busy());
         return;
     };
     tauri::async_runtime::spawn(async move {
+      let admitted = admit(preview_admission(), ADMISSION_WAIT).await;
+      drop(waiting);
+      let Some(admitted) = admitted else {
+          responder.respond(busy());
+          return;
+      };
       let Ok(worker) = preview_budget().clone().acquire_owned().await else {
-          responder.respond(status_only(StatusCode::SERVICE_UNAVAILABLE, None));
+          responder.respond(busy());
           return;
       };
       // Opening and reading the file blocks; keep both permits until it finishes.
       tauri::async_runtime::spawn_blocking(move || {
         let _admitted = admitted;
         let _worker = worker;
-        let origins = ORIGINS.get_or_init(|| {
-            AllowedOrigins::for_app(
-                app.config().build.dev_url.as_ref(),
-                tauri::is_dev(),
-                cfg!(windows),
-            )
-        });
-        let origin_header = request.headers().get(header::ORIGIN);
-        let Some(origin) = origins.check(origin_header.map(HeaderValue::as_bytes)) else {
-            responder.respond(status_only(StatusCode::FORBIDDEN, None));
-            return;
-        };
-        let belongs = app
-            .try_state::<NetworkPages>()
-            .is_some_and(|pages| page_admits(&pages, &label, request.uri().query()));
-        if !belongs {
-            responder.respond(status_only(StatusCode::FORBIDDEN, Some(&origin)));
-            return;
-        }
         let scope = app.asset_protocol_scope();
         let served = |real: &Path| {
             serves(
