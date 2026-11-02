@@ -21,7 +21,7 @@ const terminalMock = vi.hoisted(() => ({
   capture: vi.fn(),
   active: true,
 }));
-const foreground = vi.hoisted(() => ({ running: [true] as boolean[], calls: 0 }));
+const foreground = vi.hoisted(() => ({ running: [true] as (boolean | null)[], calls: 0 }));
 
 vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
   useManagedAgentsStore: {
@@ -36,9 +36,11 @@ vi.mock("@/modules/agents/store/managedAgentsStore", () => ({
 
 vi.mock("@/modules/terminal", () => ({
   captureGhosttyInputOwner: terminalMock.capture,
-  leafHasForegroundProcess: async () => {
+  // leafShellAtPrompt: false means a foreground job owns the terminal; null is unknown.
+  leafShellAtPrompt: async () => {
     const index = Math.min(foreground.calls++, foreground.running.length - 1);
-    return foreground.running[index];
+    const value = foreground.running[index];
+    return value === null ? null : !value;
   },
 }));
 
@@ -210,6 +212,14 @@ describe("send_to_agent", () => {
     expect(r.error).toContain("typed but not submitted");
     expect(r.error).not.toContain("resend");
     expect(terminalMock.writeToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a lookup that cannot be told as not running", async () => {
+    storeMock.getBySessionId.mockReturnValue(AGENT);
+    foreground.running = [null];
+    const r = await run("send_to_agent", makeContext(), { instruction: "fix it" });
+    expect(r.error).toContain("not running");
+    expect(terminalMock.writeToSession).not.toHaveBeenCalled();
   });
 
   it("types into an agent whose shell has no integration record", async () => {
