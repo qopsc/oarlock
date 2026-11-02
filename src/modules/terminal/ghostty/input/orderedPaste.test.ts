@@ -39,7 +39,7 @@ function setup(
     cellSize: () => ({ width: 10, height: 20 }), isMac: true,
     onCopy: () => false, onData: (bytes) => { writer.enqueue(bytes); },
     reserveInput: () => writer.reserveInput(),
-    deferInput: (action) => writer.deferInput(action),
+    deferInput: (action, size, repeat) => writer.deferInput(action, size, repeat),
     ...extra,
   });
   return { input, writer, sent, controller };
@@ -177,5 +177,19 @@ it("refuses a paste over the hard cap with a notice and keeps typing", async () 
   expect(writer.hasFailed).toBe(false);
   input.dispatchEvent(key({ key: "Enter", code: "Enter" }));
   await vi.waitFor(() => expect(sent).toEqual(["\r"]));
+  controller.dispose(); writer.dispose();
+});
+
+it("drops held-key repeats past a small backlog behind a stalled read", () => {
+  delayedClipboard();
+  const refused = vi.fn();
+  const { input, writer, controller } = setup({}, refused);
+  input.dispatchEvent(key({ key: "v", code: "KeyV", metaKey: true }));
+  for (let index = 0; index < 100; index++) {
+    input.dispatchEvent(key({ key: "a", code: "KeyA", repeat: true }));
+  }
+  expect(refused).not.toHaveBeenCalled();
+  expect(writer.holdingInput).toBe(true);
+  input.dispatchEvent(key({ key: "b", code: "KeyB" }));
   controller.dispose(); writer.dispose();
 });

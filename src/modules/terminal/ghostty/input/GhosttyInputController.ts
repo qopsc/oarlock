@@ -161,7 +161,7 @@ export type GhosttyInputControllerOptions = {
   readonly onData: (bytes: Uint8Array) => void;
   readonly onInput?: () => void;
   readonly reserveInput?: () => ((action: () => void, size?: number) => void) | null;
-  readonly deferInput?: (action: () => void, size?: number) => boolean;
+  readonly deferInput?: (action: () => void, size?: number, repeat?: boolean) => boolean;
   /**
    * Copies the selection; false when nothing is selected, and the key goes
    * on to the program. `clearSelection` asks for the copied selection to be
@@ -425,7 +425,7 @@ export class GhosttyInputController {
     }
 
     if (!(this.isMac && event.metaKey) &&
-        this.options.deferInput?.(() => this.finishKeyDown(event), event.key.length * 2)) {
+        this.options.deferInput?.(() => this.finishKeyDown(event), event.key.length * 2, event.repeat)) {
       consume(event);
       return;
     }

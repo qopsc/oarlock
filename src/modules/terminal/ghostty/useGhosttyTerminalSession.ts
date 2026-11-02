@@ -1352,7 +1352,7 @@ function createGhosttyInput(
     gridShiftY: () => surface.gridShiftY(),
     onInput: () => noteGhosttyUserInput(session.leafId),
     reserveInput: () => session.writer.reserveInput(),
-    deferInput: (action, size) => session.writer.deferInput(action, size),
+    deferInput: (action, size, repeat) => session.writer.deferInput(action, size, repeat),
     onData: (bytes) => {
       if (
         ghosttyBlocks(session.leafId)?.getMode() === "prompt" &&

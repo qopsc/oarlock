@@ -74,6 +74,18 @@ describe("BoundedPtyWriter", () => {
     expect(writer.hasFailed).toBe(false);
   });
 
+  it("coalesces held-key repeats behind a reserved slot", () => {
+    const refused = vi.fn();
+    const writer = new BoundedPtyWriter(() => undefined, refused);
+    writer.reserveInput();
+    const kept = vi.fn();
+    for (let index = 0; index < 100; index++) expect(writer.deferInput(kept, 2, true)).toBe(true);
+    // Reserved: the first slot plus the repeats taken before the limit.
+    for (let index = 0; index < 5; index++) expect(writer.deferInput(kept, 2, false)).toBe(true);
+    expect(refused).not.toHaveBeenCalled();
+    expect(writer.pendingActions).toBe(32 + 5);
+  });
+
   it("releases a reserved slot nobody resolved so typing flows again", async () => {
     vi.useFakeTimers();
     try {

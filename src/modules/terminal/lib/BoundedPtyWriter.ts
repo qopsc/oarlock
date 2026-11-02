@@ -22,6 +22,8 @@ const MAX_INPUT_UNIT_BYTES = 8 * 1024 * 1024;
 const RESERVED_SLOT_DEADLINE_MS = 60_000;
 const MAX_WRITE_BATCH_BYTES = 64 * 1024;
 const MAX_PENDING_ACTIONS = 256;
+/** Held-key repeats queue behind a reserved slot only up to this many. */
+const MAX_DEFERRED_REPEATS = 32;
 
 type PendingBytes = { kind: "bytes"; bytes: Uint8Array; reply: boolean; valid?: () => boolean; cancelled?: () => void };
 type PendingAction = {
@@ -87,6 +89,10 @@ export class BoundedPtyWriter {
 
   get hasPendingInput(): boolean {
     return this.actions > 0 || this.queue.some((item) => item.kind === "bytes" && !item.reply);
+  }
+
+  get pendingActions(): number {
+    return this.actions;
   }
 
   get holdingInput(): boolean {
@@ -155,9 +161,10 @@ export class BoundedPtyWriter {
   }
 
   /** Delay synchronous editor input only while a reserved operation is pending. */
-  deferInput(action: () => void, size = 0): boolean {
+  deferInput(action: () => void, size = 0, repeat = false): boolean {
     if (this.disposed || this.failed) return true;
     if (this.insertion !== null || this.actions === 0) return false;
+    if (repeat && this.actions >= MAX_DEFERRED_REPEATS) return true;
     const resolve = this.reserveInput();
     if (resolve) resolve(action, size);
     return true;
