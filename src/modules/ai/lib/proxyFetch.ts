@@ -22,26 +22,19 @@ type Route = {
   extra: Record<string, unknown>;
 };
 
-function aiRoute(allowPrivateNetwork: boolean): Route {
-  return {
-    label: "AI",
-    stream: "ai_http_stream",
-    cancel: "ai_http_cancel",
-    ack: "ai_http_ack",
-    metadataHeader: "x-oarlock-ai-request",
-    extra: { allowPrivateNetwork },
-  };
-}
-
-export function createProxyFetch(
-  opts: { allowPrivateNetwork?: boolean } = {},
-): typeof fetch {
-  const route = aiRoute(opts.allowPrivateNetwork === true);
-  return (input, init) => proxyFetchImpl(input, init, route);
-}
+/** Whether a request may reach the user's own network is decided natively from the
+ *  host, so a route carries no such flag. */
+const AI_ROUTE: Route = {
+  label: "AI",
+  stream: "ai_http_stream",
+  cancel: "ai_http_cancel",
+  ack: "ai_http_ack",
+  metadataHeader: "x-oarlock-ai-request",
+  extra: {},
+};
 
 export const proxyFetch: typeof fetch = (input, init) =>
-  proxyFetchImpl(input, init, aiRoute(false));
+  proxyFetchImpl(input, init, AI_ROUTE);
 
 /**
  * A fetch for one remote MCP server's session (`mcp_http_open`): the same

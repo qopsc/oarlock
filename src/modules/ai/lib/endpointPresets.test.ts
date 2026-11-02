@@ -8,7 +8,7 @@ import {
 } from "./endpointPresets";
 import { opencodeSessionHeaders } from "./opencodeSession";
 
-vi.mock("./proxyFetch", () => ({ createProxyFetch: () => fetch }));
+vi.mock("./proxyFetch", () => ({ proxyFetch: fetch }));
 
 const opencodeGo = ENDPOINT_PRESETS.find((p) => p.id === "opencode-go");
 
