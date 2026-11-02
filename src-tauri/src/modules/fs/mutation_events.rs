@@ -152,21 +152,32 @@ impl Stream {
         let _claim = self.claim(claims);
         // Only recovery needs this additional metadata work, and identity must
         // be captured before deletion/rename makes the old parent unavailable.
-        let recovering = self
+        // Recoveries registered later cannot overlap this claim (their `begin`
+        // would have waited for it), so only these are judged at publish.
+        let existing: Vec<String> = self
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .recoveries
-            .values()
-            .any(|entry| entry.generation.load(Ordering::Acquire));
-        let paths = if recovering { resolve() } else { HashMap::new() };
+            .iter()
+            .filter(|(_, entry)| entry.generation.load(Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let paths = if existing.is_empty() { HashMap::new() } else { resolve() };
         let (result, change) = mutation()?;
         if let Some(change) = change {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let changed_paths = change.paths();
-            for recovery in state.recoveries.values_mut().filter(|entry| {
-                entry.workspace == workspace && entry.generation.load(Ordering::Acquire)
-            }) {
+            for recovery in state
+                .recoveries
+                .iter_mut()
+                .filter(|(id, entry)| {
+                    existing.contains(*id)
+                        && entry.workspace == workspace
+                        && entry.generation.load(Ordering::Acquire)
+                })
+                .map(|(_, entry)| entry)
+            {
                 recovery.changed |= changed_paths.iter().any(|path| {
                     // If preflight could not resolve an entry that did commit,
                     // conservatively invalidate rather than miss its identity.
@@ -475,15 +486,28 @@ mod tests {
             })
         };
         started.recv().unwrap();
-        // A different folder is not delayed by the slow delete above.
-        let unrelated = stream.apply_tracked(
-            WorkspaceEnv::Local,
-            &[PathBuf::from("/work/other")],
-            HashMap::new,
-            || Ok((7, None)),
-            |_| Ok(()),
-        );
-        assert_eq!(unrelated.unwrap(), 7);
+        // A different folder is not delayed by the slow delete above. It runs on
+        // a thread so a broken claim fails the test instead of hanging it.
+        let (done, finished) = mpsc::channel();
+        let other = {
+            let stream = stream.clone();
+            std::thread::spawn(move || {
+                let result = stream.apply_tracked(
+                    WorkspaceEnv::Local,
+                    &[PathBuf::from("/work/other")],
+                    HashMap::new,
+                    || Ok((7, None)),
+                    |_| Ok(()),
+                );
+                done.send(result).unwrap();
+            })
+        };
+        let unrelated = finished.recv_timeout(Duration::from_secs(2));
+        if unrelated.is_err() {
+            release.send(()).unwrap();
+        }
+        assert_eq!(unrelated.expect("an unrelated mutation waited").unwrap(), 7);
+        other.join().unwrap();
         // Something inside the folder being removed waits for it.
         let (ran, observed) = mpsc::channel();
         let nested = {
@@ -531,6 +555,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(seen, 2, "the lost event must be visible as a gap");
+    }
+    #[test]
+    fn an_unrelated_mutation_does_not_invalidate_a_recovery_registered_meanwhile() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let stream = Arc::new(Stream::default());
+        let (entered, started) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let mutation = {
+            let stream = stream.clone();
+            std::thread::spawn(move || {
+                stream
+                    .apply_tracked(
+                        WorkspaceEnv::Local,
+                        &[PathBuf::from("/elsewhere/node_modules")],
+                        HashMap::new,
+                        || {
+                            entered.send(()).unwrap();
+                            held.recv().unwrap();
+                            Ok((
+                                (),
+                                Some(Change::Deleted {
+                                    paths: vec!["/elsewhere/node_modules".into()],
+                                }),
+                            ))
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            })
+        };
+        started.recv().unwrap();
+        let id = begin_at(&stream, "a", &root.join("draft"));
+        release.send(()).unwrap();
+        mutation.join().unwrap();
+        let changed = stream.0.lock().unwrap().recoveries.get(&id).unwrap().changed;
+        assert!(!changed, "an unrelated delete invalidated a concurrent recovery");
     }
     #[test]
     fn a_recovery_waits_for_a_running_mutation_of_its_target() {
