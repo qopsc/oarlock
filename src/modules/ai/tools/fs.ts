@@ -156,7 +156,10 @@ export function buildFsTools(ctx: ToolContext) {
         let expected: string | null | undefined =
           ctx.readCache.get(abs)?.version;
         let original = "";
-        if (expected === undefined) {
+        const planning = usePlanStore.getState().active;
+        // The plan review compares against the file as it is now, so plan mode reads it
+        // even when the model's cached version could stand in for the write itself.
+        if (expected === undefined || planning) {
           try {
             const r = await native.readFile(abs, { versioned: true });
             if (r.kind !== "text" || typeof r.version !== "string") {
@@ -167,13 +170,13 @@ export function buildFsTools(ctx: ToolContext) {
               };
             }
             original = r.content;
-            expected = r.version;
+            expected ??= r.version;
           } catch {
-            expected = null;
+            expected ??= null;
           }
         }
 
-        if (usePlanStore.getState().active) {
+        if (planning) {
           usePlanStore.getState().enqueue({
             workspace: ctx.workspace,
             id: newQueuedEditId(),

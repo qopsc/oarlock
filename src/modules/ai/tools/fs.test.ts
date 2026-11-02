@@ -329,6 +329,29 @@ describe("write_file", () => {
     );
   });
 
+  it("shows the plan review the file as it is, keeping the version the model read", async () => {
+    planMock.active = true;
+    nativeMock.readFile.mockResolvedValue({
+      kind: "text",
+      content: "line one\nline two",
+      size: 17,
+      version: "v7",
+    });
+    await run(
+      "write_file",
+      makeContext(new Map([[FILE, { size: 1, hash: 1, version: "v5" }]])),
+      { path: FILE, content: "line one" },
+    );
+    expect(planMock.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        originalContent: "line one\nline two",
+        proposedContent: "line one",
+        baseVersion: "v5",
+        isNewFile: false,
+      }),
+    );
+  });
+
   it("propagates a security refusal without writing", async () => {
     securityMock.checkWritableCanonical.mockResolvedValue({
       ok: false,
