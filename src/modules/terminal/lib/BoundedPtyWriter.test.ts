@@ -212,6 +212,20 @@ describe("BoundedPtyWriter", () => {
     expect(cleared).toHaveBeenCalledWith(false);
   });
 
+  it("does not keep the last batch referenced after its write settles", async () => {
+    const { pty, release } = stalledPty();
+    const writer = new BoundedPtyWriter(() => undefined);
+    writer.attach(pty);
+    const done = vi.fn();
+    writer.enqueue(new Uint8Array(1024), false, () => true, undefined, done);
+    await vi.waitFor(() => expect(pty.write).toHaveBeenCalled());
+    const held = () => (writer as unknown as { lastTaken: unknown[] }).lastTaken;
+    expect(held()).toHaveLength(0);
+    release();
+    await vi.waitFor(() => expect(done).toHaveBeenCalledWith(true));
+    expect(held()).toHaveLength(0);
+  });
+
   it("stays failed after a real write error until detached", async () => {
     const failed = vi.fn();
     const writer = new BoundedPtyWriter(failed);

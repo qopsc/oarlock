@@ -266,6 +266,7 @@ export class BoundedPtyWriter {
         const generation = this.generation;
         const batch = this.takeBatch();
         const taken = this.lastTaken;
+        this.lastTaken = [];
         try {
           await pty.write(batch);
           for (const item of taken) item.settled?.(true);
