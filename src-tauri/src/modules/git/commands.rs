@@ -436,7 +436,7 @@ mod tests {
             (commands, "worktree::add_with_guard(r, &repo_root, &branch, path.as_deref(), &workspace,\n            &super::utils::store_guard(&dirs))"),
             (commands, "worktree::remove_with_guard(r, &repo_root, &path, force, &workspace,\n            &super::utils::store_guard(&dirs))"),
             (commands, "crate::modules::fs::native_store::refuse_write(&owner, &root)?;\n        operations::checkout_branch("),
-            (discard, "let guard = super::utils::store_guard(&dirs);\n            let outcome = work.execute(&app.state::<WorkspaceRegistry>(), &guard);"),
+            (discard, "let guard = super::utils::store_guard(&dirs);\n            work.execute(&app.state::<WorkspaceRegistry>(), &guard)"),
         ] {
             assert!(source.contains(call), "missing the native-store guard: {call}");
         }

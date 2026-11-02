@@ -600,8 +600,7 @@ pub async fn execute(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let dirs = crate::modules::fs::native_store::store_dirs(&app)?;
             let guard = super::utils::store_guard(&dirs);
-            let outcome = work.execute(&app.state::<WorkspaceRegistry>(), &guard);
-            outcome
+            work.execute(&app.state::<WorkspaceRegistry>(), &guard)
         }))
         .unwrap_or_else(|_| {
             Err("Git Discard failed unexpectedly; editor drafts were retained".into())
