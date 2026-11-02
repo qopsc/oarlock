@@ -906,12 +906,18 @@ export default function App() {
       }
       updateTab(change.id, { path: change.path, title: change.title });
     }
+    const detached = new Set<number>();
     for (const id of plan.deleted) {
       const editor = editorRefs.current.get(id);
-      if (editor?.hasUnsavedChanges()) editor.detach();
+      if (editor?.hasUnsavedChanges()) {
+        editor.detach();
+        detached.add(id);
+      }
     }
-    handlePathsDeleted(plan.deleted, (id) =>
-      editorRefs.current.get(id)?.hasUnsavedChanges(),
+    handlePathsDeleted(
+      plan.deleted,
+      (id) => editorRefs.current.get(id)?.hasUnsavedChanges(),
+      detached,
     );
     for (const id of plan.refresh) editorRefs.current.get(id)?.reload();
   }, async (scope, isLive, failedEvent) => {

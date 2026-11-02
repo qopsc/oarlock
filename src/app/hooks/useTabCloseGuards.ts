@@ -296,8 +296,17 @@ export function useTabCloseGuards({
   }, []);
 
   const handlePathsDeleted = useCallback(
-    (ids: number[], isDirty: (id: number) => boolean | undefined) => {
-      const affected = partitionDeletedTabs(tabsRef.current, ids, isDirty);
+    (
+      ids: number[],
+      isDirty: (id: number) => boolean | undefined,
+      detached: ReadonlySet<number> = new Set(),
+    ) => {
+      // A draft the same event just detached already offers Restore and Save As.
+      const affected = partitionDeletedTabs(
+        tabsRef.current,
+        ids.filter((id) => !detached.has(id)),
+        isDirty,
+      );
       disposeDeletedTabs(affected.cleanIds);
       if (affected.dirtyIds.length > 0) {
         setPendingDeleteTabs((current) => [

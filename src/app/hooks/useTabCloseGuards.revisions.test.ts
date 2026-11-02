@@ -17,7 +17,9 @@ vi.mock("react", () => ({
   useState: (value: unknown) => {
     const index = fake.cursor++;
     if (!(index in fake.slots)) fake.slots[index] = value;
-    return [fake.slots[index], (next: unknown) => { fake.slots[index] = next; }];
+    return [fake.slots[index], (next: unknown) => {
+      fake.slots[index] = typeof next === "function" ? next(fake.slots[index]) : next;
+    }];
   },
 }));
 vi.mock("@/modules/settings/preferences", () => ({
@@ -118,6 +120,19 @@ it("closing a split pane asks first when a program runs in it", async () => {
   fake.busy.mockResolvedValue(false);
   await render().handleClosePane(5);
   expect(disposePane).toHaveBeenCalledWith(5);
+});
+
+it("a deleted dirty draft the same event detached raises no delete dialog", async () => {
+  const disposeDeletedTabs = vi.fn();
+  const params = {
+    tabs, activeId: 1, editorIsDirty: () => true,
+    disposeTab: vi.fn(), disposeDeletedTabs, disposeTabs: vi.fn(), disposePane: vi.fn(),
+  };
+  const render = () => { fake.cursor = 0; return useTabCloseGuards(params); };
+  render().handlePathsDeleted([2], () => true, new Set([2]));
+  expect(render().pendingDeleteTabs).toBeNull();
+  render().handlePathsDeleted([2], () => true);
+  expect(render().pendingDeleteTabs).toEqual([2]);
 });
 
 const otherSpaceTab = { id: 9, kind: "editor", spaceId: "other", dirty: true } as Tab;
