@@ -54,6 +54,8 @@ fn version_identity(version: &str) -> Option<&str> {
         .strip_prefix("v2:")?
         .rsplit_once(':')
         .map(|(identity, _)| identity)
+        // The placeholder of a save whose version could not be read back names no file.
+        .filter(|identity| *identity != "unavailable")
 }
 
 fn opened_identity(
@@ -122,16 +124,30 @@ fn reconcile_within(
     }
     // A hard-linked file may have several names. Never choose one arbitrarily.
     let mut matches: HashMap<String, Option<String>> = HashMap::new();
-    let mut visited: Vec<PathBuf> = Vec::new();
-    let mut scan = |walk_root: &Path, root: &Root| {
-        // Roots overlap with the former folders scanned first; a folder is read once.
-        if visited.iter().any(|done| walk_root.starts_with(done)) {
-            return;
+    let deadline = Instant::now() + limits.time;
+    // A rename usually stays in the folder the document came from: look there first, for the
+    // documents still unresolved only. The walk starts at the root so its ignore rules apply.
+    let mut formers: Vec<(PathBuf, usize)> = Vec::new();
+    for indexes in unresolved.values() {
+        for &i in indexes {
+            let former = resolve_path(&documents[i].path, workspace)
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .and_then(|dir| fs::canonicalize(dir).ok());
+            let Some(former) = former else { continue };
+            let Some(root) = roots.iter().position(|root| former.starts_with(&root.path)) else {
+                continue;
+            };
+            if !formers.iter().any(|(done, _)| former.starts_with(done)) {
+                formers.push((former, root));
+            }
         }
-        visited.push(walk_root.to_path_buf());
-        let started = Instant::now();
+    }
+    let scan = |root: &Root, only: Option<&Path>, skip: &[PathBuf], matches: &mut HashMap<String, Option<String>>| {
         let mut seen = 0usize;
-        let walker = WalkBuilder::new(walk_root)
+        let only = only.map(Path::to_path_buf);
+        let skip = skip.to_vec();
+        let walker = WalkBuilder::new(&root.path)
             .hidden(false)
             .ignore(true)
             .git_ignore(true)
@@ -140,11 +156,18 @@ fn reconcile_within(
             .require_git(false)
             .parents(false)
             .follow_links(false)
-            .filter_entry(|entry| entry.file_name() != ".git")
+            .filter_entry(move |entry| {
+                let path = entry.path();
+                entry.file_name() != ".git"
+                    && !skip.iter().any(|done| path.starts_with(done))
+                    && only
+                        .as_ref()
+                        .is_none_or(|target| path.starts_with(target) || target.starts_with(path))
+            })
             .build();
         for entry in walker {
             seen += 1;
-            if seen > limits.entries || started.elapsed() > limits.time {
+            if seen > limits.entries || Instant::now() > deadline {
                 return;
             }
             let Ok(entry) = entry else { continue };
@@ -172,22 +195,12 @@ fn reconcile_within(
                 .or_insert(Some(path));
         }
     };
-    // A rename usually stays in the folder the document came from: look there first.
-    for (i, doc) in documents.iter().enumerate() {
-        let former = resolve_path(&doc.path, workspace)
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .and_then(|dir| fs::canonicalize(dir).ok());
-        let Some(former) = former else { continue };
-        let Some(root) = roots.iter().find(|root| former.starts_with(&root.path)) else {
-            continue;
-        };
-        if bindings[i].path.is_none() {
-            scan(&former, root);
-        }
+    for (former, root) in &formers {
+        scan(&roots[*root], Some(former), &[], &mut matches);
     }
+    let done: Vec<PathBuf> = formers.into_iter().map(|(former, _)| former).collect();
     for root in roots {
-        scan(&root.path, root);
+        scan(root, None, &done, &mut matches);
     }
     for (identity, indexes) in unresolved {
         if let Some(Some(path)) = matches.get(&identity) {
@@ -197,6 +210,24 @@ fn reconcile_within(
         }
     }
     Ok(bindings)
+}
+
+/// A root that is gone, not a folder or out of reach is skipped: its documents stay
+/// unresolved instead of stalling the whole batch.
+fn usable_roots(
+    displays: Vec<String>,
+    workspace: &WorkspaceEnv,
+    authorize: impl Fn(&Path) -> Result<PathBuf, String>,
+) -> Result<Vec<Root>, String> {
+    let mut roots = Vec::new();
+    for display in displays {
+        let requested = resolve_path(&display, workspace)?;
+        match authorize(&requested) {
+            Ok(path) if path.is_dir() => roots.push(Root { path, display }),
+            _ => {}
+        }
+    }
+    Ok(roots)
 }
 
 #[tauri::command]
@@ -213,16 +244,7 @@ pub async fn fs_reconcile_documents(
         let workspace = WorkspaceEnv::from_option(workspace);
         let registry = app.state::<WorkspaceRegistry>();
         let gates = registry.gates(Origin::App);
-        let roots = roots
-            .into_iter()
-            .map(|display| {
-                let path = gates.authorized_existing(&resolve_path(&display, &workspace)?)?;
-                if !path.is_dir() {
-                    return Err(format!("Reconciliation root is not a folder: {display}"));
-                }
-                Ok(Root { path, display })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let roots = usable_roots(roots, &workspace, |path| gates.authorized_existing(path))?;
         reconcile(&documents, &roots, &workspace, |path| {
             gates.authorized_existing(path).map(drop)
         })
@@ -349,6 +371,62 @@ mod tests {
             version: Some(version),
         };
         (file, doc)
+    }
+
+    #[test]
+    fn a_missing_or_unauthorized_root_is_skipped_not_fatal() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let good = base.join("good");
+        let denied = base.join("denied");
+        fs::create_dir_all(&good).unwrap();
+        fs::create_dir_all(&denied).unwrap();
+        let shown = |p: &Path| p.to_string_lossy().into_owned();
+        let roots = usable_roots(
+            vec![shown(&base.join("gone")), shown(&denied), shown(&good)],
+            &WorkspaceEnv::default(),
+            |path| {
+                if path.starts_with(&denied) {
+                    Err("outside".into())
+                } else {
+                    fs::canonicalize(path).map_err(|e| e.to_string())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, good);
+    }
+
+    #[test]
+    fn the_unavailable_placeholder_matches_the_file_at_its_own_path() {
+        assert_eq!(version_identity("v2:unavailable:abcd"), None);
+        assert_eq!(version_identity("v2:1:2:birth:x:abcd"), Some("1:2:birth:x"));
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("doc");
+        fs::write(&file, "x").unwrap();
+        let doc = Document {
+            id: 1,
+            path: file.to_string_lossy().into(),
+            version: Some("v2:unavailable:abcd".into()),
+        };
+        let found = reconcile(&[doc], &[root(temp.path())], &WorkspaceEnv::default(), |_| Ok(())).unwrap();
+        assert_eq!(found[0].path.as_deref(), file.to_str());
+    }
+
+    #[test]
+    fn a_former_folder_is_walked_once_and_only_for_unresolved_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let sub = base.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(base.join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir_all(sub.join("ignored")).unwrap();
+        let (original, doc) = versioned(&sub, "doc.txt");
+        let hidden = sub.join("ignored/doc.txt");
+        fs::rename(&original, &hidden).unwrap();
+        let found = reconcile(&[doc], &[root(&base)], &WorkspaceEnv::default(), |_| Ok(())).unwrap();
+        assert_eq!(found[0].path, None, "the root's ignore rules apply inside a former folder");
     }
 
     fn root(path: &Path) -> Root {
