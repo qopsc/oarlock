@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::modules::fs::{blocking, to_canon};
-use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv};
+use crate::modules::workspace::{resolve_path, Origin, WorkspaceEnv, WorkspaceRegistry};
 
 /// Sent to every window when a decision is made or revoked, or a window opens or leaves a
 /// project.
@@ -213,6 +213,27 @@ pub fn resolve_project(root: &str, workspace: Option<WorkspaceEnv>) -> Result<Op
         root: root.to_owned(),
         workspace,
     })
+}
+
+/// `resolve_project` for a root the workspace registry authorizes: a page cannot make any
+/// readable folder the window's open project and have its `AGENTS.md` head, `.mcp.json` command
+/// lines and skill descriptions read back.
+pub fn resolve_authorized_project(
+    app: &AppHandle,
+    root: &str,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<OpenProject, String> {
+    authorized_project(&app.state::<WorkspaceRegistry>(), root, workspace)
+}
+
+fn authorized_project(
+    registry: &WorkspaceRegistry,
+    root: &str,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<OpenProject, String> {
+    let project = resolve_project(root, workspace)?;
+    registry.authorized_existing(&project.real)?;
+    Ok(project)
 }
 
 #[derive(Default)]
@@ -1269,7 +1290,7 @@ pub async fn project_trust_status(
 ) -> Result<Option<ProjectStatus>, String> {
     let label = webview.label().to_owned();
     blocking(move || {
-        let Ok(project) = resolve_project(&root, workspace) else {
+        let Ok(project) = resolve_authorized_project(&app, &root, workspace) else {
             if app.state::<ProjectTrustState>().release_window(&label) {
                 crate::modules::skills::open_projects_changed(&app);
                 let _ = app.emit(CHANGED_EVENT, ());
@@ -1301,7 +1322,7 @@ pub async fn project_trust_decide(
     decisions: Vec<DecisionInput>,
 ) -> Result<ProjectStatus, String> {
     blocking(move || {
-        let project = resolve_project(&root, workspace)?;
+        let project = resolve_authorized_project(&app, &root, workspace)?;
         let current: HashMap<ItemKind, Result<String, String>> = decisions
             .iter()
             .filter_map(|decision| inspect(&project.real, decision.kind))
@@ -1708,6 +1729,23 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn a_root_the_registry_does_not_authorize_is_not_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let registry = WorkspaceRegistry::default();
+        let text = root.to_string_lossy().into_owned();
+        assert!(authorized_project(&registry, &text, None).is_err());
+        registry.authorize(&root).unwrap();
+        assert_eq!(
+            authorized_project(&registry, &text, None).unwrap().real,
+            root
+        );
+        let inside = root.join("sub");
+        std::fs::create_dir(&inside).unwrap();
+        assert!(authorized_project(&registry, &inside.to_string_lossy(), None).is_ok());
     }
 
     #[test]

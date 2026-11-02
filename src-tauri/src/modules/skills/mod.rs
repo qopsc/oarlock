@@ -26,7 +26,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::modules::fs::{blocking, to_canon};
 use crate::modules::project_trust::{
-    self, item_path, open_projects, resolve_project, Inspected, ItemEntry, ItemKind, OpenProject,
+    self, item_path, open_projects, resolve_authorized_project, Inspected, ItemEntry, ItemKind, OpenProject,
     ProjectStatus,
 };
 use crate::modules::workspace::{is_plain_name, Opened, WorkspaceEnv, WorkspaceRegistry};
@@ -611,16 +611,19 @@ fn parse_id(id: &str) -> Result<(SourceKind, String), String> {
     Ok((kind, dir_name.to_owned()))
 }
 
-fn project_of(input: Option<ProjectInput>) -> Result<Option<OpenProject>, String> {
+fn project_of(
+    app: &AppHandle,
+    input: Option<ProjectInput>,
+) -> Result<Option<OpenProject>, String> {
     input
-        .map(|project| resolve_project(&project.root, project.workspace))
+        .map(|project| resolve_authorized_project(app, &project.root, project.workspace))
         .transpose()
 }
 
 /// A skill the model may use in a conversation working in `project`: valid, on, trusted and
 /// not overridden.
 fn usable(app: &AppHandle, skill: SkillRef) -> Result<SkillView, String> {
-    let project = project_of(skill.project)?;
+    let project = project_of(app, skill.project)?;
     let snapshot = collect(app, Scope::Agent(project.as_ref()));
     let view = snapshot
         .skills
@@ -651,7 +654,7 @@ fn skill_file_of(app: &AppHandle, skill: &SkillRef) -> Result<PathBuf, String> {
             source.dir
         }
         Some(item) => {
-            let project = project_of(skill.project.clone())?.ok_or("unknown skill")?;
+            let project = project_of(app, skill.project.clone())?.ok_or("unknown skill")?;
             project_item_dir(&project.real, item).ok_or("unknown skill")??
         }
     };
@@ -677,8 +680,9 @@ pub async fn skills_list(
         if all == Some(true) {
             return Ok(collect(&app, Scope::All));
         }
-        let project =
-            project.and_then(|project| resolve_project(&project.root, project.workspace).ok());
+        let project = project.and_then(|project| {
+            resolve_authorized_project(&app, &project.root, project.workspace).ok()
+        });
         Ok(collect(&app, Scope::Agent(project.as_ref())))
     })
     .await
